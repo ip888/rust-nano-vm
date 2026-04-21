@@ -1,0 +1,14 @@
+[package]
+name = "vm-mock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-memory Hypervisor implementation for tests and CI."
+
+[dependencies]
+vm-core.workspace = true
+
+[lints]
+workspace = true

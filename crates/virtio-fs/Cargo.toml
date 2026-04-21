@@ -1,0 +1,13 @@
+[package]
+name = "virtio-fs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "virtio-fs host<->guest filesystem integration. Placeholder; implementation lands in M3."
+
+[dependencies]
+
+[lints]
+workspace = true

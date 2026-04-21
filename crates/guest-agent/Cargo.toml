@@ -1,0 +1,13 @@
+[package]
+name = "guest-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Static musl binary that runs inside every sandbox. Placeholder; implementation lands in M2."
+
+[dependencies]
+
+[lints]
+workspace = true

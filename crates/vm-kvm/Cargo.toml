@@ -1,0 +1,24 @@
+[package]
+name = "vm-kvm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "KVM-backed Hypervisor implementation. Linux-only, feature-gated."
+
+[dependencies]
+vm-core.workspace = true
+
+# Real KVM deps (kvm-ioctls, vm-memory, linux-loader) arrive with the `kvm`
+# feature in M1. Keeping them out of the default build keeps
+# `cargo build --workspace` fast and portable (incl. in the gVisor sandbox,
+# which has no /dev/kvm).
+
+[features]
+default = []
+# Enable the real KVM backend. Requires Linux + /dev/kvm at runtime.
+kvm = []
+
+[lints]
+workspace = true
