@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vm-core",
+    "crates/vm-mock",
+    "crates/vm-kvm",
+    "crates/virtio-fs",
+    "crates/virtio-vsock",
+    "crates/snapshot",
+    "crates/guest-agent",
+    "crates/control-plane",
+    "crates/proto",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.94"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/ip888/Rust-nano-vm"
+authors = ["Rust-nano-vm contributors"]
+
+[workspace.dependencies]
+# Local crates
+vm-core = { path = "crates/vm-core", version = "0.0.1" }
+vm-mock = { path = "crates/vm-mock", version = "0.0.1" }
+vm-kvm = { path = "crates/vm-kvm", version = "0.0.1" }
+proto = { path = "crates/proto", version = "0.0.1" }
+virtio-fs = { path = "crates/virtio-fs", version = "0.0.1" }
+virtio-vsock = { path = "crates/virtio-vsock", version = "0.0.1" }
+snapshot = { path = "crates/snapshot", version = "0.0.1" }
+
+# External
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+todo = "allow"

@@ -1,0 +1,13 @@
+[package]
+name = "control-plane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "axum REST/gRPC API, auth, quotas, metering. Placeholder; implementation lands in M6."
+
+[dependencies]
+
+[lints]
+workspace = true

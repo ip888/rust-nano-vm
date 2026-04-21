@@ -1,0 +1,13 @@
+[package]
+name = "snapshot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Snapshot + fork primitive (userfaultfd + CoW memory). Placeholder; implementation lands in M5."
+
+[dependencies]
+
+[lints]
+workspace = true
