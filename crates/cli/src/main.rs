@@ -1,7 +1,7 @@
 //! `nanovm` — the rust-nano-vm command-line driver.
 //!
 //! M0 ships only the subcommand surface. Subcommands print
-//! `unimplemented: milestone Mx` and exit 1 so downstream tooling can depend
+//! `unimplemented: milestone Mx` and exit 2 so downstream tooling can depend
 //! on the CLI shape today. Real behaviour lands in M1–M6.
 
 #![forbid(unsafe_code)]
@@ -24,7 +24,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Boot a new sandbox VM from a rootfs/kernel image. [M1]
+    /// Boot a new sandbox VM from a rootfs/kernel image. (milestone M1)
     Run {
         /// Path to the rootfs or guest image.
         image: String,
@@ -35,7 +35,7 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         vcpus: u32,
     },
-    /// Execute a command inside an already-running sandbox. [M2]
+    /// Execute a command inside an already-running sandbox. (milestone M2)
     Exec {
         /// Target sandbox id (as printed by `run`).
         id: String,
@@ -43,19 +43,19 @@ enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         argv: Vec<String>,
     },
-    /// Copy a file into or out of a sandbox. [M3]
+    /// Copy a file into or out of a sandbox. (milestone M3)
     Cp {
         /// Source (either local path or `<id>:/path`).
         src: String,
         /// Destination (either local path or `<id>:/path`).
         dst: String,
     },
-    /// Take a snapshot of a running sandbox. [M5]
+    /// Take a snapshot of a running sandbox. (milestone M5)
     Snapshot {
         /// Target sandbox id.
         id: String,
     },
-    /// Fork a new sandbox from a snapshot. [M5]
+    /// Fork a new sandbox from a snapshot. (milestone M5)
     Fork {
         /// Snapshot id to fork from.
         snapshot: String,
@@ -63,7 +63,7 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         count: u32,
     },
-    /// List running sandboxes. [M2]
+    /// List running sandboxes. (milestone M2)
     Ps,
 }
 

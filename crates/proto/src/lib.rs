@@ -86,7 +86,8 @@ pub enum RequestBody {
     },
     /// Send a UNIX signal to a previously-spawned process.
     Signal {
-        /// Guest-side pid returned from [`ResponseBody::ExecStarted`] (future).
+        /// Guest-side pid. In M2 `Exec` will be split into a streaming form
+        /// that returns a pid up-front; for now this field is reserved.
         pid: u32,
         /// Signal number.
         signum: i32,

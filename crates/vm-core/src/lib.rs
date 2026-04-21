@@ -1,9 +1,9 @@
 //! Core traits and types for `rust-nano-vm`.
 //!
-//! Every hypervisor backend ([`vm-kvm`], [`vm-mock`], future in-process or
+//! Every hypervisor backend (`vm-kvm`, `vm-mock`, future in-process or
 //! userfaultfd-based backends) implements the [`Hypervisor`] trait. Consumers
 //! (CLI, control-plane) program against the trait, never the concrete
-//! backend, so test and CI runs can use [`vm-mock`] without a KVM device.
+//! backend, so test and CI runs can use `vm-mock` without a KVM device.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -64,7 +64,7 @@ pub struct VmConfig {
     /// Guest memory in MiB.
     pub memory_mib: u64,
     /// Path to the kernel image (bzImage or vmlinux). `None` is allowed for
-    /// backends that don't actually boot a guest (e.g. [`vm-mock`]).
+    /// backends that don't actually boot a guest (e.g. `vm-mock`).
     pub kernel: Option<PathBuf>,
     /// Path to the root filesystem image.
     pub rootfs: Option<PathBuf>,

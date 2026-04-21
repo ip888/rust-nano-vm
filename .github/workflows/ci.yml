@@ -62,7 +62,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-test-
       - name: cargo build
-        run: cargo build --workspace --locked || cargo build --workspace
+        run: cargo build --workspace --locked
       - name: cargo test
         run: cargo test --workspace
       # The `kvm` feature is NOT exercised in CI — GitHub runners don't

@@ -98,6 +98,7 @@ E2B (which layers its own solution on top).
 - Mirror the Firecracker threat model (documented there thoroughly).
 - Seccomp-BPF filter on the VMM process (M1+).
 - `cargo-fuzz` on virtio queue parsers before shipping real devices (M2+).
-- `cargo-audit` / `cargo-deny` in CI (M0).
+- `cargo-audit` / `cargo-deny` RustSec checks planned for CI; current M0
+  CI runs fmt / clippy / build / test only.
 - No network to the guest unless explicitly requested; vsock only by
   default.
