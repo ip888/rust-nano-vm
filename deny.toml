@@ -1,0 +1,69 @@
+# cargo-deny configuration. See https://embarkstudios.github.io/cargo-deny/
+#
+# Runs in CI on every push/PR. Fail the build on:
+#  - any security advisory in a dependency (RustSec)
+#  - any dependency whose license isn't on the permissive allow-list below
+#  - any dep pulled from an unknown git repo or registry
+#
+# Intentionally loose on duplicate versions (modern async Rust pulls many
+# major versions transitively — we only care about this if it bloats the
+# binary). Tighten to "deny" once the tree stabilizes.
+
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "x86_64-unknown-linux-musl" },
+]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+version = 2
+# Fail the build on any unmaintained / yanked / vulnerable crate. Override
+# with `ignore` entries (tracking-issue required) if we intentionally accept a
+# specific advisory.
+ignore = []
+
+[licenses]
+version = 2
+# Permissive OSS licenses compatible with our dual Apache-2.0 OR MIT.
+# Every crate in the tree must match one of these; add only after a review
+# of the license text.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "0BSD",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[bans]
+# Warn (don't fail) when two major versions of the same crate are in the
+# tree. Common with axum / tokio ecosystems during transitions.
+multiple-versions = "warn"
+# Wildcards are fine for our own path-based workspace deps.
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

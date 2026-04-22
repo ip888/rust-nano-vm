@@ -67,3 +67,15 @@ jobs:
         run: cargo test --workspace
       # The `kvm` feature is NOT exercised in CI — GitHub runners don't
       # expose /dev/kvm. M1+ will wire up a self-hosted KVM runner.
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # Runs all check types: advisories, licenses, bans, sources.
+          command: check
+          log-level: warn
+          rust-version: stable
