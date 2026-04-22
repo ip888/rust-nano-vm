@@ -47,6 +47,19 @@ cargo test --workspace
 cargo run -p cli -- --help
 ```
 
+Run the REST control plane (M6) against the mock backend — no KVM needed:
+
+```sh
+cargo run -p control-plane
+# → nanovm-control-plane listening on 127.0.0.1:8080
+
+curl -X POST localhost:8080/v1/vms -H 'content-type: application/json' -d '{}'
+# → {"id":1,"display":"vm-0000000000000001","state":"created"}
+
+curl -X POST localhost:8080/v1/vms/1/start  # 204
+curl localhost:8080/v1/vms/1                # {"state":"running",...}
+```
+
 On a Linux host with `/dev/kvm` (M1+):
 
 ```sh
@@ -109,7 +122,7 @@ crates/
 | M3 | virtio-fs host↔guest file push/pull | yes |
 | M4 | Python/Node in guest, stdio streaming demo | yes |
 | M5 | Snapshot + fork; < 50 ms p50 cold start on warm pool | yes |
-| M6 | Control plane REST API + auth + metering | yes |
+| M6 | Control plane REST API (lifecycle) | no — runs on `vm-mock`; auth + metering follow on KVM |
 | M7 | Public docs + launch | any |
 
 Full plan: [`docs/PLAN.md`](docs/PLAN.md).

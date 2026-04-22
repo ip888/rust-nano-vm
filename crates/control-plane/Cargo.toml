@@ -5,9 +5,27 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "axum REST/gRPC API, auth, quotas, metering. Placeholder; implementation lands in M6."
+description = "REST control plane for rust-nano-vm. Exposes the Hypervisor trait over HTTP."
+
+[[bin]]
+name = "nanovm-control-plane"
+path = "src/bin/server.rs"
 
 [dependencies]
+vm-core.workspace = true
+vm-mock.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+tower = { workspace = true, features = ["util"] }
 
 [lints]
 workspace = true
