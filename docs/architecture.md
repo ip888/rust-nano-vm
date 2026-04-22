@@ -98,8 +98,8 @@ E2B (which layers its own solution on top).
 - Mirror the Firecracker threat model (documented there thoroughly).
 - Seccomp-BPF filter on the VMM process (M1+).
 - `cargo-fuzz` on virtio queue parsers before shipping real devices (M2+).
-- `cargo-deny` (advisories, licenses, bans, sources) runs in CI on every
-  push/PR — see `deny.toml`. Subsumes `cargo-audit` (RustSec advisories) and
-  adds license + source vetting.
+- `cargo-deny` (advisories, licenses, bans, sources) runs in CI on pushes to
+  `main` and PRs targeting `main` — see `deny.toml`. Subsumes `cargo-audit`
+  (RustSec advisories) and adds license + source vetting.
 - No network to the guest unless explicitly requested; vsock only by
   default.

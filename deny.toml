@@ -1,7 +1,8 @@
 # cargo-deny configuration. See https://embarkstudios.github.io/cargo-deny/
 #
-# Runs in CI on every push/PR. Fail the build on:
-#  - any security advisory in a dependency (RustSec)
+# Runs in CI on pushes to `main` and PRs targeting `main` (see
+# `.github/workflows/ci.yml`). Fail the build on:
+#  - any security advisory or yanked version in a dependency (RustSec)
 #  - any dependency whose license isn't on the permissive allow-list below
 #  - any dep pulled from an unknown git repo or registry
 #
@@ -22,16 +23,22 @@ feature-depth = 1
 
 [advisories]
 version = 2
-# Fail the build on any unmaintained / yanked / vulnerable crate. Override
-# with `ignore` entries (tracking-issue required) if we intentionally accept a
-# specific advisory.
+# Explicit "deny" on yanked so the policy doesn't drift with cargo-deny
+# defaults across upgrades. In v2-schema, all RustSec advisory categories
+# (vulnerability / unmaintained / unsound / notice) are reported by default
+# and denied unless individually listed in `ignore`.
+yanked = "deny"
+# Override with `ignore` entries (tracking-issue required) if we
+# intentionally accept a specific advisory.
 ignore = []
 
 [licenses]
 version = 2
 # Permissive OSS licenses compatible with our dual Apache-2.0 OR MIT.
 # Every crate in the tree must match one of these; add only after a review
-# of the license text.
+# of the license text. Weak-copyleft licenses (MPL-2.0, LGPL) are
+# intentionally NOT listed — if something we depend on requires one, add it
+# explicitly via an `exceptions` entry with a note.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -43,7 +50,6 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
-    "MPL-2.0",
     "0BSD",
 ]
 confidence-threshold = 0.8
