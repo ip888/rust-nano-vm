@@ -2,7 +2,9 @@
 //! guest-agent running inside a `rust-nano-vm` sandbox.
 //!
 //! Goals:
-//! - Simple JSON-RPC-ish frames (one [`Request`] → one [`Response`]).
+//! - Simple JSON-RPC-ish frames. Most ops are one [`Request`] → one
+//!   [`Response`]; the streaming `ExecStart` op (see below) is the lone
+//!   exception and produces multiple responses that share the request's id.
 //! - Versioned at the envelope level so the host can refuse to talk to a
 //!   too-old or too-new guest.
 //! - Symmetric across the host and guest crates. Keeping it small and in
@@ -26,9 +28,17 @@
 //! but a single `ExecStart` produces multiple responses.
 //!
 //! [`RequestBody::ExecStdin`] forwards bytes to a running child's stdin; the
-//! guest acknowledges with [`ResponseBody::StdinAccepted`].
+//! guest acknowledges with [`ResponseBody::StdinAccepted`]. If the pid is
+//! unknown or already reaped the guest replies with
+//! [`ErrorCode::NoSuchProcess`].
+//!
 //! [`RequestBody::ExecWait`] blocks host-side until the guest emits the
-//! terminal [`ResponseBody::ExecExited`] frame for a given pid.
+//! terminal [`ResponseBody::ExecExited`] frame for that request. `ExecWait`
+//! is independent of the `ExecStart` stream: a single child's exit can
+//! produce one `ExecExited` per subscribed request — typically one
+//! terminating the `ExecStart` stream plus one for each outstanding
+//! `ExecWait` — each carrying that request's own `id`. Hosts correlate by
+//! [`Response::id`], not by pid.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -134,8 +144,19 @@ pub enum RequestBody {
         /// If `true`, close the child's stdin after writing `data`.
         eof: bool,
     },
-    /// Block until the child identified by `pid` exits. The terminal
-    /// [`ResponseBody::ExecExited`] frame is sent exactly once per child.
+    /// Block until the child identified by `pid` exits. Replies with exactly
+    /// one [`ResponseBody::ExecExited`] carrying this request's `id`.
+    ///
+    /// If the child has already exited at the time this request arrives, the
+    /// guest MUST keep its exit status cached long enough to answer (at least
+    /// until the host acknowledges; unbounded retention is up to the guest
+    /// policy) and reply immediately.
+    ///
+    /// Callers may use `ExecWait` independently of the `ExecStart` stream —
+    /// in that case a single child's exit can produce two `ExecExited`
+    /// frames, one per originating request id (one terminating the stream
+    /// opened by `ExecStart`, one replying to this `ExecWait`). The host
+    /// correlates by the enclosing [`Response::id`].
     ExecWait {
         /// pid returned by [`ResponseBody::ExecStarted`].
         pid: u32,
@@ -200,9 +221,15 @@ pub enum ResponseBody {
         /// Raw bytes (UTF-8 when possible; raw otherwise).
         data: Vec<u8>,
     },
-    /// Terminal frame for an [`RequestBody::ExecStart`] stream or reply to
-    /// an [`RequestBody::ExecWait`]. After this, no further
-    /// [`ResponseBody::ExecOutput`] frames will be sent for `pid`.
+    /// Terminal frame for the request whose `id` this response carries —
+    /// either an [`RequestBody::ExecStart`] stream or an
+    /// [`RequestBody::ExecWait`]. Once a request has received its
+    /// `ExecExited`, no further frames will carry that request's `id`.
+    ///
+    /// A single child's exit produces one `ExecExited` per subscribed
+    /// request: typically one terminating the `ExecStart` stream, plus one
+    /// for each outstanding `ExecWait`. Hosts correlate by the enclosing
+    /// [`Response::id`].
     ExecExited {
         /// pid of the exited child.
         pid: u32,
@@ -461,6 +488,52 @@ mod tests {
         assert!(
             json.contains(r#""kind":"exec_output""#) && json.contains(r#""stream":"stdout""#),
             "got: {json}"
+        );
+
+        let json = serde_json::to_string(&ResponseBody::ExecExited {
+            pid: 42,
+            exit_code: Some(0),
+            signal: None,
+            duration_ms: 7,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"exec_exited","pid":42,"exit_code":0,"signal":null,"duration_ms":7}"#
+        );
+
+        let json = serde_json::to_string(&ResponseBody::StdinAccepted { bytes: 14 }).unwrap();
+        assert_eq!(json, r#"{"kind":"stdin_accepted","bytes":14}"#);
+
+        // Also pin StdStream's on-the-wire form independently so future code
+        // that serializes it standalone doesn't silently shift.
+        assert_eq!(
+            serde_json::to_string(&StdStream::Stdout).unwrap(),
+            r#""stdout""#
+        );
+        assert_eq!(
+            serde_json::to_string(&StdStream::Stderr).unwrap(),
+            r#""stderr""#
+        );
+    }
+
+    #[test]
+    fn no_such_process_error_code_has_stable_tag() {
+        // `no_such_process_error_roundtrips` only exercises Serialize↔Deserialize
+        // symmetry — a lock-step tag rename would still round-trip. Pin the
+        // on-the-wire spelling explicitly so external consumers can match on it.
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::NoSuchProcess).unwrap(),
+            r#""no_such_process""#
+        );
+        let json = serde_json::to_string(&RpcError {
+            code: ErrorCode::NoSuchProcess,
+            message: "pid 4242 not found".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"code":"no_such_process","message":"pid 4242 not found"}"#
         );
     }
 
