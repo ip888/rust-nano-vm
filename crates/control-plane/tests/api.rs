@@ -16,7 +16,7 @@ use vm_mock::MockHypervisor;
 
 fn app() -> Router {
     let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
-    router(AppState::new(hv))
+    router().with_state(AppState::new(hv))
 }
 
 async fn send(app: Router, method: Method, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -194,4 +194,49 @@ async fn restore_unknown_snapshot_is_not_found() {
     let (status, body) = send(app(), Method::POST, "/v1/snapshots/99999/restore", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["code"], "unknown_snapshot");
+}
+
+// --- Extractor-rejection paths (must use the same error envelope). -----
+
+#[tokio::test]
+async fn malformed_json_body_uses_structured_error_envelope() {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/vms")
+        .header("content-type", "application/json")
+        .body(Body::from("{not valid json"))
+        .unwrap();
+    let resp = app().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).expect("error body must be JSON");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "bad_request");
+    assert!(body["error"]["message"].is_string());
+}
+
+#[tokio::test]
+async fn missing_content_type_on_body_uses_structured_error_envelope() {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/vms")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = app().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).expect("error body must be JSON");
+
+    // axum rejects a missing/wrong content-type with 415 Unsupported Media
+    // Type via JsonRejection; we just require that our envelope wraps it.
+    assert!(status.is_client_error(), "status was {status}");
+    assert_eq!(body["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn non_numeric_path_segment_uses_structured_error_envelope() {
+    let (status, body) = send(app(), Method::GET, "/v1/vms/not-a-number", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "bad_request");
 }

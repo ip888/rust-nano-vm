@@ -1,7 +1,8 @@
 //! HTTP error envelope.
 //!
-//! Every error returned by a handler implements [`IntoResponse`] so axum can
-//! render it with a consistent JSON body:
+//! Every failure mode — including extractor rejections (malformed JSON
+//! bodies, non-numeric path ids) and errors surfaced by the hypervisor —
+//! renders with the same JSON shape:
 //!
 //! ```json
 //! { "error": { "code": "unknown_vm", "message": "unknown vm id: vm-..." } }
@@ -11,6 +12,7 @@
 //! detail that may change between releases.
 
 use axum::{
+    extract::rejection::{JsonRejection, PathRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -23,11 +25,29 @@ use vm_core::VmError;
 pub(crate) enum ApiError {
     /// Failure surfaced by the hypervisor backend.
     Vm(VmError),
+    /// The request body failed JSON decoding (malformed JSON, wrong shape,
+    /// wrong content-type).
+    BadJson(JsonRejection),
+    /// A URL path segment failed to parse into the expected type (e.g. a
+    /// non-numeric `:id`).
+    BadPath(PathRejection),
 }
 
 impl From<VmError> for ApiError {
     fn from(e: VmError) -> Self {
         Self::Vm(e)
+    }
+}
+
+impl From<JsonRejection> for ApiError {
+    fn from(e: JsonRejection) -> Self {
+        Self::BadJson(e)
+    }
+}
+
+impl From<PathRejection> for ApiError {
+    fn from(e: PathRejection) -> Self {
+        Self::BadPath(e)
     }
 }
 
@@ -61,6 +81,8 @@ impl IntoResponse for ApiError {
                 };
                 (status, code, msg)
             }
+            ApiError::BadJson(rej) => (rej.status(), "bad_request", rej.body_text()),
+            ApiError::BadPath(rej) => (rej.status(), "bad_request", rej.body_text()),
         };
         let body = Json(ErrorEnvelope {
             error: ErrorBody { code, message },
