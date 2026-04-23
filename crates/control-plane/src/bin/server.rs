@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("NANOVM_CONTROL_PLANE_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
 
     let hypervisor: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
-    let app = router(AppState::new(hypervisor));
+    let app = router().with_state(AppState::new(hypervisor));
 
     let listener = TcpListener::bind(&addr).await?;
     info!(%addr, "nanovm-control-plane listening");

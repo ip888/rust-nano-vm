@@ -14,8 +14,7 @@
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let hypervisor = Arc::new(MockHypervisor::new());
-//! let state = AppState::new(hypervisor);
-//! let app = router(state);
+//! let app = router().with_state(AppState::new(hypervisor));
 //!
 //! let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
 //! axum::serve(listener, app).await?;

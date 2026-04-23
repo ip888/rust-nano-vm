@@ -21,7 +21,10 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{
+        rejection::{JsonRejection, PathRejection},
+        Path, State,
+    },
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -53,9 +56,22 @@ impl AppState {
     }
 }
 
-/// Build the REST router. Call once at startup; the returned [`Router`] is
-/// `Clone` and can be served from `axum::serve`.
-pub fn router(state: AppState) -> Router {
+/// Build the REST router. The returned [`Router`] is parameterised over
+/// [`AppState`]; callers bind a concrete state with `.with_state(...)`
+/// before serving. Keeping state late-bound lets callers layer middleware
+/// or compose this router into a larger app without constructing the
+/// hypervisor backend first.
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use axum::Router;
+/// # use control_plane::{router, AppState};
+/// # use vm_mock::MockHypervisor;
+/// let state = AppState::new(Arc::new(MockHypervisor::new()));
+/// let app: Router = router().with_state(state);
+/// # let _ = app;
+/// ```
+pub fn router() -> Router<AppState> {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/vms", post(create_vm))
@@ -65,26 +81,31 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/vms/:id/snapshot", post(snapshot_vm))
         .route("/v1/snapshots/:id/restore", post(restore_snapshot))
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
 }
 
 async fn healthz() -> &'static str {
     "ok"
 }
 
+// Each handler takes extractors as `Result<Extractor, Rejection>` and `?`s the
+// rejection into `ApiError`. This keeps extractor failures (malformed JSON,
+// non-numeric path segment, wrong content-type) in the same structured error
+// envelope as hypervisor errors, instead of leaking axum's plain-text defaults.
+
 async fn create_vm(
     State(state): State<AppState>,
-    Json(req): Json<CreateVmRequest>,
+    body: Result<Json<CreateVmRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<VmHandleDto>), ApiError> {
-    let cfg = req.into();
-    let handle = state.hypervisor.create_vm(&cfg)?;
+    let Json(req) = body?;
+    let handle = state.hypervisor.create_vm(&req.into())?;
     Ok((StatusCode::CREATED, Json(handle.into())))
 }
 
 async fn get_vm(
     State(state): State<AppState>,
-    Path(id): Path<u64>,
+    id: Result<Path<u64>, PathRejection>,
 ) -> Result<Json<VmStateResponse>, ApiError> {
+    let Path(id) = id?;
     let vm_id = VmId(id);
     let vm_state = state.hypervisor.state(vm_id)?;
     Ok(Json(VmStateResponse::new(vm_id, vm_state)))
@@ -92,40 +113,45 @@ async fn get_vm(
 
 async fn start_vm(
     State(state): State<AppState>,
-    Path(id): Path<u64>,
+    id: Result<Path<u64>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
+    let Path(id) = id?;
     state.hypervisor.start(VmId(id))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn stop_vm(
     State(state): State<AppState>,
-    Path(id): Path<u64>,
+    id: Result<Path<u64>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
+    let Path(id) = id?;
     state.hypervisor.stop(VmId(id))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn destroy_vm(
     State(state): State<AppState>,
-    Path(id): Path<u64>,
+    id: Result<Path<u64>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
+    let Path(id) = id?;
     state.hypervisor.destroy(VmId(id))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn snapshot_vm(
     State(state): State<AppState>,
-    Path(id): Path<u64>,
+    id: Result<Path<u64>, PathRejection>,
 ) -> Result<(StatusCode, Json<SnapshotDto>), ApiError> {
+    let Path(id) = id?;
     let snap = state.hypervisor.snapshot(VmId(id))?;
     Ok((StatusCode::CREATED, Json(snap.into())))
 }
 
 async fn restore_snapshot(
     State(state): State<AppState>,
-    Path(id): Path<u64>,
+    id: Result<Path<u64>, PathRejection>,
 ) -> Result<(StatusCode, Json<VmHandleDto>), ApiError> {
+    let Path(id) = id?;
     let handle = state.hypervisor.restore(SnapshotId(id))?;
     Ok((StatusCode::CREATED, Json(handle.into())))
 }
