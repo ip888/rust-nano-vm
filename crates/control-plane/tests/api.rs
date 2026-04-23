@@ -218,6 +218,83 @@ async fn restore_unknown_snapshot_is_not_found() {
     assert_eq!(body["error"]["code"], "unknown_snapshot");
 }
 
+// --- Listing -----
+
+#[tokio::test]
+async fn list_vms_is_empty_initially() {
+    let (status, body) = send(app(), Method::GET, "/v1/vms", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["vms"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn list_vms_returns_all_created_vms_with_state() {
+    let app = app();
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let (_, h) = send(app.clone(), Method::POST, "/v1/vms", Some(json!({}))).await;
+        ids.push(h["id"].as_u64().unwrap());
+    }
+    // Start the second, start+stop the third — first stays Created.
+    send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{}/start", ids[1]),
+        None,
+    )
+    .await;
+    send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{}/start", ids[2]),
+        None,
+    )
+    .await;
+    send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{}/stop", ids[2]),
+        None,
+    )
+    .await;
+
+    let (status, body) = send(app.clone(), Method::GET, "/v1/vms", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let vms = body["vms"].as_array().unwrap();
+    assert_eq!(vms.len(), 3);
+
+    let mut by_id: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    for vm in vms {
+        by_id.insert(
+            vm["id"].as_u64().unwrap(),
+            vm["state"].as_str().unwrap().to_owned(),
+        );
+    }
+    assert_eq!(by_id[&ids[0]], "created");
+    assert_eq!(by_id[&ids[1]], "running");
+    assert_eq!(by_id[&ids[2]], "stopped");
+}
+
+#[tokio::test]
+async fn list_vms_excludes_destroyed_entries() {
+    let app = app();
+    let (_, a) = send(app.clone(), Method::POST, "/v1/vms", Some(json!({}))).await;
+    let (_, b) = send(app.clone(), Method::POST, "/v1/vms", Some(json!({}))).await;
+    let a_id = a["id"].as_u64().unwrap();
+    let b_id = b["id"].as_u64().unwrap();
+    send(
+        app.clone(),
+        Method::DELETE,
+        &format!("/v1/vms/{a_id}"),
+        None,
+    )
+    .await;
+    let (_, body) = send(app.clone(), Method::GET, "/v1/vms", None).await;
+    let vms = body["vms"].as_array().unwrap();
+    assert_eq!(vms.len(), 1);
+    assert_eq!(vms[0]["id"].as_u64().unwrap(), b_id);
+}
+
 // --- Extractor-rejection paths (must use the same error envelope). -----
 
 #[tokio::test]

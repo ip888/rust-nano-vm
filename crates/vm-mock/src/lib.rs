@@ -165,6 +165,18 @@ impl Hypervisor for MockHypervisor {
         }
         Ok(())
     }
+
+    fn list_vms(&self) -> VmResult<Vec<VmHandle>> {
+        let inner = self.inner.lock().expect("mock hypervisor poisoned");
+        Ok(inner
+            .vms
+            .iter()
+            .map(|(id, vm)| VmHandle {
+                id: *id,
+                state: vm.state,
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -301,5 +313,51 @@ mod tests {
     fn hypervisor_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<MockHypervisor>();
+    }
+
+    #[test]
+    fn list_vms_returns_each_created_vm_with_current_state() {
+        let hv = MockHypervisor::new();
+        assert!(hv.list_vms().unwrap().is_empty());
+
+        let a = hv.create_vm(&cfg()).unwrap();
+        let b = hv.create_vm(&cfg()).unwrap();
+        let c = hv.create_vm(&cfg()).unwrap();
+        hv.start(b.id).unwrap();
+        hv.start(c.id).unwrap();
+        hv.stop(c.id).unwrap();
+
+        let mut listed = hv.list_vms().unwrap();
+        listed.sort_by_key(|h| h.id);
+        let mut expected = vec![
+            VmHandle {
+                id: a.id,
+                state: VmState::Created,
+            },
+            VmHandle {
+                id: b.id,
+                state: VmState::Running,
+            },
+            VmHandle {
+                id: c.id,
+                state: VmState::Stopped,
+            },
+        ];
+        expected.sort_by_key(|h| h.id);
+        // VmHandle is Clone but not PartialEq; compare by (id, state).
+        let listed: Vec<_> = listed.into_iter().map(|h| (h.id, h.state)).collect();
+        let expected: Vec<_> = expected.into_iter().map(|h| (h.id, h.state)).collect();
+        assert_eq!(listed, expected);
+    }
+
+    #[test]
+    fn list_vms_excludes_destroyed_vms() {
+        let hv = MockHypervisor::new();
+        let a = hv.create_vm(&cfg()).unwrap();
+        let b = hv.create_vm(&cfg()).unwrap();
+        hv.destroy(a.id).unwrap();
+        let listed = hv.list_vms().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, b.id);
     }
 }

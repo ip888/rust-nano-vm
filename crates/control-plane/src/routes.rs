@@ -6,6 +6,7 @@
 //! | Method | Path                                | Trait method   |
 //! |--------|-------------------------------------|----------------|
 //! | POST   | `/v1/vms`                           | `create_vm`    |
+//! | GET    | `/v1/vms`                           | `list_vms`     |
 //! | GET    | `/v1/vms/:id`                       | `state`        |
 //! | POST   | `/v1/vms/:id/start`                 | `start`        |
 //! | POST   | `/v1/vms/:id/stop`                  | `stop`         |
@@ -33,7 +34,7 @@ use axum::{
 use tower_http::trace::TraceLayer;
 use vm_core::{Hypervisor, SnapshotId, VmId};
 
-use crate::api::{CreateVmRequest, SnapshotDto, VmHandleDto, VmStateResponse};
+use crate::api::{CreateVmRequest, SnapshotDto, VmHandleDto, VmListResponse, VmStateResponse};
 use crate::auth;
 use crate::error::ApiError;
 
@@ -79,7 +80,7 @@ pub fn router() -> Router<AppState> {
     // The middleware reads `Arc<ApiTokens>` from request extensions; callers
     // install it via `.layer(Extension(Arc::new(tokens)))` before serving.
     let v1 = Router::new()
-        .route("/vms", post(create_vm))
+        .route("/vms", get(list_vms).post(create_vm))
         .route("/vms/:id", get(get_vm).delete(destroy_vm))
         .route("/vms/:id/start", post(start_vm))
         .route("/vms/:id/stop", post(stop_vm))
@@ -109,6 +110,11 @@ async fn create_vm(
     let Json(req) = body?;
     let handle = state.hypervisor.create_vm(&req.into())?;
     Ok((StatusCode::CREATED, Json(handle.into())))
+}
+
+async fn list_vms(State(state): State<AppState>) -> Result<Json<VmListResponse>, ApiError> {
+    let handles = state.hypervisor.list_vms()?;
+    Ok(Json(VmListResponse::new(handles)))
 }
 
 async fn get_vm(
