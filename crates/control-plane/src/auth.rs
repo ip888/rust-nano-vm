@@ -50,9 +50,9 @@ impl ApiTokens {
         Self { tokens }
     }
 
-    /// Build from a comma-separated string (typical env-var shape). Reads
-    /// `NANOVM_API_TOKENS` if `s` is `None`. Empty string → empty set
-    /// (auth disabled).
+    /// Build from the `NANOVM_API_TOKENS` environment variable, parsed as a
+    /// comma-separated token list. If the variable is unset or expands to
+    /// only empty/whitespace entries, returns an empty set (auth disabled).
     pub fn from_env() -> Self {
         let raw = std::env::var("NANOVM_API_TOKENS").unwrap_or_default();
         Self::from_csv(&raw)
@@ -89,11 +89,24 @@ impl ApiTokens {
 /// When [`ApiTokens::is_empty`] is true the middleware short-circuits to
 /// allow the request — auth is "off". The binary logs a warning at startup
 /// in that mode so the operator notices.
+///
+/// If the [`ApiTokens`] extension is not installed at all, this returns a
+/// structured [`ApiError::Internal`] (500 `"internal"`) rather than letting
+/// axum short-circuit with its plain-text `ExtensionRejection`. That keeps
+/// the error envelope contract intact even when a library consumer forgets
+/// to call `.layer(Extension(...))`.
 pub async fn require_token(
-    Extension(tokens): Extension<Arc<ApiTokens>>,
+    tokens: Option<Extension<Arc<ApiTokens>>>,
     req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    let Some(Extension(tokens)) = tokens else {
+        return Err(ApiError::Internal(
+            "auth middleware installed but ApiTokens extension is missing \
+             — call `.layer(Extension(Arc::new(ApiTokens::from_env())))` \
+             on the router before serving",
+        ));
+    };
     if tokens.is_empty() {
         return Ok(next.run(req).await);
     }

@@ -34,6 +34,11 @@ pub(crate) enum ApiError {
     /// The request lacked a valid bearer token. The `String` is the reason
     /// (surfaced to the client in `message`).
     Unauthorized(String),
+    /// The server is misconfigured in a way the client can't fix (e.g. a
+    /// required `axum::Extension` was not installed at startup). Surfaced as
+    /// 500 with code "internal" — the message is intended for the operator
+    /// reading server logs, not for end-user diagnosis.
+    Internal(&'static str),
 }
 
 impl From<VmError> for ApiError {
@@ -87,6 +92,7 @@ impl IntoResponse for ApiError {
             ApiError::BadJson(rej) => (rej.status(), "bad_request", rej.body_text()),
             ApiError::BadPath(rej) => (rej.status(), "bad_request", rej.body_text()),
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "unauthorized", msg),
+            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", msg.into()),
         };
         let body = Json(ErrorEnvelope {
             error: ErrorBody { code, message },

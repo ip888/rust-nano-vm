@@ -334,3 +334,19 @@ async fn malformed_authorization_header_returns_401() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"]["code"], "unauthorized");
 }
+
+#[tokio::test]
+async fn missing_api_tokens_extension_returns_structured_500() {
+    // Mount the router WITHOUT an ApiTokens extension — simulates a library
+    // consumer that forgot to `.layer(Extension(...))` before serving.
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    let app: Router = router().with_state(AppState::new(hv));
+
+    let (status, body) = send(app, Method::POST, "/v1/vms", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"]["code"], "internal");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("ApiTokens extension is missing"));
+}
