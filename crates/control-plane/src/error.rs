@@ -31,6 +31,9 @@ pub(crate) enum ApiError {
     /// A URL path segment failed to parse into the expected type (e.g. a
     /// non-numeric `:id`).
     BadPath(PathRejection),
+    /// The request lacked a valid bearer token. The `String` is the reason
+    /// (surfaced to the client in `message`).
+    Unauthorized(String),
 }
 
 impl From<VmError> for ApiError {
@@ -83,6 +86,7 @@ impl IntoResponse for ApiError {
             }
             ApiError::BadJson(rej) => (rej.status(), "bad_request", rej.body_text()),
             ApiError::BadPath(rej) => (rej.status(), "bad_request", rej.body_text()),
+            ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "unauthorized", msg),
         };
         let body = Json(ErrorEnvelope {
             error: ErrorBody { code, message },

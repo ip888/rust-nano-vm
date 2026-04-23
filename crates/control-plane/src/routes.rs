@@ -26,6 +26,7 @@ use axum::{
         Path, State,
     },
     http::StatusCode,
+    middleware,
     routing::{get, post},
     Json, Router,
 };
@@ -33,6 +34,7 @@ use tower_http::trace::TraceLayer;
 use vm_core::{Hypervisor, SnapshotId, VmId};
 
 use crate::api::{CreateVmRequest, SnapshotDto, VmHandleDto, VmStateResponse};
+use crate::auth;
 use crate::error::ApiError;
 
 /// Shared state plumbed into every handler.
@@ -72,14 +74,22 @@ impl AppState {
 /// # let _ = app;
 /// ```
 pub fn router() -> Router<AppState> {
+    // `/v1/*` is guarded by [`auth::require_token`]. `/healthz` is
+    // intentionally exempt so external liveness probes don't carry secrets.
+    // The middleware reads `Arc<ApiTokens>` from request extensions; callers
+    // install it via `.layer(Extension(Arc::new(tokens)))` before serving.
+    let v1 = Router::new()
+        .route("/vms", post(create_vm))
+        .route("/vms/:id", get(get_vm).delete(destroy_vm))
+        .route("/vms/:id/start", post(start_vm))
+        .route("/vms/:id/stop", post(stop_vm))
+        .route("/vms/:id/snapshot", post(snapshot_vm))
+        .route("/snapshots/:id/restore", post(restore_snapshot))
+        .route_layer(middleware::from_fn(auth::require_token));
+
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/v1/vms", post(create_vm))
-        .route("/v1/vms/:id", get(get_vm).delete(destroy_vm))
-        .route("/v1/vms/:id/start", post(start_vm))
-        .route("/v1/vms/:id/stop", post(stop_vm))
-        .route("/v1/vms/:id/snapshot", post(snapshot_vm))
-        .route("/v1/snapshots/:id/restore", post(restore_snapshot))
+        .nest("/v1", v1)
         .layer(TraceLayer::new_for_http())
 }
 

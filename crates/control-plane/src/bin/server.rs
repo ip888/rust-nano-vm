@@ -1,17 +1,22 @@
 //! `nanovm-control-plane` — REST server binary.
 //!
 //! Wires a `MockHypervisor` by default so this binary is runnable on any
-//! machine without `/dev/kvm`. Bind address is configurable via the
-//! `NANOVM_CONTROL_PLANE_ADDR` environment variable (default `127.0.0.1:8080`).
+//! machine without `/dev/kvm`.
+//!
+//! Environment:
+//! - `NANOVM_CONTROL_PLANE_ADDR` — bind address (default `127.0.0.1:8080`).
+//! - `NANOVM_API_TOKENS` — comma-separated bearer tokens. **Empty disables
+//!   auth** and emits a `WARN` log line on startup.
 
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
 
-use control_plane::{router, AppState};
+use axum::Extension;
+use control_plane::{router, ApiTokens, AppState};
 use tokio::net::TcpListener;
 use tokio::signal;
-use tracing::info;
+use tracing::{info, warn};
 use vm_mock::MockHypervisor;
 
 #[tokio::main]
@@ -25,8 +30,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr =
         std::env::var("NANOVM_CONTROL_PLANE_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
 
+    let tokens = Arc::new(ApiTokens::from_env());
+    if tokens.is_empty() {
+        warn!(
+            "NANOVM_API_TOKENS is empty — /v1/* is unauthenticated. \
+             Set this env var to a comma-separated list of bearer tokens \
+             before exposing this service to the network."
+        );
+    } else {
+        info!(count = tokens.len(), "bearer-token auth enabled");
+    }
+
     let hypervisor: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
-    let app = router().with_state(AppState::new(hypervisor));
+    let app = router()
+        .layer(Extension(tokens))
+        .with_state(AppState::new(hypervisor));
 
     let listener = TcpListener::bind(&addr).await?;
     info!(%addr, "nanovm-control-plane listening");
