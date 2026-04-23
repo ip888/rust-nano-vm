@@ -174,6 +174,18 @@ pub trait Hypervisor: Send + Sync {
     /// Destroy a VM and release its resources. After this returns `Ok`, the
     /// [`VmId`] must not be reused.
     fn destroy(&self, id: VmId) -> VmResult<()>;
+
+    /// Enumerate every VM currently known to this hypervisor.
+    ///
+    /// Order is implementation-defined. Each returned [`VmHandle`] carries
+    /// the VM's state at the moment the listing was assembled — that read
+    /// is not synchronised with concurrent transitions, so a handle may
+    /// report a stale state by the time the caller inspects it. Re-query
+    /// [`Hypervisor::state`] for an authoritative read.
+    ///
+    /// Backends that don't track in-process state (e.g. wrappers around an
+    /// out-of-band orchestrator) may return [`VmError::Unsupported`].
+    fn list_vms(&self) -> VmResult<Vec<VmHandle>>;
 }
 
 #[cfg(test)]

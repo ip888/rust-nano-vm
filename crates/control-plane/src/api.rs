@@ -89,6 +89,25 @@ impl From<VmHandle> for VmHandleDto {
     }
 }
 
+/// Response body for `GET /v1/vms`. Wraps a list rather than returning a
+/// bare JSON array so we can add pagination / filter metadata at the
+/// envelope level later without breaking clients.
+#[derive(Debug, Serialize)]
+pub(crate) struct VmListResponse {
+    pub vms: Vec<VmHandleDto>,
+}
+
+impl VmListResponse {
+    pub fn new<I>(handles: I) -> Self
+    where
+        I: IntoIterator<Item = VmHandle>,
+    {
+        Self {
+            vms: handles.into_iter().map(VmHandleDto::from).collect(),
+        }
+    }
+}
+
 /// Response body for `GET /v1/vms/{id}`.
 #[derive(Debug, Serialize)]
 pub(crate) struct VmStateResponse {

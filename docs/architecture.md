@@ -50,6 +50,7 @@ pub trait Hypervisor: Send + Sync {
     fn snapshot(&self, id: VmId) -> VmResult<SnapshotId>;
     fn restore(&self, snap: SnapshotId) -> VmResult<VmHandle>;
     fn destroy(&self, id: VmId) -> VmResult<()>;
+    fn list_vms(&self) -> VmResult<Vec<VmHandle>>;
 }
 ```
 

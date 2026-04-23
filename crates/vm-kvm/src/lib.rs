@@ -61,6 +61,10 @@ impl Hypervisor for KvmHypervisor {
     fn destroy(&self, _id: VmId) -> VmResult<()> {
         Err(unsupported())
     }
+
+    fn list_vms(&self) -> VmResult<Vec<VmHandle>> {
+        Err(unsupported())
+    }
 }
 
 #[cfg(feature = "kvm")]
@@ -108,6 +112,10 @@ mod tests {
         ));
         assert!(matches!(
             hv.destroy(VmId(1)).unwrap_err(),
+            VmError::Unsupported(_)
+        ));
+        assert!(matches!(
+            hv.list_vms().unwrap_err(),
             VmError::Unsupported(_)
         ));
     }

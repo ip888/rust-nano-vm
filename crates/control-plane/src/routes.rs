@@ -6,6 +6,7 @@
 //! | Method | Path                                | Trait method   |
 //! |--------|-------------------------------------|----------------|
 //! | POST   | `/v1/vms`                           | `create_vm`    |
+//! | GET    | `/v1/vms`                           | `list_vms`     |
 //! | GET    | `/v1/vms/:id`                       | `state`        |
 //! | POST   | `/v1/vms/:id/start`                 | `start`        |
 //! | POST   | `/v1/vms/:id/stop`                  | `stop`         |
@@ -32,7 +33,7 @@ use axum::{
 use tower_http::trace::TraceLayer;
 use vm_core::{Hypervisor, SnapshotId, VmId};
 
-use crate::api::{CreateVmRequest, SnapshotDto, VmHandleDto, VmStateResponse};
+use crate::api::{CreateVmRequest, SnapshotDto, VmHandleDto, VmListResponse, VmStateResponse};
 use crate::error::ApiError;
 
 /// Shared state plumbed into every handler.
@@ -74,7 +75,7 @@ impl AppState {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/v1/vms", post(create_vm))
+        .route("/v1/vms", get(list_vms).post(create_vm))
         .route("/v1/vms/:id", get(get_vm).delete(destroy_vm))
         .route("/v1/vms/:id/start", post(start_vm))
         .route("/v1/vms/:id/stop", post(stop_vm))
@@ -99,6 +100,11 @@ async fn create_vm(
     let Json(req) = body?;
     let handle = state.hypervisor.create_vm(&req.into())?;
     Ok((StatusCode::CREATED, Json(handle.into())))
+}
+
+async fn list_vms(State(state): State<AppState>) -> Result<Json<VmListResponse>, ApiError> {
+    let handles = state.hypervisor.list_vms()?;
+    Ok(Json(VmListResponse::new(handles)))
 }
 
 async fn get_vm(
