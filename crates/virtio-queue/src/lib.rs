@@ -62,9 +62,12 @@ pub struct Descriptor {
 }
 
 impl Descriptor {
-    /// Parse a little-endian descriptor from exactly [`DESC_SIZE`] bytes.
+    /// Parse a little-endian descriptor from the first [`DESC_SIZE`] bytes
+    /// of `buf`. `buf` must be **at least** that long; trailing bytes are
+    /// ignored (common when the caller scans a descriptor table slice by
+    /// advancing 16 bytes at a time).
     pub fn from_bytes(buf: &[u8]) -> Result<Self, QueueError> {
-        if buf.len() != DESC_SIZE {
+        if buf.len() < DESC_SIZE {
             return Err(QueueError::ShortDescriptor {
                 have: buf.len(),
                 need: DESC_SIZE,
@@ -97,7 +100,11 @@ impl Descriptor {
     /// Serialize into a fresh fixed-size byte array.
     pub fn to_bytes(&self) -> [u8; DESC_SIZE] {
         let mut out = [0u8; DESC_SIZE];
-        let _ = self.write_to(&mut out);
+        // Cannot fail: we just allocated exactly DESC_SIZE bytes. The
+        // expect() ensures any future validation added to write_to trips
+        // loudly instead of being silently dropped.
+        self.write_to(&mut out)
+            .expect("serializing Descriptor into a fixed-size buffer must succeed");
         out
     }
 
@@ -307,6 +314,23 @@ mod tests {
                 need: DESC_SIZE,
             }
         );
+    }
+
+    #[test]
+    fn from_bytes_accepts_longer_buffer_and_ignores_trailing_bytes() {
+        // Scanning a raw descriptor table slice is the common case; the
+        // caller shouldn't have to exactly-slice to DESC_SIZE.
+        let d = Descriptor {
+            addr: 0xdead_beef,
+            len: 64,
+            flags: DESC_F_NEXT,
+            next: 3,
+        };
+        let mut buf = Vec::with_capacity(DESC_SIZE + 16);
+        buf.extend_from_slice(&d.to_bytes());
+        buf.extend_from_slice(&[0xAB; 16]);
+        let decoded = Descriptor::from_bytes(&buf).expect("longer buffer must parse");
+        assert_eq!(decoded, d);
     }
 
     #[test]
