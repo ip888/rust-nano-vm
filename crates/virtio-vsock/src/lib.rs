@@ -167,11 +167,15 @@ pub struct VsockHeader {
 }
 
 impl VsockHeader {
-    /// Parse a little-endian header from `buf`. `buf` must be exactly
-    /// [`VSOCK_HDR_LEN`] bytes. Returns `Err` if any enum field carries a
-    /// value the spec doesn't define or we don't yet support.
+    /// Parse a little-endian header from the first [`VSOCK_HDR_LEN`] bytes
+    /// of `buf`. `buf` must be **at least** that long; trailing bytes
+    /// (typically the packet payload) are ignored by this call — parse them
+    /// separately using the `len` field this returns.
+    ///
+    /// Returns `Err` if any enum field carries a value the spec doesn't
+    /// define or we don't yet support.
     pub fn from_bytes(buf: &[u8]) -> Result<Self, VsockError> {
-        if buf.len() != VSOCK_HDR_LEN {
+        if buf.len() < VSOCK_HDR_LEN {
             return Err(VsockError::ShortHeader {
                 have: buf.len(),
                 need: VSOCK_HDR_LEN,
@@ -227,8 +231,10 @@ impl VsockHeader {
     /// Serialize into a fresh fixed-size byte array.
     pub fn to_bytes(&self) -> [u8; VSOCK_HDR_LEN] {
         let mut out = [0u8; VSOCK_HDR_LEN];
-        // Cannot fail: we just allocated exactly VSOCK_HDR_LEN bytes.
-        let _ = self.write_to(&mut out);
+        // Cannot fail: we just allocated exactly VSOCK_HDR_LEN bytes. If
+        // write_to ever grows a validation step it will trip this loudly.
+        self.write_to(&mut out)
+            .expect("serializing VsockHeader into a fixed-size buffer must succeed");
         out
     }
 }
@@ -334,6 +340,19 @@ mod tests {
                 need: VSOCK_HDR_LEN,
             }
         );
+    }
+
+    #[test]
+    fn from_bytes_accepts_longer_buffer_and_ignores_trailing_payload() {
+        // Real vsock frames arrive as (header || payload) in a single buffer.
+        // `from_bytes` should parse the header and leave payload handling to
+        // the caller, not reject the longer buffer.
+        let header = sample().to_bytes();
+        let mut packet = Vec::with_capacity(header.len() + 32);
+        packet.extend_from_slice(&header);
+        packet.extend_from_slice(&[0xAB; 32]); // simulated payload
+        let decoded = VsockHeader::from_bytes(&packet).expect("longer buffer must parse");
+        assert_eq!(decoded, sample());
     }
 
     #[test]
