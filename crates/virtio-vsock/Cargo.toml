@@ -5,9 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "virtio-vsock transport for host<->guest-agent RPC. Placeholder; implementation lands in M2."
+description = "virtio-vsock transport for host<->guest-agent RPC."
 
 [dependencies]
+thiserror.workspace = true
 
 [lints]
 workspace = true
