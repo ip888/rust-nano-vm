@@ -6,21 +6,43 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
-    Router,
+    Extension, Router,
 };
-use control_plane::{router, AppState};
+use control_plane::{router, ApiTokens, AppState};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 use vm_mock::MockHypervisor;
 
+/// Router with auth disabled (empty token set). Most tests use this so they
+/// don't need to juggle headers.
 fn app() -> Router {
+    app_with_tokens(ApiTokens::default())
+}
+
+/// Router configured with an explicit token set. Use for auth tests.
+fn app_with_tokens(tokens: ApiTokens) -> Router {
     let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
-    router().with_state(AppState::new(hv))
+    router()
+        .layer(Extension(Arc::new(tokens)))
+        .with_state(AppState::new(hv))
 }
 
 async fn send(app: Router, method: Method, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
-    let builder = Request::builder().method(method).uri(uri);
+    send_with(app, method, uri, body, None).await
+}
+
+async fn send_with(
+    app: Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(tok) = bearer {
+        builder = builder.header("authorization", format!("Bearer {tok}"));
+    }
     let req = match body {
         Some(v) => builder
             .header("content-type", "application/json")
@@ -316,4 +338,92 @@ async fn non_numeric_path_segment_uses_structured_error_envelope() {
     let (status, body) = send(app(), Method::GET, "/v1/vms/not-a-number", None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "bad_request");
+}
+
+// --- Bearer-token auth (`/v1/*` is guarded; `/healthz` is exempt). -----
+
+#[tokio::test]
+async fn empty_token_set_disables_auth() {
+    let app = app_with_tokens(ApiTokens::default());
+    let (status, _) = send(app, Method::POST, "/v1/vms", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn missing_authorization_header_returns_401() {
+    let app = app_with_tokens(ApiTokens::new(["s3cret"]));
+    let (status, body) = send(app, Method::POST, "/v1/vms", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["code"], "unauthorized");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("missing"));
+}
+
+#[tokio::test]
+async fn wrong_token_returns_401() {
+    let app = app_with_tokens(ApiTokens::new(["s3cret"]));
+    let (status, body) =
+        send_with(app, Method::POST, "/v1/vms", Some(json!({})), Some("nope")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["code"], "unauthorized");
+}
+
+#[tokio::test]
+async fn valid_bearer_token_allows_request() {
+    let app = app_with_tokens(ApiTokens::new(["s3cret"]));
+    let (status, body) = send_with(
+        app,
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        Some("s3cret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["state"], "created");
+}
+
+#[tokio::test]
+async fn healthz_does_not_require_auth_even_when_tokens_are_set() {
+    let app = app_with_tokens(ApiTokens::new(["s3cret"]));
+    let (status, body) = send(app, Method::GET, "/healthz", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, Value::String("ok".into()));
+}
+
+#[tokio::test]
+async fn malformed_authorization_header_returns_401() {
+    let app = app_with_tokens(ApiTokens::new(["s3cret"]));
+    // Missing the "Bearer " prefix.
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/vms")
+        .header("authorization", "s3cret")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["code"], "unauthorized");
+}
+
+#[tokio::test]
+async fn missing_api_tokens_extension_returns_structured_500() {
+    // Mount the router WITHOUT an ApiTokens extension — simulates a library
+    // consumer that forgot to `.layer(Extension(...))` before serving.
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    let app: Router = router().with_state(AppState::new(hv));
+
+    let (status, body) = send(app, Method::POST, "/v1/vms", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"]["code"], "internal");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("ApiTokens extension is missing"));
 }

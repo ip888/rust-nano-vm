@@ -50,14 +50,20 @@ cargo run -p cli -- --help
 Run the REST control plane (M6) against the mock backend — no KVM needed:
 
 ```sh
-cargo run -p control-plane
+NANOVM_API_TOKENS=dev-token cargo run -p control-plane
 # → nanovm-control-plane listening on 127.0.0.1:8080
+# (omit NANOVM_API_TOKENS for local-only no-auth mode; the binary will WARN)
 
-curl -X POST localhost:8080/v1/vms -H 'content-type: application/json' -d '{}'
+curl -X POST localhost:8080/v1/vms \
+     -H 'authorization: Bearer dev-token' \
+     -H 'content-type: application/json' -d '{}'
 # → {"id":1,"display":"vm-0000000000000001","state":"created"}
 
-curl -X POST localhost:8080/v1/vms/1/start  # 204
-curl localhost:8080/v1/vms/1                # {"state":"running",...}
+curl -X POST localhost:8080/v1/vms/1/start -H 'authorization: Bearer dev-token'  # 204
+curl localhost:8080/v1/vms/1 -H 'authorization: Bearer dev-token'
+# → {"state":"running",...}
+
+curl localhost:8080/healthz   # /healthz is exempt from auth
 ```
 
 On a Linux host with `/dev/kvm` (M1+):
