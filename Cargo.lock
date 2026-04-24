@@ -849,6 +849,9 @@ dependencies = [
 [[package]]
 name = "virtio-vsock"
 version = "0.0.1"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "vm-core"
