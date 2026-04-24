@@ -5,9 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Snapshot + fork primitive (userfaultfd + CoW memory). Placeholder; implementation lands in M5."
+description = "Snapshot format and CoW backing-file layout for rust-nano-vm."
 
 [dependencies]
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 
 [lints]
 workspace = true
