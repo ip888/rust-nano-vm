@@ -840,6 +840,13 @@ name = "virtio-fs"
 version = "0.0.1"
 
 [[package]]
+name = "virtio-queue"
+version = "0.0.1"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "virtio-vsock"
 version = "0.0.1"
 
