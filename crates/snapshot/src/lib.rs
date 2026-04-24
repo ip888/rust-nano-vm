@@ -145,7 +145,11 @@ pub const BACKING_MAGIC: [u8; 8] = *b"NANOVMS1";
 /// | 16     | 8    | page_count    |
 /// | 24     | 8    | memory_bytes  |
 /// | 32     | 4    | flags         |
-/// | 36     | 28   | reserved (zero) |
+/// | 36     | 28   | reserved (writers zero; readers ignore) |
+///
+/// Current writers zero the reserved tail. Current readers ignore those
+/// bytes on read, so they are available for future extension without
+/// changing existing parsing behavior.
 ///
 /// Page data follows the header immediately. There are `page_count`
 /// records each `page_size` bytes; total `page_count * page_size ==
