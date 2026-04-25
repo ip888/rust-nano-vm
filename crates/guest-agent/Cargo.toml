@@ -7,7 +7,13 @@ license.workspace = true
 repository.workspace = true
 description = "Static musl binary that runs inside every sandbox. Placeholder; implementation lands in M2."
 
+[[bin]]
+name = "nanovm-agent"
+path = "src/main.rs"
+
 [dependencies]
+proto.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

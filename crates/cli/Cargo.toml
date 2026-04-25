@@ -15,9 +15,12 @@ path = "src/main.rs"
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-# The CLI will drive vm-core/vm-mock/vm-kvm starting in M1; kept out of M0
-# deps to avoid declaring unused-crate-deps. Re-add as commands start
-# calling into them.
+serde.workspace = true
+serde_json.workspace = true
+# Minimal blocking HTTP client for communicating with nanovm-control-plane.
+# default-features = false drops the default TLS backend so the binary stays
+# small; plain HTTP (localhost) is sufficient for local dev.
+reqwest.workspace = true
 
 [lints]
 workspace = true
