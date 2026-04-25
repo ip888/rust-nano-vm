@@ -63,7 +63,7 @@ crates/
 | M3 | virtio-fs; `nanovm cp file.py <id>:/work/` | yes |
 | M4 | Python / Node run in guest; stdio streaming demo | yes |
 | M5 | Snapshot + fork via userfaultfd; warm pool; p50 < 50 ms cold start | yes |
-| M6 | Control plane REST API; auth; per-sandbox-second metering | yes |
+| M6 | Control plane lifecycle API on `vm-mock`; quotas, metering, and KVM wiring follow on top | no — foundation already ships without KVM |
 | M7 | Docs polish + public launch (HN / r/rust / r/MachineLearning) | any |
 
 Stretch: M8 GPU passthrough, M9 multi-node, M10 confidential compute
@@ -71,8 +71,8 @@ Stretch: M8 GPU passthrough, M9 multi-node, M10 confidential compute
 
 ## M0 — what this session ships
 
-- [x] Cargo workspace with 10 crates (2 real implementations, 1 skeleton,
-      5 placeholders, proto, cli).
+- [x] Cargo workspace with 11 crates (6 implemented foundations, 2 entry
+      points, 3 placeholders/skeletons).
 - [x] `vm-core::Hypervisor` trait + supporting types (`VmConfig`,
       `VmHandle`, `VmState`, `VmError`, `VmId`, `SnapshotId`).
 - [x] `vm-mock::MockHypervisor` with full state-machine + snapshot/fork
@@ -122,7 +122,60 @@ guests, multi-tenant hard SLA, confidential compute. Revisit v2.
 | Security posture | Mirror Firecracker threat model; `cargo-fuzz` on virtio queue parsers from day 1; RustSec audit in CI |
 | Solo burnout | Ship M0–M4 publicly before M5; treat M5 as the v0.1 launch gate |
 
+## Current codebase assessment
+
+The workspace baseline is green on a non-KVM host:
+
+- `cargo build --workspace`
+- `cargo test --workspace`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo fmt --all -- --check`
+
+That baseline means the project has already moved beyond a pure scaffold.
+Today the strongest foundations are:
+
+- `vm-core`: the stable trait boundary every backend and entry point depends
+  on.
+- `vm-mock`: a fully tested state-machine backend that keeps CI and API work
+  independent from `/dev/kvm`.
+- `proto`, `virtio-queue`, `virtio-vsock`, and `snapshot`: wire-format and
+  file-format crates with focused serialization and parser coverage.
+- `control-plane`: a working REST lifecycle API with auth and integration
+  tests against `vm-mock`.
+
+The main gaps are now concentrated in the execution path rather than the
+interfaces:
+
+- `vm-kvm` is still an M0 skeleton, so there is no real boot path yet.
+- `guest-agent` and `virtio-fs` remain placeholders, so exec/copy workflows
+  cannot be exercised end-to-end.
+- `cli` intentionally exposes only the command surface; every subcommand still
+  exits with a milestone placeholder message.
+
+## Continuation priorities
+
+1. **Finish M1 first: real KVM boot.** This is the critical path because it
+   validates the `vm-core` abstraction against a real backend and unblocks all
+   later guest-facing work. The minimum useful slice is: open `/dev/kvm`,
+   create a VM from `VmConfig`, boot a tiny guest, and make `nanovm run`
+   print the serial "hello from guest" path end-to-end.
+2. **Then finish M2: vsock + guest-agent exec.** The protocol crate is already
+   defined, so the next high-leverage step is wiring `virtio-vsock` into
+   `vm-kvm`, implementing a tiny musl `guest-agent`, and making `nanovm exec`
+   and the control-plane speak the existing `proto` contract.
+3. **Treat snapshot/fork as the first performance milestone, not the first
+   implementation milestone.** The `snapshot` crate already pins the on-disk
+   format, so the next step there should be a benchmark-backed runtime
+   prototype (`userfaultfd`, warm pool, fork latency) once M1/M2 give a real
+   guest to snapshot.
+4. **Defer ergonomics until the execution path exists.** `virtio-fs`,
+   language-runtime images, metering, and quota work are valuable, but they
+   should layer on top of a real boot + exec loop rather than compete with it.
+
 ## Next up
 
-**M1 on a KVM host.** See [`kvm-host.md`](kvm-host.md) for the cheapest
-options (local Linux, GCP nested virt, AWS bare metal, Hetzner dedicated).
+**M1 on a KVM host.** Use `vm-mock` to preserve fast CI, but do the next round
+of implementation work around a single end-to-end KVM success criterion:
+create → boot → serial output. See [`kvm-host.md`](kvm-host.md) for the
+cheapest options (local Linux, GCP nested virt, AWS bare metal, Hetzner
+dedicated).
