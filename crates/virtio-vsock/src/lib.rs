@@ -504,6 +504,13 @@ pub enum ConnectionError {
         /// The connection's current state.
         state: ConnectionState,
     },
+    /// A local operation (e.g. `listen`, `shutdown`) was called when the
+    /// connection was not in the required state.
+    #[error("invalid state transition: operation not allowed in state {state:?}")]
+    InvalidStateTransition {
+        /// The state the connection was in when the operation was attempted.
+        state: ConnectionState,
+    },
     /// Peer sent a packet whose src/dst endpoints don't match this
     /// connection's identity.
     #[error("endpoint mismatch: expected {expected:?}, got {got:?}")]
@@ -566,13 +573,10 @@ impl Connection {
 
     /// Transition to `Listen`: ready to accept an incoming `Request`.
     ///
-    /// Returns `Err(InvalidOp)` if not currently `Closed`.
+    /// Returns `Err(InvalidStateTransition)` if not currently `Closed`.
     pub fn listen(&mut self) -> Result<(), ConnectionError> {
         if self.state != ConnectionState::Closed {
-            return Err(ConnectionError::InvalidOp {
-                op: VsockOp::Invalid,
-                state: self.state,
-            });
+            return Err(ConnectionError::InvalidStateTransition { state: self.state });
         }
         self.state = ConnectionState::Listen;
         Ok(())
@@ -580,13 +584,10 @@ impl Connection {
 
     /// Transition to `SynSent`: caller has sent a `Request` to the peer.
     ///
-    /// Returns `Err(InvalidOp)` if not currently `Closed`.
+    /// Returns `Err(InvalidStateTransition)` if not currently `Closed`.
     pub fn connect(&mut self) -> Result<(), ConnectionError> {
         if self.state != ConnectionState::Closed {
-            return Err(ConnectionError::InvalidOp {
-                op: VsockOp::Request,
-                state: self.state,
-            });
+            return Err(ConnectionError::InvalidStateTransition { state: self.state });
         }
         self.state = ConnectionState::SynSent;
         Ok(())
@@ -708,13 +709,10 @@ impl Connection {
     /// Initiate a graceful local shutdown: transitions `Established →
     /// FinWait`. The caller must send a `Shutdown` packet to the peer.
     ///
-    /// Returns `Err(InvalidOp)` if not `Established`.
+    /// Returns `Err(InvalidStateTransition)` if not `Established`.
     pub fn shutdown(&mut self) -> Result<(), ConnectionError> {
         if self.state != ConnectionState::Established {
-            return Err(ConnectionError::InvalidOp {
-                op: VsockOp::Shutdown,
-                state: self.state,
-            });
+            return Err(ConnectionError::InvalidStateTransition { state: self.state });
         }
         self.state = ConnectionState::FinWait;
         Ok(())
@@ -781,7 +779,12 @@ mod connection_tests {
         let mut c = new_conn();
         c.listen().unwrap();
         let err = c.listen().unwrap_err();
-        assert!(matches!(err, ConnectionError::InvalidOp { .. }));
+        assert!(matches!(
+            err,
+            ConnectionError::InvalidStateTransition {
+                state: ConnectionState::Listen
+            }
+        ));
     }
 
     #[test]

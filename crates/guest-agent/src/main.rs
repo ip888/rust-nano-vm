@@ -233,7 +233,8 @@ fn handle_stat(path: String) -> Result<ResponseBody, RpcError> {
 }
 
 fn write_response(out: &mut impl Write, resp: &Response) -> io::Result<()> {
-    let json = serde_json::to_string(resp).map_err(|e| io::Error::other(e.to_string()))?;
+    let json =
+        serde_json::to_string(resp).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     writeln!(out, "{json}")?;
     out.flush()
 }
