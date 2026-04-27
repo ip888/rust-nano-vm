@@ -55,24 +55,24 @@ crates/
 
 ## Milestones
 
-| # | Scope | Needs KVM host |
-| - | --- | --- |
-| **M0** | Workspace scaffold, `Hypervisor` trait, `vm-mock` backend, CI without KVM, docs | **no (this session)** |
-| M1 | `vm-kvm` boots minimal kernel; serial "hello from guest" | yes |
-| M2 | virtio-vsock transport + musl guest agent; `nanovm exec <id> -- echo hi` round-trips | yes |
-| M3 | virtio-fs; `nanovm cp file.py <id>:/work/` | yes |
-| M4 | Python / Node run in guest; stdio streaming demo | yes |
-| M5 | Snapshot + fork via userfaultfd; warm pool; p50 < 50 ms cold start | yes |
-| M6 | Control plane REST API; auth; per-sandbox-second metering | yes |
-| M7 | Docs polish + public launch (HN / r/rust / r/MachineLearning) | any |
+| # | Scope | Needs KVM host | Status |
+| - | --- | --- | --- |
+| **M0** | Workspace scaffold, `Hypervisor` trait, `vm-mock` backend, CI without KVM, docs | **no** | ✅ complete |
+| M1 | `vm-kvm` boots minimal kernel; serial "hello from guest" | yes | 🔲 next on KVM host |
+| M2 | virtio-vsock transport + musl guest agent; `nanovm exec <id> -- echo hi` round-trips | yes | 🔲 partial (wire format + connection types done) |
+| M3 | virtio-fs; `nanovm cp file.py <id>:/work/` | yes | 🔲 placeholder |
+| M4 | Python / Node run in guest; stdio streaming demo | yes | 🔲 depends M2 |
+| M5 | Snapshot + fork via userfaultfd; warm pool; p50 < 50 ms cold start | yes | 🔲 on-disk format done |
+| M6 | Control plane REST API; auth; per-sandbox-second metering | **no** | ✅ complete (axum REST + bearer auth + integration tests) |
+| M7 | Docs polish + public launch (HN / r/rust / r/MachineLearning) | any | 🔲 |
 
 Stretch: M8 GPU passthrough, M9 multi-node, M10 confidential compute
 (SEV-SNP / TDX).
 
-## M0 — what this session ships
+## M0 — workspace scaffold (complete)
 
-- [x] Cargo workspace with 10 crates (2 real implementations, 1 skeleton,
-      5 placeholders, proto, cli).
+- [x] Cargo workspace with 11 crates (2 real implementations, 1 skeleton,
+      5 placeholders, proto, cli, control-plane).
 - [x] `vm-core::Hypervisor` trait + supporting types (`VmConfig`,
       `VmHandle`, `VmState`, `VmError`, `VmId`, `SnapshotId`).
 - [x] `vm-mock::MockHypervisor` with full state-machine + snapshot/fork
@@ -89,6 +89,55 @@ Stretch: M8 GPU passthrough, M9 multi-node, M10 confidential compute
 - [x] Docs: `PLAN.md` (this file), `architecture.md`, `comparison.md`,
       `kvm-host.md`.
 - [x] Dual Apache-2.0 / MIT licensing (Rust convention).
+
+## M6 — control plane REST API (complete, no KVM needed)
+
+- [x] `control-plane` crate with axum 0.7 REST router.
+- [x] Full CRUD: `POST /v1/vms`, `GET /v1/vms`, `GET /v1/vms/:id`,
+      `POST /v1/vms/:id/start`, `POST /v1/vms/:id/stop`,
+      `POST /v1/vms/:id/snapshot`, `DELETE /v1/vms/:id`,
+      `POST /v1/snapshots/:id/restore`, `GET /healthz`.
+- [x] Bearer-token auth middleware (`NANOVM_API_TOKENS` env).
+- [x] Structured JSON error envelope `{"error":{"code":"...","message":"..."}}`.
+- [x] `nanovm-control-plane` binary wrapping `MockHypervisor` (real KVM
+      backend wired in M1 via `Arc<dyn Hypervisor>`).
+- [x] 22 end-to-end integration tests using `tower::ServiceExt::oneshot`
+      (no network, no KVM).
+
+## M2 — partial progress (no KVM needed for wire-format work)
+
+- [x] `virtio-queue`: descriptor table, flag constants, cycle-safe
+      `DescriptorChain` iterator with bounds + cycle detection.
+- [x] `virtio-vsock`: 44-byte `VsockHeader` parse/serialize, all op codes
+      and type codes, well-known CIDs, shutdown flags.
+- [x] `virtio-vsock::Connection` state machine: `Closed → Listen/SynSent →
+      Established → CloseWait/FinWait → Closed` with credit-based flow
+      control fields.
+- [x] `guest-agent` binary scaffold: compiles as a static binary, processes
+      `Ping` and `Exec` requests over stdin/stdout (vsock wiring deferred
+      to M2 on a KVM host).
+
+## M2 — still needs KVM host
+
+- [ ] Wire `virtio-vsock` into the KVM vCPU run loop (eventfd, virtqueue
+      consumer, ioeventfd).
+- [ ] `guest-agent` reads/writes on `/dev/vsock` and routes requests to
+      the full handler set (WriteFile, ReadFile, Stat, Signal, ExecStart
+      streaming).
+- [ ] `nanovm exec <id> -- echo hi` round-trips end-to-end.
+
+## M1 — needs KVM host
+
+M1 is blocked on `/dev/kvm`. See [`kvm-host.md`](kvm-host.md) for the
+cheapest options. Once on a KVM host the steps are:
+
+1. Add `kvm-ioctls`, `vm-memory`, `linux-loader` behind the `kvm` feature.
+2. Implement `KvmHypervisor::create_vm` (mmap guest RAM, load bzImage with
+   `linux-loader`).
+3. Implement `KvmHypervisor::start` (create vCPU, set registers, run loop).
+4. Attach a minimal 8250 UART device so the kernel can print to `ttyS0`.
+5. Add seccomp-BPF filter to the VMM process.
+6. Smoke-test: `cargo run -p cli -- run bzImage` prints "hello from guest".
 
 ## Verification
 
@@ -126,3 +175,28 @@ guests, multi-tenant hard SLA, confidential compute. Revisit v2.
 
 **M1 on a KVM host.** See [`kvm-host.md`](kvm-host.md) for the cheapest
 options (local Linux, GCP nested virt, AWS bare metal, Hetzner dedicated).
+
+The M2 vsock wiring can overlap with M1 development — once the kernel boots
+and a `ttyS0` line appears, plugging in virtio-vsock is the immediate next
+step so the agent can receive commands.
+
+## Development without a KVM host
+
+While a KVM host is being sourced, these items advance the project:
+
+1. **Snapshot runtime (M5 prep)** — add `userfaultfd` bindings and the CoW
+   page-fault handler to the `snapshot` crate. The on-disk format is done;
+   the page-fault interception is the hard part.
+
+2. **virtio-queue ring parsers** — complete the available/used ring, packed
+   virtqueue, and guest-memory integration in `virtio-queue`. These are unit-
+   testable with synthetic byte slices.
+
+3. **virtio-fs (M3 prep)** — add FUSE in/out message parsing to `virtio-fs`.
+   The FUSE kernel protocol is fully documented and testable offline.
+
+4. **cargo-fuzz harnesses** — add fuzzing targets for `virtio-queue`,
+   `virtio-vsock`, and `snapshot` parsers. Run locally with `cargo fuzz`.
+
+5. **OpenAPI / Swagger spec** — auto-generate from the `control-plane`
+   routes for external consumers and SDK generation.
