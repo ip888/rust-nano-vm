@@ -5,9 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "virtio-fs host<->guest filesystem integration. Placeholder; implementation lands in M3."
+description = "virtio-fs host<->guest filesystem integration: FUSE protocol framing for rust-nano-vm."
 
 [dependencies]
+thiserror.workspace = true
 
 [lints]
 workspace = true
