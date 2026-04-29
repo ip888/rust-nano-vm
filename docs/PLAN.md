@@ -55,24 +55,24 @@ crates/
 
 ## Milestones
 
-| # | Scope | Needs KVM host |
-| - | --- | --- |
-| **M0** | Workspace scaffold, `Hypervisor` trait, `vm-mock` backend, CI without KVM, docs | **no (this session)** |
-| M1 | `vm-kvm` boots minimal kernel; serial "hello from guest" | yes |
-| M2 | virtio-vsock transport + musl guest agent; `nanovm exec <id> -- echo hi` round-trips | yes |
-| M3 | virtio-fs; `nanovm cp file.py <id>:/work/` | yes |
-| M4 | Python / Node run in guest; stdio streaming demo | yes |
-| M5 | Snapshot + fork via userfaultfd; warm pool; p50 < 50 ms cold start | yes |
-| M6 | Control plane lifecycle API on `vm-mock`; quotas, metering, and KVM wiring follow on top | no — foundation already ships without KVM |
-| M7 | Docs polish + public launch (HN / r/rust / r/MachineLearning) | any |
+| # | Scope | Needs KVM host | Status |
+| - | --- | --- | --- |
+| **M0** | Workspace scaffold, `Hypervisor` trait, `vm-mock` backend, CI without KVM, docs | **no** | ✅ complete |
+| M1 | `vm-kvm` boots minimal kernel; serial "hello from guest" | yes | 🔲 next on KVM host |
+| M2 | virtio-vsock transport + musl guest agent; `nanovm exec <id> -- echo hi` round-trips | yes | 🔲 partial (wire types, connection state, guest-agent stdin/stdout mode, and CLI `ps` done) |
+| M3 | virtio-fs; `nanovm cp file.py <id>:/work/` | yes | 🔲 partial (FUSE framing done) |
+| M4 | Python / Node run in guest; stdio streaming demo | yes | 🔲 depends M2 |
+| M5 | Snapshot + fork via userfaultfd; warm pool; p50 < 50 ms cold start | yes | 🔲 on-disk format done |
+| M6 | Control plane lifecycle API on `vm-mock`; quotas, metering, and KVM wiring follow on top | **no** | ✅ complete (axum REST + bearer auth + integration tests) |
+| M7 | Docs polish + public launch (HN / r/rust / r/MachineLearning) | any | 🔲 |
 
 Stretch: M8 GPU passthrough, M9 multi-node, M10 confidential compute
 (SEV-SNP / TDX).
 
-## M0 — what this session ships
+## M0 — workspace scaffold (complete)
 
-- [x] Cargo workspace with 11 crates (6 implemented foundations, 2 entry
-      points, 3 placeholders/skeletons).
+- [x] Cargo workspace with 11 crates spanning hypervisor core/backends,
+      protocol + device-model foundations, guest agent, CLI, and control plane.
 - [x] `vm-core::Hypervisor` trait + supporting types (`VmConfig`,
       `VmHandle`, `VmState`, `VmError`, `VmId`, `SnapshotId`).
 - [x] `vm-mock::MockHypervisor` with full state-machine + snapshot/fork
@@ -89,6 +89,55 @@ Stretch: M8 GPU passthrough, M9 multi-node, M10 confidential compute
 - [x] Docs: `PLAN.md` (this file), `architecture.md`, `comparison.md`,
       `kvm-host.md`.
 - [x] Dual Apache-2.0 / MIT licensing (Rust convention).
+
+## M6 — control plane REST API (complete, no KVM needed)
+
+- [x] `control-plane` crate with axum 0.7 REST router.
+- [x] Full CRUD: `POST /v1/vms`, `GET /v1/vms`, `GET /v1/vms/:id`,
+      `POST /v1/vms/:id/start`, `POST /v1/vms/:id/stop`,
+      `POST /v1/vms/:id/snapshot`, `DELETE /v1/vms/:id`,
+      `POST /v1/snapshots/:id/restore`, `GET /healthz`.
+- [x] Bearer-token auth middleware (`NANOVM_API_TOKENS` env).
+- [x] Structured JSON error envelope `{"error":{"code":"...","message":"..."}}`.
+- [x] `nanovm-control-plane` binary wrapping `MockHypervisor` (real KVM
+      backend wired in M1 via `Arc<dyn Hypervisor>`).
+- [x] 22 end-to-end integration tests using `tower::ServiceExt::oneshot`
+      (no network, no KVM).
+
+## M2 — partial progress (no KVM needed for wire-format work)
+
+- [x] `virtio-queue`: descriptor table, flag constants, cycle-safe
+      `DescriptorChain` iterator with bounds + cycle detection.
+- [x] `virtio-vsock`: 44-byte `VsockHeader` parse/serialize, all op codes
+      and type codes, well-known CIDs, shutdown flags.
+- [x] `virtio-vsock::Connection` state machine: `Closed → Listen/SynSent →
+      Established → CloseWait/FinWait → Closed` with credit-based flow
+      control fields.
+- [x] `guest-agent` binary scaffold: compiles as a static binary, processes
+      `Ping` and `Exec` requests over stdin/stdout (vsock wiring deferred
+      to M2 on a KVM host).
+
+## M2 — still needs KVM host
+
+- [ ] Wire `virtio-vsock` into the KVM vCPU run loop (eventfd, virtqueue
+      consumer, ioeventfd).
+- [ ] `guest-agent` reads/writes on `/dev/vsock` and routes requests to
+      the full handler set (WriteFile, ReadFile, Stat, Signal, ExecStart
+      streaming).
+- [ ] `nanovm exec <id> -- echo hi` round-trips end-to-end.
+
+## M1 — needs KVM host
+
+M1 is blocked on `/dev/kvm`. See [`kvm-host.md`](kvm-host.md) for the
+cheapest options. Once on a KVM host the steps are:
+
+1. Add `kvm-ioctls`, `vm-memory`, `linux-loader` behind the `kvm` feature.
+2. Implement `KvmHypervisor::create_vm` (mmap guest RAM, load bzImage with
+   `linux-loader`).
+3. Implement `KvmHypervisor::start` (create vCPU, set registers, run loop).
+4. Attach a minimal 8250 UART device so the kernel can print to `ttyS0`.
+5. Add seccomp-BPF filter to the VMM process.
+6. Smoke-test: `cargo run -p cli -- run bzImage` prints "hello from guest".
 
 ## Verification
 
@@ -147,10 +196,14 @@ The main gaps are now concentrated in the execution path rather than the
 interfaces:
 
 - `vm-kvm` is still an M0 skeleton, so there is no real boot path yet.
-- `guest-agent` and `virtio-fs` remain placeholders, so exec/copy workflows
-  cannot be exercised end-to-end.
-- `cli` intentionally exposes only the command surface; every subcommand still
-  exits with a milestone placeholder message.
+- `virtio-vsock` and `guest-agent` have local/offline building blocks, but the
+  real `/dev/vsock` and KVM wiring is still missing, so exec cannot run
+  end-to-end inside a guest yet.
+- `virtio-fs` now has FUSE framing, but it still needs per-op bodies, dispatch,
+  and KVM integration before `nanovm cp` can work.
+- `cli` has a working `ps` command against the control plane, but the
+  guest-facing subcommands (`run`, `exec`, `cp`, `snapshot`, `fork`) remain
+  milestone placeholders.
 
 ## Continuation priorities
 
@@ -168,9 +221,11 @@ interfaces:
    format, so the next step there should be a benchmark-backed runtime
    prototype (`userfaultfd`, warm pool, fork latency) once M1/M2 give a real
    guest to snapshot.
-4. **Defer ergonomics until the execution path exists.** `virtio-fs`,
-   language-runtime images, metering, and quota work are valuable, but they
-   should layer on top of a real boot + exec loop rather than compete with it.
+4. **Keep offline-preparable pieces moving in parallel.** `virtio-fs`
+   request/response bodies, `virtio-queue` ring work, fuzzing, and snapshot
+   runtime prep are valuable because they are unit-testable without `/dev/kvm`,
+   but they should still support — not displace — the boot + exec critical
+   path.
 
 ## Next up
 
@@ -179,3 +234,28 @@ of implementation work around a single end-to-end KVM success criterion:
 create → boot → serial output. See [`kvm-host.md`](kvm-host.md) for the
 cheapest options (local Linux, GCP nested virt, AWS bare metal, Hetzner
 dedicated).
+
+The M2 vsock wiring can overlap with M1 development — once the kernel boots
+and a `ttyS0` line appears, plugging in virtio-vsock is the immediate next
+step so the agent can receive commands.
+
+## Development without a KVM host
+
+While a KVM host is being sourced, these items advance the project:
+
+1. **Snapshot runtime (M5 prep)** — add `userfaultfd` bindings and the CoW
+   page-fault handler to the `snapshot` crate. The on-disk format is done;
+   the page-fault interception is the hard part.
+
+2. **virtio-queue ring parsers** — complete the available/used ring, packed
+   virtqueue, and guest-memory integration in `virtio-queue`. These are unit-
+   testable with synthetic byte slices.
+
+3. **virtio-fs (M3 prep)** — add per-op FUSE request/response bodies and the
+   dispatch scaffolding on top of the framing already in `virtio-fs`.
+
+4. **cargo-fuzz harnesses** — add fuzzing targets for `virtio-queue`,
+   `virtio-vsock`, and `snapshot` parsers. Run locally with `cargo fuzz`.
+
+5. **OpenAPI / Swagger spec** — auto-generate from the `control-plane`
+   routes for external consumers and SDK generation.

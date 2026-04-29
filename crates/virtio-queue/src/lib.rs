@@ -1,16 +1,18 @@
 //! Split virtqueue primitives.
 //!
 //! Scope: what every virtio device (vsock, fs, net, ...) needs in common —
-//! the descriptor table entry, flag constants, and a cycle-safe iterator
-//! that walks a descriptor chain. Device-specific logic (vsock packet
-//! framing, vsock connection state, virtio-fs FUSE framing, ...) lives in
-//! each device crate.
+//! the descriptor table entry, flag constants, the cycle-safe descriptor
+//! chain iterator, and the available / used ring views over caller-owned
+//! byte buffers. Device-specific logic (vsock packet framing, virtio-fs
+//! FUSE framing, ...) lives in each device crate.
 //!
-//! Deferred to follow-up PRs: the available / used ring parsers, indirect
-//! descriptors, packed (vs split) virtqueue, guest-memory integration
-//! (`vm-memory`), KVM eventfd plumbing.
+//! Deferred to follow-up PRs: indirect descriptors, packed (vs split)
+//! virtqueue, guest-memory integration (`vm-memory`), KVM eventfd
+//! plumbing.
 //!
 //! # Wire format
+//!
+//! Descriptor table entry (16 bytes, all little-endian, virtio 1.3 §2.7):
 //!
 //! ```c
 //! struct virtq_desc {
@@ -21,8 +23,33 @@
 //! };
 //! ```
 //!
-//! 16 bytes per descriptor, all little-endian. Offsets are pinned by the
-//! virtio 1.3 spec §2.7.
+//! Available ring (driver → device, `6 + 2 * qsize` bytes):
+//!
+//! ```c
+//! struct virtq_avail {
+//!     __le16 flags;             // VIRTQ_AVAIL_F_NO_INTERRUPT
+//!     __le16 idx;               // monotonic write counter, wraps at u16
+//!     __le16 ring[qsize];       // descriptor head indices
+//!     __le16 used_event;        // VIRTQ_F_EVENT_IDX feature
+//! };
+//! ```
+//!
+//! Used ring (device → driver, `6 + 8 * qsize` bytes):
+//!
+//! ```c
+//! struct virtq_used_elem {
+//!     __le32 id;                // start of used descriptor chain (head)
+//!     __le32 len;               // bytes written into device-writable area
+//! };
+//! struct virtq_used {
+//!     __le16 flags;             // VIRTQ_USED_F_NO_NOTIFY
+//!     __le16 idx;               // monotonic write counter, wraps at u16
+//!     struct virtq_used_elem ring[qsize];
+//!     __le16 avail_event;       // VIRTQ_F_EVENT_IDX feature
+//! };
+//! ```
+//!
+//! All offsets are pinned by virtio 1.3 §2.7 and verified by tests.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -240,6 +267,263 @@ pub enum QueueError {
         /// Max chain length we permit (equal to table size).
         limit: usize,
     },
+    /// Backing buffer for an available / used ring is smaller than the
+    /// ring's nominal size for the given queue size.
+    #[error("ring buffer too small: have {have} bytes, need {need} (qsize={qsize})")]
+    ShortRing {
+        /// Bytes in the buffer we were handed.
+        have: usize,
+        /// Bytes the ring requires for the configured queue size.
+        need: usize,
+        /// Configured queue size.
+        qsize: u16,
+    },
+    /// Queue size is zero, larger than [`MAX_QUEUE_SIZE`], or not a power
+    /// of two — virtio requires the latter.
+    #[error("invalid queue size {qsize}; must be a power of two in 1..={max}")]
+    BadQueueSize {
+        /// Queue size we were handed.
+        qsize: u16,
+        /// Maximum allowed queue size.
+        max: u16,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Ring constants
+// ---------------------------------------------------------------------------
+
+/// Maximum queue size per the virtio spec: 2^15.
+pub const MAX_QUEUE_SIZE: u16 = 32_768;
+
+/// Set in [`AvailRing::flags`] when the driver doesn't want the device to
+/// send an interrupt for completed buffers.
+pub const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1 << 0;
+
+/// Set in [`UsedRing::flags`] when the device doesn't want the driver to
+/// kick (notify) for newly-supplied descriptors.
+pub const VIRTQ_USED_F_NO_NOTIFY: u16 = 1 << 0;
+
+/// Bytes occupied by an available ring of the given queue size:
+/// `flags(2) + idx(2) + ring(2 * qsize) + used_event(2)`.
+pub fn avail_ring_size(qsize: u16) -> usize {
+    6 + 2 * qsize as usize
+}
+
+/// Bytes occupied by a used ring of the given queue size:
+/// `flags(2) + idx(2) + ring(8 * qsize) + avail_event(2)`.
+pub fn used_ring_size(qsize: u16) -> usize {
+    6 + 8 * qsize as usize
+}
+
+fn validate_qsize(qsize: u16) -> Result<(), QueueError> {
+    if qsize == 0 || qsize > MAX_QUEUE_SIZE || !qsize.is_power_of_two() {
+        return Err(QueueError::BadQueueSize {
+            qsize,
+            max: MAX_QUEUE_SIZE,
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Available ring (driver → device, read-only on our side)
+// ---------------------------------------------------------------------------
+
+/// Borrowed read-only view of a virtio split available ring.
+///
+/// The driver writes; the device (us) reads. `bytes` must be backed by a
+/// `2 * qsize + 6` byte slab inside guest memory. Multi-byte fields are
+/// interpreted little-endian by the accessors.
+///
+/// All slot reads use modular arithmetic against `qsize`, matching the
+/// driver's wraparound semantics — so a producer that has wrapped its
+/// `idx` field many times still indexes valid slots.
+#[derive(Debug, Clone, Copy)]
+pub struct AvailRing<'a> {
+    bytes: &'a [u8],
+    qsize: u16,
+}
+
+impl<'a> AvailRing<'a> {
+    /// Wrap `bytes` as an available ring of size `qsize`. Validates that
+    /// `qsize` is a power of two in `1..=MAX_QUEUE_SIZE` and that `bytes`
+    /// is at least [`avail_ring_size`] bytes.
+    pub fn new(bytes: &'a [u8], qsize: u16) -> Result<Self, QueueError> {
+        validate_qsize(qsize)?;
+        let need = avail_ring_size(qsize);
+        if bytes.len() < need {
+            return Err(QueueError::ShortRing {
+                have: bytes.len(),
+                need,
+                qsize,
+            });
+        }
+        Ok(Self { bytes, qsize })
+    }
+
+    /// Configured queue size.
+    pub fn qsize(&self) -> u16 {
+        self.qsize
+    }
+
+    /// `flags` field (offset 0).
+    pub fn flags(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[0..2].try_into().unwrap())
+    }
+
+    /// Driver's monotonic-mod-2^16 producer index (offset 2). The number of
+    /// available descriptor heads is `idx().wrapping_sub(last_seen)`; slots
+    /// are read mod `qsize`.
+    pub fn idx(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[2..4].try_into().unwrap())
+    }
+
+    /// Descriptor head index at `slot` (which is implicitly taken mod
+    /// `qsize`).
+    pub fn head(&self, slot: u16) -> u16 {
+        let i = (slot % self.qsize) as usize;
+        let off = 4 + 2 * i;
+        u16::from_le_bytes(self.bytes[off..off + 2].try_into().unwrap())
+    }
+
+    /// `used_event` field at the very end of the ring. Only meaningful
+    /// when the `VIRTQ_F_EVENT_IDX` feature is negotiated; otherwise the
+    /// bytes are reserved.
+    pub fn used_event(&self) -> u16 {
+        let off = 4 + 2 * self.qsize as usize;
+        u16::from_le_bytes(self.bytes[off..off + 2].try_into().unwrap())
+    }
+
+    /// Iterate descriptor heads added by the driver since `last_seen`
+    /// (the consumer's previous read of `idx()`). Yields heads in the
+    /// order the driver produced them.
+    pub fn iter_new(&self, last_seen: u16) -> AvailIter<'_, 'a> {
+        AvailIter {
+            ring: self,
+            next: last_seen,
+            end: self.idx(),
+        }
+    }
+}
+
+/// Iterator yielded by [`AvailRing::iter_new`].
+#[derive(Debug)]
+pub struct AvailIter<'r, 'a> {
+    ring: &'r AvailRing<'a>,
+    next: u16,
+    end: u16,
+}
+
+impl<'r, 'a> Iterator for AvailIter<'r, 'a> {
+    type Item = u16;
+    fn next(&mut self) -> Option<u16> {
+        if self.next == self.end {
+            return None;
+        }
+        let head = self.ring.head(self.next);
+        self.next = self.next.wrapping_add(1);
+        Some(head)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Used ring (device → driver, read+write on our side)
+// ---------------------------------------------------------------------------
+
+/// Borrowed mutable view of a virtio split used ring.
+///
+/// The device (us) writes; the driver reads. Each completed descriptor
+/// chain is reported via [`UsedRing::push`]: write `(head_idx, written_len)`
+/// into `ring[idx % qsize]`, then advance `idx`.
+#[derive(Debug)]
+pub struct UsedRing<'a> {
+    bytes: &'a mut [u8],
+    qsize: u16,
+}
+
+impl<'a> UsedRing<'a> {
+    /// Wrap `bytes` as a used ring of size `qsize`. Validates `qsize` and
+    /// buffer length the same way as [`AvailRing::new`].
+    pub fn new(bytes: &'a mut [u8], qsize: u16) -> Result<Self, QueueError> {
+        validate_qsize(qsize)?;
+        let need = used_ring_size(qsize);
+        if bytes.len() < need {
+            return Err(QueueError::ShortRing {
+                have: bytes.len(),
+                need,
+                qsize,
+            });
+        }
+        Ok(Self { bytes, qsize })
+    }
+
+    /// Configured queue size.
+    pub fn qsize(&self) -> u16 {
+        self.qsize
+    }
+
+    /// `flags` field (offset 0).
+    pub fn flags(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[0..2].try_into().unwrap())
+    }
+
+    /// Set the `flags` field.
+    pub fn set_flags(&mut self, v: u16) {
+        self.bytes[0..2].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// Device's monotonic-mod-2^16 producer index (offset 2).
+    pub fn idx(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[2..4].try_into().unwrap())
+    }
+
+    /// Set `idx`. Real callers should prefer [`Self::push`], which wraps
+    /// the slot/index dance.
+    pub fn set_idx(&mut self, v: u16) {
+        self.bytes[2..4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// `avail_event` field at the very end of the ring. Only meaningful
+    /// when `VIRTQ_F_EVENT_IDX` is negotiated.
+    pub fn avail_event(&self) -> u16 {
+        let off = 4 + 8 * self.qsize as usize;
+        u16::from_le_bytes(self.bytes[off..off + 2].try_into().unwrap())
+    }
+
+    /// Set `avail_event`.
+    pub fn set_avail_event(&mut self, v: u16) {
+        let off = 4 + 8 * self.qsize as usize;
+        self.bytes[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// Read used-elem at the given slot (taken mod `qsize`). Returns
+    /// `(head_idx, written_len)`.
+    pub fn elem(&self, slot: u16) -> (u32, u32) {
+        let i = (slot % self.qsize) as usize;
+        let off = 4 + 8 * i;
+        let id = u32::from_le_bytes(self.bytes[off..off + 4].try_into().unwrap());
+        let len = u32::from_le_bytes(self.bytes[off + 4..off + 8].try_into().unwrap());
+        (id, len)
+    }
+
+    /// Append a used-elem at the slot indicated by current `idx() %
+    /// qsize` and advance `idx` by one (with wraparound at `u16::MAX`).
+    /// Returns the slot index that was written.
+    ///
+    /// `head_idx` is the descriptor table index that started the chain
+    /// the driver gave us; `written_len` is the number of bytes the
+    /// device wrote into the device-writable portion of that chain.
+    pub fn push(&mut self, head_idx: u32, written_len: u32) -> u16 {
+        let cur = self.idx();
+        let slot = (cur % self.qsize) as usize;
+        let off = 4 + 8 * slot;
+        self.bytes[off..off + 4].copy_from_slice(&head_idx.to_le_bytes());
+        self.bytes[off + 4..off + 8].copy_from_slice(&written_len.to_le_bytes());
+        let new_idx = cur.wrapping_add(1);
+        self.set_idx(new_idx);
+        cur
+    }
 }
 
 #[cfg(test)]
@@ -443,5 +727,220 @@ mod tests {
         assert!(chain.next().unwrap().is_err()); // BadIndex
         assert!(chain.next().is_none()); // fused
         assert!(chain.next().is_none());
+    }
+
+    // ---- Ring sizing + qsize validation -------------------------------
+
+    #[test]
+    fn ring_sizes_match_spec_formulas() {
+        // 6 + 2*qsize for avail, 6 + 8*qsize for used.
+        assert_eq!(avail_ring_size(8), 22);
+        assert_eq!(used_ring_size(8), 70);
+        assert_eq!(avail_ring_size(256), 518);
+        assert_eq!(used_ring_size(256), 2054);
+    }
+
+    #[test]
+    fn validate_qsize_accepts_powers_of_two_in_range() {
+        for qs in [1u16, 2, 4, 8, 16, 256, 1024, MAX_QUEUE_SIZE] {
+            let mut buf = vec![0u8; avail_ring_size(qs)];
+            buf.extend(std::iter::once(0)); // pad
+            assert!(AvailRing::new(&buf, qs).is_ok(), "qsize={qs} rejected");
+        }
+    }
+
+    #[test]
+    fn validate_qsize_rejects_zero_non_power_of_two_and_out_of_range() {
+        let buf = [0u8; 1024];
+        for qs in [0u16, 3, 5, 7, 100, 1000] {
+            let err = AvailRing::new(&buf, qs).unwrap_err();
+            assert!(matches!(err, QueueError::BadQueueSize { .. }), "qs={qs}");
+        }
+    }
+
+    #[test]
+    fn ring_constructors_reject_short_buffers() {
+        let buf = [0u8; 4];
+        let err = AvailRing::new(&buf, 8).unwrap_err();
+        assert!(matches!(
+            err,
+            QueueError::ShortRing {
+                have: 4,
+                need: 22,
+                qsize: 8
+            }
+        ));
+        let mut buf = [0u8; 4];
+        let err = UsedRing::new(&mut buf, 8).unwrap_err();
+        assert!(matches!(
+            err,
+            QueueError::ShortRing {
+                have: 4,
+                need: 70,
+                qsize: 8
+            }
+        ));
+    }
+
+    // ---- AvailRing -----------------------------------------------------
+
+    /// Build an avail-ring backing buffer with the given heads and idx.
+    fn avail_buf(qsize: u16, idx: u16, heads: &[u16], used_event: u16) -> Vec<u8> {
+        let mut buf = vec![0u8; avail_ring_size(qsize)];
+        // flags = 0
+        buf[2..4].copy_from_slice(&idx.to_le_bytes());
+        for (i, h) in heads.iter().enumerate() {
+            let off = 4 + 2 * i;
+            buf[off..off + 2].copy_from_slice(&h.to_le_bytes());
+        }
+        let off = 4 + 2 * qsize as usize;
+        buf[off..off + 2].copy_from_slice(&used_event.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn avail_ring_reads_flags_idx_and_heads() {
+        let buf = avail_buf(4, 3, &[10, 20, 30, 0], 7);
+        let ring = AvailRing::new(&buf, 4).unwrap();
+        assert_eq!(ring.qsize(), 4);
+        assert_eq!(ring.flags(), 0);
+        assert_eq!(ring.idx(), 3);
+        assert_eq!(ring.head(0), 10);
+        assert_eq!(ring.head(1), 20);
+        assert_eq!(ring.head(2), 30);
+        assert_eq!(ring.used_event(), 7);
+    }
+
+    #[test]
+    fn avail_ring_head_indexes_modulo_qsize() {
+        // Slot 4 mod qsize=4 == slot 0. Pinning the wraparound semantics.
+        let buf = avail_buf(4, 0, &[42, 0, 0, 0], 0);
+        let ring = AvailRing::new(&buf, 4).unwrap();
+        assert_eq!(ring.head(0), 42);
+        assert_eq!(ring.head(4), 42);
+        assert_eq!(ring.head(8), 42);
+    }
+
+    #[test]
+    fn avail_ring_iter_new_yields_heads_since_last_seen() {
+        let buf = avail_buf(8, 5, &[10, 11, 12, 13, 14, 0, 0, 0], 0);
+        let ring = AvailRing::new(&buf, 8).unwrap();
+        let new: Vec<_> = ring.iter_new(0).collect();
+        assert_eq!(new, vec![10, 11, 12, 13, 14]);
+        let none: Vec<_> = ring.iter_new(5).collect();
+        assert!(none.is_empty(), "no new heads since last_seen == idx");
+        let two: Vec<_> = ring.iter_new(3).collect();
+        assert_eq!(two, vec![13, 14]);
+    }
+
+    #[test]
+    fn avail_ring_iter_new_handles_idx_wraparound() {
+        // Driver has wrapped past u16::MAX once. last_seen=u16::MAX-1,
+        // idx=2 means 4 entries written: at slots
+        // (u16::MAX-1, u16::MAX, 0, 1) all mod qsize.
+        let qsize = 4u16;
+        let mut buf = vec![0u8; avail_ring_size(qsize)];
+        let idx: u16 = 2;
+        buf[2..4].copy_from_slice(&idx.to_le_bytes());
+        // Heads stored at slots determined by mod-qsize wraparound:
+        let placements = [
+            ((u16::MAX - 1) % qsize, 0xA1u16),
+            (u16::MAX % qsize, 0xA2),
+            (0 % qsize, 0xA3),
+            (1 % qsize, 0xA4),
+        ];
+        for (slot, head) in placements {
+            let off = 4 + 2 * slot as usize;
+            buf[off..off + 2].copy_from_slice(&head.to_le_bytes());
+        }
+        let ring = AvailRing::new(&buf, qsize).unwrap();
+        let new: Vec<_> = ring.iter_new(u16::MAX - 1).collect();
+        assert_eq!(new, vec![0xA1, 0xA2, 0xA3, 0xA4]);
+    }
+
+    // ---- UsedRing ------------------------------------------------------
+
+    #[test]
+    fn used_ring_push_writes_elem_and_advances_idx() {
+        let qsize = 8u16;
+        let mut buf = vec![0u8; used_ring_size(qsize)];
+        let mut ring = UsedRing::new(&mut buf, qsize).unwrap();
+        assert_eq!(ring.idx(), 0);
+        let slot = ring.push(7, 256);
+        assert_eq!(slot, 0);
+        assert_eq!(ring.idx(), 1);
+        assert_eq!(ring.elem(0), (7, 256));
+        let slot = ring.push(13, 512);
+        assert_eq!(slot, 1);
+        assert_eq!(ring.idx(), 2);
+        assert_eq!(ring.elem(1), (13, 512));
+    }
+
+    #[test]
+    fn used_ring_push_wraps_slot_at_qsize() {
+        let qsize = 4u16;
+        let mut buf = vec![0u8; used_ring_size(qsize)];
+        let mut ring = UsedRing::new(&mut buf, qsize).unwrap();
+        for i in 0..6 {
+            // 6 pushes into a 4-slot ring. Slots reused after qsize.
+            ring.push(i as u32, i as u32 * 10);
+        }
+        assert_eq!(ring.idx(), 6);
+        // Slot 0 was overwritten by push #4.
+        assert_eq!(ring.elem(0), (4, 40));
+        // Slot 1 was overwritten by push #5.
+        assert_eq!(ring.elem(1), (5, 50));
+        // Slots 2/3 still hold pushes #2 and #3.
+        assert_eq!(ring.elem(2), (2, 20));
+        assert_eq!(ring.elem(3), (3, 30));
+    }
+
+    #[test]
+    fn used_ring_idx_wraps_at_u16_boundary() {
+        let qsize = 4u16;
+        let mut buf = vec![0u8; used_ring_size(qsize)];
+        let mut ring = UsedRing::new(&mut buf, qsize).unwrap();
+        ring.set_idx(u16::MAX);
+        ring.push(99, 99);
+        assert_eq!(ring.idx(), 0, "idx must wrap u16::MAX -> 0");
+    }
+
+    #[test]
+    fn used_ring_flags_and_avail_event_roundtrip() {
+        let qsize = 16u16;
+        let mut buf = vec![0u8; used_ring_size(qsize)];
+        let mut ring = UsedRing::new(&mut buf, qsize).unwrap();
+        ring.set_flags(VIRTQ_USED_F_NO_NOTIFY);
+        ring.set_avail_event(0xCAFE);
+        assert_eq!(ring.flags(), VIRTQ_USED_F_NO_NOTIFY);
+        assert_eq!(ring.avail_event(), 0xCAFE);
+    }
+
+    #[test]
+    fn ring_flag_constants_match_virtio_spec() {
+        // Pinned by the spec.
+        assert_eq!(VIRTQ_AVAIL_F_NO_INTERRUPT, 1);
+        assert_eq!(VIRTQ_USED_F_NO_NOTIFY, 1);
+    }
+
+    #[test]
+    fn used_ring_field_offsets_match_spec() {
+        // qsize=2 → flags(0..2), idx(2..4), elem0(4..12), elem1(12..20),
+        // avail_event(20..22). Total 22 bytes.
+        let qsize = 2u16;
+        let mut buf = vec![0u8; used_ring_size(qsize)];
+        assert_eq!(buf.len(), 22);
+        let mut ring = UsedRing::new(&mut buf, qsize).unwrap();
+        ring.set_flags(0x0102);
+        ring.set_idx(0x0304);
+        ring.push(0x0A0B0C0D, 0x10111213); // writes into slot 0, advances idx
+        ring.set_avail_event(0xFEFE);
+        // Reconstruct expected bytes manually.
+        assert_eq!(&buf[0..2], &0x0102u16.to_le_bytes());
+        // After set_idx then push, idx == 0x0305.
+        assert_eq!(&buf[2..4], &0x0305u16.to_le_bytes());
+        assert_eq!(&buf[4..8], &0x0A0B0C0Du32.to_le_bytes());
+        assert_eq!(&buf[8..12], &0x10111213u32.to_le_bytes());
+        assert_eq!(&buf[20..22], &0xFEFEu16.to_le_bytes());
     }
 }
