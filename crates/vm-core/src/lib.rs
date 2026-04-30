@@ -55,16 +55,28 @@ impl SnapshotId {
     }
 }
 
-/// Configuration for a new VM. Minimal M0 surface; will grow with M1/M2/M5.
+/// Configuration for a new VM.
+///
+/// `snapshot_dir`, when set, asks the backend to restore the VM from a
+/// previously-captured snapshot directory (see the `snapshot` crate's
+/// `Manifest` / `BackingFileHeader`) instead of cold-booting from
+/// `kernel` / `rootfs`. Backends that don't support snapshot restore
+/// return [`VmError::Unsupported`]; backends that do should treat the
+/// manifest's `memory_bytes` / `vcpu_count` as authoritative when
+/// `snapshot_dir` is set, ignoring the matching fields in this struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VmConfig {
-    /// Number of virtual CPUs.
+    /// Number of virtual CPUs. Ignored when [`Self::snapshot_dir`] is set
+    /// (the snapshot's `vcpu_count` wins).
     pub vcpus: u32,
-    /// Guest memory in MiB.
+    /// Guest memory in MiB. Ignored when [`Self::snapshot_dir`] is set
+    /// (the snapshot's `memory_bytes` wins).
     pub memory_mib: u64,
     /// Path to the kernel image (bzImage or vmlinux). `None` is allowed for
-    /// backends that don't actually boot a guest (e.g. `vm-mock`).
+    /// backends that don't actually boot a guest (e.g. `vm-mock`), and
+    /// also when [`Self::snapshot_dir`] is set (the snapshot supplies the
+    /// kernel state).
     pub kernel: Option<PathBuf>,
     /// Path to the root filesystem image.
     pub rootfs: Option<PathBuf>,
@@ -72,6 +84,10 @@ pub struct VmConfig {
     pub cmdline: String,
     /// vsock context id for host↔guest RPC, filled in during M2.
     pub vsock_cid: Option<u32>,
+    /// Snapshot directory to restore from. When `Some`, the backend reads
+    /// `manifest.json` + `memory.cow` from this directory and uses the
+    /// captured state instead of booting fresh.
+    pub snapshot_dir: Option<PathBuf>,
 }
 
 impl Default for VmConfig {
@@ -83,6 +99,7 @@ impl Default for VmConfig {
             rootfs: None,
             cmdline: String::new(),
             vsock_cid: None,
+            snapshot_dir: None,
         }
     }
 }
@@ -223,6 +240,7 @@ mod tests {
         assert!(cfg.rootfs.is_none());
         assert!(cfg.cmdline.is_empty());
         assert!(cfg.vsock_cid.is_none());
+        assert!(cfg.snapshot_dir.is_none());
     }
 
     #[test]
