@@ -9,6 +9,7 @@ description = "In-memory Hypervisor implementation for tests and CI."
 
 [dependencies]
 vm-core.workspace = true
+snapshot.workspace = true
 
 [lints]
 workspace = true

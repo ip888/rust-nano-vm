@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 http-body-util.workspace = true
 tower = { workspace = true, features = ["util"] }
+snapshot.workspace = true
 
 [lints]
 workspace = true

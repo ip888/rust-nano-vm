@@ -229,6 +229,7 @@ dependencies = [
  "http-body-util",
  "serde",
  "serde_json",
+ "snapshot",
  "tokio",
  "tower",
  "tower-http 0.5.2",
@@ -1187,6 +1188,7 @@ dependencies = [
 name = "vm-mock"
 version = "0.0.1"
 dependencies = [
+ "snapshot",
  "vm-core",
 ]
 
