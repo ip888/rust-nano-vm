@@ -203,6 +203,18 @@ pub trait Hypervisor: Send + Sync {
     /// Backends that don't track in-process state (e.g. wrappers around an
     /// out-of-band orchestrator) may return [`VmError::Unsupported`].
     fn list_vms(&self) -> VmResult<Vec<VmHandle>>;
+
+    /// Enumerate every snapshot currently held by this hypervisor.
+    ///
+    /// Order is implementation-defined. Backends that don't retain
+    /// in-process snapshot state may return [`VmError::Unsupported`].
+    fn list_snapshots(&self) -> VmResult<Vec<SnapshotId>>;
+
+    /// Drop a previously-captured snapshot. After this returns `Ok`, the
+    /// [`SnapshotId`] is invalid and any subsequent
+    /// [`Hypervisor::restore`] call referencing it returns
+    /// [`VmError::UnknownSnapshot`].
+    fn delete_snapshot(&self, snap: SnapshotId) -> VmResult<()>;
 }
 
 #[cfg(test)]

@@ -472,3 +472,109 @@ async fn create_vm_with_missing_snapshot_dir_returns_backend_500() {
         .unwrap()
         .contains("snapshot manifest"));
 }
+
+// --- GET /v1/snapshots, DELETE /v1/snapshots/:id --------------------
+
+#[tokio::test]
+async fn list_snapshots_is_empty_initially() {
+    let (status, body) = send(app(), Method::GET, "/v1/snapshots", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["snapshots"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn list_snapshots_returns_each_captured_snapshot() {
+    let app = app();
+    let (_, h) = send(app.clone(), Method::POST, "/v1/vms", Some(json!({}))).await;
+    let id = h["id"].as_u64().unwrap();
+    send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{id}/start"),
+        None,
+    )
+    .await;
+    // Capture two snapshots from the same VM.
+    let (_, s1) = send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{id}/snapshot"),
+        None,
+    )
+    .await;
+    let (_, s2) = send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{id}/snapshot"),
+        None,
+    )
+    .await;
+    let s1_id = s1["id"].as_u64().unwrap();
+    let s2_id = s2["id"].as_u64().unwrap();
+
+    let (status, body) = send(app.clone(), Method::GET, "/v1/snapshots", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let snaps = body["snapshots"].as_array().unwrap();
+    assert_eq!(snaps.len(), 2);
+    let mut ids: Vec<u64> = snaps.iter().map(|s| s["id"].as_u64().unwrap()).collect();
+    ids.sort();
+    let mut want = vec![s1_id, s2_id];
+    want.sort();
+    assert_eq!(ids, want);
+    for s in snaps {
+        assert!(s["display"].as_str().unwrap().starts_with("snap-"));
+    }
+}
+
+#[tokio::test]
+async fn delete_snapshot_removes_it_and_subsequent_restore_404s() {
+    let app = app();
+    let (_, h) = send(app.clone(), Method::POST, "/v1/vms", Some(json!({}))).await;
+    let id = h["id"].as_u64().unwrap();
+    send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{id}/start"),
+        None,
+    )
+    .await;
+    let (_, s) = send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{id}/snapshot"),
+        None,
+    )
+    .await;
+    let snap_id = s["id"].as_u64().unwrap();
+
+    let (status, _) = send(
+        app.clone(),
+        Method::DELETE,
+        &format!("/v1/snapshots/{snap_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Subsequent restore must 404 with the structured envelope.
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/snapshots/{snap_id}/restore"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "unknown_snapshot");
+
+    // And the listing now omits it.
+    let (_, list) = send(app.clone(), Method::GET, "/v1/snapshots", None).await;
+    assert_eq!(list["snapshots"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn delete_unknown_snapshot_returns_structured_404() {
+    let (status, body) = send(app(), Method::DELETE, "/v1/snapshots/99999", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "unknown_snapshot");
+}

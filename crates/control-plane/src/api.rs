@@ -149,3 +149,22 @@ impl From<SnapshotId> for SnapshotDto {
         }
     }
 }
+
+/// Response body for `GET /v1/snapshots`. Wraps the list in an envelope
+/// for the same forward-compat reason as [`VmListResponse`] — leaves
+/// room for pagination / filter metadata later.
+#[derive(Debug, Serialize)]
+pub(crate) struct SnapshotListResponse {
+    pub snapshots: Vec<SnapshotDto>,
+}
+
+impl SnapshotListResponse {
+    pub fn new<I>(ids: I) -> Self
+    where
+        I: IntoIterator<Item = SnapshotId>,
+    {
+        Self {
+            snapshots: ids.into_iter().map(SnapshotDto::from).collect(),
+        }
+    }
+}
