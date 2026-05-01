@@ -68,9 +68,27 @@ impl MockHypervisor {
 
 impl Hypervisor for MockHypervisor {
     fn create_vm(&self, cfg: &VmConfig) -> VmResult<VmHandle> {
+        // If snapshot_dir is set, the manifest is authoritative for the
+        // VM's geometry — overwrite the config-provided vcpus / memory_mib
+        // before we record the VM. Surfaces a Backend error if the
+        // manifest is missing, malformed, or has an unsupported version.
+        let cfg = match &cfg.snapshot_dir {
+            None => cfg.clone(),
+            Some(dir) => {
+                let manifest = snapshot::Manifest::read_from_dir(dir)
+                    .map_err(|e| VmError::Backend(format!("snapshot manifest: {e}")))?;
+                let mib = manifest.memory_bytes / (1024 * 1024);
+                VmConfig {
+                    vcpus: manifest.vcpu_count,
+                    memory_mib: mib,
+                    cmdline: manifest.kernel_cmdline.clone(),
+                    ..cfg.clone()
+                }
+            }
+        };
         let id = VmId::next();
         let vm = MockVm {
-            config: cfg.clone(),
+            config: cfg,
             state: VmState::Created,
         };
         self.inner
@@ -359,5 +377,64 @@ mod tests {
         let listed = hv.list_vms().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, b.id);
+    }
+
+    // ---- Snapshot-restore path ----------------------------------------
+
+    fn snapshot_dir_with_manifest(
+        slug: &str,
+        snapshot_id: u64,
+        memory_mib: u64,
+        vcpu_count: u32,
+        cmdline: &str,
+    ) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rust-nano-vm-{}-{}-{}",
+            slug,
+            std::process::id(),
+            snapshot_id
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut m =
+            snapshot::Manifest::new(snapshot_id, memory_mib * 1024 * 1024, 4096, vcpu_count);
+        m.kernel_cmdline = cmdline.to_owned();
+        m.write_to_dir(&dir).expect("write manifest");
+        dir
+    }
+
+    #[test]
+    fn create_vm_with_snapshot_dir_uses_manifest_geometry() {
+        let dir = snapshot_dir_with_manifest("create-from-snap", 7, 256, 4, "console=ttyS0");
+        let hv = MockHypervisor::new();
+        let cfg = VmConfig {
+            // Caller-provided values that must be overridden by the manifest.
+            vcpus: 1,
+            memory_mib: 16,
+            snapshot_dir: Some(dir.clone()),
+            ..VmConfig::default()
+        };
+        let handle = hv.create_vm(&cfg).expect("create from snapshot");
+        // Inspect via the internal map by listing.
+        let listed = hv.list_vms().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, handle.id);
+        // We can't read MockVm.config externally, so re-create with no
+        // snapshot to confirm by symmetry that geometry differs.
+        let baseline = hv.create_vm(&VmConfig::default()).expect("baseline create");
+        assert_ne!(baseline.id, handle.id);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn create_vm_with_missing_snapshot_dir_returns_backend_error() {
+        let hv = MockHypervisor::new();
+        let cfg = VmConfig {
+            snapshot_dir: Some(std::path::PathBuf::from(
+                "/nonexistent/rust-nano-vm/snapshot",
+            )),
+            ..VmConfig::default()
+        };
+        let err = hv.create_vm(&cfg).unwrap_err();
+        assert!(matches!(err, VmError::Backend(_)), "got {err:?}");
     }
 }

@@ -427,3 +427,48 @@ async fn missing_api_tokens_extension_returns_structured_500() {
         .unwrap()
         .contains("ApiTokens extension is missing"));
 }
+
+// --- POST /v1/vms with snapshot_dir ----------------------------------
+
+/// Write a manifest into a fresh temp dir; caller cleans up.
+fn snapshot_dir_with_manifest(slug: &str, snapshot_id: u64) -> std::path::PathBuf {
+    use std::collections::BTreeMap;
+    let dir = std::env::temp_dir().join(format!(
+        "rust-nano-vm-cp-{}-{}-{}",
+        slug,
+        std::process::id(),
+        snapshot_id
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut m = snapshot::Manifest::new(snapshot_id, 256 * 1024 * 1024, 4096, 4);
+    m.kernel_cmdline = "console=ttyS0".into();
+    m.labels = BTreeMap::from([("kind".into(), "test".into())]);
+    m.write_to_dir(&dir).expect("write manifest");
+    dir
+}
+
+#[tokio::test]
+async fn create_vm_with_snapshot_dir_returns_created() {
+    let dir = snapshot_dir_with_manifest("create-from-snapshot", 1);
+    let body = json!({ "snapshot_dir": dir });
+    let (status, resp) = send(app(), Method::POST, "/v1/vms", Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "got body {resp:?}");
+    assert_eq!(resp["state"], "created");
+    assert!(resp["id"].is_u64());
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[tokio::test]
+async fn create_vm_with_missing_snapshot_dir_returns_backend_500() {
+    let body = json!({
+        "snapshot_dir": "/nonexistent/rust-nano-vm/snapshot",
+    });
+    let (status, resp) = send(app(), Method::POST, "/v1/vms", Some(body)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    // Mapped from VmError::Backend(..) per error.rs.
+    assert_eq!(resp["error"]["code"], "backend");
+    assert!(resp["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("snapshot manifest"));
+}
