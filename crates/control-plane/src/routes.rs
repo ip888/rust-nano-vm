@@ -3,17 +3,19 @@
 //! The REST surface intentionally mirrors the [`Hypervisor`] trait one-for-one,
 //! so the mental model is stable and the control plane stays a thin shell.
 //!
-//! | Method | Path                                | Trait method   |
-//! |--------|-------------------------------------|----------------|
-//! | POST   | `/v1/vms`                           | `create_vm`    |
-//! | GET    | `/v1/vms`                           | `list_vms`     |
-//! | GET    | `/v1/vms/:id`                       | `state`        |
-//! | POST   | `/v1/vms/:id/start`                 | `start`        |
-//! | POST   | `/v1/vms/:id/stop`                  | `stop`         |
-//! | POST   | `/v1/vms/:id/snapshot`              | `snapshot`     |
-//! | DELETE | `/v1/vms/:id`                       | `destroy`      |
-//! | POST   | `/v1/snapshots/:id/restore`         | `restore`      |
-//! | GET    | `/healthz`                          | —              |
+//! | Method | Path                                | Trait method      |
+//! |--------|-------------------------------------|-------------------|
+//! | POST   | `/v1/vms`                           | `create_vm`       |
+//! | GET    | `/v1/vms`                           | `list_vms`        |
+//! | GET    | `/v1/vms/:id`                       | `state`           |
+//! | POST   | `/v1/vms/:id/start`                 | `start`           |
+//! | POST   | `/v1/vms/:id/stop`                  | `stop`            |
+//! | POST   | `/v1/vms/:id/snapshot`              | `snapshot`        |
+//! | DELETE | `/v1/vms/:id`                       | `destroy`         |
+//! | GET    | `/v1/snapshots`                     | `list_snapshots`  |
+//! | DELETE | `/v1/snapshots/:id`                 | `delete_snapshot` |
+//! | POST   | `/v1/snapshots/:id/restore`         | `restore`         |
+//! | GET    | `/healthz`                          | —                 |
 //!
 //! Hypervisor calls are synchronous and cheap for `vm-mock` so we call them
 //! directly from async handlers. Real backends (M1+) should wrap expensive
@@ -34,7 +36,10 @@ use axum::{
 use tower_http::trace::TraceLayer;
 use vm_core::{Hypervisor, SnapshotId, VmId};
 
-use crate::api::{CreateVmRequest, SnapshotDto, VmHandleDto, VmListResponse, VmStateResponse};
+use crate::api::{
+    CreateVmRequest, SnapshotDto, SnapshotListResponse, VmHandleDto, VmListResponse,
+    VmStateResponse,
+};
 use crate::auth;
 use crate::error::ApiError;
 
@@ -85,6 +90,8 @@ pub fn router() -> Router<AppState> {
         .route("/vms/:id/start", post(start_vm))
         .route("/vms/:id/stop", post(stop_vm))
         .route("/vms/:id/snapshot", post(snapshot_vm))
+        .route("/snapshots", get(list_snapshots))
+        .route("/snapshots/:id", axum::routing::delete(delete_snapshot))
         .route("/snapshots/:id/restore", post(restore_snapshot))
         .route_layer(middleware::from_fn(auth::require_token));
 
@@ -170,4 +177,20 @@ async fn restore_snapshot(
     let Path(id) = id?;
     let handle = state.hypervisor.restore(SnapshotId(id))?;
     Ok((StatusCode::CREATED, Json(handle.into())))
+}
+
+async fn list_snapshots(
+    State(state): State<AppState>,
+) -> Result<Json<SnapshotListResponse>, ApiError> {
+    let ids = state.hypervisor.list_snapshots()?;
+    Ok(Json(SnapshotListResponse::new(ids)))
+}
+
+async fn delete_snapshot(
+    State(state): State<AppState>,
+    id: Result<Path<u64>, PathRejection>,
+) -> Result<StatusCode, ApiError> {
+    let Path(id) = id?;
+    state.hypervisor.delete_snapshot(SnapshotId(id))?;
+    Ok(StatusCode::NO_CONTENT)
 }

@@ -106,6 +106,14 @@ enum Command {
     },
     /// List sandboxes (requires a running nanovm-control-plane).
     Ps,
+    /// List captured snapshots.
+    Snapshots,
+    /// Delete a snapshot. After this returns, `nanovm fork <id>` on it
+    /// fails with `unknown_snapshot`.
+    RmSnap {
+        /// Snapshot id (raw u64 or `snap-...` display form).
+        snapshot: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -138,6 +146,8 @@ fn main() -> ExitCode {
         Command::Snapshot { id } => cmd_snapshot(&client, &id),
         Command::Fork { snapshot, count } => cmd_fork(&client, &snapshot, count),
         Command::Ps => cmd_ps(&client),
+        Command::Snapshots => cmd_snapshots(&client),
+        Command::RmSnap { snapshot } => cmd_rm_snap(&client, &snapshot),
     }
 }
 
@@ -221,6 +231,9 @@ impl Client {
     }
     fn post(&self, path: &str, body: Option<Value>) -> Result<Value, CliError> {
         self.send(Method::POST, path, body)
+    }
+    fn delete(&self, path: &str) -> Result<Value, CliError> {
+        self.send(Method::DELETE, path, None)
     }
 }
 
@@ -371,6 +384,44 @@ fn cmd_fork(client: &Client, snapshot: &str, count: u32) -> ExitCode {
         let display = restored["display"].as_str().unwrap_or("?");
         println!("{display}");
     }
+    ExitCode::SUCCESS
+}
+
+fn cmd_snapshots(client: &Client) -> ExitCode {
+    let body = match client.get("/v1/snapshots") {
+        Ok(v) => v,
+        Err(e) => return fail("snapshots", &e),
+    };
+    let snaps = match body["snapshots"].as_array() {
+        Some(a) => a,
+        None => {
+            eprintln!("nanovm snapshots: unexpected response shape: {body}");
+            return ExitCode::from(1);
+        }
+    };
+    if snaps.is_empty() {
+        println!("no snapshots");
+        return ExitCode::SUCCESS;
+    }
+    for s in snaps {
+        let display = s["display"].as_str().unwrap_or("?");
+        println!("{display}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn cmd_rm_snap(client: &Client, snapshot: &str) -> ExitCode {
+    let snap_id = match parse_id(snapshot, "snap") {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("nanovm rm-snap: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(e) = client.delete(&format!("/v1/snapshots/{snap_id}")) {
+        return fail("rm-snap", &e);
+    }
+    println!("snap-{snap_id:016x} deleted");
     ExitCode::SUCCESS
 }
 

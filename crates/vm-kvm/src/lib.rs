@@ -65,6 +65,14 @@ impl Hypervisor for KvmHypervisor {
     fn list_vms(&self) -> VmResult<Vec<VmHandle>> {
         Err(unsupported())
     }
+
+    fn list_snapshots(&self) -> VmResult<Vec<SnapshotId>> {
+        Err(unsupported())
+    }
+
+    fn delete_snapshot(&self, _snap: SnapshotId) -> VmResult<()> {
+        Err(unsupported())
+    }
 }
 
 #[cfg(feature = "kvm")]
@@ -116,6 +124,14 @@ mod tests {
         ));
         assert!(matches!(
             hv.list_vms().unwrap_err(),
+            VmError::Unsupported(_)
+        ));
+        assert!(matches!(
+            hv.list_snapshots().unwrap_err(),
+            VmError::Unsupported(_)
+        ));
+        assert!(matches!(
+            hv.delete_snapshot(SnapshotId(1)).unwrap_err(),
             VmError::Unsupported(_)
         ));
     }
