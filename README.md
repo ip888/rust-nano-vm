@@ -53,16 +53,26 @@ Run the REST control plane (M6) against the mock backend — no KVM needed:
 NANOVM_API_TOKENS=dev-token cargo run -p control-plane
 # → nanovm-control-plane listening on 127.0.0.1:8080
 # (omit NANOVM_API_TOKENS for local-only no-auth mode; the binary will WARN)
+```
 
+Drive it from the CLI in another terminal:
+
+```sh
+export NANOVM_TOKEN=dev-token  # if the server has tokens enabled
+
+nanovm run /tmp/dummy.img      # → vm-0000000000000001 running
+nanovm ps                      # → list of VMs
+nanovm snapshot vm-0000000000000001  # → snap-0000000000000001
+nanovm fork    snap-0000000000000001 --count 4
+# → vm-0000000000000002
+#   vm-0000000000000003
+#   vm-0000000000000004
+#   vm-0000000000000005
+
+# Or talk to the API directly:
 curl -X POST localhost:8080/v1/vms \
-     -H 'authorization: Bearer dev-token' \
+     -H "authorization: Bearer $NANOVM_TOKEN" \
      -H 'content-type: application/json' -d '{}'
-# → {"id":1,"display":"vm-0000000000000001","state":"created"}
-
-curl -X POST localhost:8080/v1/vms/1/start -H 'authorization: Bearer dev-token'  # 204
-curl localhost:8080/v1/vms/1 -H 'authorization: Bearer dev-token'
-# → {"state":"running",...}
-
 curl localhost:8080/healthz   # /healthz is exempt from auth
 ```
 
