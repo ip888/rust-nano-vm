@@ -195,6 +195,19 @@ impl Hypervisor for MockHypervisor {
             })
             .collect())
     }
+
+    fn list_snapshots(&self) -> VmResult<Vec<SnapshotId>> {
+        let inner = self.inner.lock().expect("mock hypervisor poisoned");
+        Ok(inner.snapshots.keys().copied().collect())
+    }
+
+    fn delete_snapshot(&self, snap: SnapshotId) -> VmResult<()> {
+        let mut inner = self.inner.lock().expect("mock hypervisor poisoned");
+        if inner.snapshots.remove(&snap).is_none() {
+            return Err(VmError::UnknownSnapshot(snap));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -436,5 +449,49 @@ mod tests {
         };
         let err = hv.create_vm(&cfg).unwrap_err();
         assert!(matches!(err, VmError::Backend(_)), "got {err:?}");
+    }
+
+    // ---- Snapshot list / delete --------------------------------------
+
+    #[test]
+    fn list_snapshots_is_empty_initially() {
+        let hv = MockHypervisor::new();
+        assert!(hv.list_snapshots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_snapshots_returns_each_captured_snapshot() {
+        let hv = MockHypervisor::new();
+        let a = hv.create_vm(&cfg()).unwrap();
+        hv.start(a.id).unwrap();
+        let s1 = hv.snapshot(a.id).unwrap();
+        let s2 = hv.snapshot(a.id).unwrap();
+        let mut listed = hv.list_snapshots().unwrap();
+        listed.sort();
+        let mut expected = vec![s1, s2];
+        expected.sort();
+        assert_eq!(listed, expected);
+    }
+
+    #[test]
+    fn delete_snapshot_removes_it_and_subsequent_restore_fails() {
+        let hv = MockHypervisor::new();
+        let h = hv.create_vm(&cfg()).unwrap();
+        hv.start(h.id).unwrap();
+        let s = hv.snapshot(h.id).unwrap();
+        assert_eq!(hv.snapshot_count(), 1);
+        hv.delete_snapshot(s).unwrap();
+        assert_eq!(hv.snapshot_count(), 0);
+        assert!(matches!(
+            hv.restore(s).unwrap_err(),
+            VmError::UnknownSnapshot(_)
+        ));
+    }
+
+    #[test]
+    fn delete_unknown_snapshot_returns_unknown_snapshot() {
+        let hv = MockHypervisor::new();
+        let err = hv.delete_snapshot(SnapshotId(0xfeed_face)).unwrap_err();
+        assert!(matches!(err, VmError::UnknownSnapshot(_)));
     }
 }
