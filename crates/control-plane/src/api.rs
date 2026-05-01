@@ -11,6 +11,11 @@ use vm_core::{SnapshotId, VmConfig, VmHandle, VmId, VmState};
 
 /// Body of `POST /v1/vms`. All fields are optional; missing fields fall back
 /// to the same defaults as [`VmConfig::default`].
+///
+/// When `snapshot_dir` is set the backend reads `manifest.json` from that
+/// directory and uses the captured geometry instead of cold-booting from
+/// `kernel`/`rootfs`. The `vcpus` / `memory_mib` fields in the request are
+/// ignored in that case (the manifest wins).
 #[derive(Debug, Deserialize)]
 pub(crate) struct CreateVmRequest {
     #[serde(default = "default_vcpus")]
@@ -25,6 +30,8 @@ pub(crate) struct CreateVmRequest {
     pub cmdline: String,
     #[serde(default)]
     pub vsock_cid: Option<u32>,
+    #[serde(default)]
+    pub snapshot_dir: Option<PathBuf>,
 }
 
 fn default_vcpus() -> u32 {
@@ -44,6 +51,7 @@ impl From<CreateVmRequest> for VmConfig {
             rootfs: r.rootfs,
             cmdline: r.cmdline,
             vsock_cid: r.vsock_cid,
+            snapshot_dir: r.snapshot_dir,
         }
     }
 }
