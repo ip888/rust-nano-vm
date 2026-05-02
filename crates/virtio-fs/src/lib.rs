@@ -10,11 +10,16 @@
 //! - [`FuseError`] for parse / serialize failures.
 //! - Spec constants: [`FUSE_KERNEL_VERSION`], [`FUSE_KERNEL_MINOR_VERSION`],
 //!   [`FUSE_IN_HDR_LEN`], [`FUSE_OUT_HDR_LEN`].
+//! - Per-op body types in the [`body`] module: [`FuseInitIn`] /
+//!   [`FuseInitOut`] for the `Init` handshake, [`FuseAttr`] for the
+//!   inode metadata returned by `Getattr` / `Setattr`, and
+//!   [`FuseEntryOut`] for the lookup-style ops (`Lookup`, `Mknod`,
+//!   `Mkdir`, `Symlink`, `Link`).
 //!
-//! Deferred to follow-up PRs: per-op request/response body structs
-//! (`fuse_init_in`, `fuse_attr`, `fuse_open_out`, ...), the dispatch loop
-//! that reads a [`FuseInHeader`] from a virtqueue descriptor chain,
-//! invokes the right handler, and writes a [`FuseOutHeader`] + body back.
+//! Deferred to follow-up PRs: bodies for `Open` / `Read` / `Write` /
+//! `Readdir`, the dispatch loop that reads a [`FuseInHeader`] from a
+//! virtqueue descriptor chain, invokes the right handler, and writes a
+//! [`FuseOutHeader`] + body back.
 //!
 //! # Wire format
 //!
@@ -46,6 +51,13 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+pub mod body;
+
+pub use body::{
+    FuseAttr, FuseEntryOut, FuseInitIn, FuseInitOut, FUSE_ATTR_LEN, FUSE_ENTRY_OUT_LEN,
+    FUSE_INIT_IN_LEN, FUSE_INIT_OUT_LEN,
+};
 
 use thiserror::Error;
 
