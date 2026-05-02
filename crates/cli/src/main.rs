@@ -94,6 +94,11 @@ enum Command {
     Snapshot {
         /// Target sandbox id (raw u64 or `vm-...` display form).
         id: String,
+        /// Persist the captured snapshot to this directory as a
+        /// `snapshot::Manifest`. The directory is created if missing
+        /// and is suitable as input to `nanovm run --snapshot-dir`.
+        #[arg(long)]
+        to: Option<String>,
     },
     /// Fork one or more new sandboxes from a snapshot. Prints each
     /// resulting VM id on its own line.
@@ -143,7 +148,7 @@ fn main() -> ExitCode {
         } => cmd_run(&client, image, snapshot_dir, memory_mib, vcpus, no_start),
         Command::Exec { .. } => unimplemented_for("exec", "M2"),
         Command::Cp { .. } => unimplemented_for("cp", "M3"),
-        Command::Snapshot { id } => cmd_snapshot(&client, &id),
+        Command::Snapshot { id, to } => cmd_snapshot(&client, &id, to),
         Command::Fork { snapshot, count } => cmd_fork(&client, &snapshot, count),
         Command::Ps => cmd_ps(&client),
         Command::Snapshots => cmd_snapshots(&client),
@@ -344,7 +349,7 @@ fn cmd_run(
     ExitCode::SUCCESS
 }
 
-fn cmd_snapshot(client: &Client, id: &str) -> ExitCode {
+fn cmd_snapshot(client: &Client, id: &str, to: Option<String>) -> ExitCode {
     let vm_id = match parse_id(id, "vm") {
         Ok(n) => n,
         Err(e) => {
@@ -352,12 +357,17 @@ fn cmd_snapshot(client: &Client, id: &str) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let snap = match client.post(&format!("/v1/vms/{vm_id}/snapshot"), None) {
+    let body = to.as_ref().map(|p| json!({ "to_dir": p }));
+    let snap = match client.post(&format!("/v1/vms/{vm_id}/snapshot"), body) {
         Ok(v) => v,
         Err(e) => return fail("snapshot", &e),
     };
     let display = snap["display"].as_str().unwrap_or("?");
-    println!("{display}");
+    if let Some(dir) = snap["dir"].as_str() {
+        println!("{display} → {dir}");
+    } else {
+        println!("{display}");
+    }
     ExitCode::SUCCESS
 }
 
