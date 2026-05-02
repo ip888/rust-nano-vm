@@ -111,6 +111,19 @@ enum Command {
     },
     /// List sandboxes (requires a running nanovm-control-plane).
     Ps,
+    /// Stop a running sandbox. Equivalent to `POST /v1/vms/:id/stop`.
+    /// The VM stays in the `Stopped` state and can be re-started or
+    /// snapshotted afterwards.
+    Stop {
+        /// Target sandbox id (raw u64 or `vm-...` display form).
+        id: String,
+    },
+    /// Destroy a sandbox. After this returns, the VM id is invalid and
+    /// any subsequent operation on it returns `unknown_vm`.
+    RmVm {
+        /// Target sandbox id (raw u64 or `vm-...` display form).
+        id: String,
+    },
     /// List captured snapshots.
     Snapshots,
     /// Delete a snapshot. After this returns, `nanovm fork <id>` on it
@@ -151,6 +164,8 @@ fn main() -> ExitCode {
         Command::Snapshot { id, to } => cmd_snapshot(&client, &id, to),
         Command::Fork { snapshot, count } => cmd_fork(&client, &snapshot, count),
         Command::Ps => cmd_ps(&client),
+        Command::Stop { id } => cmd_stop(&client, &id),
+        Command::RmVm { id } => cmd_rm_vm(&client, &id),
         Command::Snapshots => cmd_snapshots(&client),
         Command::RmSnap { snapshot } => cmd_rm_snap(&client, &snapshot),
     }
@@ -432,6 +447,36 @@ fn cmd_rm_snap(client: &Client, snapshot: &str) -> ExitCode {
         return fail("rm-snap", &e);
     }
     println!("snap-{snap_id:016x} deleted");
+    ExitCode::SUCCESS
+}
+
+fn cmd_stop(client: &Client, id: &str) -> ExitCode {
+    let vm_id = match parse_id(id, "vm") {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("nanovm stop: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(e) = client.post(&format!("/v1/vms/{vm_id}/stop"), None) {
+        return fail("stop", &e);
+    }
+    println!("vm-{vm_id:016x} stopped");
+    ExitCode::SUCCESS
+}
+
+fn cmd_rm_vm(client: &Client, id: &str) -> ExitCode {
+    let vm_id = match parse_id(id, "vm") {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("nanovm rm-vm: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(e) = client.delete(&format!("/v1/vms/{vm_id}")) {
+        return fail("rm-vm", &e);
+    }
+    println!("vm-{vm_id:016x} destroyed");
     ExitCode::SUCCESS
 }
 
