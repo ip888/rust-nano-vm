@@ -578,3 +578,99 @@ async fn delete_unknown_snapshot_returns_structured_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["code"], "unknown_snapshot");
 }
+
+#[tokio::test]
+async fn snapshot_with_to_dir_persists_a_manifest_round_trip() {
+    let app = app();
+
+    // Create + start a VM with a recognizable cmdline so we can verify
+    // that the persisted manifest captured it.
+    let (_, h) = send(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({
+            "vcpus": 4,
+            "memory_mib": 64,
+            "cmdline": "console=ttyS0 panic=1",
+        })),
+    )
+    .await;
+    let id = h["id"].as_u64().unwrap();
+    send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{id}/start"),
+        None,
+    )
+    .await;
+
+    let dir = std::env::temp_dir().join(format!(
+        "rust-nano-vm-cp-persist-{}-{}",
+        std::process::id(),
+        id
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{id}/snapshot"),
+        Some(json!({ "to_dir": dir })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "got body {body:?}");
+    assert!(body["display"].as_str().unwrap().starts_with("snap-"));
+    assert_eq!(
+        body["dir"].as_str().unwrap(),
+        dir.to_str().unwrap(),
+        "response must echo the persisted directory"
+    );
+
+    // The persisted manifest must be readable and contain the captured
+    // geometry verbatim.
+    let manifest = snapshot::Manifest::read_from_dir(&dir).expect("read manifest");
+    assert_eq!(manifest.vcpu_count, 4);
+    assert_eq!(manifest.memory_bytes, 64 * 1024 * 1024);
+    assert_eq!(manifest.page_size, 4096);
+    assert_eq!(manifest.kernel_cmdline, "console=ttyS0 panic=1");
+
+    // Round-trip: a fresh `POST /v1/vms` with `snapshot_dir` referring
+    // to the directory we just persisted accepts cleanly.
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({ "snapshot_dir": dir })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[tokio::test]
+async fn snapshot_with_empty_body_still_works_legacy_shape() {
+    // The old "no body, just capture in memory" shape must keep working
+    // so we don't break existing callers.
+    let app = app();
+    let (_, h) = send(app.clone(), Method::POST, "/v1/vms", Some(json!({}))).await;
+    let id = h["id"].as_u64().unwrap();
+    send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{id}/start"),
+        None,
+    )
+    .await;
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{id}/snapshot"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body["display"].as_str().unwrap().starts_with("snap-"));
+    assert!(body.get("dir").is_none() || body["dir"].is_null());
+}
