@@ -12,7 +12,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use vm_core::{Hypervisor, SnapshotId, VmConfig, VmError, VmHandle, VmId, VmResult, VmState};
+use vm_core::{
+    Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError, VmHandle, VmId, VmResult, VmState,
+};
 
 #[derive(Debug, Clone)]
 struct MockVm {
@@ -207,6 +209,25 @@ impl Hypervisor for MockHypervisor {
             return Err(VmError::UnknownSnapshot(snap));
         }
         Ok(())
+    }
+
+    fn snapshot_meta(&self, snap: SnapshotId) -> VmResult<SnapshotMeta> {
+        let inner = self.inner.lock().expect("mock hypervisor poisoned");
+        let s = inner
+            .snapshots
+            .get(&snap)
+            .ok_or(VmError::UnknownSnapshot(snap))?;
+        // The mock has no real "memory" — fabricate plausible bytes from
+        // the captured `memory_mib`. 4096 page size matches x86_64 host
+        // expectations and the snapshot crate's BackingFileHeader::new
+        // sample.
+        Ok(SnapshotMeta {
+            id: snap,
+            vcpu_count: s.config.vcpus,
+            memory_bytes: s.config.memory_mib.saturating_mul(1024 * 1024),
+            page_size: 4096,
+            kernel_cmdline: s.config.cmdline.clone(),
+        })
     }
 }
 
@@ -492,6 +513,34 @@ mod tests {
     fn delete_unknown_snapshot_returns_unknown_snapshot() {
         let hv = MockHypervisor::new();
         let err = hv.delete_snapshot(SnapshotId(0xfeed_face)).unwrap_err();
+        assert!(matches!(err, VmError::UnknownSnapshot(_)));
+    }
+
+    #[test]
+    fn snapshot_meta_reports_captured_geometry() {
+        let hv = MockHypervisor::new();
+        let h = hv
+            .create_vm(&VmConfig {
+                vcpus: 3,
+                memory_mib: 256,
+                cmdline: "console=ttyS0".into(),
+                ..VmConfig::default()
+            })
+            .unwrap();
+        hv.start(h.id).unwrap();
+        let snap = hv.snapshot(h.id).unwrap();
+        let meta = hv.snapshot_meta(snap).expect("meta");
+        assert_eq!(meta.id, snap);
+        assert_eq!(meta.vcpu_count, 3);
+        assert_eq!(meta.memory_bytes, 256 * 1024 * 1024);
+        assert_eq!(meta.page_size, 4096);
+        assert_eq!(meta.kernel_cmdline, "console=ttyS0");
+    }
+
+    #[test]
+    fn snapshot_meta_for_unknown_id_is_unknown_snapshot() {
+        let hv = MockHypervisor::new();
+        let err = hv.snapshot_meta(SnapshotId(0xdead)).unwrap_err();
         assert!(matches!(err, VmError::UnknownSnapshot(_)));
     }
 }

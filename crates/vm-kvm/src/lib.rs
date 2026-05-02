@@ -10,7 +10,9 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use vm_core::{Hypervisor, SnapshotId, VmConfig, VmError, VmHandle, VmId, VmResult, VmState};
+use vm_core::{
+    Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError, VmHandle, VmId, VmResult, VmState,
+};
 
 /// KVM-backed hypervisor.
 ///
@@ -73,6 +75,10 @@ impl Hypervisor for KvmHypervisor {
     fn delete_snapshot(&self, _snap: SnapshotId) -> VmResult<()> {
         Err(unsupported())
     }
+
+    fn snapshot_meta(&self, _snap: SnapshotId) -> VmResult<SnapshotMeta> {
+        Err(unsupported())
+    }
 }
 
 #[cfg(feature = "kvm")]
@@ -132,6 +138,10 @@ mod tests {
         ));
         assert!(matches!(
             hv.delete_snapshot(SnapshotId(1)).unwrap_err(),
+            VmError::Unsupported(_)
+        ));
+        assert!(matches!(
+            hv.snapshot_meta(SnapshotId(1)).unwrap_err(),
             VmError::Unsupported(_)
         ));
     }

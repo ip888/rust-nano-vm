@@ -24,6 +24,7 @@
 use std::sync::Arc;
 
 use axum::{
+    body::Bytes,
     extract::{
         rejection::{JsonRejection, PathRejection},
         Path, State,
@@ -37,8 +38,8 @@ use tower_http::trace::TraceLayer;
 use vm_core::{Hypervisor, SnapshotId, VmId};
 
 use crate::api::{
-    CreateVmRequest, SnapshotDto, SnapshotListResponse, VmHandleDto, VmListResponse,
-    VmStateResponse,
+    CreateVmRequest, SnapshotDto, SnapshotListResponse, SnapshotRequest, VmHandleDto,
+    VmListResponse, VmStateResponse,
 };
 use crate::auth;
 use crate::error::ApiError;
@@ -164,10 +165,39 @@ async fn destroy_vm(
 async fn snapshot_vm(
     State(state): State<AppState>,
     id: Result<Path<u64>, PathRejection>,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<SnapshotDto>), ApiError> {
     let Path(id) = id?;
+    // Body is optional. Empty (legacy callers) → default request.
+    // Otherwise must parse as SnapshotRequest JSON, mirroring the
+    // BadJson envelope shape used by the rest of the API.
+    let req = if body.is_empty() {
+        SnapshotRequest::default()
+    } else {
+        serde_json::from_slice::<SnapshotRequest>(&body)
+            .map_err(|e| ApiError::Bad(format!("snapshot body: {e}")))?
+    };
     let snap = state.hypervisor.snapshot(VmId(id))?;
-    Ok((StatusCode::CREATED, Json(snap.into())))
+    let mut dto: SnapshotDto = snap.into();
+    if let Some(dir) = req.to_dir {
+        // Pull the captured geometry from the backend, render it as a
+        // snapshot::Manifest, and persist alongside the directory.
+        // Errors here surface as Backend(...) — same envelope shape as
+        // any other backend failure.
+        let meta = state.hypervisor.snapshot_meta(snap)?;
+        let mut manifest = snapshot::Manifest::new(
+            meta.id.0,
+            meta.memory_bytes,
+            meta.page_size,
+            meta.vcpu_count,
+        );
+        manifest.kernel_cmdline = meta.kernel_cmdline;
+        manifest
+            .write_to_dir(&dir)
+            .map_err(|e| vm_core::VmError::Backend(format!("snapshot persist: {e}")))?;
+        dto.dir = Some(dir);
+    }
+    Ok((StatusCode::CREATED, Json(dto)))
 }
 
 async fn restore_snapshot(

@@ -39,6 +39,10 @@ pub(crate) enum ApiError {
     /// 500 with code "internal" — the message is intended for the operator
     /// reading server logs, not for end-user diagnosis.
     Internal(&'static str),
+    /// Generic "client error" envelope a handler can synthesize when it
+    /// parses the request body itself (bypassing axum's JSON extractor).
+    /// Renders as 400 with `code: "bad_request"`.
+    Bad(String),
 }
 
 impl From<VmError> for ApiError {
@@ -93,6 +97,7 @@ impl IntoResponse for ApiError {
             ApiError::BadPath(rej) => (rej.status(), "bad_request", rej.body_text()),
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "unauthorized", msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", msg.into()),
+            ApiError::Bad(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg),
         };
         let body = Json(ErrorEnvelope {
             error: ErrorBody { code, message },
