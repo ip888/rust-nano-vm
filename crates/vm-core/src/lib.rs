@@ -215,6 +215,31 @@ pub trait Hypervisor: Send + Sync {
     /// [`Hypervisor::restore`] call referencing it returns
     /// [`VmError::UnknownSnapshot`].
     fn delete_snapshot(&self, snap: SnapshotId) -> VmResult<()>;
+
+    /// Read the metadata recorded for a snapshot. The control plane uses
+    /// this when persisting a snapshot directory to disk: it retrieves
+    /// the geometry the backend captured and writes a `Manifest` from
+    /// it. Backends that don't track in-process snapshot state may
+    /// return [`VmError::Unsupported`].
+    fn snapshot_meta(&self, snap: SnapshotId) -> VmResult<SnapshotMeta>;
+}
+
+/// Metadata describing a captured snapshot. Read via
+/// [`Hypervisor::snapshot_meta`]; mirrors the relevant fields of the
+/// `snapshot::Manifest` produced when a snapshot is persisted to disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotMeta {
+    /// Snapshot identifier.
+    pub id: SnapshotId,
+    /// vCPU count captured at snapshot time.
+    pub vcpu_count: u32,
+    /// Guest memory size in bytes.
+    pub memory_bytes: u64,
+    /// Guest page size at snapshot time.
+    pub page_size: u32,
+    /// Kernel command line captured at snapshot time. Empty when the
+    /// VM was never given one (typical for the mock backend).
+    pub kernel_cmdline: String,
 }
 
 #[cfg(test)]

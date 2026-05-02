@@ -134,11 +134,27 @@ impl VmStateResponse {
     }
 }
 
-/// Response body for `POST /v1/vms/{id}/snapshot`.
+/// Optional body for `POST /v1/vms/{id}/snapshot`. The endpoint also
+/// accepts an empty body (the legacy in-memory-only behaviour).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct SnapshotRequest {
+    /// When set, after capturing the in-memory snapshot the control
+    /// plane writes a `snapshot::Manifest` to this directory so the
+    /// snapshot can later be restored via the `snapshot_dir` field of
+    /// `POST /v1/vms`.
+    #[serde(default)]
+    pub to_dir: Option<PathBuf>,
+}
+
+/// Response body for `POST /v1/vms/{id}/snapshot`. When `to_dir` was
+/// supplied in the request, `dir` echoes that path so the client can
+/// confirm where the manifest was written.
 #[derive(Debug, Serialize)]
 pub(crate) struct SnapshotDto {
     pub id: u64,
     pub display: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dir: Option<PathBuf>,
 }
 
 impl From<SnapshotId> for SnapshotDto {
@@ -146,6 +162,7 @@ impl From<SnapshotId> for SnapshotDto {
         Self {
             id: s.0,
             display: s.to_string(),
+            dir: None,
         }
     }
 }
