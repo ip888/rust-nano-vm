@@ -763,4 +763,58 @@ mod tests {
         let path = m.backing_file_path(dir);
         assert_eq!(path, Path::new("/tmp/snapshots/snap-001/memory.cow"));
     }
+
+    // ---- Randomized smoke fuzz ----------------------------------------
+    //
+    // Deterministic xorshift PRNG drives `BackingFileHeader::from_bytes`
+    // against random inputs of varying lengths. cargo-fuzz remains the
+    // long-term plan; this is the stable-Rust smoke layer that runs on
+    // every CI build.
+
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn fill(&mut self, buf: &mut [u8]) {
+            let mut i = 0;
+            while i < buf.len() {
+                let n = self.next();
+                for b in n.to_le_bytes() {
+                    if i >= buf.len() {
+                        return;
+                    }
+                    buf[i] = b;
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn backing_header_from_bytes_never_panics_on_random_input() {
+        let mut rng = XorShift(0xBACC_F11E_BACC_F11E);
+        let mut buf = [0u8; 128];
+        for _ in 0..10_000 {
+            let len = (rng.next() as usize) % buf.len();
+            rng.fill(&mut buf[..len]);
+            let _ = BackingFileHeader::from_bytes(&buf[..len]);
+        }
+    }
+
+    #[test]
+    fn manifest_from_json_never_panics_on_random_input() {
+        // JSON parser path: random bytes will rarely be valid UTF-8 / JSON
+        // but the parser must reject cleanly without panicking.
+        let mut rng = XorShift(0x501F_F11E_DEAD_BEEFu64);
+        let mut buf = [0u8; 256];
+        for _ in 0..1_000 {
+            let len = (rng.next() as usize) % buf.len();
+            rng.fill(&mut buf[..len]);
+            let _ = Manifest::from_json(&buf[..len]);
+        }
+    }
 }
