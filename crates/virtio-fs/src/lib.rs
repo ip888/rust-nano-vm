@@ -655,4 +655,89 @@ mod tests {
         assert_eq!(FuseOpcode::Init.as_raw(), 26);
         assert_eq!(FuseOpcode::Destroy.as_raw(), 38);
     }
+
+    // ---- Randomized smoke fuzz ----------------------------------------
+    //
+    // Deterministic xorshift PRNG drives every from_bytes parser the
+    // crate exposes (the two FUSE headers + the four body types) against
+    // ~10000 random inputs each. cargo-fuzz remains the long-term plan;
+    // this is the stable-Rust smoke layer that runs in regular CI.
+
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn fill(&mut self, buf: &mut [u8]) {
+            let mut i = 0;
+            while i < buf.len() {
+                let n = self.next();
+                for b in n.to_le_bytes() {
+                    if i >= buf.len() {
+                        return;
+                    }
+                    buf[i] = b;
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    fn fuzz_parser<F>(seed: u64, max_len: usize, mut parse: F)
+    where
+        F: FnMut(&[u8]),
+    {
+        let mut rng = XorShift(seed);
+        let mut buf = vec![0u8; max_len];
+        for _ in 0..10_000 {
+            let len = (rng.next() as usize) % max_len;
+            rng.fill(&mut buf[..len]);
+            parse(&buf[..len]);
+        }
+    }
+
+    #[test]
+    fn fuse_in_header_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x1111_1111_1111_1111, 96, |b| {
+            let _ = FuseInHeader::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_out_header_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x2222_2222_2222_2222, 64, |b| {
+            let _ = FuseOutHeader::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_init_in_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x3333_3333_3333_3333, 48, |b| {
+            let _ = FuseInitIn::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_init_out_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x4444_4444_4444_4444, 128, |b| {
+            let _ = FuseInitOut::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_attr_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x5555_5555_5555_5555, 160, |b| {
+            let _ = FuseAttr::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_entry_out_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x6666_6666_6666_6666, 192, |b| {
+            let _ = FuseEntryOut::from_bytes(b);
+        });
+    }
 }
