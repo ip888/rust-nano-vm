@@ -943,4 +943,71 @@ mod tests {
         assert_eq!(&buf[8..12], &0x10111213u32.to_le_bytes());
         assert_eq!(&buf[20..22], &0xFEFEu16.to_le_bytes());
     }
+
+    // ---- Randomized smoke fuzz ----------------------------------------
+    //
+    // Deterministic xorshift PRNG drives `from_bytes` against random
+    // inputs of varying lengths to prove no panic. cargo-fuzz stays the
+    // long-term plan; this is the stable-Rust smoke layer that runs on
+    // every CI build.
+
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn fill(&mut self, buf: &mut [u8]) {
+            let mut i = 0;
+            while i < buf.len() {
+                let n = self.next();
+                for b in n.to_le_bytes() {
+                    if i >= buf.len() {
+                        return;
+                    }
+                    buf[i] = b;
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn descriptor_from_bytes_never_panics_on_random_input() {
+        let mut rng = XorShift(0xDE5C_DE5C_DE5C_DE5C);
+        let mut buf = [0u8; 64];
+        for _ in 0..10_000 {
+            let len = (rng.next() as usize) % buf.len();
+            rng.fill(&mut buf[..len]);
+            let _ = Descriptor::from_bytes(&buf[..len]);
+        }
+    }
+
+    #[test]
+    fn descriptor_chain_walker_never_panics_on_random_table() {
+        // The chain walker bounds-checks indexes and caps at table.len()
+        // — pin that no random arrangement of (head, table) panics.
+        let mut rng = XorShift(0xCAFE_F00D_DEAD_BEEF);
+        for _ in 0..1_000 {
+            let table_len = ((rng.next() as usize) % 32) + 1;
+            let mut table = Vec::with_capacity(table_len);
+            for _ in 0..table_len {
+                let n = rng.next();
+                table.push(Descriptor {
+                    addr: n,
+                    len: (n >> 32) as u32,
+                    flags: (n >> 16) as u16,
+                    next: n as u16,
+                });
+            }
+            let head = (rng.next() as u16) % (table_len as u16 + 4);
+            // Drain the iterator; results may be Ok or Err but must not
+            // panic.
+            for r in DescriptorChain::new(&table, head) {
+                let _ = r;
+            }
+        }
+    }
 }

@@ -98,7 +98,13 @@ E2B (which layers its own solution on top).
 
 - Mirror the Firecracker threat model (documented there thoroughly).
 - Seccomp-BPF filter on the VMM process (M1+).
-- `cargo-fuzz` on virtio queue parsers before shipping real devices (M2+).
+- Randomized smoke fuzz tests on every wire parser (vsock packet
+  header, virtqueue descriptor + chain walker, FUSE in/out headers and
+  body types, snapshot backing-file header, snapshot manifest JSON) run
+  on every CI build via stable Rust — deterministic xorshift PRNG, no
+  new deps, ~10000 random-byte inputs per parser asserting no panic.
+  `cargo-fuzz` for deeper coverage lands in a follow-up once a nightly
+  CI runner is wired up.
 - `cargo-deny` (advisories, licenses, bans, sources) runs in CI on pushes to
   `main` and PRs targeting `main` — see `deny.toml`. Subsumes `cargo-audit`
   (RustSec advisories) and adds license + source vetting.
