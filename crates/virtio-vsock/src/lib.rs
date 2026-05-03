@@ -971,4 +971,47 @@ mod connection_tests {
             }
         }
     }
+
+    // ---- Randomized smoke fuzz ----------------------------------------
+    //
+    // Driven by a deterministic xorshift PRNG so the test is reproducible
+    // across CI runs and Rust toolchain bumps. cargo-fuzz remains the
+    // long-term plan (see docs/architecture.md security posture); this
+    // covers the parser-doesn't-panic invariant on stable Rust today.
+
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn fill(&mut self, buf: &mut [u8]) {
+            let mut i = 0;
+            while i < buf.len() {
+                let n = self.next();
+                for b in n.to_le_bytes() {
+                    if i >= buf.len() {
+                        return;
+                    }
+                    buf[i] = b;
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vsock_header_from_bytes_never_panics_on_random_input() {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        let mut buf = [0u8; 96];
+        for _ in 0..10_000 {
+            // Length in [0, 96) so we exercise short, exact, and longer
+            // input paths.
+            let len = (rng.next() as usize) % buf.len();
+            rng.fill(&mut buf[..len]);
+            let _ = VsockHeader::from_bytes(&buf[..len]);
+        }
+    }
 }
