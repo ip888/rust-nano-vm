@@ -60,10 +60,11 @@
 pub mod body;
 
 pub use body::{
-    FuseAttr, FuseEntryOut, FuseInitIn, FuseInitOut, FuseOpenIn, FuseOpenOut, FuseReadIn,
-    FuseWriteIn, FuseWriteOut, FUSE_ATTR_LEN, FUSE_ENTRY_OUT_LEN, FUSE_INIT_IN_LEN,
-    FUSE_INIT_OUT_LEN, FUSE_OPEN_IN_LEN, FUSE_OPEN_OUT_LEN, FUSE_READ_IN_LEN, FUSE_WRITE_IN_LEN,
-    FUSE_WRITE_OUT_LEN,
+    dt, fuse_dirent_padded_size, DirentWriteError, FuseAttr, FuseDirentHeader, FuseDirentIter,
+    FuseDirentWriter, FuseEntryOut, FuseInitIn, FuseInitOut, FuseOpenIn, FuseOpenOut, FuseReadIn,
+    FuseWriteIn, FuseWriteOut, FUSE_ATTR_LEN, FUSE_DIRENT_ALIGN, FUSE_DIRENT_HDR_LEN,
+    FUSE_ENTRY_OUT_LEN, FUSE_INIT_IN_LEN, FUSE_INIT_OUT_LEN, FUSE_OPEN_IN_LEN, FUSE_OPEN_OUT_LEN,
+    FUSE_READ_IN_LEN, FUSE_WRITE_IN_LEN, FUSE_WRITE_OUT_LEN,
 };
 
 use thiserror::Error;
@@ -781,5 +782,38 @@ mod tests {
         fuzz_parser(0xBBBB_BBBB_BBBB_BBBB, 32, |b| {
             let _ = FuseWriteOut::from_bytes(b);
         });
+    }
+
+    #[test]
+    fn fuse_dirent_header_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0xCCCC_CCCC_CCCC_CCCC, 64, |b| {
+            let _ = FuseDirentHeader::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_dirent_iter_never_panics_on_random_input() {
+        // The iterator path is the easiest place for a malicious
+        // namelen to wedge a parser; pin that no random buffer makes
+        // it loop forever or panic.
+        let mut rng = XorShift(0xDDDD_DDDD_DDDD_DDDD);
+        let mut buf = vec![0u8; 256];
+        for _ in 0..1_000 {
+            let len = (rng.next() as usize) % buf.len();
+            // Write random bytes.
+            for slot in buf.iter_mut().take(len) {
+                *slot = (rng.next() & 0xFF) as u8;
+            }
+            // Bound the iteration count too — even if the parser is
+            // sound, a non-terminating iterator is itself a bug.
+            let mut steps = 0;
+            for r in FuseDirentIter::new(&buf[..len]) {
+                let _ = r;
+                steps += 1;
+                if steps > 1_000 {
+                    panic!("FuseDirentIter did not terminate on len={len}");
+                }
+            }
+        }
     }
 }
