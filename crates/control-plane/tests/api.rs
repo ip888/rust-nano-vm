@@ -269,10 +269,44 @@ async fn list_vms_returns_all_created_vms_with_state() {
             vm["id"].as_u64().unwrap(),
             vm["state"].as_str().unwrap().to_owned(),
         );
+        // Each row carries the geometry pulled via vm_meta.
+        assert!(vm["vcpus"].is_u64(), "row missing vcpus: {vm}");
+        assert!(vm["memory_mib"].is_u64(), "row missing memory_mib: {vm}");
+        assert!(
+            vm["kernel_cmdline"].is_string(),
+            "row missing kernel_cmdline: {vm}"
+        );
     }
     assert_eq!(by_id[&ids[0]], "created");
     assert_eq!(by_id[&ids[1]], "running");
     assert_eq!(by_id[&ids[2]], "stopped");
+}
+
+#[tokio::test]
+async fn list_vms_metadata_reflects_create_geometry() {
+    let app = app();
+    let (_, h) = send(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({
+            "vcpus": 4,
+            "memory_mib": 256,
+            "cmdline": "console=ttyS0 panic=1",
+        })),
+    )
+    .await;
+    let id = h["id"].as_u64().unwrap();
+    let (_, body) = send(app.clone(), Method::GET, "/v1/vms", None).await;
+    let vms = body["vms"].as_array().unwrap();
+    assert_eq!(vms.len(), 1);
+    let vm = &vms[0];
+    assert_eq!(vm["id"].as_u64().unwrap(), id);
+    assert_eq!(vm["vcpus"], 4);
+    assert_eq!(vm["memory_mib"], 256);
+    assert_eq!(vm["kernel_cmdline"], "console=ttyS0 panic=1");
+    // No snapshot_dir for cold-booted VMs — field omitted from JSON.
+    assert!(vm.get("snapshot_dir").is_none() || vm["snapshot_dir"].is_null());
 }
 
 #[tokio::test]

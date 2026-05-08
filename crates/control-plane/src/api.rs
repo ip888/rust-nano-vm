@@ -102,16 +102,63 @@ impl From<VmHandle> for VmHandleDto {
 /// envelope level later without breaking clients.
 #[derive(Debug, Serialize)]
 pub(crate) struct VmListResponse {
-    pub vms: Vec<VmHandleDto>,
+    pub vms: Vec<VmListEntry>,
 }
 
-impl VmListResponse {
-    pub fn new<I>(handles: I) -> Self
-    where
-        I: IntoIterator<Item = VmHandle>,
-    {
+/// Per-VM row in `GET /v1/vms`. Carries the same id + display + state
+/// as [`VmHandleDto`] plus the geometry pulled from
+/// [`vm_core::Hypervisor::vm_meta`]. Backends that don't track per-VM
+/// state (e.g. the placeholder `vm-kvm`) return `Unsupported` and
+/// the metadata fields are omitted, leaving id/display/state usable.
+#[derive(Debug, Serialize)]
+pub(crate) struct VmListEntry {
+    pub id: u64,
+    pub display: String,
+    pub state: VmStateDto,
+    /// vCPU count the VM was created with. Absent when the backend
+    /// can't surface geometry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vcpus: Option<u32>,
+    /// Guest memory in MiB. Absent when the backend can't surface
+    /// geometry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_mib: Option<u64>,
+    /// Captured kernel command line (empty string when the VM had
+    /// none). Absent when the backend can't surface geometry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_cmdline: Option<String>,
+    /// Snapshot directory the VM was restored from, if any. Absent
+    /// either when the backend can't surface geometry, or when the VM
+    /// was cold-booted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_dir: Option<PathBuf>,
+}
+
+impl VmListEntry {
+    /// Build a row from the basic [`VmHandle`] fields only — used when
+    /// `vm_meta` returned `Unsupported` for this id.
+    pub fn id_only(handle: VmHandle) -> Self {
         Self {
-            vms: handles.into_iter().map(VmHandleDto::from).collect(),
+            id: handle.id.0,
+            display: handle.id.to_string(),
+            state: handle.state.into(),
+            vcpus: None,
+            memory_mib: None,
+            kernel_cmdline: None,
+            snapshot_dir: None,
+        }
+    }
+
+    /// Build a row from a [`vm_core::VmMeta`] returned by the backend.
+    pub fn from_meta(meta: vm_core::VmMeta) -> Self {
+        Self {
+            id: meta.id.0,
+            display: meta.id.to_string(),
+            state: meta.state.into(),
+            vcpus: Some(meta.vcpus),
+            memory_mib: Some(meta.memory_mib),
+            kernel_cmdline: Some(meta.kernel_cmdline),
+            snapshot_dir: meta.snapshot_dir,
         }
     }
 }
