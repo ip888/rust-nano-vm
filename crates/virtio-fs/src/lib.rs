@@ -10,16 +10,21 @@
 //! - [`FuseError`] for parse / serialize failures.
 //! - Spec constants: [`FUSE_KERNEL_VERSION`], [`FUSE_KERNEL_MINOR_VERSION`],
 //!   [`FUSE_IN_HDR_LEN`], [`FUSE_OUT_HDR_LEN`].
-//! - Per-op body types in the [`body`] module: [`FuseInitIn`] /
-//!   [`FuseInitOut`] for the `Init` handshake, [`FuseAttr`] for the
-//!   inode metadata returned by `Getattr` / `Setattr`, and
-//!   [`FuseEntryOut`] for the lookup-style ops (`Lookup`, `Mknod`,
-//!   `Mkdir`, `Symlink`, `Link`).
+//! - Per-op body types in the [`body`] module:
+//!     - [`FuseInitIn`] / [`FuseInitOut`] — `Init` handshake
+//!     - [`FuseAttr`] — inode metadata for `Getattr` / `Setattr`
+//!     - [`FuseEntryOut`] — directory entry for `Lookup`, `Mknod`,
+//!       `Mkdir`, `Symlink`, `Link`
+//!     - [`FuseOpenIn`] / [`FuseOpenOut`] — `Open` / `Opendir`
+//!     - [`FuseReadIn`] — `Read` request (response is a bare byte
+//!       stream of up to `size` bytes)
+//!     - [`FuseWriteIn`] / [`FuseWriteOut`] — `Write`
 //!
-//! Deferred to follow-up PRs: bodies for `Open` / `Read` / `Write` /
-//! `Readdir`, the dispatch loop that reads a [`FuseInHeader`] from a
-//! virtqueue descriptor chain, invokes the right handler, and writes a
-//! [`FuseOutHeader`] + body back.
+//! Deferred to follow-up PRs: bodies for `Readdir` (the variable-length
+//! `fuse_dirent` records), `Flush` / `Release`, and the dispatch loop
+//! that reads a [`FuseInHeader`] from a virtqueue descriptor chain,
+//! invokes the right handler, and writes a [`FuseOutHeader`] + body
+//! back.
 //!
 //! # Wire format
 //!
@@ -55,8 +60,10 @@
 pub mod body;
 
 pub use body::{
-    FuseAttr, FuseEntryOut, FuseInitIn, FuseInitOut, FUSE_ATTR_LEN, FUSE_ENTRY_OUT_LEN,
-    FUSE_INIT_IN_LEN, FUSE_INIT_OUT_LEN,
+    FuseAttr, FuseEntryOut, FuseInitIn, FuseInitOut, FuseOpenIn, FuseOpenOut, FuseReadIn,
+    FuseWriteIn, FuseWriteOut, FUSE_ATTR_LEN, FUSE_ENTRY_OUT_LEN, FUSE_INIT_IN_LEN,
+    FUSE_INIT_OUT_LEN, FUSE_OPEN_IN_LEN, FUSE_OPEN_OUT_LEN, FUSE_READ_IN_LEN, FUSE_WRITE_IN_LEN,
+    FUSE_WRITE_OUT_LEN,
 };
 
 use thiserror::Error;
@@ -738,6 +745,41 @@ mod tests {
     fn fuse_entry_out_from_bytes_never_panics_on_random_input() {
         fuzz_parser(0x6666_6666_6666_6666, 192, |b| {
             let _ = FuseEntryOut::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_open_in_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x7777_7777_7777_7777, 32, |b| {
+            let _ = FuseOpenIn::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_open_out_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x8888_8888_8888_8888, 48, |b| {
+            let _ = FuseOpenOut::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_read_in_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x9999_9999_9999_9999, 96, |b| {
+            let _ = FuseReadIn::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_write_in_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0xAAAA_AAAA_AAAA_AAAA, 96, |b| {
+            let _ = FuseWriteIn::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_write_out_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0xBBBB_BBBB_BBBB_BBBB, 32, |b| {
+            let _ = FuseWriteOut::from_bytes(b);
         });
     }
 }

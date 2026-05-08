@@ -1,23 +1,32 @@
 //! Per-op FUSE request / response body structs.
 //!
-//! Scope today: the four types needed for the M3 handshake + lookup
-//! path:
+//! Scope today — the body types needed for the M3 handshake + lookup
+//! + open-read-write happy path:
 //!
 //! - [`FuseInitIn`] / [`FuseInitOut`] — protocol negotiation (op = `Init`)
 //! - [`FuseAttr`] — file attributes shared by `Getattr`, `Setattr`, and
 //!   the bodies of [`FuseEntryOut`]
 //! - [`FuseEntryOut`] — directory entry returned by `Lookup`, `Mknod`,
 //!   `Mkdir`, `Symlink`, `Link`
+//! - [`FuseOpenIn`] / [`FuseOpenOut`] — `Open` / `Opendir` (request
+//!   carries `open(2)` flags; response gives the guest a file handle)
+//! - [`FuseReadIn`] — `Read` request. The response body is a bare byte
+//!   stream of up to `size` bytes following the
+//!   [`super::FuseOutHeader`] — no struct.
+//! - [`FuseWriteIn`] / [`FuseWriteOut`] — `Write` (request struct
+//!   followed by `size` bytes of payload; response carries the bytes
+//!   actually committed)
 //!
-//! Bodies for `Open` / `Read` / `Write` / `Readdir` come in a follow-up
-//! PR — keeping this one tight on the smallest surface that lets the
-//! dispatcher already negotiate a session and answer attribute queries.
+//! Bodies for `Readdir` (the variable-length `fuse_dirent` records),
+//! `Flush` / `Release`, and the dispatch loop that ties it all into a
+//! virtqueue come in follow-up PRs.
 //!
 //! All structs follow the same convention used by [`super::FuseInHeader`]
 //! / [`super::FuseOutHeader`]: explicit little-endian
 //! `from_bytes` / `write_to` / `to_bytes`, no `#[repr(C)]` casting,
 //! `from_bytes` accepts `>= N` so a caller can pass a buffer that also
-//! contains trailing data.
+//! contains trailing data (request body in front of read/write payload,
+//! header in front of body, ...).
 
 use crate::FuseError;
 
@@ -410,6 +419,323 @@ impl FuseEntryOut {
     }
 }
 
+// ---------------------------------------------------------------------------
+// fuse_open_in / fuse_open_out
+// ---------------------------------------------------------------------------
+
+/// On-the-wire size of [`FuseOpenIn`] in bytes.
+pub const FUSE_OPEN_IN_LEN: usize = 8;
+
+/// On-the-wire size of [`FuseOpenOut`] in bytes.
+pub const FUSE_OPEN_OUT_LEN: usize = 16;
+
+/// Body of a `FUSE_OPEN` / `FUSE_OPENDIR` request. Carries the
+/// `open(2)` flags plus a small bag of FUSE-specific bits; the host
+/// responds with a [`FuseOpenOut`] containing the file handle the
+/// guest will use for subsequent reads / writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseOpenIn {
+    /// `open(2)` flags (`O_RDONLY`, `O_WRONLY`, `O_APPEND`, ...).
+    pub flags: u32,
+    /// FUSE-specific bits. `0` for the conservative paths we emit
+    /// today.
+    pub open_flags: u32,
+}
+
+impl FuseOpenIn {
+    /// Parse the first [`FUSE_OPEN_IN_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_OPEN_IN_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_OPEN_IN_LEN,
+            });
+        }
+        Ok(Self {
+            flags: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            open_flags: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize into `buf`.
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_OPEN_IN_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_OPEN_IN_LEN,
+            });
+        }
+        buf[0..4].copy_from_slice(&self.flags.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.open_flags.to_le_bytes());
+        Ok(FUSE_OPEN_IN_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_OPEN_IN_LEN] {
+        let mut out = [0u8; FUSE_OPEN_IN_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseOpenIn into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+/// Body of a `FUSE_OPEN` / `FUSE_OPENDIR` response — gives the guest
+/// the opaque file handle it should pass back in subsequent
+/// [`FuseReadIn`] / [`FuseWriteIn`] requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseOpenOut {
+    /// Opaque file handle; the host keeps an internal map from `fh` to
+    /// the underlying file descriptor / VFS state.
+    pub fh: u64,
+    /// FUSE-specific response bits (`FOPEN_DIRECT_IO`,
+    /// `FOPEN_KEEP_CACHE`, ...).
+    pub open_flags: u32,
+    /// Padding; writers MUST emit `0`, readers MUST ignore.
+    pub padding: u32,
+}
+
+impl FuseOpenOut {
+    /// Parse the first [`FUSE_OPEN_OUT_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_OPEN_OUT_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_OPEN_OUT_LEN,
+            });
+        }
+        Ok(Self {
+            fh: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            open_flags: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            padding: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize into `buf`.
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_OPEN_OUT_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_OPEN_OUT_LEN,
+            });
+        }
+        buf[0..8].copy_from_slice(&self.fh.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.open_flags.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.padding.to_le_bytes());
+        Ok(FUSE_OPEN_OUT_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_OPEN_OUT_LEN] {
+        let mut out = [0u8; FUSE_OPEN_OUT_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseOpenOut into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fuse_read_in
+// ---------------------------------------------------------------------------
+
+/// On-the-wire size of [`FuseReadIn`] in bytes.
+pub const FUSE_READ_IN_LEN: usize = 40;
+
+/// Body of a `FUSE_READ` request. Tells the host which file handle to
+/// read from, where to start, and how many bytes the guest can accept.
+/// The response is a bare byte stream of length up to `size` —
+/// no header struct, just the data after the [`super::FuseOutHeader`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseReadIn {
+    /// File handle returned by [`FuseOpenOut`].
+    pub fh: u64,
+    /// Byte offset within the file.
+    pub offset: u64,
+    /// Maximum bytes the guest can accept in the response.
+    pub size: u32,
+    /// FUSE-specific read flags (e.g. `FUSE_READ_LOCKOWNER`).
+    pub read_flags: u32,
+    /// POSIX lock owner if `FUSE_READ_LOCKOWNER` is set in `read_flags`.
+    pub lock_owner: u64,
+    /// `open(2)` flags as carried by the original [`FuseOpenIn::flags`].
+    pub flags: u32,
+    /// Padding; writers MUST emit `0`, readers MUST ignore.
+    pub padding: u32,
+}
+
+impl FuseReadIn {
+    /// Parse the first [`FUSE_READ_IN_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_READ_IN_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_READ_IN_LEN,
+            });
+        }
+        Ok(Self {
+            fh: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            offset: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            size: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+            read_flags: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
+            lock_owner: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+            flags: u32::from_le_bytes(buf[32..36].try_into().unwrap()),
+            padding: u32::from_le_bytes(buf[36..40].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize into `buf`.
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_READ_IN_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_READ_IN_LEN,
+            });
+        }
+        buf[0..8].copy_from_slice(&self.fh.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.offset.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.size.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.read_flags.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.lock_owner.to_le_bytes());
+        buf[32..36].copy_from_slice(&self.flags.to_le_bytes());
+        buf[36..40].copy_from_slice(&self.padding.to_le_bytes());
+        Ok(FUSE_READ_IN_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_READ_IN_LEN] {
+        let mut out = [0u8; FUSE_READ_IN_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseReadIn into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fuse_write_in / fuse_write_out
+// ---------------------------------------------------------------------------
+
+/// On-the-wire size of [`FuseWriteIn`] in bytes. Same shape as
+/// `fuse_read_in` modulo field semantics — kept as separate constants
+/// so each type's wire size is a single named source of truth.
+pub const FUSE_WRITE_IN_LEN: usize = 40;
+
+/// On-the-wire size of [`FuseWriteOut`] in bytes.
+pub const FUSE_WRITE_OUT_LEN: usize = 8;
+
+/// Body of a `FUSE_WRITE` request. The data to be written follows
+/// immediately after the header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseWriteIn {
+    /// File handle returned by [`FuseOpenOut`].
+    pub fh: u64,
+    /// Byte offset within the file.
+    pub offset: u64,
+    /// Number of bytes of payload to follow.
+    pub size: u32,
+    /// FUSE-specific write flags (`FUSE_WRITE_CACHE`, `FUSE_WRITE_LOCKOWNER`).
+    pub write_flags: u32,
+    /// POSIX lock owner if `FUSE_WRITE_LOCKOWNER` is set.
+    pub lock_owner: u64,
+    /// `open(2)` flags from the original open.
+    pub flags: u32,
+    /// Padding; writers MUST emit `0`, readers MUST ignore.
+    pub padding: u32,
+}
+
+impl FuseWriteIn {
+    /// Parse the first [`FUSE_WRITE_IN_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_WRITE_IN_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_WRITE_IN_LEN,
+            });
+        }
+        Ok(Self {
+            fh: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            offset: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            size: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+            write_flags: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
+            lock_owner: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+            flags: u32::from_le_bytes(buf[32..36].try_into().unwrap()),
+            padding: u32::from_le_bytes(buf[36..40].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize into `buf`.
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_WRITE_IN_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_WRITE_IN_LEN,
+            });
+        }
+        buf[0..8].copy_from_slice(&self.fh.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.offset.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.size.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.write_flags.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.lock_owner.to_le_bytes());
+        buf[32..36].copy_from_slice(&self.flags.to_le_bytes());
+        buf[36..40].copy_from_slice(&self.padding.to_le_bytes());
+        Ok(FUSE_WRITE_IN_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_WRITE_IN_LEN] {
+        let mut out = [0u8; FUSE_WRITE_IN_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseWriteIn into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+/// Body of a `FUSE_WRITE` response — reports how many bytes the host
+/// actually committed (which may be less than the requested size on
+/// short writes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseWriteOut {
+    /// Bytes actually written.
+    pub size: u32,
+    /// Padding; writers MUST emit `0`, readers MUST ignore.
+    pub padding: u32,
+}
+
+impl FuseWriteOut {
+    /// Parse the first [`FUSE_WRITE_OUT_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_WRITE_OUT_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_WRITE_OUT_LEN,
+            });
+        }
+        Ok(Self {
+            size: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            padding: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize into `buf`.
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_WRITE_OUT_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_WRITE_OUT_LEN,
+            });
+        }
+        buf[0..4].copy_from_slice(&self.size.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.padding.to_le_bytes());
+        Ok(FUSE_WRITE_OUT_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_WRITE_OUT_LEN] {
+        let mut out = [0u8; FUSE_WRITE_OUT_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseWriteOut into a fixed-size buffer must succeed");
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,6 +1025,196 @@ mod tests {
         let entry = FuseEntryOut::default();
         assert!(matches!(
             entry.write_to(&mut tiny),
+            Err(FuseError::ShortBuffer { .. })
+        ));
+    }
+
+    // ---- fuse_open_in / fuse_open_out ---------------------------------
+
+    #[test]
+    fn open_lengths_match_spec() {
+        assert_eq!(FUSE_OPEN_IN_LEN, 8);
+        assert_eq!(FUSE_OPEN_OUT_LEN, 16);
+    }
+
+    #[test]
+    fn open_in_roundtrips_and_offsets_match_spec() {
+        let h = FuseOpenIn {
+            flags: 0x0101_0101,
+            open_flags: 0x0202_0202,
+        };
+        let b = h.to_bytes();
+        assert_eq!(&b[0..4], &[0x01; 4]);
+        assert_eq!(&b[4..8], &[0x02; 4]);
+        assert_eq!(FuseOpenIn::from_bytes(&b).unwrap(), h);
+    }
+
+    #[test]
+    fn open_out_roundtrips_and_offsets_match_spec() {
+        let h = FuseOpenOut {
+            fh: 0x0101_0101_0101_0101,
+            open_flags: 0x0202_0202,
+            padding: 0x0303_0303,
+        };
+        let b = h.to_bytes();
+        assert_eq!(&b[0..8], &[0x01; 8]);
+        assert_eq!(&b[8..12], &[0x02; 4]);
+        assert_eq!(&b[12..16], &[0x03; 4]);
+        assert_eq!(FuseOpenOut::from_bytes(&b).unwrap(), h);
+    }
+
+    #[test]
+    fn open_in_accepts_longer_input_and_rejects_short() {
+        let h = FuseOpenIn::default();
+        let mut packet = h.to_bytes().to_vec();
+        packet.extend_from_slice(&[0xAB; 8]);
+        assert_eq!(FuseOpenIn::from_bytes(&packet).unwrap(), h);
+        let short = [0u8; 7];
+        assert!(matches!(
+            FuseOpenIn::from_bytes(&short),
+            Err(FuseError::ShortHeader { have: 7, need: 8 })
+        ));
+    }
+
+    #[test]
+    fn open_out_accepts_longer_input_and_rejects_short() {
+        let h = FuseOpenOut::default();
+        let mut packet = h.to_bytes().to_vec();
+        packet.extend_from_slice(&[0xAB; 8]);
+        assert_eq!(FuseOpenOut::from_bytes(&packet).unwrap(), h);
+        let short = [0u8; 15];
+        assert!(matches!(
+            FuseOpenOut::from_bytes(&short),
+            Err(FuseError::ShortHeader { have: 15, need: 16 })
+        ));
+    }
+
+    // ---- fuse_read_in -------------------------------------------------
+
+    #[test]
+    fn read_in_length_is_40() {
+        assert_eq!(FUSE_READ_IN_LEN, 40);
+    }
+
+    #[test]
+    fn read_in_roundtrips_and_offsets_match_spec() {
+        let h = FuseReadIn {
+            fh: 0x0101_0101_0101_0101,
+            offset: 0x0202_0202_0202_0202,
+            size: 0x0303_0303,
+            read_flags: 0x0404_0404,
+            lock_owner: 0x0505_0505_0505_0505,
+            flags: 0x0606_0606,
+            padding: 0x0707_0707,
+        };
+        let b = h.to_bytes();
+        assert_eq!(&b[0..8], &[0x01; 8]);
+        assert_eq!(&b[8..16], &[0x02; 8]);
+        assert_eq!(&b[16..20], &[0x03; 4]);
+        assert_eq!(&b[20..24], &[0x04; 4]);
+        assert_eq!(&b[24..32], &[0x05; 8]);
+        assert_eq!(&b[32..36], &[0x06; 4]);
+        assert_eq!(&b[36..40], &[0x07; 4]);
+        assert_eq!(FuseReadIn::from_bytes(&b).unwrap(), h);
+    }
+
+    #[test]
+    fn read_in_rejects_short_input() {
+        let short = [0u8; 39];
+        assert!(matches!(
+            FuseReadIn::from_bytes(&short),
+            Err(FuseError::ShortHeader { have: 39, need: 40 })
+        ));
+    }
+
+    // ---- fuse_write_in / fuse_write_out -------------------------------
+
+    #[test]
+    fn write_lengths_match_spec() {
+        assert_eq!(FUSE_WRITE_IN_LEN, 40);
+        assert_eq!(FUSE_WRITE_OUT_LEN, 8);
+    }
+
+    #[test]
+    fn write_in_roundtrips_and_offsets_match_spec() {
+        let h = FuseWriteIn {
+            fh: 0x0101_0101_0101_0101,
+            offset: 0x0202_0202_0202_0202,
+            size: 0x0303_0303,
+            write_flags: 0x0404_0404,
+            lock_owner: 0x0505_0505_0505_0505,
+            flags: 0x0606_0606,
+            padding: 0x0707_0707,
+        };
+        let b = h.to_bytes();
+        assert_eq!(&b[0..8], &[0x01; 8]);
+        assert_eq!(&b[8..16], &[0x02; 8]);
+        assert_eq!(&b[16..20], &[0x03; 4]);
+        assert_eq!(&b[20..24], &[0x04; 4]);
+        assert_eq!(&b[24..32], &[0x05; 8]);
+        assert_eq!(&b[32..36], &[0x06; 4]);
+        assert_eq!(&b[36..40], &[0x07; 4]);
+        assert_eq!(FuseWriteIn::from_bytes(&b).unwrap(), h);
+    }
+
+    #[test]
+    fn write_in_and_read_in_share_layout() {
+        // The two are intentionally identical on the wire (modulo the
+        // *_flags semantics). Pin that any byte slice that decodes as
+        // one decodes as the other with the same numeric values.
+        let bytes = FuseReadIn {
+            fh: 0xAB,
+            offset: 0x1234,
+            size: 100,
+            read_flags: 1,
+            lock_owner: 0xC0FFEE,
+            flags: 2,
+            padding: 0,
+        }
+        .to_bytes();
+        let r = FuseReadIn::from_bytes(&bytes).unwrap();
+        let w = FuseWriteIn::from_bytes(&bytes).unwrap();
+        assert_eq!(r.fh, w.fh);
+        assert_eq!(r.offset, w.offset);
+        assert_eq!(r.size, w.size);
+        assert_eq!(r.read_flags, w.write_flags);
+        assert_eq!(r.lock_owner, w.lock_owner);
+        assert_eq!(r.flags, w.flags);
+    }
+
+    #[test]
+    fn write_out_roundtrips_and_offsets_match_spec() {
+        let h = FuseWriteOut {
+            size: 0x0101_0101,
+            padding: 0x0202_0202,
+        };
+        let b = h.to_bytes();
+        assert_eq!(&b[0..4], &[0x01; 4]);
+        assert_eq!(&b[4..8], &[0x02; 4]);
+        assert_eq!(FuseWriteOut::from_bytes(&b).unwrap(), h);
+    }
+
+    #[test]
+    fn io_body_write_to_rejects_short_output() {
+        let mut tiny = [0u8; 3];
+        assert!(matches!(
+            FuseOpenIn::default().write_to(&mut tiny),
+            Err(FuseError::ShortBuffer { .. })
+        ));
+        assert!(matches!(
+            FuseOpenOut::default().write_to(&mut tiny),
+            Err(FuseError::ShortBuffer { .. })
+        ));
+        assert!(matches!(
+            FuseReadIn::default().write_to(&mut tiny),
+            Err(FuseError::ShortBuffer { .. })
+        ));
+        assert!(matches!(
+            FuseWriteIn::default().write_to(&mut tiny),
+            Err(FuseError::ShortBuffer { .. })
+        ));
+        assert!(matches!(
+            FuseWriteOut::default().write_to(&mut tiny),
             Err(FuseError::ShortBuffer { .. })
         ));
     }
