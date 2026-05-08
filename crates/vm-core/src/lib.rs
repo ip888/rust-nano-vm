@@ -222,6 +222,35 @@ pub trait Hypervisor: Send + Sync {
     /// it. Backends that don't track in-process snapshot state may
     /// return [`VmError::Unsupported`].
     fn snapshot_meta(&self, snap: SnapshotId) -> VmResult<SnapshotMeta>;
+
+    /// Read metadata describing a VM's geometry — what it was created
+    /// with, plus its current observed state. The control plane uses
+    /// this to enrich `GET /v1/vms` so operators see vcpu / memory
+    /// columns without an extra round-trip per VM. Backends that
+    /// don't track per-VM state in-process may return
+    /// [`VmError::Unsupported`].
+    fn vm_meta(&self, id: VmId) -> VmResult<VmMeta>;
+}
+
+/// Metadata describing a VM's geometry. Read via
+/// [`Hypervisor::vm_meta`]. State is the snapshot at the moment the
+/// read assembled — same caveat as [`VmHandle::state`]: a concurrent
+/// transition can stale it before the caller looks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmMeta {
+    /// VM identifier.
+    pub id: VmId,
+    /// Lifecycle state at read time.
+    pub state: VmState,
+    /// vCPU count this VM was created with (or that the snapshot it
+    /// was restored from carried).
+    pub vcpus: u32,
+    /// Guest memory in MiB the VM was created with.
+    pub memory_mib: u64,
+    /// Kernel command line the VM was given at create time.
+    pub kernel_cmdline: String,
+    /// Snapshot directory the VM was restored from, if any.
+    pub snapshot_dir: Option<std::path::PathBuf>,
 }
 
 /// Metadata describing a captured snapshot. Read via
