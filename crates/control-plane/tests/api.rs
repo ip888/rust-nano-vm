@@ -523,7 +523,56 @@ async fn list_snapshots_returns_each_captured_snapshot() {
     assert_eq!(ids, want);
     for s in snaps {
         assert!(s["display"].as_str().unwrap().starts_with("snap-"));
+        // Each row carries the geometry pulled via snapshot_meta.
+        assert!(s["vcpu_count"].is_u64(), "row missing vcpu_count: {s}");
+        assert!(s["memory_bytes"].is_u64(), "row missing memory_bytes: {s}");
+        assert!(s["page_size"].is_u64(), "row missing page_size: {s}");
+        assert!(
+            s["kernel_cmdline"].is_string(),
+            "row missing kernel_cmdline: {s}"
+        );
     }
+}
+
+#[tokio::test]
+async fn list_snapshots_metadata_reflects_vm_geometry() {
+    let app = app();
+    // Create a VM with a recognizable geometry.
+    let (_, h) = send(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({
+            "vcpus": 4,
+            "memory_mib": 64,
+            "cmdline": "console=ttyS0 panic=1",
+        })),
+    )
+    .await;
+    let id = h["id"].as_u64().unwrap();
+    send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{id}/start"),
+        None,
+    )
+    .await;
+    send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{id}/snapshot"),
+        None,
+    )
+    .await;
+
+    let (_, body) = send(app.clone(), Method::GET, "/v1/snapshots", None).await;
+    let snaps = body["snapshots"].as_array().unwrap();
+    assert_eq!(snaps.len(), 1);
+    let s = &snaps[0];
+    assert_eq!(s["vcpu_count"], 4);
+    assert_eq!(s["memory_bytes"].as_u64().unwrap(), 64 * 1024 * 1024);
+    assert_eq!(s["page_size"], 4096);
+    assert_eq!(s["kernel_cmdline"], "console=ttyS0 panic=1");
 }
 
 #[tokio::test]

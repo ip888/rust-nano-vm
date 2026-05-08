@@ -442,11 +442,38 @@ fn cmd_snapshots(client: &Client) -> ExitCode {
         println!("no snapshots");
         return ExitCode::SUCCESS;
     }
+    println!("{:<24} {:>4} {:>10}  CMDLINE", "ID", "VCPU", "MEM");
     for s in snaps {
         let display = s["display"].as_str().unwrap_or("?");
-        println!("{display}");
+        let vcpu = s["vcpu_count"]
+            .as_u64()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".into());
+        let mem = match s["memory_bytes"].as_u64() {
+            Some(b) => format_size(b),
+            None => "-".into(),
+        };
+        let cmdline = s["kernel_cmdline"].as_str().unwrap_or("");
+        println!("{display:<24} {vcpu:>4} {mem:>10}  {cmdline}");
     }
     ExitCode::SUCCESS
+}
+
+/// Render `bytes` as `<n> MiB` / `GiB` for the snapshot listing.
+/// Approximate is fine — this is a CLI display helper, not an API.
+fn format_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn cmd_rm_snap(client: &Client, snapshot: &str) -> ExitCode {
