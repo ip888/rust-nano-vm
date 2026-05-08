@@ -38,8 +38,8 @@ use tower_http::trace::TraceLayer;
 use vm_core::{Hypervisor, SnapshotId, VmId};
 
 use crate::api::{
-    CreateVmRequest, SnapshotDto, SnapshotListResponse, SnapshotRequest, VmHandleDto,
-    VmListResponse, VmStateResponse,
+    CreateVmRequest, SnapshotDto, SnapshotListEntry, SnapshotListResponse, SnapshotRequest,
+    VmHandleDto, VmListResponse, VmStateResponse,
 };
 use crate::auth;
 use crate::error::ApiError;
@@ -213,7 +213,28 @@ async fn list_snapshots(
     State(state): State<AppState>,
 ) -> Result<Json<SnapshotListResponse>, ApiError> {
     let ids = state.hypervisor.list_snapshots()?;
-    Ok(Json(SnapshotListResponse::new(ids)))
+    let mut snapshots = Vec::with_capacity(ids.len());
+    for id in ids {
+        // Best-effort metadata enrichment. Two failure modes are
+        // expected and we degrade gracefully:
+        // - Unsupported: the backend can't surface geometry. Keep the
+        //   entry with id + display so the listing never silently
+        //   swallows snapshots that exist.
+        // - UnknownSnapshot: a concurrent delete raced with our list.
+        //   Same handling — id-only row.
+        // Any other error means the backend is unhealthy; bubble it up
+        // as a 5xx so the caller learns rather than getting a partial
+        // list with no signal.
+        let entry = match state.hypervisor.snapshot_meta(id) {
+            Ok(meta) => SnapshotListEntry::from_meta(meta),
+            Err(vm_core::VmError::Unsupported(_)) | Err(vm_core::VmError::UnknownSnapshot(_)) => {
+                SnapshotListEntry::id_only(id)
+            }
+            Err(e) => return Err(ApiError::from(e)),
+        };
+        snapshots.push(entry);
+    }
+    Ok(Json(SnapshotListResponse { snapshots }))
 }
 
 async fn delete_snapshot(

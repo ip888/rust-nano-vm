@@ -172,16 +172,61 @@ impl From<SnapshotId> for SnapshotDto {
 /// room for pagination / filter metadata later.
 #[derive(Debug, Serialize)]
 pub(crate) struct SnapshotListResponse {
-    pub snapshots: Vec<SnapshotDto>,
+    pub snapshots: Vec<SnapshotListEntry>,
 }
 
-impl SnapshotListResponse {
-    pub fn new<I>(ids: I) -> Self
-    where
-        I: IntoIterator<Item = SnapshotId>,
-    {
+/// Per-snapshot row in `GET /v1/snapshots`. Carries the same id +
+/// display as [`SnapshotDto`] plus the captured geometry pulled from
+/// [`vm_core::Hypervisor::snapshot_meta`]. Backends that don't track
+/// geometry (e.g. the placeholder `vm-kvm`) return `Unsupported` and
+/// the metadata fields are simply omitted, leaving id + display
+/// usable.
+#[derive(Debug, Serialize)]
+pub(crate) struct SnapshotListEntry {
+    pub id: u64,
+    pub display: String,
+    /// vCPU count captured at snapshot time. Absent when the backend
+    /// can't surface geometry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vcpu_count: Option<u32>,
+    /// Guest memory size in bytes. Absent when the backend can't
+    /// surface geometry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    /// Guest page size in bytes. Absent when the backend can't surface
+    /// geometry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+    /// Captured kernel command line (empty string when the VM had
+    /// none). Absent when the backend can't surface geometry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_cmdline: Option<String>,
+}
+
+impl SnapshotListEntry {
+    /// Build a row that carries id + display only (for backends that
+    /// can't surface metadata).
+    pub fn id_only(id: SnapshotId) -> Self {
         Self {
-            snapshots: ids.into_iter().map(SnapshotDto::from).collect(),
+            id: id.0,
+            display: id.to_string(),
+            vcpu_count: None,
+            memory_bytes: None,
+            page_size: None,
+            kernel_cmdline: None,
+        }
+    }
+
+    /// Build a row from a [`vm_core::SnapshotMeta`] returned by the
+    /// backend.
+    pub fn from_meta(meta: vm_core::SnapshotMeta) -> Self {
+        Self {
+            id: meta.id.0,
+            display: meta.id.to_string(),
+            vcpu_count: Some(meta.vcpu_count),
+            memory_bytes: Some(meta.memory_bytes),
+            page_size: Some(meta.page_size),
+            kernel_cmdline: Some(meta.kernel_cmdline),
         }
     }
 }
