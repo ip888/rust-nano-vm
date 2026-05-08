@@ -111,6 +111,18 @@ enum Command {
     },
     /// List sandboxes (requires a running nanovm-control-plane).
     Ps,
+    /// Print the current state of a sandbox. Equivalent to
+    /// `GET /v1/vms/:id`.
+    Inspect {
+        /// Target sandbox id (raw u64 or `vm-...` display form).
+        id: String,
+    },
+    /// Start a sandbox that is in the `Created` or `Stopped` state.
+    /// Equivalent to `POST /v1/vms/:id/start`.
+    Start {
+        /// Target sandbox id (raw u64 or `vm-...` display form).
+        id: String,
+    },
     /// Stop a running sandbox. Equivalent to `POST /v1/vms/:id/stop`.
     /// The VM stays in the `Stopped` state and can be re-started or
     /// snapshotted afterwards.
@@ -164,6 +176,8 @@ fn main() -> ExitCode {
         Command::Snapshot { id, to } => cmd_snapshot(&client, &id, to),
         Command::Fork { snapshot, count } => cmd_fork(&client, &snapshot, count),
         Command::Ps => cmd_ps(&client),
+        Command::Inspect { id } => cmd_inspect(&client, &id),
+        Command::Start { id } => cmd_start(&client, &id),
         Command::Stop { id } => cmd_stop(&client, &id),
         Command::RmVm { id } => cmd_rm_vm(&client, &id),
         Command::Snapshots => cmd_snapshots(&client),
@@ -462,6 +476,39 @@ fn cmd_stop(client: &Client, id: &str) -> ExitCode {
         return fail("stop", &e);
     }
     println!("vm-{vm_id:016x} stopped");
+    ExitCode::SUCCESS
+}
+
+fn cmd_start(client: &Client, id: &str) -> ExitCode {
+    let vm_id = match parse_id(id, "vm") {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("nanovm start: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(e) = client.post(&format!("/v1/vms/{vm_id}/start"), None) {
+        return fail("start", &e);
+    }
+    println!("vm-{vm_id:016x} running");
+    ExitCode::SUCCESS
+}
+
+fn cmd_inspect(client: &Client, id: &str) -> ExitCode {
+    let vm_id = match parse_id(id, "vm") {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("nanovm inspect: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let body = match client.get(&format!("/v1/vms/{vm_id}")) {
+        Ok(v) => v,
+        Err(e) => return fail("inspect", &e),
+    };
+    let display = body["display"].as_str().unwrap_or("?");
+    let state = body["state"].as_str().unwrap_or("?");
+    println!("{display:<24} {state}");
     ExitCode::SUCCESS
 }
 
