@@ -737,6 +737,135 @@ impl FuseWriteOut {
 }
 
 // ---------------------------------------------------------------------------
+// fuse_flush_in / fuse_release_in
+// ---------------------------------------------------------------------------
+
+/// On-the-wire size of [`FuseFlushIn`] in bytes.
+pub const FUSE_FLUSH_IN_LEN: usize = 24;
+
+/// On-the-wire size of [`FuseReleaseIn`] in bytes.
+pub const FUSE_RELEASE_IN_LEN: usize = 24;
+
+/// Body of a `FUSE_FLUSH` request. Sent by the kernel before a final
+/// `Release` (or after every `close(2)` when the file was opened with
+/// `O_SYNC`). The host responds with an empty body — the
+/// [`super::FuseOutHeader::error`] field carries the status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseFlushIn {
+    /// File handle returned by [`FuseOpenOut`].
+    pub fh: u64,
+    /// Reserved; writers MUST emit `0`, readers MUST ignore.
+    pub unused: u32,
+    /// Padding; writers MUST emit `0`, readers MUST ignore.
+    pub padding: u32,
+    /// POSIX lock owner — `0` when the file was not opened by a
+    /// process that holds posix locks.
+    pub lock_owner: u64,
+}
+
+impl FuseFlushIn {
+    /// Parse the first [`FUSE_FLUSH_IN_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_FLUSH_IN_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_FLUSH_IN_LEN,
+            });
+        }
+        Ok(Self {
+            fh: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            unused: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            padding: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            lock_owner: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize into `buf`.
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_FLUSH_IN_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_FLUSH_IN_LEN,
+            });
+        }
+        buf[0..8].copy_from_slice(&self.fh.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.unused.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.padding.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.lock_owner.to_le_bytes());
+        Ok(FUSE_FLUSH_IN_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_FLUSH_IN_LEN] {
+        let mut out = [0u8; FUSE_FLUSH_IN_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseFlushIn into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+/// Body of a `FUSE_RELEASE` / `FUSE_RELEASEDIR` request. Tells the
+/// host the kernel is done with a file handle and the host can drop
+/// the underlying state. Like `Flush`, the response is an empty body
+/// (status in the [`super::FuseOutHeader::error`] field).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseReleaseIn {
+    /// File handle returned by [`FuseOpenOut`].
+    pub fh: u64,
+    /// `open(2)` flags from the original [`FuseOpenIn::flags`] —
+    /// echoed so the host can apply the same `O_SYNC` / `O_DSYNC`
+    /// semantics on close.
+    pub flags: u32,
+    /// FUSE-specific release bits (e.g. `FUSE_RELEASE_FLUSH`,
+    /// `FUSE_RELEASE_FLOCK_UNLOCK`).
+    pub release_flags: u32,
+    /// POSIX lock owner — relevant when `release_flags` requests
+    /// implicit `flock(2)` cleanup.
+    pub lock_owner: u64,
+}
+
+impl FuseReleaseIn {
+    /// Parse the first [`FUSE_RELEASE_IN_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_RELEASE_IN_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_RELEASE_IN_LEN,
+            });
+        }
+        Ok(Self {
+            fh: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            flags: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            release_flags: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            lock_owner: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize into `buf`.
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_RELEASE_IN_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_RELEASE_IN_LEN,
+            });
+        }
+        buf[0..8].copy_from_slice(&self.fh.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.flags.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.release_flags.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.lock_owner.to_le_bytes());
+        Ok(FUSE_RELEASE_IN_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_RELEASE_IN_LEN] {
+        let mut out = [0u8; FUSE_RELEASE_IN_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseReleaseIn into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // fuse_dirent (FUSE_READDIR)
 // ---------------------------------------------------------------------------
 
@@ -1658,5 +1787,101 @@ mod tests {
         w.push(1, 1, dt::REG, b"x").unwrap(); // 32 bytes
         assert_eq!(w.remaining(), 32);
         assert!(!w.is_empty());
+    }
+
+    // ---- fuse_flush_in / fuse_release_in ------------------------------
+
+    #[test]
+    fn flush_release_lengths_match_spec() {
+        assert_eq!(FUSE_FLUSH_IN_LEN, 24);
+        assert_eq!(FUSE_RELEASE_IN_LEN, 24);
+    }
+
+    #[test]
+    fn flush_in_roundtrips_and_offsets_match_spec() {
+        let h = FuseFlushIn {
+            fh: 0x0101_0101_0101_0101,
+            unused: 0x0202_0202,
+            padding: 0x0303_0303,
+            lock_owner: 0x0404_0404_0404_0404,
+        };
+        let b = h.to_bytes();
+        assert_eq!(&b[0..8], &[0x01; 8]);
+        assert_eq!(&b[8..12], &[0x02; 4]);
+        assert_eq!(&b[12..16], &[0x03; 4]);
+        assert_eq!(&b[16..24], &[0x04; 8]);
+        assert_eq!(FuseFlushIn::from_bytes(&b).unwrap(), h);
+    }
+
+    #[test]
+    fn release_in_roundtrips_and_offsets_match_spec() {
+        let h = FuseReleaseIn {
+            fh: 0x0101_0101_0101_0101,
+            flags: 0x0202_0202,
+            release_flags: 0x0303_0303,
+            lock_owner: 0x0404_0404_0404_0404,
+        };
+        let b = h.to_bytes();
+        assert_eq!(&b[0..8], &[0x01; 8]);
+        assert_eq!(&b[8..12], &[0x02; 4]);
+        assert_eq!(&b[12..16], &[0x03; 4]);
+        assert_eq!(&b[16..24], &[0x04; 8]);
+        assert_eq!(FuseReleaseIn::from_bytes(&b).unwrap(), h);
+    }
+
+    #[test]
+    fn flush_in_accepts_longer_input_and_rejects_short() {
+        let h = FuseFlushIn::default();
+        let mut packet = h.to_bytes().to_vec();
+        packet.extend_from_slice(&[0xAB; 8]);
+        assert_eq!(FuseFlushIn::from_bytes(&packet).unwrap(), h);
+        let short = [0u8; 23];
+        assert!(matches!(
+            FuseFlushIn::from_bytes(&short),
+            Err(FuseError::ShortHeader { have: 23, need: 24 })
+        ));
+    }
+
+    #[test]
+    fn release_in_accepts_longer_input_and_rejects_short() {
+        let h = FuseReleaseIn::default();
+        let mut packet = h.to_bytes().to_vec();
+        packet.extend_from_slice(&[0xAB; 8]);
+        assert_eq!(FuseReleaseIn::from_bytes(&packet).unwrap(), h);
+        let short = [0u8; 23];
+        assert!(matches!(
+            FuseReleaseIn::from_bytes(&short),
+            Err(FuseError::ShortHeader { have: 23, need: 24 })
+        ));
+    }
+
+    #[test]
+    fn flush_release_share_layout_for_fh_and_lock_owner() {
+        // The first u64 (fh) and last u64 (lock_owner) are at the same
+        // offsets in both structs — pin that, since the dispatcher may
+        // peek at fh without committing to a specific op type.
+        let bytes = FuseReleaseIn {
+            fh: 0xDEADBEEF,
+            flags: 0,
+            release_flags: 0,
+            lock_owner: 0xCAFEF00D,
+        }
+        .to_bytes();
+        let f = FuseFlushIn::from_bytes(&bytes).unwrap();
+        assert_eq!(f.fh, 0xDEADBEEF);
+        assert_eq!(f.lock_owner, 0xCAFEF00D);
+    }
+
+    #[test]
+    fn flush_release_write_to_rejects_short_output() {
+        let mut tiny = [0u8; 8];
+        assert!(matches!(
+            FuseFlushIn::default().write_to(&mut tiny),
+            Err(FuseError::ShortBuffer { have: 8, need: 24 })
+        ));
+        assert!(matches!(
+            FuseReleaseIn::default().write_to(&mut tiny),
+            Err(FuseError::ShortBuffer { have: 8, need: 24 })
+        ));
     }
 }
