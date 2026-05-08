@@ -1,7 +1,7 @@
 //! Per-op FUSE request / response body structs.
 //!
 //! Scope today — the body types needed for the M3 handshake + lookup
-//! + open-read-write happy path:
+//! + open-read-write + readdir paths:
 //!
 //! - [`FuseInitIn`] / [`FuseInitOut`] — protocol negotiation (op = `Init`)
 //! - [`FuseAttr`] — file attributes shared by `Getattr`, `Setattr`, and
@@ -10,16 +10,16 @@
 //!   `Mkdir`, `Symlink`, `Link`
 //! - [`FuseOpenIn`] / [`FuseOpenOut`] — `Open` / `Opendir` (request
 //!   carries `open(2)` flags; response gives the guest a file handle)
-//! - [`FuseReadIn`] — `Read` request. The response body is a bare byte
-//!   stream of up to `size` bytes following the
-//!   [`super::FuseOutHeader`] — no struct.
-//! - [`FuseWriteIn`] / [`FuseWriteOut`] — `Write` (request struct
-//!   followed by `size` bytes of payload; response carries the bytes
-//!   actually committed)
+//! - [`FuseReadIn`] — `Read` and `Readdir` request (response is a bare
+//!   byte stream; for `Readdir` it's a sequence of `fuse_dirent`
+//!   records — see [`FuseDirentWriter`] / [`FuseDirentIter`])
+//! - [`FuseWriteIn`] / [`FuseWriteOut`] — `Write`
+//! - [`FuseDirentHeader`] + [`FuseDirentWriter`] / [`FuseDirentIter`] —
+//!   variable-length `fuse_dirent` records that make up a `Readdir`
+//!   response, plus `DT_*` file-type constants in [`dt`]
 //!
-//! Bodies for `Readdir` (the variable-length `fuse_dirent` records),
-//! `Flush` / `Release`, and the dispatch loop that ties it all into a
-//! virtqueue come in follow-up PRs.
+//! `Flush` / `Release` headers and the dispatch loop that ties it all
+//! into a virtqueue come in follow-up PRs.
 //!
 //! All structs follow the same convention used by [`super::FuseInHeader`]
 //! / [`super::FuseOutHeader`]: explicit little-endian
@@ -736,6 +736,299 @@ impl FuseWriteOut {
     }
 }
 
+// ---------------------------------------------------------------------------
+// fuse_dirent (FUSE_READDIR)
+// ---------------------------------------------------------------------------
+
+/// On-the-wire size of [`FuseDirentHeader`] in bytes — the fixed portion
+/// preceding the variable-length name.
+pub const FUSE_DIRENT_HDR_LEN: usize = 24;
+
+/// Round-up alignment for `fuse_dirent` records on the wire. Each record
+/// (header + name) is padded to a multiple of this so the next record
+/// starts on an 8-byte boundary.
+pub const FUSE_DIRENT_ALIGN: usize = 8;
+
+/// `DT_*` file type constants matching `<dirent.h>`. Carried in
+/// [`FuseDirentHeader::ftype`] and pinned by [`dt`] tests.
+pub mod dt {
+    /// Unknown file type. Servers with no idea what type a name refers
+    /// to should send `Unknown`; the kernel will issue a follow-up
+    /// `Lookup` to find out.
+    pub const UNKNOWN: u32 = 0;
+    /// FIFO (named pipe).
+    pub const FIFO: u32 = 1;
+    /// Character device.
+    pub const CHR: u32 = 2;
+    /// Directory.
+    pub const DIR: u32 = 4;
+    /// Block device.
+    pub const BLK: u32 = 6;
+    /// Regular file.
+    pub const REG: u32 = 8;
+    /// Symbolic link.
+    pub const LNK: u32 = 10;
+    /// UNIX-domain socket.
+    pub const SOCK: u32 = 12;
+}
+
+/// Round `n` up to the next multiple of [`FUSE_DIRENT_ALIGN`].
+#[inline]
+pub fn fuse_dirent_padded_size(name_len: usize) -> usize {
+    let total = FUSE_DIRENT_HDR_LEN + name_len;
+    (total + FUSE_DIRENT_ALIGN - 1) & !(FUSE_DIRENT_ALIGN - 1)
+}
+
+/// Fixed 24-byte header preceding each `fuse_dirent` record. The name
+/// follows immediately and is `namelen` bytes (no NUL terminator);
+/// the record is then padded to a multiple of [`FUSE_DIRENT_ALIGN`]
+/// so the next record starts aligned.
+///
+/// ```c
+/// struct fuse_dirent {
+///     uint64_t ino;
+///     uint64_t off;
+///     uint32_t namelen;
+///     uint32_t type;
+///     char     name[];   // namelen bytes, then 0..7 padding
+/// };
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseDirentHeader {
+    /// Inode number.
+    pub ino: u64,
+    /// Position to seek to in order to read the *next* record. The
+    /// kernel echoes this in subsequent [`FuseReadIn::offset`] requests.
+    pub off: u64,
+    /// Length of the name that follows (bytes; no NUL terminator).
+    pub namelen: u32,
+    /// `DT_*` file type — see the [`dt`] module.
+    pub ftype: u32,
+}
+
+impl FuseDirentHeader {
+    /// Parse the first [`FUSE_DIRENT_HDR_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_DIRENT_HDR_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_DIRENT_HDR_LEN,
+            });
+        }
+        Ok(Self {
+            ino: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            off: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            namelen: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+            ftype: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize into `buf`.
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_DIRENT_HDR_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_DIRENT_HDR_LEN,
+            });
+        }
+        buf[0..8].copy_from_slice(&self.ino.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.off.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.namelen.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.ftype.to_le_bytes());
+        Ok(FUSE_DIRENT_HDR_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_DIRENT_HDR_LEN] {
+        let mut out = [0u8; FUSE_DIRENT_HDR_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseDirentHeader into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+/// Errors returned by [`FuseDirentWriter::push`] when the entry can't
+/// fit in the response buffer the host advertised. Kept distinct from
+/// [`FuseError`] so the dispatcher can decide to flush + retry rather
+/// than treat it as a parse failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirentWriteError {
+    /// Adding this record (header + name + padding) would exceed the
+    /// buffer cap the kernel asked for.
+    BufferFull {
+        /// Bytes the entry would consume.
+        need: usize,
+        /// Bytes left in the cap.
+        remaining: usize,
+    },
+    /// Name length exceeds `u32::MAX`. Practically impossible (POSIX
+    /// caps NAME_MAX at 255) but we surface rather than truncate.
+    NameTooLong {
+        /// Length we got handed.
+        len: usize,
+    },
+}
+
+impl std::fmt::Display for DirentWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BufferFull { need, remaining } => {
+                write!(f, "dirent buffer full: need {need}, have {remaining} left")
+            }
+            Self::NameTooLong { len } => write!(f, "dirent name too long: {len} bytes"),
+        }
+    }
+}
+
+impl std::error::Error for DirentWriteError {}
+
+/// Builds a `FUSE_READDIR` response payload.
+///
+/// The reply body for `FUSE_READDIR` is a sequence of `fuse_dirent`
+/// records concatenated, each padded to [`FUSE_DIRENT_ALIGN`] bytes.
+/// The kernel caps the total size via the request's `size` field; we
+/// honour that cap by refusing further records once the next one
+/// wouldn't fit, returning [`DirentWriteError::BufferFull`].
+///
+/// ```
+/// # use virtio_fs::body::{dt, FuseDirentWriter};
+/// let mut w = FuseDirentWriter::with_capacity(1024);
+/// w.push(7, 1, dt::DIR, b".").unwrap();
+/// w.push(8, 2, dt::DIR, b"..").unwrap();
+/// w.push(9, 3, dt::REG, b"hello.txt").unwrap();
+/// let _ = w.into_bytes();
+/// ```
+#[derive(Debug)]
+pub struct FuseDirentWriter {
+    buf: Vec<u8>,
+    cap: usize,
+}
+
+impl FuseDirentWriter {
+    /// Construct a writer that will refuse to grow past `cap` bytes.
+    /// Use the `size` field of the originating [`FuseReadIn`] request
+    /// as the cap.
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(cap),
+            cap,
+        }
+    }
+
+    /// Total bytes written so far (including padding).
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// `true` when no records have been appended.
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// Bytes still available before [`Self::push`] would refuse.
+    pub fn remaining(&self) -> usize {
+        self.cap.saturating_sub(self.buf.len())
+    }
+
+    /// Append a record. Returns [`DirentWriteError::BufferFull`] if
+    /// the padded record wouldn't fit; the writer is unchanged in
+    /// that case (so the caller can flush what's been written so far
+    /// and start a fresh writer for the next page).
+    pub fn push(
+        &mut self,
+        ino: u64,
+        off: u64,
+        ftype: u32,
+        name: &[u8],
+    ) -> Result<(), DirentWriteError> {
+        let namelen = u32::try_from(name.len())
+            .map_err(|_| DirentWriteError::NameTooLong { len: name.len() })?;
+        let need = fuse_dirent_padded_size(name.len());
+        if self.buf.len() + need > self.cap {
+            return Err(DirentWriteError::BufferFull {
+                need,
+                remaining: self.remaining(),
+            });
+        }
+        let header = FuseDirentHeader {
+            ino,
+            off,
+            namelen,
+            ftype,
+        };
+        self.buf.extend_from_slice(&header.to_bytes());
+        self.buf.extend_from_slice(name);
+        // Pad to FUSE_DIRENT_ALIGN.
+        let pad = need - FUSE_DIRENT_HDR_LEN - name.len();
+        for _ in 0..pad {
+            self.buf.push(0);
+        }
+        Ok(())
+    }
+
+    /// Consume the writer and return the assembled payload.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
+/// Iterator that walks a `FUSE_READDIR` response payload, yielding one
+/// `(FuseDirentHeader, &[u8] name)` pair per record. Stops cleanly at
+/// end-of-buffer; surfaces [`FuseError::ShortHeader`] if a trailing
+/// truncated record is encountered.
+#[derive(Debug)]
+pub struct FuseDirentIter<'a> {
+    rest: &'a [u8],
+    failed: bool,
+}
+
+impl<'a> FuseDirentIter<'a> {
+    /// Wrap a payload buffer.
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self {
+            rest: buf,
+            failed: false,
+        }
+    }
+}
+
+impl<'a> Iterator for FuseDirentIter<'a> {
+    type Item = Result<(FuseDirentHeader, &'a [u8]), FuseError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed || self.rest.is_empty() {
+            return None;
+        }
+        // Header
+        if self.rest.len() < FUSE_DIRENT_HDR_LEN {
+            self.failed = true;
+            return Some(Err(FuseError::ShortHeader {
+                have: self.rest.len(),
+                need: FUSE_DIRENT_HDR_LEN,
+            }));
+        }
+        let hdr = match FuseDirentHeader::from_bytes(&self.rest[..FUSE_DIRENT_HDR_LEN]) {
+            Ok(h) => h,
+            Err(e) => {
+                self.failed = true;
+                return Some(Err(e));
+            }
+        };
+        let name_len = hdr.namelen as usize;
+        let total = fuse_dirent_padded_size(name_len);
+        if self.rest.len() < total {
+            self.failed = true;
+            return Some(Err(FuseError::ShortHeader {
+                have: self.rest.len(),
+                need: total,
+            }));
+        }
+        let name = &self.rest[FUSE_DIRENT_HDR_LEN..FUSE_DIRENT_HDR_LEN + name_len];
+        self.rest = &self.rest[total..];
+        Some(Ok((hdr, name)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1217,5 +1510,153 @@ mod tests {
             FuseWriteOut::default().write_to(&mut tiny),
             Err(FuseError::ShortBuffer { .. })
         ));
+    }
+
+    // ---- fuse_dirent --------------------------------------------------
+
+    #[test]
+    fn dirent_constants_match_spec() {
+        assert_eq!(FUSE_DIRENT_HDR_LEN, 24);
+        assert_eq!(FUSE_DIRENT_ALIGN, 8);
+        // DT_* values are pinned by <dirent.h>.
+        assert_eq!(dt::UNKNOWN, 0);
+        assert_eq!(dt::FIFO, 1);
+        assert_eq!(dt::CHR, 2);
+        assert_eq!(dt::DIR, 4);
+        assert_eq!(dt::BLK, 6);
+        assert_eq!(dt::REG, 8);
+        assert_eq!(dt::LNK, 10);
+        assert_eq!(dt::SOCK, 12);
+    }
+
+    #[test]
+    fn dirent_padded_size_rounds_up_to_eight() {
+        // header alone: 24 bytes (already aligned).
+        assert_eq!(fuse_dirent_padded_size(0), 24);
+        // 1-byte name: 24 + 1 = 25 → round up to 32.
+        assert_eq!(fuse_dirent_padded_size(1), 32);
+        // 8-byte name: 24 + 8 = 32 (already aligned).
+        assert_eq!(fuse_dirent_padded_size(8), 32);
+        // 9-byte name: 24 + 9 = 33 → 40.
+        assert_eq!(fuse_dirent_padded_size(9), 40);
+        // 255-byte name (POSIX NAME_MAX): 24 + 255 = 279 → 280.
+        assert_eq!(fuse_dirent_padded_size(255), 280);
+    }
+
+    #[test]
+    fn dirent_header_roundtrips_and_offsets_match_spec() {
+        let h = FuseDirentHeader {
+            ino: 0x0101_0101_0101_0101,
+            off: 0x0202_0202_0202_0202,
+            namelen: 0x0303_0303,
+            ftype: 0x0404_0404,
+        };
+        let b = h.to_bytes();
+        assert_eq!(&b[0..8], &[0x01; 8]);
+        assert_eq!(&b[8..16], &[0x02; 8]);
+        assert_eq!(&b[16..20], &[0x03; 4]);
+        assert_eq!(&b[20..24], &[0x04; 4]);
+        assert_eq!(FuseDirentHeader::from_bytes(&b).unwrap(), h);
+    }
+
+    #[test]
+    fn dirent_writer_then_iter_round_trip_three_entries() {
+        let entries: &[(u64, u64, u32, &[u8])] = &[
+            (7, 1, dt::DIR, b"."),         // 24 + 1 → 32 bytes
+            (8, 2, dt::DIR, b".."),        // 24 + 2 → 32 bytes
+            (9, 3, dt::REG, b"hello.txt"), // 24 + 9 → 40 bytes
+        ];
+        let mut w = FuseDirentWriter::with_capacity(1024);
+        for (ino, off, ftype, name) in entries {
+            w.push(*ino, *off, *ftype, name).expect("push");
+        }
+        let payload = w.into_bytes();
+        // Total = 32 + 32 + 40 = 104 bytes.
+        assert_eq!(payload.len(), 104);
+
+        let read: Vec<(FuseDirentHeader, Vec<u8>)> = FuseDirentIter::new(&payload)
+            .map(|r| {
+                let (h, n) = r.expect("dirent");
+                (h, n.to_vec())
+            })
+            .collect();
+        assert_eq!(read.len(), 3);
+        for (i, (got_hdr, got_name)) in read.iter().enumerate() {
+            let (ino, off, ftype, name) = entries[i];
+            assert_eq!(got_hdr.ino, ino);
+            assert_eq!(got_hdr.off, off);
+            assert_eq!(got_hdr.ftype, ftype);
+            assert_eq!(got_hdr.namelen as usize, name.len());
+            assert_eq!(got_name, name, "entry {i}");
+        }
+    }
+
+    #[test]
+    fn dirent_writer_pads_each_record_to_alignment() {
+        let mut w = FuseDirentWriter::with_capacity(1024);
+        w.push(1, 1, dt::REG, b"a").unwrap(); // 24 + 1 → 32
+        w.push(2, 2, dt::REG, b"ab").unwrap(); // 24 + 2 → 32
+        let bytes = w.into_bytes();
+        assert_eq!(bytes.len() % FUSE_DIRENT_ALIGN, 0);
+        // Tail bytes of each record (the padding) must be zero so the
+        // payload is byte-deterministic.
+        assert_eq!(&bytes[25..32], &[0u8; 7]); // padding after "a"
+        assert_eq!(&bytes[32 + 26..32 + 32], &[0u8; 6]); // padding after "ab"
+    }
+
+    #[test]
+    fn dirent_writer_refuses_when_record_would_exceed_cap() {
+        // Cap = exactly 32 bytes → one entry of 24+8 fits, second one
+        // doesn't.
+        let mut w = FuseDirentWriter::with_capacity(32);
+        w.push(1, 1, dt::REG, b"01234567").expect("first fits");
+        let err = w.push(2, 2, dt::REG, b"x").expect_err("second must fail");
+        assert!(matches!(
+            err,
+            DirentWriteError::BufferFull {
+                need: 32,
+                remaining: 0,
+            }
+        ));
+        // Buffer should be unchanged after the failed push.
+        assert_eq!(w.len(), 32);
+    }
+
+    #[test]
+    fn dirent_iter_surfaces_short_header_on_truncated_input() {
+        // Build one valid entry then truncate mid-record.
+        let mut w = FuseDirentWriter::with_capacity(1024);
+        w.push(1, 1, dt::REG, b"x").unwrap();
+        let mut bytes = w.into_bytes();
+        bytes.truncate(bytes.len() - 5); // chop into the padding/name
+        let results: Vec<_> = FuseDirentIter::new(&bytes).collect();
+        // First should succeed up to the namelen byte / fail because
+        // the iterator computes total record size before reading the
+        // name. Either way, *some* result must be Err and after the
+        // Err the iterator stops.
+        // With truncation eating into the padded region, the header
+        // claimed 1 byte name (32 total) but only 27 are present, so
+        // we expect ShortHeader { have: 27, need: 32 }.
+        assert_eq!(results.len(), 1, "got: {results:?}");
+        assert!(matches!(
+            results[0],
+            Err(FuseError::ShortHeader { have: 27, need: 32 })
+        ));
+    }
+
+    #[test]
+    fn dirent_iter_handles_empty_buffer_without_error() {
+        let results: Vec<_> = FuseDirentIter::new(&[]).collect();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn dirent_writer_remaining_tracks_bytes_left() {
+        let mut w = FuseDirentWriter::with_capacity(64);
+        assert_eq!(w.remaining(), 64);
+        assert!(w.is_empty());
+        w.push(1, 1, dt::REG, b"x").unwrap(); // 32 bytes
+        assert_eq!(w.remaining(), 32);
+        assert!(!w.is_empty());
     }
 }
