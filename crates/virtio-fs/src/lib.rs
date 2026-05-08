@@ -16,15 +16,19 @@
 //!     - [`FuseEntryOut`] — directory entry for `Lookup`, `Mknod`,
 //!       `Mkdir`, `Symlink`, `Link`
 //!     - [`FuseOpenIn`] / [`FuseOpenOut`] — `Open` / `Opendir`
-//!     - [`FuseReadIn`] — `Read` request (response is a bare byte
-//!       stream of up to `size` bytes)
+//!     - [`FuseReadIn`] — `Read` and `Readdir` request (response is
+//!       a bare byte stream of up to `size` bytes; for `Readdir`
+//!       it's a sequence of `fuse_dirent` records — see
+//!       [`FuseDirentWriter`] / [`FuseDirentIter`])
 //!     - [`FuseWriteIn`] / [`FuseWriteOut`] — `Write`
+//!     - [`FuseFlushIn`] — `Flush` (commits cached writes before close)
+//!     - [`FuseReleaseIn`] — `Release` / `Releasedir` (drops a file
+//!       handle)
 //!
-//! Deferred to follow-up PRs: bodies for `Readdir` (the variable-length
-//! `fuse_dirent` records), `Flush` / `Release`, and the dispatch loop
-//! that reads a [`FuseInHeader`] from a virtqueue descriptor chain,
-//! invokes the right handler, and writes a [`FuseOutHeader`] + body
-//! back.
+//! With the per-op body surface complete, the remaining M3 work is
+//! the dispatch loop that reads a [`FuseInHeader`] from a virtqueue
+//! descriptor chain, invokes the right handler, and writes a
+//! [`FuseOutHeader`] + body back.
 //!
 //! # Wire format
 //!
@@ -61,10 +65,11 @@ pub mod body;
 
 pub use body::{
     dt, fuse_dirent_padded_size, DirentWriteError, FuseAttr, FuseDirentHeader, FuseDirentIter,
-    FuseDirentWriter, FuseEntryOut, FuseInitIn, FuseInitOut, FuseOpenIn, FuseOpenOut, FuseReadIn,
-    FuseWriteIn, FuseWriteOut, FUSE_ATTR_LEN, FUSE_DIRENT_ALIGN, FUSE_DIRENT_HDR_LEN,
-    FUSE_ENTRY_OUT_LEN, FUSE_INIT_IN_LEN, FUSE_INIT_OUT_LEN, FUSE_OPEN_IN_LEN, FUSE_OPEN_OUT_LEN,
-    FUSE_READ_IN_LEN, FUSE_WRITE_IN_LEN, FUSE_WRITE_OUT_LEN,
+    FuseDirentWriter, FuseEntryOut, FuseFlushIn, FuseInitIn, FuseInitOut, FuseOpenIn, FuseOpenOut,
+    FuseReadIn, FuseReleaseIn, FuseWriteIn, FuseWriteOut, FUSE_ATTR_LEN, FUSE_DIRENT_ALIGN,
+    FUSE_DIRENT_HDR_LEN, FUSE_ENTRY_OUT_LEN, FUSE_FLUSH_IN_LEN, FUSE_INIT_IN_LEN,
+    FUSE_INIT_OUT_LEN, FUSE_OPEN_IN_LEN, FUSE_OPEN_OUT_LEN, FUSE_READ_IN_LEN, FUSE_RELEASE_IN_LEN,
+    FUSE_WRITE_IN_LEN, FUSE_WRITE_OUT_LEN,
 };
 
 use thiserror::Error;
@@ -788,6 +793,20 @@ mod tests {
     fn fuse_dirent_header_from_bytes_never_panics_on_random_input() {
         fuzz_parser(0xCCCC_CCCC_CCCC_CCCC, 64, |b| {
             let _ = FuseDirentHeader::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_flush_in_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0xEEEE_EEEE_EEEE_EEEE, 64, |b| {
+            let _ = FuseFlushIn::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_release_in_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0xFFFF_FFFF_FFFF_FFFF, 64, |b| {
+            let _ = FuseReleaseIn::from_bytes(b);
         });
     }
 
