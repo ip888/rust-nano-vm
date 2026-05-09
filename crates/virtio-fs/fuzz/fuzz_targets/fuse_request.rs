@@ -35,5 +35,5 @@ fuzz_target!(|data: &[u8]| {
     };
 
     // Property 2: dispatch on a valid parse never panics.
-    let _ = dispatch(hdr, req, &mut NullHandler);
+    let _ = dispatch(&hdr, req, &mut NullHandler);
 });
