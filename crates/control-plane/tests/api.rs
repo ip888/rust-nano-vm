@@ -79,6 +79,7 @@ async fn openapi_json_returns_document() {
     assert_eq!(body["info"]["title"], "rust-nano-vm control-plane API");
     assert!(body["paths"]["/v1/vms"].is_object());
     assert!(body["paths"]["/v1/snapshots/{id}/restore"].is_object());
+    assert!(body["paths"]["/openapi.json"].is_object());
     assert!(body["components"]["schemas"]["VmHandleDto"].is_object());
 }
 
