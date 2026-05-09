@@ -74,6 +74,7 @@ curl -X POST localhost:8080/v1/vms \
      -H "authorization: Bearer $NANOVM_TOKEN" \
      -H 'content-type: application/json' -d '{}'
 curl localhost:8080/healthz   # /healthz is exempt from auth
+curl localhost:8080/openapi.json | jq '.info,.paths'  # OpenAPI 3.1 contract
 ```
 
 On a Linux host with `/dev/kvm` (M1+):

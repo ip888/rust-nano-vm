@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use vm_core::{SnapshotId, VmConfig, VmHandle, VmId, VmState};
 
 /// Body of `POST /v1/vms`. All fields are optional; missing fields fall back
@@ -276,4 +277,268 @@ impl SnapshotListEntry {
             kernel_cmdline: Some(meta.kernel_cmdline),
         }
     }
+}
+
+/// OpenAPI 3.1 document for the control-plane REST surface.
+pub(crate) fn openapi_spec() -> Value {
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "rust-nano-vm control-plane API",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "paths": {
+            "/healthz": {
+                "get": {
+                    "summary": "Liveness check",
+                    "responses": {
+                        "200": {
+                            "description": "Plain-text health status",
+                            "content": {
+                                "text/plain": {
+                                    "schema": { "type": "string", "example": "ok" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/vms": {
+                "get": {
+                    "summary": "List VMs",
+                    "responses": {
+                        "200": {
+                            "description": "VM list",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/VmListResponse" } }
+                            }
+                        }
+                    }
+                },
+                "post": {
+                    "summary": "Create VM",
+                    "requestBody": {
+                        "required": false,
+                        "content": {
+                            "application/json": { "schema": { "$ref": "#/components/schemas/CreateVmRequest" } }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Created VM",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/VmHandleDto" } }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/vms/{id}": {
+                "get": {
+                    "summary": "Get VM state",
+                    "parameters": [{ "$ref": "#/components/parameters/VmIdPath" }],
+                    "responses": {
+                        "200": {
+                            "description": "VM state",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/VmStateResponse" } }
+                            }
+                        }
+                    }
+                },
+                "delete": {
+                    "summary": "Destroy VM",
+                    "parameters": [{ "$ref": "#/components/parameters/VmIdPath" }],
+                    "responses": { "204": { "description": "Destroyed" } }
+                }
+            },
+            "/v1/vms/{id}/start": {
+                "post": {
+                    "summary": "Start VM",
+                    "parameters": [{ "$ref": "#/components/parameters/VmIdPath" }],
+                    "responses": { "204": { "description": "Started" } }
+                }
+            },
+            "/v1/vms/{id}/stop": {
+                "post": {
+                    "summary": "Stop VM",
+                    "parameters": [{ "$ref": "#/components/parameters/VmIdPath" }],
+                    "responses": { "204": { "description": "Stopped" } }
+                }
+            },
+            "/v1/vms/{id}/snapshot": {
+                "post": {
+                    "summary": "Create snapshot",
+                    "parameters": [{ "$ref": "#/components/parameters/VmIdPath" }],
+                    "requestBody": {
+                        "required": false,
+                        "content": {
+                            "application/json": { "schema": { "$ref": "#/components/schemas/SnapshotRequest" } }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Created snapshot",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/SnapshotDto" } }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/snapshots": {
+                "get": {
+                    "summary": "List snapshots",
+                    "responses": {
+                        "200": {
+                            "description": "Snapshot list",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/SnapshotListResponse" } }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/snapshots/{id}": {
+                "delete": {
+                    "summary": "Delete snapshot",
+                    "parameters": [{ "$ref": "#/components/parameters/SnapshotIdPath" }],
+                    "responses": { "204": { "description": "Deleted" } }
+                }
+            },
+            "/v1/snapshots/{id}/restore": {
+                "post": {
+                    "summary": "Restore snapshot into VM",
+                    "parameters": [{ "$ref": "#/components/parameters/SnapshotIdPath" }],
+                    "responses": {
+                        "201": {
+                            "description": "Created VM from snapshot",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/VmHandleDto" } }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "components": {
+            "securitySchemes": {
+                "BearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer"
+                }
+            },
+            "parameters": {
+                "VmIdPath": {
+                    "name": "id",
+                    "in": "path",
+                    "required": true,
+                    "schema": { "type": "integer", "minimum": 0 }
+                },
+                "SnapshotIdPath": {
+                    "name": "id",
+                    "in": "path",
+                    "required": true,
+                    "schema": { "type": "integer", "minimum": 0 }
+                }
+            },
+            "schemas": {
+                "CreateVmRequest": {
+                    "type": "object",
+                    "properties": {
+                        "vcpus": { "type": "integer", "minimum": 1, "default": 1 },
+                        "memory_mib": { "type": "integer", "minimum": 1, "default": 128 },
+                        "kernel": { "type": "string" },
+                        "rootfs": { "type": "string" },
+                        "cmdline": { "type": "string" },
+                        "vsock_cid": { "type": "integer", "minimum": 1 },
+                        "snapshot_dir": { "type": "string" }
+                    }
+                },
+                "VmStateDto": {
+                    "type": "string",
+                    "enum": ["created", "running", "stopped"]
+                },
+                "VmHandleDto": {
+                    "type": "object",
+                    "required": ["id", "display", "state"],
+                    "properties": {
+                        "id": { "type": "integer" },
+                        "display": { "type": "string" },
+                        "state": { "$ref": "#/components/schemas/VmStateDto" }
+                    }
+                },
+                "VmListEntry": {
+                    "type": "object",
+                    "required": ["id", "display", "state"],
+                    "properties": {
+                        "id": { "type": "integer" },
+                        "display": { "type": "string" },
+                        "state": { "$ref": "#/components/schemas/VmStateDto" },
+                        "vcpus": { "type": "integer" },
+                        "memory_mib": { "type": "integer" },
+                        "kernel_cmdline": { "type": "string" },
+                        "snapshot_dir": { "type": "string" }
+                    }
+                },
+                "VmListResponse": {
+                    "type": "object",
+                    "required": ["vms"],
+                    "properties": {
+                        "vms": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/VmListEntry" }
+                        }
+                    }
+                },
+                "VmStateResponse": {
+                    "type": "object",
+                    "required": ["id", "display", "state"],
+                    "properties": {
+                        "id": { "type": "integer" },
+                        "display": { "type": "string" },
+                        "state": { "$ref": "#/components/schemas/VmStateDto" }
+                    }
+                },
+                "SnapshotRequest": {
+                    "type": "object",
+                    "properties": {
+                        "to_dir": { "type": "string" }
+                    }
+                },
+                "SnapshotDto": {
+                    "type": "object",
+                    "required": ["id", "display"],
+                    "properties": {
+                        "id": { "type": "integer" },
+                        "display": { "type": "string" },
+                        "dir": { "type": "string" }
+                    }
+                },
+                "SnapshotListEntry": {
+                    "type": "object",
+                    "required": ["id", "display"],
+                    "properties": {
+                        "id": { "type": "integer" },
+                        "display": { "type": "string" },
+                        "vcpu_count": { "type": "integer" },
+                        "memory_bytes": { "type": "integer" },
+                        "page_size": { "type": "integer" },
+                        "kernel_cmdline": { "type": "string" }
+                    }
+                },
+                "SnapshotListResponse": {
+                    "type": "object",
+                    "required": ["snapshots"],
+                    "properties": {
+                        "snapshots": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/SnapshotListEntry" }
+                        }
+                    }
+                }
+            }
+        },
+        "security": [{ "BearerAuth": [] }]
+    })
 }
