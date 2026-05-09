@@ -45,8 +45,8 @@ use thiserror::Error;
 
 mod runtime;
 pub use runtime::{
-    CowFaultAction, CowPager, RuntimeError, UffdPagefaultEvent, UFFD_API,
-    UFFD_PAGEFAULT_FLAG_WRITE, UFFDIO_REGISTER_MODE_MISSING,
+    CowFaultAction, CowPager, RuntimeError, UffdPagefaultEvent, UFFDIO_REGISTER_MODE_MISSING,
+    UFFD_API, UFFD_PAGEFAULT_FLAG_WRITE,
 };
 
 /// Current snapshot format version. Bump on any backwards-incompatible

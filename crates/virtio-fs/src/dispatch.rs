@@ -37,12 +37,12 @@
 //! synthetic buffers on any machine.
 
 use crate::{
-    FuseError, FuseInHeader, FuseOpcode, FuseOutHeader, FUSE_IN_HDR_LEN, FUSE_OUT_HDR_LEN,
-};
-use crate::{
     FuseAttrOut, FuseEntryOut, FuseFlushIn, FuseForgetIn, FuseFsyncIn, FuseGetattrIn, FuseInitIn,
     FuseInitOut, FuseLinkIn, FuseMkdirIn, FuseMknodIn, FuseOpenIn, FuseOpenOut, FuseReadIn,
     FuseReleaseIn, FuseRenameIn, FuseSetattrIn, FuseStatfsOut, FuseWriteIn, FuseWriteOut,
+};
+use crate::{
+    FuseError, FuseInHeader, FuseOpcode, FuseOutHeader, FUSE_IN_HDR_LEN, FUSE_OUT_HDR_LEN,
 };
 use crate::{
     FUSE_LINK_IN_LEN, FUSE_MKDIR_IN_LEN, FUSE_MKNOD_IN_LEN, FUSE_RENAME_IN_LEN, FUSE_WRITE_IN_LEN,
@@ -515,9 +515,10 @@ pub fn dispatch<H: FuseHandler>(
         }
 
         // ---- ops with fixed-size response bodies -------------------------
-        FuseRequest::Init(ref body) => {
-            encode_result(hdr.unique, handler.init(hdr, body).map(|r| r.to_bytes().to_vec()))
-        }
+        FuseRequest::Init(ref body) => encode_result(
+            hdr.unique,
+            handler.init(hdr, body).map(|r| r.to_bytes().to_vec()),
+        ),
         FuseRequest::Getattr(ref body) => encode_result(
             hdr.unique,
             handler.getattr(hdr, body).map(|r| r.to_bytes().to_vec()),
@@ -526,19 +527,22 @@ pub fn dispatch<H: FuseHandler>(
             hdr.unique,
             handler.setattr(hdr, body).map(|r| r.to_bytes().to_vec()),
         ),
-        FuseRequest::Lookup { name } => {
-            encode_result(hdr.unique, handler.lookup(hdr, name).map(|r| r.to_bytes().to_vec()))
-        }
-        FuseRequest::Readlink => {
-            encode_result(hdr.unique, handler.readlink(hdr))
-        }
+        FuseRequest::Lookup { name } => encode_result(
+            hdr.unique,
+            handler.lookup(hdr, name).map(|r| r.to_bytes().to_vec()),
+        ),
+        FuseRequest::Readlink => encode_result(hdr.unique, handler.readlink(hdr)),
         FuseRequest::Mknod { ref body, name } => encode_result(
             hdr.unique,
-            handler.mknod(hdr, body, name).map(|r| r.to_bytes().to_vec()),
+            handler
+                .mknod(hdr, body, name)
+                .map(|r| r.to_bytes().to_vec()),
         ),
         FuseRequest::Mkdir { ref body, name } => encode_result(
             hdr.unique,
-            handler.mkdir(hdr, body, name).map(|r| r.to_bytes().to_vec()),
+            handler
+                .mkdir(hdr, body, name)
+                .map(|r| r.to_bytes().to_vec()),
         ),
         FuseRequest::Unlink { name } => {
             encode_result(hdr.unique, handler.unlink(hdr, name).map(|()| vec![]))
@@ -548,7 +552,9 @@ pub fn dispatch<H: FuseHandler>(
         }
         FuseRequest::Symlink { name, target } => encode_result(
             hdr.unique,
-            handler.symlink(hdr, name, target).map(|r| r.to_bytes().to_vec()),
+            handler
+                .symlink(hdr, name, target)
+                .map(|r| r.to_bytes().to_vec()),
         ),
         FuseRequest::Rename {
             ref body,
@@ -556,25 +562,29 @@ pub fn dispatch<H: FuseHandler>(
             new_name,
         } => encode_result(
             hdr.unique,
-            handler.rename(hdr, body, old_name, new_name).map(|()| vec![]),
+            handler
+                .rename(hdr, body, old_name, new_name)
+                .map(|()| vec![]),
         ),
         FuseRequest::Link { ref body, name } => encode_result(
             hdr.unique,
             handler.link(hdr, body, name).map(|r| r.to_bytes().to_vec()),
         ),
-        FuseRequest::Open(ref body) => {
-            encode_result(hdr.unique, handler.open(hdr, body).map(|r| r.to_bytes().to_vec()))
-        }
-        FuseRequest::Read(ref body) => {
-            encode_result(hdr.unique, handler.read(hdr, body))
-        }
+        FuseRequest::Open(ref body) => encode_result(
+            hdr.unique,
+            handler.open(hdr, body).map(|r| r.to_bytes().to_vec()),
+        ),
+        FuseRequest::Read(ref body) => encode_result(hdr.unique, handler.read(hdr, body)),
         FuseRequest::Write { ref body, data } => encode_result(
             hdr.unique,
-            handler.write(hdr, body, data).map(|r| r.to_bytes().to_vec()),
+            handler
+                .write(hdr, body, data)
+                .map(|r| r.to_bytes().to_vec()),
         ),
-        FuseRequest::Statfs => {
-            encode_result(hdr.unique, handler.statfs(hdr).map(|r| r.to_bytes().to_vec()))
-        }
+        FuseRequest::Statfs => encode_result(
+            hdr.unique,
+            handler.statfs(hdr).map(|r| r.to_bytes().to_vec()),
+        ),
         FuseRequest::Release(ref body) => {
             encode_result(hdr.unique, handler.release(hdr, body).map(|()| vec![]))
         }
@@ -584,12 +594,11 @@ pub fn dispatch<H: FuseHandler>(
         FuseRequest::Flush(ref body) => {
             encode_result(hdr.unique, handler.flush(hdr, body).map(|()| vec![]))
         }
-        FuseRequest::Opendir(ref body) => {
-            encode_result(hdr.unique, handler.opendir(hdr, body).map(|r| r.to_bytes().to_vec()))
-        }
-        FuseRequest::Readdir(ref body) => {
-            encode_result(hdr.unique, handler.readdir(hdr, body))
-        }
+        FuseRequest::Opendir(ref body) => encode_result(
+            hdr.unique,
+            handler.opendir(hdr, body).map(|r| r.to_bytes().to_vec()),
+        ),
+        FuseRequest::Readdir(ref body) => encode_result(hdr.unique, handler.readdir(hdr, body)),
         FuseRequest::Releasedir(ref body) => {
             encode_result(hdr.unique, handler.releasedir(hdr, body).map(|()| vec![]))
         }
@@ -634,8 +643,8 @@ fn encode_result(unique: u64, result: Result<Vec<u8>, i32>) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::{
-        FuseInitIn, FuseInitOut, FuseOpcode, FUSE_INIT_IN_LEN, FUSE_INIT_OUT_LEN,
-        FUSE_IN_HDR_LEN, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_OUT_HDR_LEN,
+        FuseInitIn, FuseInitOut, FuseOpcode, FUSE_INIT_IN_LEN, FUSE_INIT_OUT_LEN, FUSE_IN_HDR_LEN,
+        FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_OUT_HDR_LEN,
     };
 
     // ---- helpers ---------------------------------------------------------
@@ -698,10 +707,7 @@ mod tests {
     #[test]
     fn parse_lookup_carries_name_bytes() {
         let name = b"hello\0";
-        let pkt = packet(
-            &make_hdr(FuseOpcode::Lookup, name.len() as u32),
-            name,
-        );
+        let pkt = packet(&make_hdr(FuseOpcode::Lookup, name.len() as u32), name);
         let (_hdr, req) = parse_request(&pkt).unwrap();
         match req {
             FuseRequest::Lookup { name: parsed_name } => assert_eq!(parsed_name, name),
@@ -766,7 +772,10 @@ mod tests {
         );
         let (_hdr, req) = parse_request(&pkt).unwrap();
         match req {
-            FuseRequest::Write { body, data: parsed_data } => {
+            FuseRequest::Write {
+                body,
+                data: parsed_data,
+            } => {
                 assert_eq!(body.fh, 7);
                 assert_eq!(parsed_data, data.as_slice());
             }
