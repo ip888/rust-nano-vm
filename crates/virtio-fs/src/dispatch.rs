@@ -602,8 +602,14 @@ pub fn dispatch<H: FuseHandler>(
 
 /// Encode a handler result into a complete FUSE response packet.
 ///
-/// On `Ok(body_bytes)` → `FuseOutHeader::ok` + body.
-/// On `Err(errno)` → `FuseOutHeader::err` (no body).
+/// On `Ok(body_bytes)` → [`FuseOutHeader::ok`] + body bytes.
+/// On `Err(errno)` → [`FuseOutHeader::err`] (no body).
+///
+/// `errno` should be a **positive** POSIX error number (e.g. `ENOSYS = 38`).
+/// [`FuseOutHeader::err`] stores the negated value in the wire field so that
+/// the guest sees a negative errno, matching the FUSE wire convention.
+/// [`i32::unsigned_abs`] is used defensively so an accidentally-negated errno
+/// still encodes correctly.
 fn encode_result(unique: u64, result: Result<Vec<u8>, i32>) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(FUSE_OUT_HDR_LEN + 128);
     match result {
