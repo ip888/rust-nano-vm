@@ -60,7 +60,7 @@ crates/
 | **M0** | Workspace scaffold, `Hypervisor` trait, `vm-mock` backend, CI without KVM, docs | **no** | ✅ complete |
 | M1 | `vm-kvm` boots minimal kernel; serial "hello from guest" | yes | 🔲 next on KVM host |
 | M2 | virtio-vsock transport + musl guest agent; `nanovm exec <id> -- echo hi` round-trips | yes | 🔲 partial (wire types, connection state, guest-agent stdin/stdout mode, and CLI `ps` done) |
-| M3 | virtio-fs; `nanovm cp file.py <id>:/work/` | yes | 🔲 partial (FUSE framing done) |
+| M3 | virtio-fs; `nanovm cp file.py <id>:/work/` | yes | 🔲 partial (FUSE framing done, per-op bodies done, dispatch scaffolding done) |
 | M4 | Python / Node run in guest; stdio streaming demo | yes | 🔲 depends M2 |
 | M5 | Snapshot + fork via userfaultfd; warm pool; p50 < 50 ms cold start | yes | 🔲 on-disk format done |
 | M6 | Control plane lifecycle API on `vm-mock`; quotas, metering, and KVM wiring follow on top | **no** | ✅ complete (axum REST + bearer auth + integration tests) |
@@ -118,7 +118,30 @@ Stretch: M8 GPU passthrough, M9 multi-node, M10 confidential compute
       `Ping` and `Exec` requests over stdin/stdout (vsock wiring deferred
       to M2 on a KVM host).
 
-## M2 — still needs KVM host
+## M3 partial progress (no KVM needed for dispatch scaffolding)
+
+- [x] `virtio-fs`: FUSE protocol framing (`FuseInHeader`, `FuseOutHeader`,
+      `FuseOpcode`, all M3 spec constants).
+- [x] `virtio-fs`: Per-op body types (all request and response structs for
+      `Init`, `Forget`, `Getattr`, `Setattr`, `Lookup`, `Readlink`, `Mknod`,
+      `Mkdir`, `Unlink`, `Rmdir`, `Symlink`, `Rename`, `Link`, `Open`, `Read`,
+      `Write`, `Statfs`, `Release`, `Fsync`, `Flush`, `Opendir`, `Readdir`,
+      `Releasedir`, `Destroy`).
+- [x] `virtio-fs`: Dispatch scaffolding (`dispatch` module):
+      - `FuseRequest<'a>` enum — one zero-copy-parsed variant per opcode.
+      - `parse_request` — parses a raw byte slice into `(FuseInHeader, FuseRequest)`.
+      - `split_nul` — helper for extracting NUL-terminated names from payloads.
+      - `FuseHandler` trait — one method per opcode; all default to ENOSYS.
+      - `dispatch` — calls handler, serialises `FuseOutHeader` + body or
+        returns `None` for no-reply ops (`Forget`, `Destroy`).
+      - 19 unit tests (parse roundtrips, no-reply invariants, ENOSYS default).
+
+## M3 — still needs KVM host
+
+- [ ] Wire the virtqueue (MMIO/PCI) interrupt and ioeventfd plumbing into
+      the dispatch loop.
+- [ ] Implement a real `FuseHandler` backed by the host filesystem.
+- [ ] `nanovm cp file.py <id>:/work/` round-trips end-to-end.
 
 - [ ] Wire `virtio-vsock` into the KVM vCPU run loop (eventfd, virtqueue
       consumer, ioeventfd).
@@ -248,15 +271,59 @@ While a KVM host is being sourced, these items advance the project:
    page-fault handler to the `snapshot` crate. The on-disk format is done;
    the page-fault interception is the hard part.
 
+   **Done.** Added `snapshot::runtime` with:
+   - userfaultfd protocol constants (`UFFD_API`,
+     `UFFDIO_REGISTER_MODE_MISSING`, `UFFD_PAGEFAULT_FLAG_WRITE`)
+   - `UffdPagefaultEvent` normalized fault type
+   - `CowPager` fault-resolution state machine mapping guest fault addresses
+     to `memory.cow` page offsets (`PopulateFromBacking` / `AlreadyMapped`)
+   - runtime error model for alignment, bounds, and arithmetic-overflow safety
+   - unit tests for write-flag semantics, alignment, in-range checks, repeated
+     faults, and event flow
+
 2. **virtio-queue ring parsers** — complete the available/used ring, packed
    virtqueue, and guest-memory integration in `virtio-queue`. These are unit-
    testable with synthetic byte slices.
 
+   **Done.** `virtio-queue` now includes:
+   - packed virtqueue descriptor wire type and parser (`PackedDesc`,
+     `packed_ring_size`, `parse_packed_ring`)
+   - packed descriptor flag constants (`PACKED_DESC_F_*`)
+   - minimal guest-memory integration trait (`GuestMemory`) plus
+     `SliceGuestMemory` test/prototyping backend
+   - descriptor guest-memory helpers (`Descriptor::read_from`,
+     `Descriptor::write_to_guest`) with bounds/overflow checks
+   - split-ring support (`AvailRing`, `UsedRing`, iterators, push/accessors)
+     plus descriptor-table parsing (`desc_table_size`, `parse_descriptor_table`)
+
 3. **virtio-fs (M3 prep)** — add per-op FUSE request/response bodies and the
    dispatch scaffolding on top of the framing already in `virtio-fs`.
+
+   **Done.** All per-op body types and the full dispatch scaffolding are
+   complete and reflected in the M3 partial progress checklist above.
 
 4. **cargo-fuzz harnesses** — add fuzzing targets for `virtio-queue`,
    `virtio-vsock`, and `snapshot` parsers. Run locally with `cargo fuzz`.
 
+   **Done.** Six fuzz targets added:
+   - `crates/virtio-queue/fuzz/`: `desc_chain`, `avail_ring`, `used_ring`,
+     `packed_ring` (covers the new packed-ring parsing added in item 2)
+   - `crates/virtio-vsock/fuzz/`: `vsock_header` (with roundtrip property)
+   - `crates/snapshot/fuzz/`: `backing_header` (with roundtrip property),
+     `manifest_json`
+   - `crates/virtio-fs/fuzz/`: `fuse_request` (full FUSE packet parsing +
+     dispatch through a no-op handler; covers all 24 opcodes)
+
+   Run any target locally with `cargo +nightly fuzz run <target-name>` from
+   the relevant `fuzz/` directory. CI uses the xorshift smoke-fuzz unit tests
+   on stable; the cargo-fuzz harnesses are the deeper, guided fuzzing layer.
+
 5. **OpenAPI / Swagger spec** — auto-generate from the `control-plane`
    routes for external consumers and SDK generation.
+
+   **Done.** Added `nanovm-openapi` (`crates/control-plane/src/bin/openapi.rs`)
+   which emits the current OpenAPI 3.1 document from `openapi_spec()`.
+   Generated spec is checked in at `docs/openapi.json`.
+
+   Regenerate with:
+   `cargo run -p control-plane --bin nanovm-openapi > docs/openapi.json`.

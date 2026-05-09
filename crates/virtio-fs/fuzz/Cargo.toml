@@ -1,0 +1,24 @@
+[package]
+name = "virtio-fs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# This is a separate Cargo workspace so it does not get compiled as part of the
+# main workspace on stable (cargo-fuzz / libfuzzer require nightly).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+virtio-fs = { path = ".." }
+
+# Fuzz targets — each maps to a file under fuzz_targets/.
+
+[[bin]]
+name = "fuse_request"
+path = "fuzz_targets/fuse_request.rs"
+test = false
+doc = false

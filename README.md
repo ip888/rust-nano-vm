@@ -75,6 +75,8 @@ curl -X POST localhost:8080/v1/vms \
      -H 'content-type: application/json' -d '{}'
 curl localhost:8080/healthz   # /healthz is exempt from auth
 curl localhost:8080/openapi.json | jq '.info,.paths'  # OpenAPI 3.1 contract
+# Export the contract for SDK generation:
+cargo run -p control-plane --bin nanovm-openapi > docs/openapi.json
 ```
 
 On a Linux host with `/dev/kvm` (M1+):

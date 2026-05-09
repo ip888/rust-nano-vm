@@ -1,0 +1,21 @@
+[package]
+name = "virtio-vsock-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Separate workspace — compiled with nightly via `cargo +nightly fuzz run`.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+virtio-vsock = { path = ".." }
+
+[[bin]]
+name = "vsock_header"
+path = "fuzz_targets/vsock_header.rs"
+test = false
+doc = false
