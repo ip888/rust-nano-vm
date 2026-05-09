@@ -44,5 +44,6 @@ mod auth;
 mod error;
 mod routes;
 
+pub use api::openapi_spec;
 pub use auth::ApiTokens;
 pub use routes::{router, AppState};
