@@ -319,13 +319,13 @@ pub const VIRTQ_USED_F_NO_NOTIFY: u16 = 1 << 0;
 // Virtio feature-negotiation flag bits (VIRTQ_F_*)
 // ---------------------------------------------------------------------------
 
-/// `VIRTIO_F_INDIRECT_DESC` — Feature bit 28. When negotiated, a descriptor
+/// `VIRTQ_F_INDIRECT_DESC` — Feature bit 28. When negotiated, a descriptor
 /// with [`DESC_F_INDIRECT`] may point to a table of further descriptors
 /// rather than a direct buffer. Queried during feature negotiation; the
 /// 64-bit feature bitmap is used across all virtio transports (MMIO, PCI).
 pub const VIRTQ_F_INDIRECT_DESC: u64 = 1 << 28;
 
-/// `VIRTIO_F_EVENT_IDX` — Feature bit 29. When negotiated, the
+/// `VIRTQ_F_EVENT_IDX` — Feature bit 29. When negotiated, the
 /// `used_event` / `avail_event` fields in the available and used rings
 /// are meaningful and suppress unnecessary interrupts / kicks. Without
 /// this feature the event fields are reserved.
