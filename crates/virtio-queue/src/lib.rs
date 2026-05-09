@@ -278,6 +278,17 @@ pub enum QueueError {
         /// Configured queue size.
         qsize: u16,
     },
+    /// Backing buffer for a descriptor table is smaller than
+    /// `qsize * DESC_SIZE` bytes.
+    #[error("descriptor table buffer too small: have {have} bytes, need {need} (qsize={qsize})")]
+    ShortTable {
+        /// Bytes in the buffer we were handed.
+        have: usize,
+        /// Bytes the table requires (`qsize * DESC_SIZE`).
+        need: usize,
+        /// Configured queue size.
+        qsize: u16,
+    },
     /// Queue size is zero, larger than [`MAX_QUEUE_SIZE`], or not a power
     /// of two — virtio requires the latter.
     #[error("invalid queue size {qsize}; must be a power of two in 1..={max}")]
@@ -304,6 +315,22 @@ pub const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1 << 0;
 /// kick (notify) for newly-supplied descriptors.
 pub const VIRTQ_USED_F_NO_NOTIFY: u16 = 1 << 0;
 
+// ---------------------------------------------------------------------------
+// Virtio feature-negotiation flag bits (VIRTQ_F_*)
+// ---------------------------------------------------------------------------
+
+/// `VIRTQ_F_INDIRECT_DESC` — Feature bit 28. When negotiated, a descriptor
+/// with [`DESC_F_INDIRECT`] may point to a table of further descriptors
+/// rather than a direct buffer. Queried during feature negotiation; the
+/// 64-bit feature bitmap is used across all virtio transports (MMIO, PCI).
+pub const VIRTQ_F_INDIRECT_DESC: u64 = 1 << 28;
+
+/// `VIRTQ_F_EVENT_IDX` — Feature bit 29. When negotiated, the
+/// `used_event` / `avail_event` fields in the available and used rings
+/// are meaningful and suppress unnecessary interrupts / kicks. Without
+/// this feature the event fields are reserved.
+pub const VIRTQ_F_EVENT_IDX: u64 = 1 << 29;
+
 /// Bytes occupied by an available ring of the given queue size:
 /// `flags(2) + idx(2) + ring(2 * qsize) + used_event(2)`.
 pub fn avail_ring_size(qsize: u16) -> usize {
@@ -314,6 +341,49 @@ pub fn avail_ring_size(qsize: u16) -> usize {
 /// `flags(2) + idx(2) + ring(8 * qsize) + avail_event(2)`.
 pub fn used_ring_size(qsize: u16) -> usize {
     6 + 8 * qsize as usize
+}
+
+/// Bytes occupied by a descriptor table of the given queue size:
+/// `qsize * DESC_SIZE`.
+pub fn desc_table_size(qsize: u16) -> usize {
+    qsize as usize * DESC_SIZE
+}
+
+/// Parse an entire descriptor table from the first `qsize * DESC_SIZE` bytes
+/// of `buf`. Returns a [`Vec<Descriptor>`] of length `qsize` in table order.
+///
+/// `qsize` must be a power of two in `1..=`[`MAX_QUEUE_SIZE`]. `buf` must be
+/// at least [`desc_table_size`]`(qsize)` bytes; any trailing bytes are
+/// ignored so callers can pass a larger guest-memory window.
+///
+/// Each descriptor is parsed and validated individually; the first
+/// [`QueueError`] encountered is returned immediately.
+///
+/// # Errors
+///
+/// - [`QueueError::BadQueueSize`] if `qsize` is invalid.
+/// - [`QueueError::ShortTable`] if `buf` is too short.
+/// - [`QueueError::ShortDescriptor`] is unreachable in practice (the inner
+///   loop always passes exactly `DESC_SIZE` bytes) but propagated for
+///   completeness.
+pub fn parse_descriptor_table(buf: &[u8], qsize: u16) -> Result<Vec<Descriptor>, QueueError> {
+    validate_qsize(qsize)?;
+    let need = desc_table_size(qsize);
+    if buf.len() < need {
+        return Err(QueueError::ShortTable {
+            have: buf.len(),
+            need,
+            qsize,
+        });
+    }
+    let mut table = Vec::with_capacity(qsize as usize);
+    for i in 0..qsize as usize {
+        let off = i * DESC_SIZE;
+        // We sliced exactly DESC_SIZE bytes, so from_bytes cannot return
+        // ShortDescriptor here; the ? is a safety net for future validation.
+        table.push(Descriptor::from_bytes(&buf[off..off + DESC_SIZE])?);
+    }
+    Ok(table)
 }
 
 fn validate_qsize(qsize: u16) -> Result<(), QueueError> {
@@ -1008,6 +1078,122 @@ mod tests {
             for r in DescriptorChain::new(&table, head) {
                 let _ = r;
             }
+        }
+    }
+
+    // ---- Feature-negotiation flag constants ---------------------------
+
+    #[test]
+    fn feature_flag_constants_match_virtio_spec() {
+        // Pinned from virtio 1.3 §6 "Reserved Feature Bits".
+        assert_eq!(VIRTQ_F_INDIRECT_DESC, 1u64 << 28);
+        assert_eq!(VIRTQ_F_EVENT_IDX, 1u64 << 29);
+        // They must be distinct bits.
+        assert_eq!(VIRTQ_F_INDIRECT_DESC & VIRTQ_F_EVENT_IDX, 0);
+    }
+
+    // ---- parse_descriptor_table ---------------------------------------
+
+    #[test]
+    fn desc_table_size_matches_formula() {
+        assert_eq!(desc_table_size(1), DESC_SIZE);
+        assert_eq!(desc_table_size(4), 4 * DESC_SIZE);
+        assert_eq!(desc_table_size(256), 256 * DESC_SIZE);
+    }
+
+    #[test]
+    fn parse_descriptor_table_roundtrips_table() {
+        let original = vec![
+            Descriptor {
+                addr: 0x1000,
+                len: 512,
+                flags: 0,
+                next: 0,
+            },
+            Descriptor {
+                addr: 0x2000,
+                len: 1024,
+                flags: DESC_F_WRITE,
+                next: 0,
+            },
+            Descriptor {
+                addr: 0x3000,
+                len: 64,
+                flags: DESC_F_NEXT,
+                next: 2,
+            },
+            Descriptor {
+                addr: 0x4000,
+                len: 128,
+                flags: DESC_F_NEXT | DESC_F_WRITE,
+                next: 1,
+            },
+        ];
+        let qsize = original.len() as u16;
+        // Serialize table into a flat byte buffer.
+        let mut buf = vec![0u8; desc_table_size(qsize)];
+        for (i, d) in original.iter().enumerate() {
+            d.write_to(&mut buf[i * DESC_SIZE..]).unwrap();
+        }
+        let parsed = parse_descriptor_table(&buf, qsize).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn parse_descriptor_table_accepts_longer_buffer() {
+        let qsize = 2u16;
+        let mut buf = vec![0u8; desc_table_size(qsize) + 32]; // 32 trailing bytes
+        let d = Descriptor {
+            addr: 0xDEAD,
+            len: 4,
+            flags: 0,
+            next: 0,
+        };
+        d.write_to(&mut buf[0..]).unwrap();
+        d.write_to(&mut buf[DESC_SIZE..]).unwrap();
+        let parsed = parse_descriptor_table(&buf, qsize).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.iter().all(|x| *x == d));
+    }
+
+    #[test]
+    fn parse_descriptor_table_rejects_short_buffer() {
+        let qsize = 4u16;
+        let short = vec![0u8; desc_table_size(qsize) - 1];
+        let err = parse_descriptor_table(&short, qsize).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                QueueError::ShortTable {
+                    have,
+                    need,
+                    qsize: 4
+                } if have == short.len() && need == desc_table_size(4)
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_descriptor_table_rejects_bad_qsize() {
+        let buf = vec![0u8; 1024];
+        let err = parse_descriptor_table(&buf, 0).unwrap_err();
+        assert!(matches!(err, QueueError::BadQueueSize { qsize: 0, .. }));
+        let err = parse_descriptor_table(&buf, 3).unwrap_err();
+        assert!(matches!(err, QueueError::BadQueueSize { qsize: 3, .. }));
+    }
+
+    #[test]
+    fn parse_descriptor_table_never_panics_on_random_input() {
+        let mut rng = XorShift(0xF00D_CAFE_BABE_5EED);
+        let mut buf = vec![0u8; desc_table_size(32)];
+        for _ in 0..100 {
+            // Use small qsizes so the test isn't slow; still exercises parsing.
+            let qsize = [1u16, 2, 4, 8, 16, 32][rng.next() as usize % 6];
+            let len = (rng.next() as usize) % (desc_table_size(qsize) + 8);
+            let len = len.min(buf.len());
+            rng.fill(&mut buf[..len]);
+            let _ = parse_descriptor_table(&buf[..len], qsize);
         }
     }
 }
