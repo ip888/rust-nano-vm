@@ -480,7 +480,7 @@ mod tests {
         };
         let b = h.to_bytes();
         assert_eq!(&b[0..4], &[0x01; 4]);
-        assert_eq!(&b[4..8], &[0x01, 0x00, 0x00, 0x00]); // opcode = 1 LE
+        assert_eq!(&b[4..8], &FuseOpcode::Lookup.as_raw().to_le_bytes());
         assert_eq!(&b[8..16], &[0x03; 8]);
         assert_eq!(&b[16..24], &[0x04; 8]);
         assert_eq!(&b[24..28], &[0x05; 4]);
