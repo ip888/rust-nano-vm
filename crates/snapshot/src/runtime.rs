@@ -122,12 +122,13 @@ impl CowPager {
                 page_size: backing.page_size,
             });
         }
-        let resident_len: usize = backing
-            .page_count
-            .try_into()
-            .map_err(|_| RuntimeError::PageCountTooLarge {
-                page_count: backing.page_count,
-            })?;
+        let resident_len: usize =
+            backing
+                .page_count
+                .try_into()
+                .map_err(|_| RuntimeError::PageCountTooLarge {
+                    page_count: backing.page_count,
+                })?;
         Ok(Self {
             base_addr,
             page_size: backing.page_size,
