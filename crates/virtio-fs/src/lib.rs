@@ -921,4 +921,21 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn parse_request_never_panics_on_random_input() {
+        use crate::dispatch::parse_request;
+        // Drive parse_request — the top-level FUSE packet dispatcher — against
+        // random byte slices of varying lengths. Covers all opcode branches and
+        // the variable-length payload paths (names, write data, ...).
+        let mut rng = XorShift(0xEEEE_EEEE_EEEE_EEEE);
+        let mut buf = vec![0u8; 256];
+        for _ in 0..10_000 {
+            let len = (rng.next() as usize) % buf.len();
+            for slot in buf.iter_mut().take(len) {
+                *slot = (rng.next() & 0xFF) as u8;
+            }
+            let _ = parse_request(&buf[..len]);
+        }
+    }
 }
