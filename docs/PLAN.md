@@ -281,5 +281,15 @@ While a KVM host is being sourced, these items advance the project:
 4. **cargo-fuzz harnesses** — add fuzzing targets for `virtio-queue`,
    `virtio-vsock`, and `snapshot` parsers. Run locally with `cargo fuzz`.
 
+   **Done.** Six fuzz targets added:
+   - `crates/virtio-queue/fuzz/`: `desc_chain`, `avail_ring`, `used_ring`
+   - `crates/virtio-vsock/fuzz/`: `vsock_header` (with roundtrip property)
+   - `crates/snapshot/fuzz/`: `backing_header` (with roundtrip property),
+     `manifest_json`
+
+   Run any target locally with `cargo +nightly fuzz run <target-name>` from
+   the relevant `fuzz/` directory. CI uses the xorshift smoke-fuzz unit tests
+   on stable; the cargo-fuzz harnesses are the deeper, guided fuzzing layer.
+
 5. **OpenAPI / Swagger spec** — auto-generate from the `control-plane`
    routes for external consumers and SDK generation.

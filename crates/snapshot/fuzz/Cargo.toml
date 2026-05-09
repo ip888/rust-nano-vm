@@ -1,0 +1,27 @@
+[package]
+name = "snapshot-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Separate workspace — compiled with nightly via `cargo +nightly fuzz run`.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+snapshot = { path = ".." }
+
+[[bin]]
+name = "backing_header"
+path = "fuzz_targets/backing_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "manifest_json"
+path = "fuzz_targets/manifest_json.rs"
+test = false
+doc = false
