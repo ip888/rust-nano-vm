@@ -38,8 +38,8 @@ use tower_http::trace::TraceLayer;
 use vm_core::{Hypervisor, SnapshotId, VmId};
 
 use crate::api::{
-    CreateVmRequest, SnapshotDto, SnapshotListEntry, SnapshotListResponse, SnapshotRequest,
-    VmHandleDto, VmListEntry, VmListResponse, VmStateResponse,
+    openapi_spec, CreateVmRequest, SnapshotDto, SnapshotListEntry, SnapshotListResponse,
+    SnapshotRequest, VmHandleDto, VmListEntry, VmListResponse, VmStateResponse,
 };
 use crate::auth;
 use crate::error::ApiError;
@@ -98,12 +98,17 @@ pub fn router() -> Router<AppState> {
 
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/openapi.json", get(openapi))
         .nest("/v1", v1)
         .layer(TraceLayer::new_for_http())
 }
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+async fn openapi() -> Json<serde_json::Value> {
+    Json(openapi_spec())
 }
 
 // Each handler takes extractors as `Result<Extractor, Rejection>` and `?`s the

@@ -97,6 +97,7 @@ Stretch: M8 GPU passthrough, M9 multi-node, M10 confidential compute
       `POST /v1/vms/:id/start`, `POST /v1/vms/:id/stop`,
       `POST /v1/vms/:id/snapshot`, `DELETE /v1/vms/:id`,
       `POST /v1/snapshots/:id/restore`, `GET /healthz`.
+- [x] OpenAPI 3.1 JSON contract published at `GET /openapi.json`.
 - [x] Bearer-token auth middleware (`NANOVM_API_TOKENS` env).
 - [x] Structured JSON error envelope `{"error":{"code":"...","message":"..."}}`.
 - [x] `nanovm-control-plane` binary wrapping `MockHypervisor` (real KVM
