@@ -12,18 +12,29 @@
 //!   [`FUSE_IN_HDR_LEN`], [`FUSE_OUT_HDR_LEN`].
 //! - Per-op body types in the [`body`] module:
 //!     - [`FuseInitIn`] / [`FuseInitOut`] — `Init` handshake
-//!     - [`FuseAttr`] — inode metadata for `Getattr` / `Setattr`
+//!     - [`FuseForgetIn`] — `Forget` (no reply; returns inode refs to host)
+//!     - [`FuseAttr`] — inode metadata embedded in multiple responses
+//!     - [`FuseAttrOut`] — `Getattr` / `Setattr` response (attr + TTL)
+//!     - [`FuseGetattrIn`] — `Getattr` request body
+//!     - [`FuseSetattrIn`] — `Setattr` request body (uses [`body::fattr`]
+//!       bitmask constants)
 //!     - [`FuseEntryOut`] — directory entry for `Lookup`, `Mknod`,
 //!       `Mkdir`, `Symlink`, `Link`
-//!     - [`FuseOpenIn`] / [`FuseOpenOut`] — `Open` / `Opendir`
+//!     - [`FuseMknodIn`] — `Mknod` request body
+//!     - [`FuseMkdirIn`] — `Mkdir` request body
+//!     - [`FuseRenameIn`] — `Rename` request body
+//!     - [`FuseLinkIn`] — `Link` request body
+//!     - [`FuseOpenIn`] / [`FuseOpenOut`] — `Open` / `Opendir` (response
+//!       flags in [`body::fopen`])
 //!     - [`FuseReadIn`] — `Read` and `Readdir` request (response is
 //!       a bare byte stream of up to `size` bytes; for `Readdir`
 //!       it's a sequence of `fuse_dirent` records — see
 //!       [`FuseDirentWriter`] / [`FuseDirentIter`])
 //!     - [`FuseWriteIn`] / [`FuseWriteOut`] — `Write`
+//!     - [`FuseFsyncIn`] — `Fsync` / `Fsyncdir` request body
 //!     - [`FuseFlushIn`] — `Flush` (commits cached writes before close)
-//!     - [`FuseReleaseIn`] — `Release` / `Releasedir` (drops a file
-//!       handle)
+//!     - [`FuseReleaseIn`] — `Release` / `Releasedir` (drops a file handle)
+//!     - [`FuseStatfsOut`] — `Statfs` response body
 //!
 //! With the per-op body surface complete, the remaining M3 work is
 //! the dispatch loop that reads a [`FuseInHeader`] from a virtqueue
@@ -64,12 +75,16 @@
 pub mod body;
 
 pub use body::{
-    dt, fuse_dirent_padded_size, DirentWriteError, FuseAttr, FuseDirentHeader, FuseDirentIter,
-    FuseDirentWriter, FuseEntryOut, FuseFlushIn, FuseInitIn, FuseInitOut, FuseOpenIn, FuseOpenOut,
-    FuseReadIn, FuseReleaseIn, FuseWriteIn, FuseWriteOut, FUSE_ATTR_LEN, FUSE_DIRENT_ALIGN,
-    FUSE_DIRENT_HDR_LEN, FUSE_ENTRY_OUT_LEN, FUSE_FLUSH_IN_LEN, FUSE_INIT_IN_LEN,
-    FUSE_INIT_OUT_LEN, FUSE_OPEN_IN_LEN, FUSE_OPEN_OUT_LEN, FUSE_READ_IN_LEN, FUSE_RELEASE_IN_LEN,
-    FUSE_WRITE_IN_LEN, FUSE_WRITE_OUT_LEN,
+    dt, fattr, fopen, fuse_dirent_padded_size, DirentWriteError, FuseAttr, FuseAttrOut,
+    FuseDirentHeader, FuseDirentIter, FuseDirentWriter, FuseEntryOut, FuseFlushIn, FuseForgetIn,
+    FuseFsyncIn, FuseGetattrIn, FuseInitIn, FuseInitOut, FuseLinkIn, FuseMkdirIn, FuseMknodIn,
+    FuseOpenIn, FuseOpenOut, FuseReadIn, FuseReleaseIn, FuseRenameIn, FuseSetattrIn, FuseStatfsOut,
+    FuseWriteIn, FuseWriteOut, FUSE_ATTR_LEN, FUSE_ATTR_OUT_LEN, FUSE_DIRENT_ALIGN,
+    FUSE_DIRENT_HDR_LEN, FUSE_ENTRY_OUT_LEN, FUSE_FLUSH_IN_LEN, FUSE_FORGET_IN_LEN,
+    FUSE_FSYNC_FDATASYNC, FUSE_FSYNC_IN_LEN, FUSE_GETATTR_FH, FUSE_GETATTR_IN_LEN,
+    FUSE_INIT_IN_LEN, FUSE_INIT_OUT_LEN, FUSE_LINK_IN_LEN, FUSE_MKDIR_IN_LEN, FUSE_MKNOD_IN_LEN,
+    FUSE_OPEN_IN_LEN, FUSE_OPEN_OUT_LEN, FUSE_READ_IN_LEN, FUSE_RELEASE_IN_LEN, FUSE_RENAME_IN_LEN,
+    FUSE_SETATTR_IN_LEN, FUSE_STATFS_OUT_LEN, FUSE_WRITE_IN_LEN, FUSE_WRITE_OUT_LEN,
 };
 
 use thiserror::Error;
@@ -807,6 +822,76 @@ mod tests {
     fn fuse_release_in_from_bytes_never_panics_on_random_input() {
         fuzz_parser(0xFFFF_FFFF_FFFF_FFFF, 64, |b| {
             let _ = FuseReleaseIn::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_forget_in_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x1010_1010_1010_1010, 32, |b| {
+            let _ = FuseForgetIn::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_getattr_in_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x2020_2020_2020_2020, 48, |b| {
+            let _ = FuseGetattrIn::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_attr_out_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x3030_3030_3030_3030, 192, |b| {
+            let _ = FuseAttrOut::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_setattr_in_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x4040_4040_4040_4040, 160, |b| {
+            let _ = FuseSetattrIn::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_statfs_out_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x5050_5050_5050_5050, 128, |b| {
+            let _ = FuseStatfsOut::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_mknod_in_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x6060_6060_6060_6060, 48, |b| {
+            let _ = FuseMknodIn::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_mkdir_in_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x7070_7070_7070_7070, 32, |b| {
+            let _ = FuseMkdirIn::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_fsync_in_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x8080_8080_8080_8080, 48, |b| {
+            let _ = FuseFsyncIn::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_rename_in_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0x9090_9090_9090_9090, 32, |b| {
+            let _ = FuseRenameIn::from_bytes(b);
+        });
+    }
+
+    #[test]
+    fn fuse_link_in_from_bytes_never_panics_on_random_input() {
+        fuzz_parser(0xA0A0_A0A0_A0A0_A0A0, 32, |b| {
+            let _ = FuseLinkIn::from_bytes(b);
         });
     }
 

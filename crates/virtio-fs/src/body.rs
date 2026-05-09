@@ -866,6 +866,768 @@ impl FuseReleaseIn {
 }
 
 // ---------------------------------------------------------------------------
+// fuse_forget_in (FUSE_FORGET)
+// ---------------------------------------------------------------------------
+
+/// On-the-wire size of [`FuseForgetIn`] in bytes.
+pub const FUSE_FORGET_IN_LEN: usize = 8;
+
+/// Body of a `FUSE_FORGET` request. Tells the host that the kernel is
+/// releasing `nlookup` references to the inode identified by the header's
+/// `nodeid`. Unlike every other FUSE operation, `FUSE_FORGET` has **no
+/// reply** — the host must never send a response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseForgetIn {
+    /// Number of lookup references the kernel is returning. The host
+    /// decrements its reference count by this amount, and may free
+    /// inode state once it reaches zero.
+    pub nlookup: u64,
+}
+
+impl FuseForgetIn {
+    /// Parse the first [`FUSE_FORGET_IN_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_FORGET_IN_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_FORGET_IN_LEN,
+            });
+        }
+        Ok(Self {
+            nlookup: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize into `buf` (must be at least [`FUSE_FORGET_IN_LEN`] bytes).
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_FORGET_IN_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_FORGET_IN_LEN,
+            });
+        }
+        buf[0..8].copy_from_slice(&self.nlookup.to_le_bytes());
+        Ok(FUSE_FORGET_IN_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_FORGET_IN_LEN] {
+        let mut out = [0u8; FUSE_FORGET_IN_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseForgetIn into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fuse_getattr_in (FUSE_GETATTR)
+// ---------------------------------------------------------------------------
+
+/// On-the-wire size of [`FuseGetattrIn`] in bytes.
+pub const FUSE_GETATTR_IN_LEN: usize = 16;
+
+/// When set in [`FuseGetattrIn::getattr_flags`], the request targets an open
+/// file handle: the host should use `fh` instead of `nodeid` to look up the
+/// file.
+pub const FUSE_GETATTR_FH: u32 = 1 << 0;
+
+/// Body of a `FUSE_GETATTR` request.
+///
+/// The host responds with a [`FuseAttrOut`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseGetattrIn {
+    /// Bitfield of `FUSE_GETATTR_*` flags (currently only
+    /// [`FUSE_GETATTR_FH`]).
+    pub getattr_flags: u32,
+    /// Reserved; writers MUST emit `0`, readers MUST ignore.
+    pub dummy: u32,
+    /// Open file handle — valid only when [`FUSE_GETATTR_FH`] is set in
+    /// `getattr_flags`.
+    pub fh: u64,
+}
+
+impl FuseGetattrIn {
+    /// Parse the first [`FUSE_GETATTR_IN_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_GETATTR_IN_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_GETATTR_IN_LEN,
+            });
+        }
+        Ok(Self {
+            getattr_flags: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            dummy: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            fh: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize into `buf` (must be at least [`FUSE_GETATTR_IN_LEN`] bytes).
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_GETATTR_IN_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_GETATTR_IN_LEN,
+            });
+        }
+        buf[0..4].copy_from_slice(&self.getattr_flags.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.dummy.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.fh.to_le_bytes());
+        Ok(FUSE_GETATTR_IN_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_GETATTR_IN_LEN] {
+        let mut out = [0u8; FUSE_GETATTR_IN_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseGetattrIn into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fuse_attr_out (FUSE_GETATTR / FUSE_SETATTR response)
+// ---------------------------------------------------------------------------
+
+/// On-the-wire size of [`FuseAttrOut`] in bytes:
+/// `attr_valid(8) + attr_valid_nsec(4) + dummy(4) + attr(88)` = 104.
+pub const FUSE_ATTR_OUT_LEN: usize = 16 + FUSE_ATTR_LEN;
+
+/// Response body for `FUSE_GETATTR` and `FUSE_SETATTR`. Contains the current
+/// (or updated) file attributes together with TTL hints that tell the kernel
+/// how long to cache them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseAttrOut {
+    /// How long the kernel may cache the embedded attributes (seconds).
+    pub attr_valid: u64,
+    /// Sub-second part of `attr_valid` (nanoseconds).
+    pub attr_valid_nsec: u32,
+    /// Reserved; writers MUST emit `0`, readers MUST ignore.
+    pub dummy: u32,
+    /// Current file attributes.
+    pub attr: FuseAttr,
+}
+
+impl FuseAttrOut {
+    /// Parse the first [`FUSE_ATTR_OUT_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_ATTR_OUT_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_ATTR_OUT_LEN,
+            });
+        }
+        Ok(Self {
+            attr_valid: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            attr_valid_nsec: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            dummy: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            attr: FuseAttr::from_bytes(&buf[16..16 + FUSE_ATTR_LEN])?,
+        })
+    }
+
+    /// Serialize into `buf` (must be at least [`FUSE_ATTR_OUT_LEN`] bytes).
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_ATTR_OUT_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_ATTR_OUT_LEN,
+            });
+        }
+        buf[0..8].copy_from_slice(&self.attr_valid.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.attr_valid_nsec.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.dummy.to_le_bytes());
+        self.attr.write_to(&mut buf[16..16 + FUSE_ATTR_LEN])?;
+        Ok(FUSE_ATTR_OUT_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_ATTR_OUT_LEN] {
+        let mut out = [0u8; FUSE_ATTR_OUT_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseAttrOut into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fuse_setattr_in (FUSE_SETATTR)
+// ---------------------------------------------------------------------------
+
+/// On-the-wire size of [`FuseSetattrIn`] in bytes.
+pub const FUSE_SETATTR_IN_LEN: usize = 88;
+
+/// `FATTR_*` valid-bit constants for the [`FuseSetattrIn::valid`] field.
+///
+/// Each bit tells the host which fields in [`FuseSetattrIn`] the kernel
+/// wants updated. Bits not set MUST be ignored by the host.
+pub mod fattr {
+    /// Update the file's mode (permission bits + file type).
+    pub const MODE: u32 = 1 << 0;
+    /// Update the file's owner user id.
+    pub const UID: u32 = 1 << 1;
+    /// Update the file's owner group id.
+    pub const GID: u32 = 1 << 2;
+    /// Truncate / extend the file to [`super::FuseSetattrIn::size`].
+    pub const SIZE: u32 = 1 << 3;
+    /// Set `atime` to the value in [`super::FuseSetattrIn::atime`].
+    pub const ATIME: u32 = 1 << 4;
+    /// Set `mtime` to the value in [`super::FuseSetattrIn::mtime`].
+    pub const MTIME: u32 = 1 << 5;
+    /// The request targets an open file handle; the host should use
+    /// [`super::FuseSetattrIn::fh`] for the underlying syscall.
+    pub const FH: u32 = 1 << 6;
+    /// Set `atime` to the current wall-clock time (ignore the `atime`
+    /// field in [`super::FuseSetattrIn`]).
+    pub const ATIME_NOW: u32 = 1 << 7;
+    /// Set `mtime` to the current wall-clock time (ignore the `mtime`
+    /// field in [`super::FuseSetattrIn`]).
+    pub const MTIME_NOW: u32 = 1 << 8;
+    /// Update the POSIX lock owner associated with the file.
+    pub const LOCKOWNER: u32 = 1 << 9;
+    /// Set `ctime` to the value in [`super::FuseSetattrIn::ctime`].
+    pub const CTIME: u32 = 1 << 10;
+    /// Strip set-uid / set-gid bits (requires kernel support for this flag).
+    pub const KILL_SUIDGID: u32 = 1 << 11;
+}
+
+/// Body of a `FUSE_SETATTR` request. The `valid` bitmask (using [`fattr`]
+/// constants) tells the host which fields to apply; all others MUST be
+/// ignored.
+///
+/// The host responds with a [`FuseAttrOut`] containing the updated
+/// attributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseSetattrIn {
+    /// Bitmask of `FATTR_*` bits indicating which fields are valid.
+    pub valid: u32,
+    /// Padding; writers MUST emit `0`, readers MUST ignore.
+    pub padding: u32,
+    /// Open file handle (used when [`fattr::FH`] is set in `valid`).
+    pub fh: u64,
+    /// New file size in bytes (used when [`fattr::SIZE`] is set).
+    pub size: u64,
+    /// POSIX lock owner (used when [`fattr::LOCKOWNER`] is set).
+    pub lock_owner: u64,
+    /// New access time, seconds since epoch (used when [`fattr::ATIME`] is set).
+    pub atime: u64,
+    /// New modification time, seconds since epoch (used when [`fattr::MTIME`] is set).
+    pub mtime: u64,
+    /// New status-change time, seconds since epoch (used when [`fattr::CTIME`] is set).
+    pub ctime: u64,
+    /// Sub-second part of `atime` in nanoseconds.
+    pub atimensec: u32,
+    /// Sub-second part of `mtime` in nanoseconds.
+    pub mtimensec: u32,
+    /// Sub-second part of `ctime` in nanoseconds.
+    pub ctimensec: u32,
+    /// New file mode (used when [`fattr::MODE`] is set).
+    pub mode: u32,
+    /// Reserved; writers MUST emit `0`, readers MUST ignore.
+    pub unused4: u32,
+    /// New owner user id (used when [`fattr::UID`] is set).
+    pub uid: u32,
+    /// New owner group id (used when [`fattr::GID`] is set).
+    pub gid: u32,
+    /// Reserved; writers MUST emit `0`, readers MUST ignore.
+    pub unused5: u32,
+}
+
+impl FuseSetattrIn {
+    /// Parse the first [`FUSE_SETATTR_IN_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_SETATTR_IN_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_SETATTR_IN_LEN,
+            });
+        }
+        Ok(Self {
+            valid: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            padding: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            fh: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            size: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            lock_owner: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+            atime: u64::from_le_bytes(buf[32..40].try_into().unwrap()),
+            mtime: u64::from_le_bytes(buf[40..48].try_into().unwrap()),
+            ctime: u64::from_le_bytes(buf[48..56].try_into().unwrap()),
+            atimensec: u32::from_le_bytes(buf[56..60].try_into().unwrap()),
+            mtimensec: u32::from_le_bytes(buf[60..64].try_into().unwrap()),
+            ctimensec: u32::from_le_bytes(buf[64..68].try_into().unwrap()),
+            mode: u32::from_le_bytes(buf[68..72].try_into().unwrap()),
+            unused4: u32::from_le_bytes(buf[72..76].try_into().unwrap()),
+            uid: u32::from_le_bytes(buf[76..80].try_into().unwrap()),
+            gid: u32::from_le_bytes(buf[80..84].try_into().unwrap()),
+            unused5: u32::from_le_bytes(buf[84..88].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize into `buf` (must be at least [`FUSE_SETATTR_IN_LEN`] bytes).
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_SETATTR_IN_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_SETATTR_IN_LEN,
+            });
+        }
+        buf[0..4].copy_from_slice(&self.valid.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.padding.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.fh.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.size.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.lock_owner.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.atime.to_le_bytes());
+        buf[40..48].copy_from_slice(&self.mtime.to_le_bytes());
+        buf[48..56].copy_from_slice(&self.ctime.to_le_bytes());
+        buf[56..60].copy_from_slice(&self.atimensec.to_le_bytes());
+        buf[60..64].copy_from_slice(&self.mtimensec.to_le_bytes());
+        buf[64..68].copy_from_slice(&self.ctimensec.to_le_bytes());
+        buf[68..72].copy_from_slice(&self.mode.to_le_bytes());
+        buf[72..76].copy_from_slice(&self.unused4.to_le_bytes());
+        buf[76..80].copy_from_slice(&self.uid.to_le_bytes());
+        buf[80..84].copy_from_slice(&self.gid.to_le_bytes());
+        buf[84..88].copy_from_slice(&self.unused5.to_le_bytes());
+        Ok(FUSE_SETATTR_IN_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_SETATTR_IN_LEN] {
+        let mut out = [0u8; FUSE_SETATTR_IN_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseSetattrIn into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fuse_statfs_out (FUSE_STATFS)
+// ---------------------------------------------------------------------------
+
+/// On-the-wire size of [`FuseStatfsOut`] in bytes.
+pub const FUSE_STATFS_OUT_LEN: usize = 80;
+
+/// Response body for `FUSE_STATFS`. Contains the filesystem statistics the
+/// kernel's `statfs(2)` / `statvfs(2)` calls will surface to userspace.
+///
+/// ```c
+/// struct fuse_kstatfs {
+///     uint64_t blocks;      // Total data blocks (in block-size units)
+///     uint64_t bfree;       // Free blocks
+///     uint64_t bavail;      // Free blocks for unprivileged users
+///     uint64_t files;       // Total file nodes (inodes)
+///     uint64_t ffree;       // Free file nodes
+///     uint32_t bsize;       // Filesystem block size
+///     uint32_t namelen;     // Maximum filename length
+///     uint32_t frsize;      // Fragment size (same as bsize for most FS)
+///     uint32_t padding;
+///     uint32_t spare[6];
+/// };
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseStatfsOut {
+    /// Total data blocks in the filesystem (in `bsize`-byte units).
+    pub blocks: u64,
+    /// Free data blocks.
+    pub bfree: u64,
+    /// Free data blocks available to non-privileged processes.
+    pub bavail: u64,
+    /// Total number of file nodes (inodes).
+    pub files: u64,
+    /// Free file nodes.
+    pub ffree: u64,
+    /// Filesystem block size in bytes.
+    pub bsize: u32,
+    /// Maximum length of a filename component (bytes).
+    pub namelen: u32,
+    /// Fragment size — equal to `bsize` for most filesystems.
+    pub frsize: u32,
+    /// Padding; writers MUST emit `0`, readers MUST ignore.
+    pub padding: u32,
+    /// Reserved; writers MUST emit `0`, readers MUST ignore.
+    pub spare: [u32; 6],
+}
+
+impl FuseStatfsOut {
+    /// Parse the first [`FUSE_STATFS_OUT_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_STATFS_OUT_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_STATFS_OUT_LEN,
+            });
+        }
+        let mut spare = [0u32; 6];
+        for (i, slot) in spare.iter_mut().enumerate() {
+            let off = 56 + 4 * i;
+            *slot = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        }
+        Ok(Self {
+            blocks: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            bfree: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            bavail: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            files: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+            ffree: u64::from_le_bytes(buf[32..40].try_into().unwrap()),
+            bsize: u32::from_le_bytes(buf[40..44].try_into().unwrap()),
+            namelen: u32::from_le_bytes(buf[44..48].try_into().unwrap()),
+            frsize: u32::from_le_bytes(buf[48..52].try_into().unwrap()),
+            padding: u32::from_le_bytes(buf[52..56].try_into().unwrap()),
+            spare,
+        })
+    }
+
+    /// Serialize into `buf` (must be at least [`FUSE_STATFS_OUT_LEN`] bytes).
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_STATFS_OUT_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_STATFS_OUT_LEN,
+            });
+        }
+        buf[0..8].copy_from_slice(&self.blocks.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.bfree.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.bavail.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.files.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.ffree.to_le_bytes());
+        buf[40..44].copy_from_slice(&self.bsize.to_le_bytes());
+        buf[44..48].copy_from_slice(&self.namelen.to_le_bytes());
+        buf[48..52].copy_from_slice(&self.frsize.to_le_bytes());
+        buf[52..56].copy_from_slice(&self.padding.to_le_bytes());
+        for (i, w) in self.spare.iter().enumerate() {
+            let off = 56 + 4 * i;
+            buf[off..off + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        Ok(FUSE_STATFS_OUT_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_STATFS_OUT_LEN] {
+        let mut out = [0u8; FUSE_STATFS_OUT_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseStatfsOut into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fuse_mknod_in (FUSE_MKNOD)
+// ---------------------------------------------------------------------------
+
+/// On-the-wire size of [`FuseMknodIn`] in bytes.
+pub const FUSE_MKNOD_IN_LEN: usize = 16;
+
+/// Body of a `FUSE_MKNOD` request. Creates a special file (device node,
+/// FIFO, or socket). The NUL-terminated file name follows immediately after
+/// this fixed header in the FUSE request buffer.
+///
+/// The host responds with a [`FuseEntryOut`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseMknodIn {
+    /// File mode including the special file type bits and permission bits.
+    pub mode: u32,
+    /// Device number for `S_IFBLK` and `S_IFCHR` nodes; `0` otherwise.
+    pub rdev: u32,
+    /// `umask` of the creating process, for the host to apply if needed.
+    pub umask: u32,
+    /// Padding; writers MUST emit `0`, readers MUST ignore.
+    pub padding: u32,
+}
+
+impl FuseMknodIn {
+    /// Parse the first [`FUSE_MKNOD_IN_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_MKNOD_IN_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_MKNOD_IN_LEN,
+            });
+        }
+        Ok(Self {
+            mode: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            rdev: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            umask: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            padding: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize into `buf` (must be at least [`FUSE_MKNOD_IN_LEN`] bytes).
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_MKNOD_IN_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_MKNOD_IN_LEN,
+            });
+        }
+        buf[0..4].copy_from_slice(&self.mode.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.rdev.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.umask.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.padding.to_le_bytes());
+        Ok(FUSE_MKNOD_IN_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_MKNOD_IN_LEN] {
+        let mut out = [0u8; FUSE_MKNOD_IN_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseMknodIn into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fuse_mkdir_in (FUSE_MKDIR)
+// ---------------------------------------------------------------------------
+
+/// On-the-wire size of [`FuseMkdirIn`] in bytes.
+pub const FUSE_MKDIR_IN_LEN: usize = 8;
+
+/// Body of a `FUSE_MKDIR` request. Creates a new directory. The NUL-
+/// terminated name follows immediately after this fixed header in the
+/// FUSE request buffer.
+///
+/// The host responds with a [`FuseEntryOut`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseMkdirIn {
+    /// Directory mode bits (including `S_IFDIR`).
+    pub mode: u32,
+    /// `umask` of the creating process.
+    pub umask: u32,
+}
+
+impl FuseMkdirIn {
+    /// Parse the first [`FUSE_MKDIR_IN_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_MKDIR_IN_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_MKDIR_IN_LEN,
+            });
+        }
+        Ok(Self {
+            mode: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            umask: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize into `buf` (must be at least [`FUSE_MKDIR_IN_LEN`] bytes).
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_MKDIR_IN_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_MKDIR_IN_LEN,
+            });
+        }
+        buf[0..4].copy_from_slice(&self.mode.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.umask.to_le_bytes());
+        Ok(FUSE_MKDIR_IN_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_MKDIR_IN_LEN] {
+        let mut out = [0u8; FUSE_MKDIR_IN_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseMkdirIn into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fuse_fsync_in (FUSE_FSYNC / FUSE_FSYNCDIR)
+// ---------------------------------------------------------------------------
+
+/// On-the-wire size of [`FuseFsyncIn`] in bytes.
+pub const FUSE_FSYNC_IN_LEN: usize = 16;
+
+/// When set in [`FuseFsyncIn::fsync_flags`], the host should call
+/// `fdatasync(2)` (flush data but not metadata) rather than `fsync(2)`.
+pub const FUSE_FSYNC_FDATASYNC: u32 = 1 << 0;
+
+/// Body of a `FUSE_FSYNC` / `FUSE_FSYNCDIR` request.
+///
+/// The host responds with an empty body (status in [`super::FuseOutHeader`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseFsyncIn {
+    /// File handle returned by the corresponding `Open` / `Opendir`.
+    pub fh: u64,
+    /// Bitfield: [`FUSE_FSYNC_FDATASYNC`] requests `fdatasync` semantics.
+    pub fsync_flags: u32,
+    /// Padding; writers MUST emit `0`, readers MUST ignore.
+    pub padding: u32,
+}
+
+impl FuseFsyncIn {
+    /// Parse the first [`FUSE_FSYNC_IN_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_FSYNC_IN_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_FSYNC_IN_LEN,
+            });
+        }
+        Ok(Self {
+            fh: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            fsync_flags: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            padding: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize into `buf` (must be at least [`FUSE_FSYNC_IN_LEN`] bytes).
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_FSYNC_IN_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_FSYNC_IN_LEN,
+            });
+        }
+        buf[0..8].copy_from_slice(&self.fh.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.fsync_flags.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.padding.to_le_bytes());
+        Ok(FUSE_FSYNC_IN_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_FSYNC_IN_LEN] {
+        let mut out = [0u8; FUSE_FSYNC_IN_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseFsyncIn into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fuse_rename_in (FUSE_RENAME)
+// ---------------------------------------------------------------------------
+
+/// On-the-wire size of [`FuseRenameIn`] in bytes.
+pub const FUSE_RENAME_IN_LEN: usize = 8;
+
+/// Body of a `FUSE_RENAME` request.
+///
+/// The old entry lives under `nodeid` (from [`super::FuseInHeader`]) with
+/// the NUL-terminated old name following this header. The new entry will
+/// live under `newdir` with the NUL-terminated new name immediately after
+/// the old name in the same request buffer.
+///
+/// The host responds with an empty body (status in [`super::FuseOutHeader`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseRenameIn {
+    /// Inode of the destination directory.
+    pub newdir: u64,
+}
+
+impl FuseRenameIn {
+    /// Parse the first [`FUSE_RENAME_IN_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_RENAME_IN_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_RENAME_IN_LEN,
+            });
+        }
+        Ok(Self {
+            newdir: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize into `buf` (must be at least [`FUSE_RENAME_IN_LEN`] bytes).
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_RENAME_IN_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_RENAME_IN_LEN,
+            });
+        }
+        buf[0..8].copy_from_slice(&self.newdir.to_le_bytes());
+        Ok(FUSE_RENAME_IN_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_RENAME_IN_LEN] {
+        let mut out = [0u8; FUSE_RENAME_IN_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseRenameIn into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fuse_link_in (FUSE_LINK)
+// ---------------------------------------------------------------------------
+
+/// On-the-wire size of [`FuseLinkIn`] in bytes.
+pub const FUSE_LINK_IN_LEN: usize = 8;
+
+/// Body of a `FUSE_LINK` request. Creates a hard link under a new name.
+///
+/// `oldnodeid` is the inode being linked; the destination directory is
+/// `nodeid` (from [`super::FuseInHeader`]); and the NUL-terminated new
+/// name follows this fixed header in the FUSE request buffer.
+///
+/// The host responds with a [`FuseEntryOut`] for the new directory entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuseLinkIn {
+    /// Inode of the existing file to link.
+    pub oldnodeid: u64,
+}
+
+impl FuseLinkIn {
+    /// Parse the first [`FUSE_LINK_IN_LEN`] bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FuseError> {
+        if buf.len() < FUSE_LINK_IN_LEN {
+            return Err(FuseError::ShortHeader {
+                have: buf.len(),
+                need: FUSE_LINK_IN_LEN,
+            });
+        }
+        Ok(Self {
+            oldnodeid: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize into `buf` (must be at least [`FUSE_LINK_IN_LEN`] bytes).
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, FuseError> {
+        if buf.len() < FUSE_LINK_IN_LEN {
+            return Err(FuseError::ShortBuffer {
+                have: buf.len(),
+                need: FUSE_LINK_IN_LEN,
+            });
+        }
+        buf[0..8].copy_from_slice(&self.oldnodeid.to_le_bytes());
+        Ok(FUSE_LINK_IN_LEN)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; FUSE_LINK_IN_LEN] {
+        let mut out = [0u8; FUSE_LINK_IN_LEN];
+        self.write_to(&mut out)
+            .expect("serializing FuseLinkIn into a fixed-size buffer must succeed");
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fopen flags (FUSE_OPEN / FUSE_OPENDIR response)
+// ---------------------------------------------------------------------------
+
+/// `FOPEN_*` flag bits carried in [`FuseOpenOut::open_flags`].
+///
+/// Set by the host in the `FUSE_OPEN` response to tell the kernel how to
+/// handle I/O for this file handle.
+pub mod fopen {
+    /// Bypass the page cache for this file (direct I/O). Every read/write
+    /// goes straight to the host without kernel buffering.
+    pub const DIRECT_IO: u32 = 1 << 0;
+    /// Do not invalidate the kernel's data cache when this file is opened.
+    /// Useful when the host can guarantee cache coherence externally.
+    pub const KEEP_CACHE: u32 = 1 << 1;
+    /// The file is not seekable; the kernel will reject `lseek(2)`.
+    pub const NONSEEKABLE: u32 = 1 << 2;
+    /// Cache `FUSE_READDIR` responses in the kernel's dentry cache.
+    pub const CACHE_DIR: u32 = 1 << 3;
+    /// The host uses stream-style I/O (no random access).
+    pub const STREAM: u32 = 1 << 4;
+    /// Do not send `FUSE_FLUSH` on `close(2)` for this handle.
+    pub const NOFLUSH: u32 = 1 << 5;
+}
+
+// ---------------------------------------------------------------------------
 // fuse_dirent (FUSE_READDIR)
 // ---------------------------------------------------------------------------
 
@@ -1883,5 +2645,522 @@ mod tests {
             FuseReleaseIn::default().write_to(&mut tiny),
             Err(FuseError::ShortBuffer { have: 8, need: 24 })
         ));
+    }
+
+    // ---- FuseForgetIn -------------------------------------------------
+
+    #[test]
+    fn forget_in_length_is_8() {
+        assert_eq!(FUSE_FORGET_IN_LEN, 8);
+    }
+
+    #[test]
+    fn forget_in_roundtrips() {
+        let h = FuseForgetIn {
+            nlookup: 0xDEAD_BEEF_CAFE_F00D,
+        };
+        let back = FuseForgetIn::from_bytes(&h.to_bytes()).unwrap();
+        assert_eq!(back, h);
+    }
+
+    #[test]
+    fn forget_in_field_offset_matches_spec() {
+        let h = FuseForgetIn {
+            nlookup: 0x0101_0101_0101_0101,
+        };
+        let b = h.to_bytes();
+        assert_eq!(&b[0..8], &[0x01u8; 8]);
+    }
+
+    #[test]
+    fn forget_in_rejects_short_input() {
+        let short = [0u8; 7];
+        assert!(matches!(
+            FuseForgetIn::from_bytes(&short),
+            Err(FuseError::ShortHeader { have: 7, need: 8 })
+        ));
+    }
+
+    // ---- FuseGetattrIn -----------------------------------------------
+
+    #[test]
+    fn getattr_in_length_is_16() {
+        assert_eq!(FUSE_GETATTR_IN_LEN, 16);
+    }
+
+    #[test]
+    fn getattr_in_roundtrips() {
+        let h = FuseGetattrIn {
+            getattr_flags: FUSE_GETATTR_FH,
+            dummy: 0,
+            fh: 0xCAFE_1234_5678_90AB,
+        };
+        let back = FuseGetattrIn::from_bytes(&h.to_bytes()).unwrap();
+        assert_eq!(back, h);
+    }
+
+    #[test]
+    fn getattr_in_field_offsets_match_spec() {
+        let h = FuseGetattrIn {
+            getattr_flags: 0x0101_0101,
+            dummy: 0x0202_0202,
+            fh: 0x0303_0303_0303_0303,
+        };
+        let b = h.to_bytes();
+        assert_eq!(&b[0..4], &[0x01; 4]);
+        assert_eq!(&b[4..8], &[0x02; 4]);
+        assert_eq!(&b[8..16], &[0x03; 8]);
+    }
+
+    #[test]
+    fn getattr_in_rejects_short_input() {
+        let short = [0u8; 15];
+        assert!(matches!(
+            FuseGetattrIn::from_bytes(&short),
+            Err(FuseError::ShortHeader { have: 15, need: 16 })
+        ));
+    }
+
+    #[test]
+    fn fuse_getattr_fh_flag_is_bit_zero() {
+        assert_eq!(FUSE_GETATTR_FH, 1);
+    }
+
+    // ---- FuseAttrOut -------------------------------------------------
+
+    #[test]
+    fn attr_out_length_is_104() {
+        assert_eq!(FUSE_ATTR_OUT_LEN, 104);
+        assert_eq!(FUSE_ATTR_OUT_LEN, 16 + FUSE_ATTR_LEN);
+    }
+
+    #[test]
+    fn attr_out_roundtrips_all_fields() {
+        let h = FuseAttrOut {
+            attr_valid: 5,
+            attr_valid_nsec: 999_999_999,
+            dummy: 0,
+            attr: FuseAttr {
+                ino: 42,
+                size: 1024,
+                ..FuseAttr::default()
+            },
+        };
+        assert_eq!(FuseAttrOut::from_bytes(&h.to_bytes()).unwrap(), h);
+    }
+
+    #[test]
+    fn attr_out_field_offsets_match_spec() {
+        // All-distinct pattern: attr_valid at [0..8], attr_valid_nsec at
+        // [8..12], dummy at [12..16], attr starts at [16].
+        let h = FuseAttrOut {
+            attr_valid: 0x0101_0101_0101_0101,
+            attr_valid_nsec: 0x0202_0202,
+            dummy: 0x0303_0303,
+            attr: FuseAttr::default(),
+        };
+        let b = h.to_bytes();
+        assert_eq!(&b[0..8], &[0x01; 8]);
+        assert_eq!(&b[8..12], &[0x02; 4]);
+        assert_eq!(&b[12..16], &[0x03; 4]);
+        // FuseAttr starts at offset 16; default is all-zero.
+        assert_eq!(&b[16..FUSE_ATTR_OUT_LEN], &[0u8; FUSE_ATTR_LEN]);
+    }
+
+    #[test]
+    fn attr_out_rejects_short_input() {
+        let short = [0u8; 103];
+        assert!(matches!(
+            FuseAttrOut::from_bytes(&short),
+            Err(FuseError::ShortHeader {
+                have: 103,
+                need: 104
+            })
+        ));
+    }
+
+    // ---- FuseSetattrIn -----------------------------------------------
+
+    #[test]
+    fn setattr_in_length_is_88() {
+        assert_eq!(FUSE_SETATTR_IN_LEN, 88);
+    }
+
+    #[test]
+    fn setattr_in_roundtrips_all_fields() {
+        let h = FuseSetattrIn {
+            valid: fattr::MODE | fattr::UID | fattr::SIZE,
+            padding: 0,
+            fh: 0xABCD_1234,
+            size: 4096,
+            lock_owner: 0,
+            atime: 1_700_000_000,
+            mtime: 1_700_000_001,
+            ctime: 1_700_000_002,
+            atimensec: 123,
+            mtimensec: 456,
+            ctimensec: 789,
+            mode: 0o644,
+            unused4: 0,
+            uid: 1000,
+            gid: 1000,
+            unused5: 0,
+        };
+        assert_eq!(FuseSetattrIn::from_bytes(&h.to_bytes()).unwrap(), h);
+    }
+
+    #[test]
+    fn setattr_in_field_offsets_match_spec() {
+        // Use distinct sentinel values per field group.
+        let h = FuseSetattrIn {
+            valid: 0x0101_0101,                // [0..4]
+            padding: 0x0202_0202,              // [4..8]
+            fh: 0x0303_0303_0303_0303,         // [8..16]
+            size: 0x0404_0404_0404_0404,       // [16..24]
+            lock_owner: 0x0505_0505_0505_0505, // [24..32]
+            atime: 0x0606_0606_0606_0606,      // [32..40]
+            mtime: 0x0707_0707_0707_0707,      // [40..48]
+            ctime: 0x0808_0808_0808_0808,      // [48..56]
+            atimensec: 0x0909_0909,            // [56..60]
+            mtimensec: 0x0A0A_0A0A,            // [60..64]
+            ctimensec: 0x0B0B_0B0B,            // [64..68]
+            mode: 0x0C0C_0C0C,                 // [68..72]
+            unused4: 0x0D0D_0D0D,              // [72..76]
+            uid: 0x0E0E_0E0E,                  // [76..80]
+            gid: 0x0F0F_0F0F,                  // [80..84]
+            unused5: 0x1010_1010,              // [84..88]
+        };
+        let b = h.to_bytes();
+        assert_eq!(&b[0..4], &[0x01; 4]);
+        assert_eq!(&b[4..8], &[0x02; 4]);
+        assert_eq!(&b[8..16], &[0x03; 8]);
+        assert_eq!(&b[16..24], &[0x04; 8]);
+        assert_eq!(&b[24..32], &[0x05; 8]);
+        assert_eq!(&b[32..40], &[0x06; 8]);
+        assert_eq!(&b[40..48], &[0x07; 8]);
+        assert_eq!(&b[48..56], &[0x08; 8]);
+        assert_eq!(&b[56..60], &[0x09; 4]);
+        assert_eq!(&b[60..64], &[0x0A; 4]);
+        assert_eq!(&b[64..68], &[0x0B; 4]);
+        assert_eq!(&b[68..72], &[0x0C; 4]);
+        assert_eq!(&b[72..76], &[0x0D; 4]);
+        assert_eq!(&b[76..80], &[0x0E; 4]);
+        assert_eq!(&b[80..84], &[0x0F; 4]);
+        assert_eq!(&b[84..88], &[0x10; 4]);
+    }
+
+    #[test]
+    fn setattr_in_rejects_short_input() {
+        let short = [0u8; 87];
+        assert!(matches!(
+            FuseSetattrIn::from_bytes(&short),
+            Err(FuseError::ShortHeader { have: 87, need: 88 })
+        ));
+    }
+
+    #[test]
+    fn fattr_constants_are_distinct_bits() {
+        let all = [
+            fattr::MODE,
+            fattr::UID,
+            fattr::GID,
+            fattr::SIZE,
+            fattr::ATIME,
+            fattr::MTIME,
+            fattr::FH,
+            fattr::ATIME_NOW,
+            fattr::MTIME_NOW,
+            fattr::LOCKOWNER,
+            fattr::CTIME,
+            fattr::KILL_SUIDGID,
+        ];
+        // Each value is a unique power-of-two.
+        for (i, a) in all.iter().enumerate() {
+            assert!(
+                a.is_power_of_two(),
+                "fattr constant at index {i} is not a power of two"
+            );
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "fattr constants at indices {i} and {j} collide");
+                }
+            }
+        }
+    }
+
+    // ---- FuseStatfsOut -----------------------------------------------
+
+    #[test]
+    fn statfs_out_length_is_80() {
+        assert_eq!(FUSE_STATFS_OUT_LEN, 80);
+    }
+
+    #[test]
+    fn statfs_out_roundtrips_all_fields() {
+        let h = FuseStatfsOut {
+            blocks: 1_000_000,
+            bfree: 500_000,
+            bavail: 499_000,
+            files: 100_000,
+            ffree: 99_000,
+            bsize: 4096,
+            namelen: 255,
+            frsize: 4096,
+            padding: 0,
+            spare: [1, 2, 3, 4, 5, 6],
+        };
+        assert_eq!(FuseStatfsOut::from_bytes(&h.to_bytes()).unwrap(), h);
+    }
+
+    #[test]
+    fn statfs_out_field_offsets_match_spec() {
+        let h = FuseStatfsOut {
+            blocks: 0x0101_0101_0101_0101, // [0..8]
+            bfree: 0x0202_0202_0202_0202,  // [8..16]
+            bavail: 0x0303_0303_0303_0303, // [16..24]
+            files: 0x0404_0404_0404_0404,  // [24..32]
+            ffree: 0x0505_0505_0505_0505,  // [32..40]
+            bsize: 0x0606_0606,            // [40..44]
+            namelen: 0x0707_0707,          // [44..48]
+            frsize: 0x0808_0808,           // [48..52]
+            padding: 0x0909_0909,          // [52..56]
+            spare: [0x0A0A_0A0A; 6],       // [56..80]
+        };
+        let b = h.to_bytes();
+        assert_eq!(&b[0..8], &[0x01; 8]);
+        assert_eq!(&b[8..16], &[0x02; 8]);
+        assert_eq!(&b[16..24], &[0x03; 8]);
+        assert_eq!(&b[24..32], &[0x04; 8]);
+        assert_eq!(&b[32..40], &[0x05; 8]);
+        assert_eq!(&b[40..44], &[0x06; 4]);
+        assert_eq!(&b[44..48], &[0x07; 4]);
+        assert_eq!(&b[48..52], &[0x08; 4]);
+        assert_eq!(&b[52..56], &[0x09; 4]);
+        assert_eq!(&b[56..80], &[0x0A; 24]);
+    }
+
+    #[test]
+    fn statfs_out_rejects_short_input() {
+        let short = [0u8; 79];
+        assert!(matches!(
+            FuseStatfsOut::from_bytes(&short),
+            Err(FuseError::ShortHeader { have: 79, need: 80 })
+        ));
+    }
+
+    // ---- FuseMknodIn / FuseMkdirIn -----------------------------------
+
+    #[test]
+    fn mknod_in_length_is_16() {
+        assert_eq!(FUSE_MKNOD_IN_LEN, 16);
+    }
+
+    #[test]
+    fn mknod_in_roundtrips() {
+        let h = FuseMknodIn {
+            mode: 0o060644, // block device (S_IFBLK) + rw-r--r--
+            rdev: (8 << 8), // major 8 (sda), minor 0
+            umask: 0o022,
+            padding: 0,
+        };
+        assert_eq!(FuseMknodIn::from_bytes(&h.to_bytes()).unwrap(), h);
+    }
+
+    #[test]
+    fn mknod_in_field_offsets_match_spec() {
+        let h = FuseMknodIn {
+            mode: 0x0101_0101,
+            rdev: 0x0202_0202,
+            umask: 0x0303_0303,
+            padding: 0x0404_0404,
+        };
+        let b = h.to_bytes();
+        assert_eq!(&b[0..4], &[0x01; 4]);
+        assert_eq!(&b[4..8], &[0x02; 4]);
+        assert_eq!(&b[8..12], &[0x03; 4]);
+        assert_eq!(&b[12..16], &[0x04; 4]);
+    }
+
+    #[test]
+    fn mknod_in_rejects_short_input() {
+        let short = [0u8; 15];
+        assert!(matches!(
+            FuseMknodIn::from_bytes(&short),
+            Err(FuseError::ShortHeader { have: 15, need: 16 })
+        ));
+    }
+
+    #[test]
+    fn mkdir_in_length_is_8() {
+        assert_eq!(FUSE_MKDIR_IN_LEN, 8);
+    }
+
+    #[test]
+    fn mkdir_in_roundtrips() {
+        let h = FuseMkdirIn {
+            mode: 0o755,
+            umask: 0o022,
+        };
+        assert_eq!(FuseMkdirIn::from_bytes(&h.to_bytes()).unwrap(), h);
+    }
+
+    #[test]
+    fn mkdir_in_field_offsets_match_spec() {
+        let h = FuseMkdirIn {
+            mode: 0x0101_0101,
+            umask: 0x0202_0202,
+        };
+        let b = h.to_bytes();
+        assert_eq!(&b[0..4], &[0x01; 4]);
+        assert_eq!(&b[4..8], &[0x02; 4]);
+    }
+
+    #[test]
+    fn mkdir_in_rejects_short_input() {
+        let short = [0u8; 7];
+        assert!(matches!(
+            FuseMkdirIn::from_bytes(&short),
+            Err(FuseError::ShortHeader { have: 7, need: 8 })
+        ));
+    }
+
+    // ---- FuseFsyncIn -------------------------------------------------
+
+    #[test]
+    fn fsync_in_length_is_16() {
+        assert_eq!(FUSE_FSYNC_IN_LEN, 16);
+    }
+
+    #[test]
+    fn fsync_in_roundtrips() {
+        let h = FuseFsyncIn {
+            fh: 0xBEEF_1234,
+            fsync_flags: FUSE_FSYNC_FDATASYNC,
+            padding: 0,
+        };
+        assert_eq!(FuseFsyncIn::from_bytes(&h.to_bytes()).unwrap(), h);
+    }
+
+    #[test]
+    fn fsync_in_field_offsets_match_spec() {
+        let h = FuseFsyncIn {
+            fh: 0x0101_0101_0101_0101,
+            fsync_flags: 0x0202_0202,
+            padding: 0x0303_0303,
+        };
+        let b = h.to_bytes();
+        assert_eq!(&b[0..8], &[0x01; 8]);
+        assert_eq!(&b[8..12], &[0x02; 4]);
+        assert_eq!(&b[12..16], &[0x03; 4]);
+    }
+
+    #[test]
+    fn fsync_fdatasync_flag_is_bit_zero() {
+        assert_eq!(FUSE_FSYNC_FDATASYNC, 1);
+    }
+
+    #[test]
+    fn fsync_in_rejects_short_input() {
+        let short = [0u8; 15];
+        assert!(matches!(
+            FuseFsyncIn::from_bytes(&short),
+            Err(FuseError::ShortHeader { have: 15, need: 16 })
+        ));
+    }
+
+    // ---- FuseRenameIn ------------------------------------------------
+
+    #[test]
+    fn rename_in_length_is_8() {
+        assert_eq!(FUSE_RENAME_IN_LEN, 8);
+    }
+
+    #[test]
+    fn rename_in_roundtrips() {
+        let h = FuseRenameIn {
+            newdir: 0xDEAD_CAFE_0000_0001,
+        };
+        assert_eq!(FuseRenameIn::from_bytes(&h.to_bytes()).unwrap(), h);
+    }
+
+    #[test]
+    fn rename_in_field_offset_matches_spec() {
+        let h = FuseRenameIn {
+            newdir: 0x0101_0101_0101_0101,
+        };
+        assert_eq!(&h.to_bytes()[0..8], &[0x01u8; 8]);
+    }
+
+    #[test]
+    fn rename_in_rejects_short_input() {
+        let short = [0u8; 7];
+        assert!(matches!(
+            FuseRenameIn::from_bytes(&short),
+            Err(FuseError::ShortHeader { have: 7, need: 8 })
+        ));
+    }
+
+    // ---- FuseLinkIn --------------------------------------------------
+
+    #[test]
+    fn link_in_length_is_8() {
+        assert_eq!(FUSE_LINK_IN_LEN, 8);
+    }
+
+    #[test]
+    fn link_in_roundtrips() {
+        let h = FuseLinkIn {
+            oldnodeid: 0xBEEF_1234_ABCD_0001,
+        };
+        assert_eq!(FuseLinkIn::from_bytes(&h.to_bytes()).unwrap(), h);
+    }
+
+    #[test]
+    fn link_in_field_offset_matches_spec() {
+        let h = FuseLinkIn {
+            oldnodeid: 0x0202_0202_0202_0202,
+        };
+        assert_eq!(&h.to_bytes()[0..8], &[0x02u8; 8]);
+    }
+
+    #[test]
+    fn link_in_rejects_short_input() {
+        let short = [0u8; 7];
+        assert!(matches!(
+            FuseLinkIn::from_bytes(&short),
+            Err(FuseError::ShortHeader { have: 7, need: 8 })
+        ));
+    }
+
+    // ---- fopen constants ---------------------------------------------
+
+    #[test]
+    fn fopen_constants_are_distinct_bits() {
+        let all = [
+            fopen::DIRECT_IO,
+            fopen::KEEP_CACHE,
+            fopen::NONSEEKABLE,
+            fopen::CACHE_DIR,
+            fopen::STREAM,
+            fopen::NOFLUSH,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            assert!(
+                a.is_power_of_two(),
+                "fopen constant at index {i} is not a power of two"
+            );
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "fopen constants at indices {i} and {j} collide");
+                }
+            }
+        }
+        // Pin the values against the kernel's fuse.h.
+        assert_eq!(fopen::DIRECT_IO, 1 << 0);
+        assert_eq!(fopen::KEEP_CACHE, 1 << 1);
+        assert_eq!(fopen::NONSEEKABLE, 1 << 2);
+        assert_eq!(fopen::CACHE_DIR, 1 << 3);
+        assert_eq!(fopen::STREAM, 1 << 4);
+        assert_eq!(fopen::NOFLUSH, 1 << 5);
     }
 }
