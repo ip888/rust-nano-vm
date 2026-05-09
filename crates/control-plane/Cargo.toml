@@ -11,6 +11,10 @@ description = "REST control plane for rust-nano-vm. Exposes the Hypervisor trait
 name = "nanovm-control-plane"
 path = "src/bin/server.rs"
 
+[[bin]]
+name = "nanovm-openapi"
+path = "src/bin/openapi.rs"
+
 [dependencies]
 vm-core.workspace = true
 vm-mock.workspace = true

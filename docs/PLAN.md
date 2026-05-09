@@ -293,3 +293,10 @@ While a KVM host is being sourced, these items advance the project:
 
 5. **OpenAPI / Swagger spec** — auto-generate from the `control-plane`
    routes for external consumers and SDK generation.
+
+   **Done.** Added `nanovm-openapi` (`crates/control-plane/src/bin/openapi.rs`)
+   which emits the current OpenAPI 3.1 document from `openapi_spec()`.
+   Generated spec is checked in at `docs/openapi.json`.
+
+   Regenerate with:
+   `cargo run -p control-plane --bin nanovm-openapi > docs/openapi.json`.
