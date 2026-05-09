@@ -1,13 +1,16 @@
 //! Snapshot format and CoW backing-file layout.
 //!
-//! This is the M5 wedge — "snapshot once, fork many" — but the runtime
-//! pieces (userfaultfd, CoW memory sharing) land in a later PR. What this
-//! crate ships today is the **on-disk file format** so that:
+//! This is the M5 wedge — "snapshot once, fork many". The syscall-facing
+//! userfaultfd integration lands in a later PR, but this crate already ships
+//! the **on-disk file format** plus runtime CoW fault-resolution scaffolding
+//! so that:
 //!
 //! - CLI / control-plane can already serialize and enumerate snapshots.
 //! - The snapshot-writer and snapshot-reader can be unit-tested on any
 //!   machine (no KVM / no userfaultfd needed).
 //! - Future format evolution is version-gated from day one.
+//! - CoW fault handling logic is testable without `/dev/kvm` or a real
+//!   `userfaultfd` file descriptor.
 //!
 //! # On-disk layout
 //!
@@ -39,6 +42,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod runtime;
+pub use runtime::{
+    CowFaultAction, CowPager, RuntimeError, UffdPagefaultEvent, UFFD_API,
+    UFFD_PAGEFAULT_FLAG_WRITE, UFFDIO_REGISTER_MODE_MISSING,
+};
 
 /// Current snapshot format version. Bump on any backwards-incompatible
 /// change (field rename, layout change, new required field). Readers MUST
