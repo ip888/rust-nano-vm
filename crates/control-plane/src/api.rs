@@ -291,6 +291,7 @@ pub(crate) fn openapi_spec() -> Value {
             "/healthz": {
                 "get": {
                     "summary": "Liveness check",
+                    "security": [],
                     "responses": {
                         "200": {
                             "description": "Plain-text health status",
@@ -298,6 +299,20 @@ pub(crate) fn openapi_spec() -> Value {
                                 "text/plain": {
                                     "schema": { "type": "string", "example": "ok" }
                                 }
+                            }
+                        }
+                    }
+                }
+            },
+            "/openapi.json": {
+                "get": {
+                    "summary": "OpenAPI contract",
+                    "security": [],
+                    "responses": {
+                        "200": {
+                            "description": "OpenAPI 3.1 document",
+                            "content": {
+                                "application/json": { "schema": { "type": "object" } }
                             }
                         }
                     }
@@ -538,7 +553,6 @@ pub(crate) fn openapi_spec() -> Value {
                     }
                 }
             }
-        },
-        "security": [{ "BearerAuth": [] }]
+        }
     })
 }
