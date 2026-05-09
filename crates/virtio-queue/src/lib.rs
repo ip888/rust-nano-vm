@@ -6,9 +6,8 @@
 //! byte buffers. Device-specific logic (vsock packet framing, virtio-fs
 //! FUSE framing, ...) lives in each device crate.
 //!
-//! Deferred to follow-up PRs: indirect descriptors, packed (vs split)
-//! virtqueue, guest-memory integration (`vm-memory`), KVM eventfd
-//! plumbing.
+//! Deferred to follow-up PRs: full indirect-descriptor walking and KVM
+//! eventfd/ioeventfd plumbing.
 //!
 //! # Wire format
 //!
@@ -58,6 +57,9 @@ use thiserror::Error;
 
 /// On-the-wire size of a single descriptor in bytes.
 pub const DESC_SIZE: usize = 16;
+
+/// On-the-wire size of a single packed-ring descriptor in bytes.
+pub const PACKED_DESC_SIZE: usize = 16;
 
 /// "Buffer continues in the descriptor at `next`."
 pub const DESC_F_NEXT: u16 = 1 << 0;
@@ -152,6 +154,39 @@ impl Descriptor {
     pub fn is_indirect(&self) -> bool {
         self.flags & DESC_F_INDIRECT != 0
     }
+
+    /// End address (`addr + len`) with overflow checks.
+    pub fn end_addr(&self) -> Result<u64, QueueError> {
+        self.addr
+            .checked_add(self.len as u64)
+            .ok_or(QueueError::AddressOverflow {
+                addr: self.addr,
+                len: self.len,
+            })
+    }
+
+    /// Read this descriptor's bytes from a guest-memory backend.
+    pub fn read_from<M: GuestMemory>(&self, mem: &M) -> Result<Vec<u8>, QueueError> {
+        let mut out = vec![0u8; self.len as usize];
+        mem.read(self.addr, &mut out)?;
+        Ok(out)
+    }
+
+    /// Write at most `self.len` bytes from `data` into guest memory.
+    ///
+    /// Returns the number of bytes written.
+    pub fn write_to_guest<M: GuestMemory>(
+        &self,
+        mem: &mut M,
+        data: &[u8],
+    ) -> Result<usize, QueueError> {
+        if !self.is_writable() {
+            return Err(QueueError::DescriptorNotWritable { addr: self.addr });
+        }
+        let n = usize::min(self.len as usize, data.len());
+        mem.write(self.addr, &data[..n])?;
+        Ok(n)
+    }
 }
 
 /// Iterator that walks a descriptor chain starting at a given head index.
@@ -230,6 +265,66 @@ impl<'a> std::fmt::Debug for DescriptorChain<'a> {
     }
 }
 
+/// Minimal guest-memory abstraction used by virtqueue helpers.
+pub trait GuestMemory {
+    /// Read `dst.len()` bytes starting at guest-physical address `addr`.
+    fn read(&self, addr: u64, dst: &mut [u8]) -> Result<(), QueueError>;
+    /// Write `src.len()` bytes starting at guest-physical address `addr`.
+    fn write(&mut self, addr: u64, src: &[u8]) -> Result<(), QueueError>;
+}
+
+/// Simple contiguous guest-memory implementation over a caller-owned byte
+/// slice, useful for unit tests and parser prototyping.
+#[derive(Debug)]
+pub struct SliceGuestMemory<'a> {
+    base_addr: u64,
+    bytes: &'a mut [u8],
+}
+
+impl<'a> SliceGuestMemory<'a> {
+    /// Wrap `bytes` as a contiguous guest-memory window starting at `base_addr`.
+    pub fn new(base_addr: u64, bytes: &'a mut [u8]) -> Self {
+        Self { base_addr, bytes }
+    }
+
+    fn checked_bounds(&self, addr: u64, len: usize) -> Result<(usize, usize), QueueError> {
+        let len_u32 = u32::try_from(len).unwrap_or(u32::MAX);
+        let req_end = addr
+            .checked_add(len as u64)
+            .ok_or(QueueError::AddressOverflow { addr, len: len_u32 })?;
+        let mem_end = self.base_addr.checked_add(self.bytes.len() as u64).ok_or(
+            QueueError::AddressOverflow {
+                addr: self.base_addr,
+                len: u32::try_from(self.bytes.len()).unwrap_or(u32::MAX),
+            },
+        )?;
+        if addr < self.base_addr || req_end > mem_end {
+            return Err(QueueError::GuestMemoryOutOfBounds {
+                addr,
+                len: len_u32,
+                mem_start: self.base_addr,
+                mem_len: self.bytes.len() as u64,
+            });
+        }
+        let start = (addr - self.base_addr) as usize;
+        Ok((start, start + len))
+    }
+}
+
+impl GuestMemory for SliceGuestMemory<'_> {
+    fn read(&self, addr: u64, dst: &mut [u8]) -> Result<(), QueueError> {
+        let (start, end) = self.checked_bounds(addr, dst.len())?;
+        dst.copy_from_slice(&self.bytes[start..end]);
+        Ok(())
+    }
+
+    fn write(&mut self, addr: u64, src: &[u8]) -> Result<(), QueueError> {
+        let (start, end) = self.checked_bounds(addr, src.len())?;
+        self.bytes[start..end].copy_from_slice(src);
+        Ok(())
+    }
+}
+
 /// Errors produced by virtqueue parsing.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -298,6 +393,44 @@ pub enum QueueError {
         /// Maximum allowed queue size.
         max: u16,
     },
+    /// Packed-ring backing buffer is smaller than `qsize * PACKED_DESC_SIZE`.
+    #[error("packed ring buffer too small: have {have} bytes, need {need} (qsize={qsize})")]
+    ShortPackedRing {
+        /// Bytes in the buffer we were handed.
+        have: usize,
+        /// Bytes required by `qsize * PACKED_DESC_SIZE`.
+        need: usize,
+        /// Configured queue size.
+        qsize: u16,
+    },
+    /// `addr + len` overflowed 64-bit address space.
+    #[error("guest address overflow: addr=0x{addr:016x}, len={len}")]
+    AddressOverflow {
+        /// Starting guest address.
+        addr: u64,
+        /// Requested access length in bytes.
+        len: u32,
+    },
+    /// Memory access range falls outside a configured guest-memory window.
+    #[error(
+        "guest memory out of bounds: addr=0x{addr:016x}, len={len}, mem=[0x{mem_start:016x}, +{mem_len}]"
+    )]
+    GuestMemoryOutOfBounds {
+        /// Starting guest address.
+        addr: u64,
+        /// Access length in bytes.
+        len: u32,
+        /// Start address of the guest-memory window.
+        mem_start: u64,
+        /// Total guest-memory window length in bytes.
+        mem_len: u64,
+    },
+    /// Caller attempted to write into a descriptor that is not device-writable.
+    #[error("descriptor at addr=0x{addr:016x} is not writable (DESC_F_WRITE not set)")]
+    DescriptorNotWritable {
+        /// Descriptor guest address.
+        addr: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +464,17 @@ pub const VIRTQ_F_INDIRECT_DESC: u64 = 1 << 28;
 /// this feature the event fields are reserved.
 pub const VIRTQ_F_EVENT_IDX: u64 = 1 << 29;
 
+/// Packed descriptor continues at the next table entry.
+pub const PACKED_DESC_F_NEXT: u16 = 1 << 0;
+/// Packed descriptor is device-writable.
+pub const PACKED_DESC_F_WRITE: u16 = 1 << 1;
+/// Packed descriptor points to an indirect table.
+pub const PACKED_DESC_F_INDIRECT: u16 = 1 << 2;
+/// Driver-owned availability bit in packed rings.
+pub const PACKED_DESC_F_AVAIL: u16 = 1 << 7;
+/// Device-owned used bit in packed rings.
+pub const PACKED_DESC_F_USED: u16 = 1 << 15;
+
 /// Bytes occupied by an available ring of the given queue size:
 /// `flags(2) + idx(2) + ring(2 * qsize) + used_event(2)`.
 pub fn avail_ring_size(qsize: u16) -> usize {
@@ -347,6 +491,11 @@ pub fn used_ring_size(qsize: u16) -> usize {
 /// `qsize * DESC_SIZE`.
 pub fn desc_table_size(qsize: u16) -> usize {
     qsize as usize * DESC_SIZE
+}
+
+/// Bytes occupied by a packed-ring descriptor array of the given queue size.
+pub fn packed_ring_size(qsize: u16) -> usize {
+    qsize as usize * PACKED_DESC_SIZE
 }
 
 /// Parse an entire descriptor table from the first `qsize * DESC_SIZE` bytes
@@ -384,6 +533,105 @@ pub fn parse_descriptor_table(buf: &[u8], qsize: u16) -> Result<Vec<Descriptor>,
         table.push(Descriptor::from_bytes(&buf[off..off + DESC_SIZE])?);
     }
     Ok(table)
+}
+
+/// Packed virtqueue descriptor entry (`virtio 1.3` packed ring layout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedDesc {
+    /// Guest-physical buffer start address.
+    pub addr: u64,
+    /// Buffer length in bytes.
+    pub len: u32,
+    /// Descriptor id (`head index`) used by the driver/device.
+    pub id: u16,
+    /// Bitfield of `PACKED_DESC_F_*`.
+    pub flags: u16,
+}
+
+impl PackedDesc {
+    /// Parse from the first [`PACKED_DESC_SIZE`] bytes of `buf`.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, QueueError> {
+        if buf.len() < PACKED_DESC_SIZE {
+            return Err(QueueError::ShortDescriptor {
+                have: buf.len(),
+                need: PACKED_DESC_SIZE,
+            });
+        }
+        Ok(Self {
+            addr: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            len: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            id: u16::from_le_bytes(buf[12..14].try_into().unwrap()),
+            flags: u16::from_le_bytes(buf[14..16].try_into().unwrap()),
+        })
+    }
+
+    /// Serialize to `buf`, which must be at least [`PACKED_DESC_SIZE`] bytes.
+    pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, QueueError> {
+        if buf.len() < PACKED_DESC_SIZE {
+            return Err(QueueError::ShortBuffer {
+                have: buf.len(),
+                need: PACKED_DESC_SIZE,
+            });
+        }
+        buf[0..8].copy_from_slice(&self.addr.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.len.to_le_bytes());
+        buf[12..14].copy_from_slice(&self.id.to_le_bytes());
+        buf[14..16].copy_from_slice(&self.flags.to_le_bytes());
+        Ok(PACKED_DESC_SIZE)
+    }
+
+    /// Serialize into a fresh fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; PACKED_DESC_SIZE] {
+        let mut out = [0u8; PACKED_DESC_SIZE];
+        self.write_to(&mut out)
+            .expect("serializing PackedDesc into a fixed-size buffer must succeed");
+        out
+    }
+
+    /// `true` when the packed descriptor has NEXT set.
+    pub fn has_next(&self) -> bool {
+        self.flags & PACKED_DESC_F_NEXT != 0
+    }
+
+    /// `true` when this descriptor is device-writable.
+    pub fn is_writable(&self) -> bool {
+        self.flags & PACKED_DESC_F_WRITE != 0
+    }
+
+    /// `true` when this descriptor is indirect.
+    pub fn is_indirect(&self) -> bool {
+        self.flags & PACKED_DESC_F_INDIRECT != 0
+    }
+
+    /// `true` when availability bit is set.
+    pub fn is_avail(&self) -> bool {
+        self.flags & PACKED_DESC_F_AVAIL != 0
+    }
+
+    /// `true` when used bit is set.
+    pub fn is_used(&self) -> bool {
+        self.flags & PACKED_DESC_F_USED != 0
+    }
+}
+
+/// Parse an entire packed descriptor array from the first
+/// `qsize * PACKED_DESC_SIZE` bytes of `buf`.
+pub fn parse_packed_ring(buf: &[u8], qsize: u16) -> Result<Vec<PackedDesc>, QueueError> {
+    validate_qsize(qsize)?;
+    let need = packed_ring_size(qsize);
+    if buf.len() < need {
+        return Err(QueueError::ShortPackedRing {
+            have: buf.len(),
+            need,
+            qsize,
+        });
+    }
+    let mut ring = Vec::with_capacity(qsize as usize);
+    for i in 0..qsize as usize {
+        let off = i * PACKED_DESC_SIZE;
+        ring.push(PackedDesc::from_bytes(&buf[off..off + PACKED_DESC_SIZE])?);
+    }
+    Ok(ring)
 }
 
 fn validate_qsize(qsize: u16) -> Result<(), QueueError> {
@@ -706,6 +954,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn descriptor_end_addr_checks_overflow() {
+        let ok = Descriptor {
+            addr: 0x1000,
+            len: 0x20,
+            flags: 0,
+            next: 0,
+        };
+        assert_eq!(ok.end_addr().unwrap(), 0x1020);
+
+        let overflow = Descriptor {
+            addr: u64::MAX - 1,
+            len: 8,
+            flags: 0,
+            next: 0,
+        };
+        assert!(matches!(
+            overflow.end_addr().unwrap_err(),
+            QueueError::AddressOverflow { .. }
+        ));
+    }
+
+    #[test]
+    fn descriptor_reads_and_writes_through_guest_memory() {
+        let mut mem_bytes = [0u8; 32];
+        mem_bytes[8..12].copy_from_slice(&[1, 2, 3, 4]);
+        let mut mem = SliceGuestMemory::new(0x1000, &mut mem_bytes);
+
+        let rd = Descriptor {
+            addr: 0x1008,
+            len: 4,
+            flags: 0,
+            next: 0,
+        };
+        assert_eq!(rd.read_from(&mem).unwrap(), vec![1, 2, 3, 4]);
+
+        let wr = Descriptor {
+            addr: 0x100c,
+            len: 4,
+            flags: DESC_F_WRITE,
+            next: 0,
+        };
+        let wrote = wr.write_to_guest(&mut mem, &[9, 8, 7, 6, 5]).unwrap();
+        assert_eq!(wrote, 4);
+        assert_eq!(&mem_bytes[12..16], &[9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn descriptor_write_rejects_non_writable_and_oob() {
+        let mut mem_bytes = [0u8; 16];
+        let mut mem = SliceGuestMemory::new(0x2000, &mut mem_bytes);
+        let readonly = Descriptor {
+            addr: 0x2000,
+            len: 4,
+            flags: 0,
+            next: 0,
+        };
+        assert!(matches!(
+            readonly
+                .write_to_guest(&mut mem, &[1, 2, 3, 4])
+                .unwrap_err(),
+            QueueError::DescriptorNotWritable { .. }
+        ));
+
+        let writable_oob = Descriptor {
+            addr: 0x200e,
+            len: 4,
+            flags: DESC_F_WRITE,
+            next: 0,
+        };
+        assert!(matches!(
+            writable_oob
+                .write_to_guest(&mut mem, &[1, 2, 3, 4])
+                .unwrap_err(),
+            QueueError::GuestMemoryOutOfBounds { .. }
+        ));
+    }
+
     fn desc(addr: u64, len: u32, flags: u16, next: u16) -> Descriptor {
         Descriptor {
             addr,
@@ -808,6 +1134,7 @@ mod tests {
         assert_eq!(used_ring_size(8), 70);
         assert_eq!(avail_ring_size(256), 518);
         assert_eq!(used_ring_size(256), 2054);
+        assert_eq!(packed_ring_size(8), 8 * PACKED_DESC_SIZE);
     }
 
     #[test]
@@ -1090,6 +1417,84 @@ mod tests {
         assert_eq!(VIRTQ_F_EVENT_IDX, 1u64 << 29);
         // They must be distinct bits.
         assert_eq!(VIRTQ_F_INDIRECT_DESC & VIRTQ_F_EVENT_IDX, 0);
+    }
+
+    #[test]
+    fn packed_desc_roundtrips_and_flag_accessors_work() {
+        let d = PackedDesc {
+            addr: 0xdead_beef,
+            len: 1234,
+            id: 7,
+            flags: PACKED_DESC_F_NEXT
+                | PACKED_DESC_F_WRITE
+                | PACKED_DESC_F_INDIRECT
+                | PACKED_DESC_F_AVAIL
+                | PACKED_DESC_F_USED,
+        };
+        let b = d.to_bytes();
+        assert_eq!(b.len(), PACKED_DESC_SIZE);
+        let back = PackedDesc::from_bytes(&b).unwrap();
+        assert_eq!(back, d);
+        assert!(back.has_next());
+        assert!(back.is_writable());
+        assert!(back.is_indirect());
+        assert!(back.is_avail());
+        assert!(back.is_used());
+    }
+
+    #[test]
+    fn parse_packed_ring_roundtrips_table() {
+        let packed = vec![
+            PackedDesc {
+                addr: 0x1000,
+                len: 32,
+                id: 1,
+                flags: PACKED_DESC_F_AVAIL,
+            },
+            PackedDesc {
+                addr: 0x2000,
+                len: 64,
+                id: 2,
+                flags: PACKED_DESC_F_AVAIL | PACKED_DESC_F_USED,
+            },
+            PackedDesc {
+                addr: 0x3000,
+                len: 96,
+                id: 3,
+                flags: PACKED_DESC_F_WRITE,
+            },
+            PackedDesc {
+                addr: 0x4000,
+                len: 128,
+                id: 4,
+                flags: 0,
+            },
+        ];
+        let qsize = packed.len() as u16;
+        let mut buf = vec![0u8; packed_ring_size(qsize)];
+        for (i, d) in packed.iter().enumerate() {
+            d.write_to(&mut buf[i * PACKED_DESC_SIZE..]).unwrap();
+        }
+        let parsed = parse_packed_ring(&buf, qsize).unwrap();
+        assert_eq!(parsed, packed);
+    }
+
+    #[test]
+    fn parse_packed_ring_rejects_short_or_bad_qsize() {
+        let err = parse_packed_ring(&[], 0).unwrap_err();
+        assert!(matches!(err, QueueError::BadQueueSize { qsize: 0, .. }));
+
+        let qsize = 8u16;
+        let short = vec![0u8; packed_ring_size(qsize) - 1];
+        let err = parse_packed_ring(&short, qsize).unwrap_err();
+        assert!(matches!(
+            err,
+            QueueError::ShortPackedRing {
+                qsize: 8,
+                have,
+                need
+            } if have == short.len() && need == packed_ring_size(8)
+        ));
     }
 
     // ---- parse_descriptor_table ---------------------------------------

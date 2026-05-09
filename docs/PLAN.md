@@ -283,6 +283,15 @@ While a KVM host is being sourced, these items advance the project:
    virtqueue, and guest-memory integration in `virtio-queue`. These are unit-
    testable with synthetic byte slices.
 
+   **In progress.** `virtio-queue` now includes:
+   - packed virtqueue descriptor wire type and parser (`PackedDesc`,
+     `packed_ring_size`, `parse_packed_ring`)
+   - packed descriptor flag constants (`PACKED_DESC_F_*`)
+   - minimal guest-memory integration trait (`GuestMemory`) plus
+     `SliceGuestMemory` test/prototyping backend
+   - descriptor guest-memory helpers (`Descriptor::read_from`,
+     `Descriptor::write_to_guest`) with bounds/overflow checks
+
 3. **virtio-fs (M3 prep)** — add per-op FUSE request/response bodies and the
    dispatch scaffolding on top of the framing already in `virtio-fs`.
 
