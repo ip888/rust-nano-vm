@@ -72,6 +72,17 @@ async fn healthz_returns_ok() {
 }
 
 #[tokio::test]
+async fn openapi_json_returns_document() {
+    let (status, body) = send(app(), Method::GET, "/openapi.json", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["openapi"], "3.1.0");
+    assert_eq!(body["info"]["title"], "rust-nano-vm control-plane API");
+    assert!(body["paths"]["/v1/vms"].is_object());
+    assert!(body["paths"]["/v1/snapshots/{id}/restore"].is_object());
+    assert!(body["components"]["schemas"]["VmHandleDto"].is_object());
+}
+
+#[tokio::test]
 async fn create_vm_with_defaults_returns_created_handle() {
     let (status, body) = send(app(), Method::POST, "/v1/vms", Some(json!({}))).await;
     assert_eq!(status, StatusCode::CREATED);
@@ -425,6 +436,14 @@ async fn healthz_does_not_require_auth_even_when_tokens_are_set() {
     let (status, body) = send(app, Method::GET, "/healthz", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, Value::String("ok".into()));
+}
+
+#[tokio::test]
+async fn openapi_json_does_not_require_auth_even_when_tokens_are_set() {
+    let app = app_with_tokens(ApiTokens::new(["s3cret"]));
+    let (status, body) = send(app, Method::GET, "/openapi.json", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["openapi"], "3.1.0");
 }
 
 #[tokio::test]
