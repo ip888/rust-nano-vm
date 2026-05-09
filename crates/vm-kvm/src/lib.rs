@@ -11,7 +11,8 @@
 #![warn(missing_docs)]
 
 use vm_core::{
-    Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError, VmHandle, VmId, VmResult, VmState,
+    Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError, VmHandle, VmId, VmMeta, VmResult,
+    VmState,
 };
 
 /// KVM-backed hypervisor.
@@ -79,6 +80,10 @@ impl Hypervisor for KvmHypervisor {
     fn snapshot_meta(&self, _snap: SnapshotId) -> VmResult<SnapshotMeta> {
         Err(unsupported())
     }
+
+    fn vm_meta(&self, _id: VmId) -> VmResult<VmMeta> {
+        Err(unsupported())
+    }
 }
 
 #[cfg(feature = "kvm")]
@@ -142,6 +147,10 @@ mod tests {
         ));
         assert!(matches!(
             hv.snapshot_meta(SnapshotId(1)).unwrap_err(),
+            VmError::Unsupported(_)
+        ));
+        assert!(matches!(
+            hv.vm_meta(VmId(1)).unwrap_err(),
             VmError::Unsupported(_)
         ));
     }
