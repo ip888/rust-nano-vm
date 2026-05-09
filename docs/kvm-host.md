@@ -14,6 +14,46 @@ kvm-ok                          # Ubuntu convenience check; exits 0 if usable
 If `/dev/kvm` is missing but the CPU flags are present, your BIOS is
 disabling virtualisation — enable `Intel VT-x` / `AMD-V` in firmware.
 
+## Continue developing without `/dev/kvm` (safe scope)
+
+You can still make high-value progress before you have a KVM-capable host:
+
+- Advance unit-testable crates and wire formats (`virtio-queue`,
+  `virtio-vsock`, `virtio-fs`, `snapshot`, `proto`).
+- Improve `vm-mock`-backed control-plane and CLI behavior.
+- Keep non-KVM CI quality green:
+  - `cargo build --workspace`
+  - `cargo test --workspace`
+  - `cargo clippy --workspace --all-targets -- -D warnings`
+  - `cargo fmt --all -- --check`
+- Keep KVM-specific work behind feature flags/abstractions, validating
+  logic with `vm-mock` and unit tests until host bring-up time.
+
+## When `/dev/kvm` becomes mandatory
+
+You must switch to a KVM-capable host at the **M1 execution boundary**:
+first real `create → boot → serial output`.
+
+That means `/dev/kvm` is no longer optional once you need to implement or
+verify:
+
+- opening `/dev/kvm`
+- a real VM/vCPU run loop
+- UART serial output path (`ttyS0`, "hello from guest")
+
+After M1 bring-up, M2 end-to-end exec also strictly needs KVM because the
+real `virtio-vsock` + `/dev/vsock` guest path must be exercised.
+
+### Practical “you now need KVM” signals
+
+- You are blocked on behavior that only appears in real vCPU execution or
+  device emulation timing.
+- You need `nanovm run ...` to produce actual guest boot serial output.
+- You need to validate guest-agent communication over real vsock, not
+  stdin/stdout scaffolding.
+- You need realistic performance numbers (especially snapshot/fork
+  benchmarking).
+
 ## Option 1 — Local Linux (free, fastest iteration)
 
 Any modern Intel/AMD laptop or desktop with virtualisation enabled:
