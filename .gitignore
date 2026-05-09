@@ -28,3 +28,9 @@ Thumbs.db
 # Local experiment output
 /bench/results/
 /scratch/
+
+# cargo-fuzz corpus, artifacts, and coverage output
+# (these are machine-generated inputs/outputs; never commit them)
+**/fuzz/corpus/
+**/fuzz/artifacts/
+**/fuzz/coverage/
