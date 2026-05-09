@@ -2958,7 +2958,7 @@ mod tests {
     #[test]
     fn mknod_in_roundtrips() {
         let h = FuseMknodIn {
-            mode: 0o20644,      // block device + rw-r--r--
+            mode: 0o60644,      // block device + rw-r--r--
             rdev: (8 << 8), // major 8, minor 0
             umask: 0o022,
             padding: 0,
