@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use vm_core::{
-    Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError, VmHandle, VmId, VmResult, VmState,
+    Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError, VmHandle, VmId, VmMeta, VmResult,
+    VmState,
 };
 
 #[derive(Debug, Clone)]
@@ -209,6 +210,19 @@ impl Hypervisor for MockHypervisor {
             return Err(VmError::UnknownSnapshot(snap));
         }
         Ok(())
+    }
+
+    fn vm_meta(&self, id: VmId) -> VmResult<VmMeta> {
+        let inner = self.inner.lock().expect("mock hypervisor poisoned");
+        let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+        Ok(VmMeta {
+            id,
+            state: vm.state,
+            vcpus: vm.config.vcpus,
+            memory_mib: vm.config.memory_mib,
+            kernel_cmdline: vm.config.cmdline.clone(),
+            snapshot_dir: vm.config.snapshot_dir.clone(),
+        })
     }
 
     fn snapshot_meta(&self, snap: SnapshotId) -> VmResult<SnapshotMeta> {
@@ -542,5 +556,36 @@ mod tests {
         let hv = MockHypervisor::new();
         let err = hv.snapshot_meta(SnapshotId(0xdead)).unwrap_err();
         assert!(matches!(err, VmError::UnknownSnapshot(_)));
+    }
+
+    #[test]
+    fn vm_meta_reports_create_geometry_and_state() {
+        let hv = MockHypervisor::new();
+        let h = hv
+            .create_vm(&VmConfig {
+                vcpus: 4,
+                memory_mib: 256,
+                cmdline: "console=ttyS0".into(),
+                ..VmConfig::default()
+            })
+            .unwrap();
+        let meta = hv.vm_meta(h.id).expect("meta");
+        assert_eq!(meta.id, h.id);
+        assert_eq!(meta.state, VmState::Created);
+        assert_eq!(meta.vcpus, 4);
+        assert_eq!(meta.memory_mib, 256);
+        assert_eq!(meta.kernel_cmdline, "console=ttyS0");
+        assert!(meta.snapshot_dir.is_none());
+
+        // State should reflect concurrent transitions.
+        hv.start(h.id).unwrap();
+        assert_eq!(hv.vm_meta(h.id).unwrap().state, VmState::Running);
+    }
+
+    #[test]
+    fn vm_meta_for_unknown_id_is_unknown_vm() {
+        let hv = MockHypervisor::new();
+        let err = hv.vm_meta(VmId(0xdead)).unwrap_err();
+        assert!(matches!(err, VmError::UnknownVm(_)));
     }
 }

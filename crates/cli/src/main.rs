@@ -570,11 +570,23 @@ fn cmd_ps(client: &Client) -> ExitCode {
         println!("no VMs");
         return ExitCode::SUCCESS;
     }
-    println!("{:<24} STATE", "ID");
+    println!(
+        "{:<24} {:<8} {:>4} {:>10}  CMDLINE",
+        "ID", "STATE", "VCPU", "MEM"
+    );
     for vm in vms {
         let display = vm["display"].as_str().unwrap_or("?");
         let state = vm["state"].as_str().unwrap_or("?");
-        println!("{display:<24} {state}");
+        let vcpu = vm["vcpus"]
+            .as_u64()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".into());
+        let mem = match vm["memory_mib"].as_u64() {
+            Some(mib) => format_size(mib.saturating_mul(1024 * 1024)),
+            None => "-".into(),
+        };
+        let cmdline = vm["kernel_cmdline"].as_str().unwrap_or("");
+        println!("{display:<24} {state:<8} {vcpu:>4} {mem:>10}  {cmdline}");
     }
     ExitCode::SUCCESS
 }

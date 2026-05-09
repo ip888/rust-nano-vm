@@ -39,7 +39,7 @@ use vm_core::{Hypervisor, SnapshotId, VmId};
 
 use crate::api::{
     CreateVmRequest, SnapshotDto, SnapshotListEntry, SnapshotListResponse, SnapshotRequest,
-    VmHandleDto, VmListResponse, VmStateResponse,
+    VmHandleDto, VmListEntry, VmListResponse, VmStateResponse,
 };
 use crate::auth;
 use crate::error::ApiError;
@@ -122,7 +122,22 @@ async fn create_vm(
 
 async fn list_vms(State(state): State<AppState>) -> Result<Json<VmListResponse>, ApiError> {
     let handles = state.hypervisor.list_vms()?;
-    Ok(Json(VmListResponse::new(handles)))
+    let mut vms = Vec::with_capacity(handles.len());
+    for handle in handles {
+        // Best-effort metadata enrichment — same degrade-gracefully
+        // pattern as list_snapshots: Unsupported (backend can't
+        // surface geometry) or UnknownVm (raced with destroy) → id-
+        // only row. Other backend errors propagate as 5xx.
+        let entry = match state.hypervisor.vm_meta(handle.id) {
+            Ok(meta) => VmListEntry::from_meta(meta),
+            Err(vm_core::VmError::Unsupported(_)) | Err(vm_core::VmError::UnknownVm(_)) => {
+                VmListEntry::id_only(handle)
+            }
+            Err(e) => return Err(ApiError::from(e)),
+        };
+        vms.push(entry);
+    }
+    Ok(Json(VmListResponse { vms }))
 }
 
 async fn get_vm(
