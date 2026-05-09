@@ -1,5 +1,5 @@
 [package]
-name = "virtio-queue-fuzz"
+name = "virtio-fs-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -13,30 +13,12 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-virtio-queue = { path = ".." }
+virtio-fs = { path = ".." }
 
 # Fuzz targets — each maps to a file under fuzz_targets/.
 
 [[bin]]
-name = "desc_chain"
-path = "fuzz_targets/desc_chain.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "avail_ring"
-path = "fuzz_targets/avail_ring.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "used_ring"
-path = "fuzz_targets/used_ring.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "packed_ring"
-path = "fuzz_targets/packed_ring.rs"
+name = "fuse_request"
+path = "fuzz_targets/fuse_request.rs"
 test = false
 doc = false

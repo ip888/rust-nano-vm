@@ -295,14 +295,20 @@ While a KVM host is being sourced, these items advance the project:
 3. **virtio-fs (M3 prep)** — add per-op FUSE request/response bodies and the
    dispatch scaffolding on top of the framing already in `virtio-fs`.
 
+   **Done.** All per-op body types and the full dispatch scaffolding are
+   complete and reflected in the M3 partial progress checklist above.
+
 4. **cargo-fuzz harnesses** — add fuzzing targets for `virtio-queue`,
    `virtio-vsock`, and `snapshot` parsers. Run locally with `cargo fuzz`.
 
    **Done.** Six fuzz targets added:
-   - `crates/virtio-queue/fuzz/`: `desc_chain`, `avail_ring`, `used_ring`
+   - `crates/virtio-queue/fuzz/`: `desc_chain`, `avail_ring`, `used_ring`,
+     `packed_ring` (covers the new packed-ring parsing added in item 2)
    - `crates/virtio-vsock/fuzz/`: `vsock_header` (with roundtrip property)
    - `crates/snapshot/fuzz/`: `backing_header` (with roundtrip property),
      `manifest_json`
+   - `crates/virtio-fs/fuzz/`: `fuse_request` (full FUSE packet parsing +
+     dispatch through a no-op handler; covers all 24 opcodes)
 
    Run any target locally with `cargo +nightly fuzz run <target-name>` from
    the relevant `fuzz/` directory. CI uses the xorshift smoke-fuzz unit tests
