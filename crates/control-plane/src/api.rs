@@ -280,7 +280,7 @@ impl SnapshotListEntry {
 }
 
 /// OpenAPI 3.1 document for the control-plane REST surface.
-pub(crate) fn openapi_spec() -> Value {
+pub fn openapi_spec() -> Value {
     json!({
         "openapi": "3.1.0",
         "info": {
