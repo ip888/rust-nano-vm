@@ -59,11 +59,11 @@ crates/
 | - | --- | --- | --- |
 | **M0** | Workspace scaffold, `Hypervisor` trait, `vm-mock` backend, CI without KVM, docs | **no** | ✅ complete |
 | M1 | `vm-kvm` boots minimal kernel; serial "hello from guest" | yes | 🔲 next on KVM host |
-| M2 | virtio-vsock transport + musl guest agent; `nanovm exec <id> -- echo hi` round-trips | yes | 🔲 partial (wire format + connection types done) |
-| M3 | virtio-fs; `nanovm cp file.py <id>:/work/` | yes | 🔲 placeholder |
+| M2 | virtio-vsock transport + musl guest agent; `nanovm exec <id> -- echo hi` round-trips | yes | 🔲 partial (wire types, connection state, guest-agent stdin/stdout mode, and CLI `ps` done) |
+| M3 | virtio-fs; `nanovm cp file.py <id>:/work/` | yes | 🔲 partial (FUSE framing done) |
 | M4 | Python / Node run in guest; stdio streaming demo | yes | 🔲 depends M2 |
 | M5 | Snapshot + fork via userfaultfd; warm pool; p50 < 50 ms cold start | yes | 🔲 on-disk format done |
-| M6 | Control plane REST API; auth; per-sandbox-second metering | **no** | ✅ complete (axum REST + bearer auth + integration tests) |
+| M6 | Control plane lifecycle API on `vm-mock`; quotas, metering, and KVM wiring follow on top | **no** | ✅ complete (axum REST + bearer auth + integration tests) |
 | M7 | Docs polish + public launch (HN / r/rust / r/MachineLearning) | any | 🔲 |
 
 Stretch: M8 GPU passthrough, M9 multi-node, M10 confidential compute
@@ -71,8 +71,8 @@ Stretch: M8 GPU passthrough, M9 multi-node, M10 confidential compute
 
 ## M0 — workspace scaffold (complete)
 
-- [x] Cargo workspace with 11 crates (2 real implementations, 1 skeleton,
-      5 placeholders, proto, cli, control-plane).
+- [x] Cargo workspace with 11 crates spanning hypervisor core/backends,
+      protocol + device-model foundations, guest agent, CLI, and control plane.
 - [x] `vm-core::Hypervisor` trait + supporting types (`VmConfig`,
       `VmHandle`, `VmState`, `VmError`, `VmId`, `SnapshotId`).
 - [x] `vm-mock::MockHypervisor` with full state-machine + snapshot/fork
@@ -171,10 +171,69 @@ guests, multi-tenant hard SLA, confidential compute. Revisit v2.
 | Security posture | Mirror Firecracker threat model; `cargo-fuzz` on virtio queue parsers from day 1; RustSec audit in CI |
 | Solo burnout | Ship M0–M4 publicly before M5; treat M5 as the v0.1 launch gate |
 
+## Current codebase assessment
+
+The workspace baseline is green on a non-KVM host:
+
+- `cargo build --workspace`
+- `cargo test --workspace`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo fmt --all -- --check`
+
+That baseline means the project has already moved beyond a pure scaffold.
+Today the strongest foundations are:
+
+- `vm-core`: the stable trait boundary every backend and entry point depends
+  on.
+- `vm-mock`: a fully tested state-machine backend that keeps CI and API work
+  independent from `/dev/kvm`.
+- `proto`, `virtio-queue`, `virtio-vsock`, and `snapshot`: wire-format and
+  file-format crates with focused serialization and parser coverage.
+- `control-plane`: a working REST lifecycle API with auth and integration
+  tests against `vm-mock`.
+
+The main gaps are now concentrated in the execution path rather than the
+interfaces:
+
+- `vm-kvm` is still an M0 skeleton, so there is no real boot path yet.
+- `virtio-vsock` and `guest-agent` have local/offline building blocks, but the
+  real `/dev/vsock` and KVM wiring is still missing, so exec cannot run
+  end-to-end inside a guest yet.
+- `virtio-fs` now has FUSE framing, but it still needs per-op bodies, dispatch,
+  and KVM integration before `nanovm cp` can work.
+- `cli` has a working `ps` command against the control plane, but the
+  guest-facing subcommands (`run`, `exec`, `cp`, `snapshot`, `fork`) remain
+  milestone placeholders.
+
+## Continuation priorities
+
+1. **Finish M1 first: real KVM boot.** This is the critical path because it
+   validates the `vm-core` abstraction against a real backend and unblocks all
+   later guest-facing work. The minimum useful slice is: open `/dev/kvm`,
+   create a VM from `VmConfig`, boot a tiny guest, and make `nanovm run`
+   print the serial "hello from guest" path end-to-end.
+2. **Then finish M2: vsock + guest-agent exec.** The protocol crate is already
+   defined, so the next high-leverage step is wiring `virtio-vsock` into
+   `vm-kvm`, implementing a tiny musl `guest-agent`, and making `nanovm exec`
+   and the control-plane speak the existing `proto` contract.
+3. **Treat snapshot/fork as the first performance milestone, not the first
+   implementation milestone.** The `snapshot` crate already pins the on-disk
+   format, so the next step there should be a benchmark-backed runtime
+   prototype (`userfaultfd`, warm pool, fork latency) once M1/M2 give a real
+   guest to snapshot.
+4. **Keep offline-preparable pieces moving in parallel.** `virtio-fs`
+   request/response bodies, `virtio-queue` ring work, fuzzing, and snapshot
+   runtime prep are valuable because they are unit-testable without `/dev/kvm`,
+   but they should still support — not displace — the boot + exec critical
+   path.
+
 ## Next up
 
-**M1 on a KVM host.** See [`kvm-host.md`](kvm-host.md) for the cheapest
-options (local Linux, GCP nested virt, AWS bare metal, Hetzner dedicated).
+**M1 on a KVM host.** Use `vm-mock` to preserve fast CI, but do the next round
+of implementation work around a single end-to-end KVM success criterion:
+create → boot → serial output. See [`kvm-host.md`](kvm-host.md) for the
+cheapest options (local Linux, GCP nested virt, AWS bare metal, Hetzner
+dedicated).
 
 The M2 vsock wiring can overlap with M1 development — once the kernel boots
 and a `ttyS0` line appears, plugging in virtio-vsock is the immediate next
@@ -192,8 +251,8 @@ While a KVM host is being sourced, these items advance the project:
    virtqueue, and guest-memory integration in `virtio-queue`. These are unit-
    testable with synthetic byte slices.
 
-3. **virtio-fs (M3 prep)** — add FUSE in/out message parsing to `virtio-fs`.
-   The FUSE kernel protocol is fully documented and testable offline.
+3. **virtio-fs (M3 prep)** — add per-op FUSE request/response bodies and the
+   dispatch scaffolding on top of the framing already in `virtio-fs`.
 
 4. **cargo-fuzz harnesses** — add fuzzing targets for `virtio-queue`,
    `virtio-vsock`, and `snapshot` parsers. Run locally with `cargo fuzz`.
