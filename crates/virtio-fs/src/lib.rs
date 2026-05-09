@@ -73,6 +73,7 @@
 #![warn(missing_docs)]
 
 pub mod body;
+pub mod dispatch;
 
 pub use body::{
     dt, fattr, fopen, fuse_dirent_padded_size, DirentWriteError, FuseAttr, FuseAttrOut,

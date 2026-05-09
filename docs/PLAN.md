@@ -60,7 +60,7 @@ crates/
 | **M0** | Workspace scaffold, `Hypervisor` trait, `vm-mock` backend, CI without KVM, docs | **no** | ✅ complete |
 | M1 | `vm-kvm` boots minimal kernel; serial "hello from guest" | yes | 🔲 next on KVM host |
 | M2 | virtio-vsock transport + musl guest agent; `nanovm exec <id> -- echo hi` round-trips | yes | 🔲 partial (wire types, connection state, guest-agent stdin/stdout mode, and CLI `ps` done) |
-| M3 | virtio-fs; `nanovm cp file.py <id>:/work/` | yes | 🔲 partial (FUSE framing done) |
+| M3 | virtio-fs; `nanovm cp file.py <id>:/work/` | yes | 🔲 partial (FUSE framing done, per-op bodies done, dispatch scaffolding done) |
 | M4 | Python / Node run in guest; stdio streaming demo | yes | 🔲 depends M2 |
 | M5 | Snapshot + fork via userfaultfd; warm pool; p50 < 50 ms cold start | yes | 🔲 on-disk format done |
 | M6 | Control plane lifecycle API on `vm-mock`; quotas, metering, and KVM wiring follow on top | **no** | ✅ complete (axum REST + bearer auth + integration tests) |
@@ -118,7 +118,30 @@ Stretch: M8 GPU passthrough, M9 multi-node, M10 confidential compute
       `Ping` and `Exec` requests over stdin/stdout (vsock wiring deferred
       to M2 on a KVM host).
 
-## M2 — still needs KVM host
+## M3 partial progress (no KVM needed for dispatch scaffolding)
+
+- [x] `virtio-fs`: FUSE protocol framing (`FuseInHeader`, `FuseOutHeader`,
+      `FuseOpcode`, all M3 spec constants).
+- [x] `virtio-fs`: Per-op body types (all request and response structs for
+      `Init`, `Forget`, `Getattr`, `Setattr`, `Lookup`, `Readlink`, `Mknod`,
+      `Mkdir`, `Unlink`, `Rmdir`, `Symlink`, `Rename`, `Link`, `Open`, `Read`,
+      `Write`, `Statfs`, `Release`, `Fsync`, `Flush`, `Opendir`, `Readdir`,
+      `Releasedir`, `Destroy`).
+- [x] `virtio-fs`: Dispatch scaffolding (`dispatch` module):
+      - `FuseRequest<'a>` enum — one zero-copy-parsed variant per opcode.
+      - `parse_request` — parses a raw byte slice into `(FuseInHeader, FuseRequest)`.
+      - `split_nul` — helper for extracting NUL-terminated names from payloads.
+      - `FuseHandler` trait — one method per opcode; all default to ENOSYS.
+      - `dispatch` — calls handler, serialises `FuseOutHeader` + body or
+        returns `None` for no-reply ops (`Forget`, `Destroy`).
+      - 19 unit tests (parse roundtrips, no-reply invariants, ENOSYS default).
+
+## M3 — still needs KVM host
+
+- [ ] Wire the virtqueue (MMIO/PCI) interrupt and ioeventfd plumbing into
+      the dispatch loop.
+- [ ] Implement a real `FuseHandler` backed by the host filesystem.
+- [ ] `nanovm cp file.py <id>:/work/` round-trips end-to-end.
 
 - [ ] Wire `virtio-vsock` into the KVM vCPU run loop (eventfd, virtqueue
       consumer, ioeventfd).
