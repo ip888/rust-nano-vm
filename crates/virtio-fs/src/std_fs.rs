@@ -26,10 +26,11 @@ use std::time::{Duration, UNIX_EPOCH};
 use crate::body::{dt, fattr, FuseDirentWriter};
 use crate::dispatch::{split_nul, FuseHandler, EINVAL, ENOSYS};
 use crate::{
-    FuseAttr, FuseAttrOut, FuseEntryOut, FuseFlushIn, FuseFsyncIn, FuseGetattrIn, FuseInHeader,
-    FuseInitIn, FuseInitOut, FuseLinkIn, FuseMkdirIn, FuseMknodIn, FuseOpenIn, FuseOpenOut,
-    FuseReadIn, FuseReleaseIn, FuseRenameIn, FuseSetattrIn, FuseStatfsOut, FuseWriteIn,
-    FuseWriteOut, FUSE_FSYNC_FDATASYNC, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
+    FuseAttr, FuseAttrOut, FuseEntryOut, FuseFlushIn, FuseForgetIn, FuseFsyncIn, FuseGetattrIn,
+    FuseInHeader, FuseInitIn, FuseInitOut, FuseLinkIn, FuseMkdirIn, FuseMknodIn, FuseOpenIn,
+    FuseOpenOut, FuseReadIn, FuseReleaseIn, FuseRenameIn, FuseSetattrIn, FuseStatfsOut,
+    FuseWriteIn, FuseWriteOut, FUSE_FSYNC_FDATASYNC, FUSE_KERNEL_MINOR_VERSION,
+    FUSE_KERNEL_VERSION,
 };
 
 const ROOT_NODE_ID: u64 = 1;
@@ -69,6 +70,7 @@ struct DirHandle {
 pub struct StdFsHandler {
     nodes: HashMap<u64, PathBuf>,
     paths: HashMap<PathBuf, u64>,
+    lookup_counts: HashMap<u64, u64>,
     next_node: u64,
     next_handle: u64,
     files: HashMap<u64, FileHandle>,
@@ -91,11 +93,14 @@ impl StdFsHandler {
         let root = root.canonicalize()?;
         let mut nodes = HashMap::new();
         let mut paths = HashMap::new();
+        let mut lookup_counts = HashMap::new();
         nodes.insert(ROOT_NODE_ID, root.clone());
         paths.insert(root.clone(), ROOT_NODE_ID);
+        lookup_counts.insert(ROOT_NODE_ID, u64::MAX);
         Ok(Self {
             nodes,
             paths,
+            lookup_counts,
             next_node: ROOT_NODE_ID + 1,
             next_handle: 1,
             files: HashMap::new(),
@@ -121,6 +126,7 @@ impl StdFsHandler {
     fn forget_path(&mut self, path: &Path) {
         if let Some(id) = self.paths.remove(path) {
             self.nodes.remove(&id);
+            self.lookup_counts.remove(&id);
         }
     }
 
@@ -173,6 +179,12 @@ impl StdFsHandler {
 
     fn entry_for_path(&mut self, path: &Path) -> Result<FuseEntryOut, i32> {
         let (id, attr) = self.node_attr(path)?;
+        if id != ROOT_NODE_ID {
+            self.lookup_counts
+                .entry(id)
+                .and_modify(|n| *n = n.saturating_add(1))
+                .or_insert(1);
+        }
         Ok(FuseEntryOut {
             nodeid: id,
             generation: 0,
@@ -245,6 +257,21 @@ impl StdFsHandler {
         }
         Ok(writer.into_bytes())
     }
+
+    fn forget_node(&mut self, nodeid: u64, nlookup: u64) {
+        if nodeid == ROOT_NODE_ID {
+            return;
+        }
+        let count = self.lookup_counts.get(&nodeid).copied().unwrap_or(0);
+        if nlookup >= count {
+            if let Some(path) = self.nodes.remove(&nodeid) {
+                self.paths.remove(&path);
+            }
+            self.lookup_counts.remove(&nodeid);
+        } else {
+            self.lookup_counts.insert(nodeid, count - nlookup);
+        }
+    }
 }
 
 impl FuseHandler for StdFsHandler {
@@ -256,6 +283,24 @@ impl FuseHandler for StdFsHandler {
             0,
             1024 * 1024,
         ))
+    }
+
+    fn forget(&mut self, hdr: &FuseInHeader, req: &FuseForgetIn) {
+        self.forget_node(hdr.nodeid, req.nlookup);
+    }
+
+    fn destroy(&mut self, _hdr: &FuseInHeader) {
+        let root = self.nodes.get(&ROOT_NODE_ID).cloned();
+        self.nodes.clear();
+        self.paths.clear();
+        self.lookup_counts.clear();
+        if let Some(root_path) = root {
+            self.nodes.insert(ROOT_NODE_ID, root_path.clone());
+            self.paths.insert(root_path, ROOT_NODE_ID);
+            self.lookup_counts.insert(ROOT_NODE_ID, u64::MAX);
+        }
+        self.files.clear();
+        self.dirs.clear();
     }
 
     fn getattr(&mut self, hdr: &FuseInHeader, _req: &FuseGetattrIn) -> Result<FuseAttrOut, i32> {
@@ -860,6 +905,101 @@ mod tests {
             assert_eq!(target, b"renamed.txt");
         }
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn forget_removes_node_mapping() {
+        let dir = temp_root("forget");
+        fs::write(dir.join("gone.txt"), b"payload").unwrap();
+        let mut handler = StdFsHandler::new(&dir).unwrap();
+
+        let looked_up = handler
+            .lookup(&hdr(FuseOpcode::Lookup, ROOT_NODE_ID, 9), b"gone.txt\0")
+            .unwrap();
+        handler.forget(
+            &hdr(
+                FuseOpcode::Forget,
+                looked_up.nodeid,
+                crate::FUSE_FORGET_IN_LEN,
+            ),
+            &FuseForgetIn { nlookup: 1 },
+        );
+
+        assert_eq!(
+            handler.getattr(
+                &hdr(
+                    FuseOpcode::Getattr,
+                    looked_up.nodeid,
+                    crate::FUSE_GETATTR_IN_LEN
+                ),
+                &FuseGetattrIn::default()
+            ),
+            Err(ENOENT)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn destroy_drops_open_handles() {
+        let dir = temp_root("destroy");
+        fs::write(dir.join("open.txt"), b"hello").unwrap();
+        let mut handler = StdFsHandler::new(&dir).unwrap();
+
+        let node = handler
+            .lookup(&hdr(FuseOpcode::Lookup, ROOT_NODE_ID, 9), b"open.txt\0")
+            .unwrap();
+        let file_open = handler
+            .open(
+                &hdr(FuseOpcode::Open, node.nodeid, FUSE_OPEN_IN_LEN),
+                &FuseOpenIn {
+                    flags: 0,
+                    open_flags: 0,
+                },
+            )
+            .unwrap();
+        let dir_open = handler
+            .opendir(
+                &hdr(FuseOpcode::Opendir, ROOT_NODE_ID, FUSE_OPEN_IN_LEN),
+                &FuseOpenIn {
+                    flags: 0,
+                    open_flags: 0,
+                },
+            )
+            .unwrap();
+
+        handler.destroy(&hdr(FuseOpcode::Destroy, ROOT_NODE_ID, 0));
+
+        assert_eq!(
+            handler.read(
+                &hdr(FuseOpcode::Read, node.nodeid, FUSE_READ_IN_LEN),
+                &FuseReadIn {
+                    fh: file_open.fh,
+                    offset: 0,
+                    size: 1,
+                    read_flags: 0,
+                    lock_owner: 0,
+                    flags: 0,
+                    padding: 0,
+                }
+            ),
+            Err(EBADF)
+        );
+        assert_eq!(
+            handler.readdir(
+                &hdr(FuseOpcode::Readdir, ROOT_NODE_ID, FUSE_READ_IN_LEN),
+                &FuseReadIn {
+                    fh: dir_open.fh,
+                    offset: 0,
+                    size: 16,
+                    read_flags: 0,
+                    lock_owner: 0,
+                    flags: 0,
+                    padding: 0,
+                }
+            ),
+            Err(EBADF)
+        );
         let _ = fs::remove_dir_all(dir);
     }
 }
