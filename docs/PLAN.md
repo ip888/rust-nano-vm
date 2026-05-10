@@ -163,6 +163,9 @@ Stretch: M8 GPU passthrough, M9 multi-node, M10 confidential compute
       `Readlink`, `Opendir`, `Readdir`, `Release`, `Releasedir`, `Flush`,
       `Fsync`, `Statfs`. Unit-tested via existing `parse_request` + `dispatch`
       scaffolding.
+- [x] `virtio-fs`: `StdFsHandler` now handles lifecycle bookkeeping offline:
+      `Forget` decrements/drops node mappings and `Destroy` resets nodes and
+      closes open file/dir handles.
 
 ## M3 — still needs KVM host
 
