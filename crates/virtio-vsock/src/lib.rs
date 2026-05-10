@@ -185,16 +185,21 @@ impl VsockHeader {
             });
         }
         // Offsets are pinned by the spec — any change is a wire break.
-        let src_cid = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        let dst_cid = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        let src_port = u32::from_le_bytes(buf[16..20].try_into().unwrap());
-        let dst_port = u32::from_le_bytes(buf[20..24].try_into().unwrap());
-        let len = u32::from_le_bytes(buf[24..28].try_into().unwrap());
-        let type_raw = u16::from_le_bytes(buf[28..30].try_into().unwrap());
-        let op_raw = u16::from_le_bytes(buf[30..32].try_into().unwrap());
-        let flags = u32::from_le_bytes(buf[32..36].try_into().unwrap());
-        let buf_alloc = u32::from_le_bytes(buf[36..40].try_into().unwrap());
-        let fwd_cnt = u32::from_le_bytes(buf[40..44].try_into().unwrap());
+        // Direct array construction is infallible after the bounds check above.
+        let src_cid = u64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]);
+        let dst_cid = u64::from_le_bytes([
+            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+        ]);
+        let src_port = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        let dst_port = u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
+        let len = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
+        let type_raw = u16::from_le_bytes([buf[28], buf[29]]);
+        let op_raw = u16::from_le_bytes([buf[30], buf[31]]);
+        let flags = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
+        let buf_alloc = u32::from_le_bytes([buf[36], buf[37], buf[38], buf[39]]);
+        let fwd_cnt = u32::from_le_bytes([buf[40], buf[41], buf[42], buf[43]]);
         Ok(Self {
             src_cid,
             dst_cid,
@@ -233,11 +238,18 @@ impl VsockHeader {
 
     /// Serialize into a fresh fixed-size byte array.
     pub fn to_bytes(&self) -> [u8; VSOCK_HDR_LEN] {
+        // Inline serialization — provably infallible, no expect() needed.
         let mut out = [0u8; VSOCK_HDR_LEN];
-        // Cannot fail: we just allocated exactly VSOCK_HDR_LEN bytes. If
-        // write_to ever grows a validation step it will trip this loudly.
-        self.write_to(&mut out)
-            .expect("serializing VsockHeader into a fixed-size buffer must succeed");
+        out[0..8].copy_from_slice(&self.src_cid.to_le_bytes());
+        out[8..16].copy_from_slice(&self.dst_cid.to_le_bytes());
+        out[16..20].copy_from_slice(&self.src_port.to_le_bytes());
+        out[20..24].copy_from_slice(&self.dst_port.to_le_bytes());
+        out[24..28].copy_from_slice(&self.len.to_le_bytes());
+        out[28..30].copy_from_slice(&(self.vtype as u16).to_le_bytes());
+        out[30..32].copy_from_slice(&self.op.as_raw().to_le_bytes());
+        out[32..36].copy_from_slice(&self.flags.to_le_bytes());
+        out[36..40].copy_from_slice(&self.buf_alloc.to_le_bytes());
+        out[40..44].copy_from_slice(&self.fwd_cnt.to_le_bytes());
         out
     }
 }
