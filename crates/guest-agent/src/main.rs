@@ -11,11 +11,16 @@
 //!
 //! In M2 the agent will:
 //!
-//! 1. Open `/dev/vsock` and bind to the well-known agent port.
-//! 2. Accept a connection from the host (CID 2).
-//! 3. Enter a request loop: read a length-prefixed JSON
+//! 1. Accept a stream from the host over AF_VSOCK.
+//! 2. Enter a request loop: read a length-prefixed JSON
 //!    [`proto::Request`], dispatch to the handler, write back a
-//!    [`proto::Response`].
+//!    length-prefixed [`proto::Response`].
+//!
+//! The AF_VSOCK socket open/bind/accept step is still blocked on safe socket
+//! integration, but the framed request/response path is already implemented:
+//! set `NANOVM_AGENT_FRAMED=1` to make the binary use 4-byte little-endian
+//! length prefixes on stdin/stdout. That framing matches the intended vsock
+//! transport and is unit-testable without KVM.
 //!
 //! ## Stdin / stdout mode (current, for local testing without KVM)
 //!
@@ -49,7 +54,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::time::Instant;
 
 use proto::{ErrorCode, Request, RequestId, Response, ResponseBody, RpcError, PROTOCOL_VERSION};
@@ -86,10 +91,16 @@ impl AgentState {
 fn main() {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut out = stdout.lock();
-    let mut state = AgentState::new();
+    if std::env::var_os("NANOVM_AGENT_FRAMED").is_some() {
+        run_length_prefixed_session(stdin.lock(), stdout.lock());
+    } else {
+        run_line_delimited_session(stdin.lock(), stdout.lock());
+    }
+}
 
-    for line in stdin.lock().lines() {
+fn run_line_delimited_session(input: impl BufRead, mut out: impl Write) {
+    let mut state = AgentState::new();
+    for line in input.lines() {
         let line = match line {
             Ok(l) if l.trim().is_empty() => continue,
             Ok(l) => l,
@@ -114,25 +125,75 @@ fn main() {
             }
         };
 
-        if req.version != PROTOCOL_VERSION {
-            let resp = error_response(
-                req.id,
-                ErrorCode::VersionMismatch,
-                format!(
-                    "expected protocol version {PROTOCOL_VERSION}, got {}",
-                    req.version
-                ),
-            );
-            if write_response(&mut out, &resp).is_err() {
-                break;
-            }
-            continue;
-        }
-
-        if handle_request(req, &mut out, &mut state).is_err() {
+        if process_request(req, &mut out, &mut state).is_err() {
             break;
         }
     }
+}
+
+fn run_length_prefixed_session(mut input: impl Read, mut out: impl Write) {
+    let mut state = AgentState::new();
+    loop {
+        let frame = match read_frame(&mut input) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("nanovm-agent: framed read error: {e}");
+                break;
+            }
+        };
+
+        let req: Request = match serde_json::from_slice(&frame) {
+            Ok(r) => r,
+            Err(e) => {
+                let resp = error_response(
+                    RequestId(0),
+                    ErrorCode::BadRequest,
+                    format!("malformed request: {e}"),
+                );
+                if write_frame(&mut out, &resp).is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let mut output_bytes = Vec::new();
+        if process_request(req, &mut output_bytes, &mut state).is_err() {
+            break;
+        }
+
+        for frame in output_bytes
+            .split(|b| *b == b'\n')
+            .filter(|part| !part.is_empty())
+        {
+            let resp: Response = match serde_json::from_slice(frame) {
+                Ok(resp) => resp,
+                Err(e) => {
+                    eprintln!("nanovm-agent: internal framed decode error: {e}");
+                    return;
+                }
+            };
+            if write_frame(&mut out, &resp).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+fn process_request(req: Request, out: &mut impl Write, state: &mut AgentState) -> Result<(), ()> {
+    if req.version != PROTOCOL_VERSION {
+        let resp = error_response(
+            req.id,
+            ErrorCode::VersionMismatch,
+            format!(
+                "expected protocol version {PROTOCOL_VERSION}, got {}",
+                req.version
+            ),
+        );
+        return write_response(out, &resp);
+    }
+    handle_request(req, out, state)
 }
 
 // ---------------------------------------------------------------------------
@@ -141,11 +202,7 @@ fn main() {
 
 /// Dispatch one request, writing one or more response frames to `out`.
 /// Returns `Err(())` if `out` is broken (the caller should stop the loop).
-fn handle_request(
-    req: Request,
-    out: &mut impl Write,
-    state: &mut AgentState,
-) -> Result<(), ()> {
+fn handle_request(req: Request, out: &mut impl Write, state: &mut AgentState) -> Result<(), ()> {
     use proto::RequestBody;
     match req.body {
         RequestBody::ExecStart {
@@ -527,6 +584,33 @@ fn write_response(out: &mut impl Write, resp: &Response) -> Result<(), ()> {
     out.flush().map_err(|_| ())
 }
 
+fn read_frame(input: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+    let mut len = [0u8; 4];
+    match input.read_exact(&mut len) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let len = u32::from_le_bytes(len) as usize;
+    let mut frame = vec![0u8; len];
+    input.read_exact(&mut frame)?;
+    Ok(Some(frame))
+}
+
+fn write_frame(out: &mut impl Write, resp: &Response) -> Result<(), ()> {
+    let json = match serde_json::to_vec(resp) {
+        Ok(buf) => buf,
+        Err(e) => {
+            eprintln!("nanovm-agent: serialize error: {e}");
+            return Err(());
+        }
+    };
+    let len = u32::try_from(json.len()).map_err(|_| ())?;
+    out.write_all(&len.to_le_bytes()).map_err(|_| ())?;
+    out.write_all(&json).map_err(|_| ())?;
+    out.flush().map_err(|_| ())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -632,7 +716,6 @@ mod tests {
 
         let mut out = Vec::new();
         let stdin = io::Cursor::new(buf);
-        let mut state = AgentState::new();
         for line in io::BufRead::lines(stdin) {
             let line = line.unwrap();
             let req: Request = serde_json::from_str(&line).unwrap();
@@ -661,13 +744,54 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn framed_session_roundtrips_ping() {
+        let req = Request {
+            version: PROTOCOL_VERSION,
+            id: RequestId(7),
+            body: RequestBody::Ping,
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        let mut input = Vec::new();
+        input.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        input.extend_from_slice(&payload);
+
+        let mut out = Vec::new();
+        run_length_prefixed_session(io::Cursor::new(input), &mut out);
+
+        let mut cursor = io::Cursor::new(out);
+        let frame = read_frame(&mut cursor).unwrap().unwrap();
+        let resp: Response = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(resp.id, RequestId(7));
+        assert!(matches!(resp.result, Ok(ResponseBody::Pong)));
+    }
+
+    #[test]
+    fn framed_session_returns_bad_request_for_malformed_json() {
+        let bad = b"{ definitely-not-json".to_vec();
+        let mut input = Vec::new();
+        input.extend_from_slice(&(bad.len() as u32).to_le_bytes());
+        input.extend_from_slice(&bad);
+
+        let mut out = Vec::new();
+        run_length_prefixed_session(io::Cursor::new(input), &mut out);
+
+        let mut cursor = io::Cursor::new(out);
+        let frame = read_frame(&mut cursor).unwrap().unwrap();
+        let resp: Response = serde_json::from_slice(&frame).unwrap();
+        assert!(matches!(
+            resp.result,
+            Err(RpcError {
+                code: ErrorCode::BadRequest,
+                ..
+            })
+        ));
+    }
+
     // ---- Streaming exec -------------------------------------------------
 
     /// Run `handle_exec_start` against a real command, collect the frames.
-    fn exec_start(
-        program: &str,
-        args: &[&str],
-    ) -> (Vec<ResponseBody>, AgentState) {
+    fn exec_start(program: &str, args: &[&str]) -> (Vec<ResponseBody>, AgentState) {
         let mut out = Vec::new();
         let mut state = AgentState::new();
         handle_exec_start(
@@ -707,18 +831,26 @@ mod tests {
         // Last frame: ExecExited
         let last = frames.last().unwrap();
         assert!(
-            matches!(last, ResponseBody::ExecExited { exit_code: Some(0), .. }),
+            matches!(
+                last,
+                ResponseBody::ExecExited {
+                    exit_code: Some(0),
+                    ..
+                }
+            ),
             "got {last:?}"
         );
 
         // ExecWait should resolve immediately from the cached state
         let mut dummy_out = Vec::new();
-        handle_exec_wait(proto::RequestId(2), pid, &mut dummy_out, &mut state)
-            .expect("wait ok");
+        handle_exec_wait(proto::RequestId(2), pid, &mut dummy_out, &mut state).expect("wait ok");
         let resp: Response = serde_json::from_slice(&dummy_out).unwrap();
         assert!(matches!(
             resp.result,
-            Ok(ResponseBody::ExecExited { exit_code: Some(0), .. })
+            Ok(ResponseBody::ExecExited {
+                exit_code: Some(0),
+                ..
+            })
         ));
     }
 
@@ -767,8 +899,7 @@ mod tests {
     fn exec_wait_unknown_pid_returns_no_such_process() {
         let mut out = Vec::new();
         let mut state = AgentState::new();
-        handle_exec_wait(proto::RequestId(1), 999_999, &mut out, &mut state)
-            .expect("write ok");
+        handle_exec_wait(proto::RequestId(1), 999_999, &mut out, &mut state).expect("write ok");
         let resp: Response = serde_json::from_slice(&out).unwrap();
         assert!(matches!(
             resp.result,

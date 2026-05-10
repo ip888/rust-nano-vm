@@ -15,6 +15,13 @@ use vm_core::{
     VmHandle, VmId, VmMeta, VmResult, VmState,
 };
 
+#[cfg(feature = "kvm")]
+use kvm_ioctls::Kvm;
+#[cfg(feature = "kvm")]
+use linux_loader::cmdline::Cmdline;
+#[cfg(feature = "kvm")]
+use vm_memory::{Address, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+
 /// KVM-backed hypervisor.
 ///
 /// On platforms without `/dev/kvm` (non-Linux or the `kvm` feature disabled)
@@ -33,6 +40,68 @@ impl KvmHypervisor {
     /// open `/dev/kvm`.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build a minimal, compile-time-validated boot plan without touching
+    /// `/dev/kvm`.
+    ///
+    /// This is the first M1 slice we can land in a non-KVM sandbox: it proves
+    /// the feature-gated dependencies compile together and that we can derive
+    /// guest memory / command-line structures from [`VmConfig`].
+    #[cfg(feature = "kvm")]
+    #[allow(dead_code)]
+    pub(crate) fn boot_plan(cfg: &VmConfig) -> VmResult<KvmBootPlan> {
+        KvmBootPlan::from_config(cfg)
+    }
+}
+
+/// Minimal KVM boot resources that can be prepared without creating a VM.
+#[cfg(feature = "kvm")]
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct KvmBootPlan {
+    guest_mem: GuestMemoryMmap,
+    kernel_load_addr: GuestAddress,
+    initrd_load_addr: Option<GuestAddress>,
+    cmdline: Cmdline,
+}
+
+#[cfg(feature = "kvm")]
+#[allow(dead_code)]
+impl KvmBootPlan {
+    const CMDLINE_CAPACITY: usize = 4096;
+    const KERNEL_LOAD_ADDR: u64 = 0x20_0000;
+
+    fn from_config(cfg: &VmConfig) -> VmResult<Self> {
+        let mem_size = cfg
+            .memory_mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| VmError::Backend("memory size overflow".into()))?;
+        let mem_len = usize::try_from(mem_size)
+            .map_err(|_| VmError::Backend(format!("memory size {mem_size} does not fit usize")))?;
+        let guest_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_len)])
+            .map_err(|e| VmError::Backend(format!("guest memory layout: {e}")))?;
+        let mut cmdline = Cmdline::new(Self::CMDLINE_CAPACITY)
+            .map_err(|e| VmError::Backend(format!("kernel cmdline capacity: {e}")))?;
+        if !cfg.cmdline.is_empty() {
+            cmdline
+                .insert_str(&cfg.cmdline)
+                .map_err(|e| VmError::Backend(format!("kernel cmdline: {e}")))?;
+        }
+        Ok(Self {
+            guest_mem,
+            kernel_load_addr: GuestAddress(Self::KERNEL_LOAD_ADDR),
+            initrd_load_addr: None,
+            cmdline,
+        })
+    }
+
+    fn memory_size_bytes(&self) -> u64 {
+        self.guest_mem.last_addr().raw_value() + 1
+    }
+
+    fn open_kvm() -> VmResult<Kvm> {
+        Kvm::new().map_err(|e| VmError::Backend(format!("open /dev/kvm: {e}")))
     }
 }
 
@@ -188,5 +257,19 @@ mod tests {
             hv.read_file(VmId(1), "/tmp/x".into()).unwrap_err(),
             VmError::Unsupported(_)
         ));
+    }
+
+    #[cfg(feature = "kvm")]
+    #[test]
+    fn boot_plan_derives_memory_and_cmdline_without_opening_kvm() {
+        let plan = KvmHypervisor::boot_plan(&VmConfig {
+            memory_mib: 64,
+            cmdline: "console=ttyS0".into(),
+            ..VmConfig::default()
+        })
+        .expect("boot plan");
+        assert_eq!(plan.memory_size_bytes(), 64 * 1024 * 1024);
+        assert_eq!(plan.kernel_load_addr, GuestAddress(0x20_0000));
+        assert!(plan.initrd_load_addr.is_none());
     }
 }

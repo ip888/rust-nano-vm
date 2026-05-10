@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use vm_core::{
@@ -21,6 +22,7 @@ use vm_core::{
 struct MockVm {
     config: VmConfig,
     state: VmState,
+    guest_root: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -90,9 +92,11 @@ impl Hypervisor for MockHypervisor {
             }
         };
         let id = VmId::next();
+        let guest_root = guest_root_dir(id);
         let vm = MockVm {
             config: cfg,
             state: VmState::Created,
+            guest_root,
         };
         self.inner
             .lock()
@@ -174,6 +178,7 @@ impl Hypervisor for MockHypervisor {
             MockVm {
                 config: snapshot.config,
                 state,
+                guest_root: guest_root_dir(id),
             },
         );
         Ok(VmHandle { id, state })
@@ -181,9 +186,10 @@ impl Hypervisor for MockHypervisor {
 
     fn destroy(&self, id: VmId) -> VmResult<()> {
         let mut inner = self.inner.lock().expect("mock hypervisor poisoned");
-        if inner.vms.remove(&id).is_none() {
+        let Some(vm) = inner.vms.remove(&id) else {
             return Err(VmError::UnknownVm(id));
-        }
+        };
+        let _ = std::fs::remove_dir_all(vm.guest_root);
         Ok(())
     }
 
@@ -310,7 +316,7 @@ impl Hypervisor for MockHypervisor {
     }
 
     fn write_file(&self, id: VmId, path: String, content: Vec<u8>, mode: u32) -> VmResult<u64> {
-        {
+        let guest_root = {
             let inner = self.inner.lock().expect("mock hypervisor poisoned");
             let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
             if vm.state != VmState::Running {
@@ -320,18 +326,25 @@ impl Hypervisor for MockHypervisor {
                     to: VmState::Running,
                 });
             }
-        }
+            vm.guest_root.clone()
+        };
 
+        let path = resolve_guest_path(&guest_root, &path)?;
         let bytes = content.len() as u64;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                VmError::Backend(format!("create parent {}: {e}", parent.display()))
+            })?;
+        }
         std::fs::write(&path, &content)
-            .map_err(|e| VmError::Backend(format!("write_file {path}: {e}")))?;
+            .map_err(|e| VmError::Backend(format!("write_file {}: {e}", path.display())))?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(mode);
             std::fs::set_permissions(&path, perms)
-                .map_err(|e| VmError::Backend(format!("chmod {path}: {e}")))?;
+                .map_err(|e| VmError::Backend(format!("chmod {}: {e}", path.display())))?;
         }
         #[cfg(not(unix))]
         let _ = mode;
@@ -340,7 +353,7 @@ impl Hypervisor for MockHypervisor {
     }
 
     fn read_file(&self, id: VmId, path: String) -> VmResult<Vec<u8>> {
-        {
+        let guest_root = {
             let inner = self.inner.lock().expect("mock hypervisor poisoned");
             let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
             if vm.state != VmState::Running {
@@ -350,10 +363,43 @@ impl Hypervisor for MockHypervisor {
                     to: VmState::Running,
                 });
             }
-        }
+            vm.guest_root.clone()
+        };
 
-        std::fs::read(&path).map_err(|e| VmError::Backend(format!("read_file {path}: {e}")))
+        let path = resolve_guest_path(&guest_root, &path)?;
+        std::fs::read(&path)
+            .map_err(|e| VmError::Backend(format!("read_file {}: {e}", path.display())))
     }
+}
+
+fn guest_root_dir(id: VmId) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "rust-nano-vm-mock-guest-{}-{}",
+        std::process::id(),
+        id.0
+    ))
+}
+
+fn resolve_guest_path(root: &Path, guest_path: &str) -> VmResult<PathBuf> {
+    let path = Path::new(guest_path);
+    if !path.is_absolute() {
+        return Err(VmError::Backend(format!(
+            "guest path must be absolute: {guest_path}"
+        )));
+    }
+    let mut resolved = root.to_path_buf();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) => resolved.push(part),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(VmError::Backend(format!(
+                    "guest path must not escape its root: {guest_path}"
+                )))
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -783,8 +829,10 @@ mod tests {
 
         let read = hv.read_file(h.id, path.clone()).expect("read_file");
         assert_eq!(read, content);
-
-        let _ = std::fs::remove_file(&path);
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "mock guest paths must not write directly onto the host filesystem"
+        );
     }
 
     #[test]
@@ -804,6 +852,17 @@ mod tests {
         hv.start(h.id).unwrap();
         let err = hv
             .read_file(h.id, "/no/such/file/for/mock/test".into())
+            .unwrap_err();
+        assert!(matches!(err, VmError::Backend(_)));
+    }
+
+    #[test]
+    fn guest_paths_cannot_escape_mock_root() {
+        let hv = MockHypervisor::new();
+        let h = hv.create_vm(&cfg()).unwrap();
+        hv.start(h.id).unwrap();
+        let err = hv
+            .write_file(h.id, "/tmp/../escape".into(), b"oops".to_vec(), 0o644)
             .unwrap_err();
         assert!(matches!(err, VmError::Backend(_)));
     }

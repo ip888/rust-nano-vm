@@ -784,7 +784,13 @@ async fn snapshot_with_empty_body_still_works_legacy_shape() {
 async fn create_running_vm(app: Router) -> u64 {
     let (_, h) = send(app.clone(), Method::POST, "/v1/vms", Some(json!({}))).await;
     let id = h["id"].as_u64().unwrap();
-    send(app.clone(), Method::POST, &format!("/v1/vms/{id}/start"), None).await;
+    send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{id}/start"),
+        None,
+    )
+    .await;
     id
 }
 
@@ -872,7 +878,11 @@ async fn exec_missing_program_field_is_bad_request() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "got body {body:?}");
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "got body {body:?}"
+    );
     assert_eq!(body["error"]["code"], "bad_request");
 }
 
@@ -882,11 +892,7 @@ async fn write_and_read_file_roundtrip_via_http() {
     let id = create_running_vm(app.clone()).await;
 
     let content: Vec<u8> = b"hello from http roundtrip".to_vec();
-    let path = format!(
-        "/tmp/rust-nano-vm-api-test-{}-{}",
-        std::process::id(),
-        id
-    );
+    let path = format!("/tmp/rust-nano-vm-api-test-{}-{}", std::process::id(), id);
 
     // Write
     let (status, body) = send(
@@ -925,13 +931,7 @@ async fn read_file_missing_path_query_is_bad_request() {
     let id = create_running_vm(app.clone()).await;
 
     // No `?path=` query parameter
-    let (status, body) = send(
-        app,
-        Method::GET,
-        &format!("/v1/vms/{id}/files"),
-        None,
-    )
-    .await;
+    let (status, body) = send(app, Method::GET, &format!("/v1/vms/{id}/files"), None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "got {body:?}");
 }
 
@@ -948,10 +948,6 @@ async fn read_file_nonexistent_path_returns_backend_error() {
     )
     .await;
     // The mock surfaces a backend error (IO error on the host) which maps to 500.
-    assert_eq!(
-        status,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "got {body:?}"
-    );
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "got {body:?}");
     assert_eq!(body["error"]["code"], "backend");
 }
