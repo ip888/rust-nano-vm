@@ -102,11 +102,15 @@ impl Descriptor {
                 need: DESC_SIZE,
             });
         }
+        // Direct array construction is infallible — no unwrap needed.
+        // Each window is exactly the right width after the bounds check above.
         Ok(Self {
-            addr: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            len: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            flags: u16::from_le_bytes(buf[12..14].try_into().unwrap()),
-            next: u16::from_le_bytes(buf[14..16].try_into().unwrap()),
+            addr: u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]),
+            len: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            flags: u16::from_le_bytes([buf[12], buf[13]]),
+            next: u16::from_le_bytes([buf[14], buf[15]]),
         })
     }
 
@@ -128,13 +132,18 @@ impl Descriptor {
 
     /// Serialize into a fresh fixed-size byte array.
     pub fn to_bytes(&self) -> [u8; DESC_SIZE] {
-        let mut out = [0u8; DESC_SIZE];
-        // Cannot fail: we just allocated exactly DESC_SIZE bytes. The
-        // expect() ensures any future validation added to write_to trips
-        // loudly instead of being silently dropped.
-        self.write_to(&mut out)
-            .expect("serializing Descriptor into a fixed-size buffer must succeed");
-        out
+        // Inline serialization so this method is provably infallible:
+        // no dynamic buffer length check, no expect().
+        let addr = self.addr.to_le_bytes();
+        let len = self.len.to_le_bytes();
+        let flags = self.flags.to_le_bytes();
+        let next = self.next.to_le_bytes();
+        [
+            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
+            len[0], len[1], len[2], len[3],
+            flags[0], flags[1],
+            next[0], next[1],
+        ]
     }
 
     /// `true` when the chain continues via [`Descriptor::next`].
@@ -166,8 +175,19 @@ impl Descriptor {
     }
 
     /// Read this descriptor's bytes from a guest-memory backend.
+    ///
+    /// Returns [`QueueError::DescriptorTooLarge`] when `self.len` exceeds
+    /// [`MAX_DESC_READ_BYTES`], preventing a guest from triggering an
+    /// out-of-memory condition on the host by crafting a huge descriptor.
     pub fn read_from<M: GuestMemory>(&self, mem: &M) -> Result<Vec<u8>, QueueError> {
-        let mut out = vec![0u8; self.len as usize];
+        let len = self.len as usize;
+        if len > MAX_DESC_READ_BYTES {
+            return Err(QueueError::DescriptorTooLarge {
+                len: self.len,
+                max: MAX_DESC_READ_BYTES,
+            });
+        }
+        let mut out = vec![0u8; len];
         mem.read(self.addr, &mut out)?;
         Ok(out)
     }
@@ -189,7 +209,13 @@ impl Descriptor {
     }
 }
 
-/// Iterator that walks a descriptor chain starting at a given head index.
+/// Maximum number of bytes [`Descriptor::read_from`] will allocate in a
+/// single call.  A guest-controlled descriptor whose `len` field is
+/// 4 GiB would cause an OOM on the host; this cap prevents that while
+/// still being large enough for any realistic virtio payload.
+pub const MAX_DESC_READ_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
+
 ///
 /// The walker is cycle-safe: it stops after visiting `table.len()`
 /// descriptors, which is the maximum legal chain length per the virtio
@@ -431,6 +457,16 @@ pub enum QueueError {
         /// Descriptor guest address.
         addr: u64,
     },
+    /// [`Descriptor::read_from`] was asked to allocate more than
+    /// [`MAX_DESC_READ_BYTES`] bytes. Indicates a possibly malicious or
+    /// corrupt descriptor.
+    #[error("descriptor len {len} exceeds read limit {max}")]
+    DescriptorTooLarge {
+        /// The descriptor's `len` field.
+        len: u32,
+        /// The configured maximum ([`MAX_DESC_READ_BYTES`]).
+        max: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -557,11 +593,14 @@ impl PackedDesc {
                 need: PACKED_DESC_SIZE,
             });
         }
+        // Direct array construction — infallible after the bounds check above.
         Ok(Self {
-            addr: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            len: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            id: u16::from_le_bytes(buf[12..14].try_into().unwrap()),
-            flags: u16::from_le_bytes(buf[14..16].try_into().unwrap()),
+            addr: u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]),
+            len: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            id: u16::from_le_bytes([buf[12], buf[13]]),
+            flags: u16::from_le_bytes([buf[14], buf[15]]),
         })
     }
 
@@ -582,10 +621,17 @@ impl PackedDesc {
 
     /// Serialize into a fresh fixed-size byte array.
     pub fn to_bytes(&self) -> [u8; PACKED_DESC_SIZE] {
-        let mut out = [0u8; PACKED_DESC_SIZE];
-        self.write_to(&mut out)
-            .expect("serializing PackedDesc into a fixed-size buffer must succeed");
-        out
+        // Inline serialization — provably infallible, no expect() needed.
+        let addr = self.addr.to_le_bytes();
+        let len = self.len.to_le_bytes();
+        let id = self.id.to_le_bytes();
+        let flags = self.flags.to_le_bytes();
+        [
+            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
+            len[0], len[1], len[2], len[3],
+            id[0], id[1],
+            flags[0], flags[1],
+        ]
     }
 
     /// `true` when the packed descriptor has NEXT set.
@@ -687,14 +733,16 @@ impl<'a> AvailRing<'a> {
 
     /// `flags` field (offset 0).
     pub fn flags(&self) -> u16 {
-        u16::from_le_bytes(self.bytes[0..2].try_into().unwrap())
+        // Infallible: constructor verified bytes.len() >= avail_ring_size(qsize) >= 6.
+        u16::from_le_bytes([self.bytes[0], self.bytes[1]])
     }
 
     /// Driver's monotonic-mod-2^16 producer index (offset 2). The number of
     /// available descriptor heads is `idx().wrapping_sub(last_seen)`; slots
     /// are read mod `qsize`.
     pub fn idx(&self) -> u16 {
-        u16::from_le_bytes(self.bytes[2..4].try_into().unwrap())
+        // Infallible: constructor verified bytes.len() >= 6.
+        u16::from_le_bytes([self.bytes[2], self.bytes[3]])
     }
 
     /// Descriptor head index at `slot` (which is implicitly taken mod
@@ -702,7 +750,8 @@ impl<'a> AvailRing<'a> {
     pub fn head(&self, slot: u16) -> u16 {
         let i = (slot % self.qsize) as usize;
         let off = 4 + 2 * i;
-        u16::from_le_bytes(self.bytes[off..off + 2].try_into().unwrap())
+        // Infallible: i < qsize, so off + 2 <= 4 + 2*qsize < avail_ring_size.
+        u16::from_le_bytes([self.bytes[off], self.bytes[off + 1]])
     }
 
     /// `used_event` field at the very end of the ring. Only meaningful
@@ -710,7 +759,8 @@ impl<'a> AvailRing<'a> {
     /// bytes are reserved.
     pub fn used_event(&self) -> u16 {
         let off = 4 + 2 * self.qsize as usize;
-        u16::from_le_bytes(self.bytes[off..off + 2].try_into().unwrap())
+        // Infallible: off + 2 == avail_ring_size(qsize) <= bytes.len().
+        u16::from_le_bytes([self.bytes[off], self.bytes[off + 1]])
     }
 
     /// Iterate descriptor heads added by the driver since `last_seen`
@@ -783,7 +833,8 @@ impl<'a> UsedRing<'a> {
 
     /// `flags` field (offset 0).
     pub fn flags(&self) -> u16 {
-        u16::from_le_bytes(self.bytes[0..2].try_into().unwrap())
+        // Infallible: constructor verified bytes.len() >= used_ring_size(qsize) >= 6.
+        u16::from_le_bytes([self.bytes[0], self.bytes[1]])
     }
 
     /// Set the `flags` field.
@@ -793,7 +844,8 @@ impl<'a> UsedRing<'a> {
 
     /// Device's monotonic-mod-2^16 producer index (offset 2).
     pub fn idx(&self) -> u16 {
-        u16::from_le_bytes(self.bytes[2..4].try_into().unwrap())
+        // Infallible: constructor verified bytes.len() >= 6.
+        u16::from_le_bytes([self.bytes[2], self.bytes[3]])
     }
 
     /// Set `idx`. Real callers should prefer [`Self::push`], which wraps
@@ -806,7 +858,8 @@ impl<'a> UsedRing<'a> {
     /// when `VIRTQ_F_EVENT_IDX` is negotiated.
     pub fn avail_event(&self) -> u16 {
         let off = 4 + 8 * self.qsize as usize;
-        u16::from_le_bytes(self.bytes[off..off + 2].try_into().unwrap())
+        // Infallible: off + 2 == used_ring_size(qsize) <= bytes.len().
+        u16::from_le_bytes([self.bytes[off], self.bytes[off + 1]])
     }
 
     /// Set `avail_event`.
@@ -820,8 +873,19 @@ impl<'a> UsedRing<'a> {
     pub fn elem(&self, slot: u16) -> (u32, u32) {
         let i = (slot % self.qsize) as usize;
         let off = 4 + 8 * i;
-        let id = u32::from_le_bytes(self.bytes[off..off + 4].try_into().unwrap());
-        let len = u32::from_le_bytes(self.bytes[off + 4..off + 8].try_into().unwrap());
+        // Infallible: i < qsize, off + 8 <= 4 + 8*qsize < used_ring_size.
+        let id = u32::from_le_bytes([
+            self.bytes[off],
+            self.bytes[off + 1],
+            self.bytes[off + 2],
+            self.bytes[off + 3],
+        ]);
+        let len = u32::from_le_bytes([
+            self.bytes[off + 4],
+            self.bytes[off + 5],
+            self.bytes[off + 6],
+            self.bytes[off + 7],
+        ]);
         (id, len)
     }
 
@@ -1600,5 +1664,43 @@ mod tests {
             rng.fill(&mut buf[..len]);
             let _ = parse_descriptor_table(&buf[..len], qsize);
         }
+    }
+
+    // ---- Descriptor::read_from size guard --------------------------------
+
+    #[test]
+    fn read_from_rejects_descriptors_larger_than_max() {
+        let mut mem_bytes = vec![0u8; 4];
+        let mem = SliceGuestMemory::new(0x0, &mut mem_bytes);
+
+        // len == MAX_DESC_READ_BYTES is accepted.
+        let at_limit = Descriptor {
+            addr: 0x0,
+            len: MAX_DESC_READ_BYTES as u32,
+            flags: 0,
+            next: 0,
+        };
+        // The GuestMemory will reject it for being out-of-bounds, but the
+        // size guard must not trigger — we only care it does not return
+        // DescriptorTooLarge here.
+        assert!(!matches!(
+            at_limit.read_from(&mem),
+            Err(QueueError::DescriptorTooLarge { .. })
+        ));
+
+        // len == MAX_DESC_READ_BYTES + 1 must return DescriptorTooLarge.
+        let over_limit = Descriptor {
+            addr: 0x0,
+            len: MAX_DESC_READ_BYTES as u32 + 1,
+            flags: 0,
+            next: 0,
+        };
+        assert!(matches!(
+            over_limit.read_from(&mem),
+            Err(QueueError::DescriptorTooLarge {
+                len,
+                max
+            }) if len == MAX_DESC_READ_BYTES as u32 + 1 && max == MAX_DESC_READ_BYTES
+        ));
     }
 }

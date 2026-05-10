@@ -315,7 +315,7 @@ fn handle_exec_start(
             return write_response(out, &resp);
         }
     };
-    let duration_ms = start.elapsed().as_millis() as u64;
+    let duration_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
     // Emit stdout as an ExecOutput frame (skip if empty).
     if !output.stdout.is_empty() {
@@ -474,7 +474,7 @@ fn handle_exec(
         message: format!("failed to spawn {program}: {e}"),
     })?;
 
-    let duration_ms = start.elapsed().as_millis() as u64;
+    let duration_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
     if let Some(limit) = timeout_ms {
         if duration_ms > limit {
@@ -585,13 +585,23 @@ fn write_response(out: &mut impl Write, resp: &Response) -> Result<(), ()> {
 }
 
 fn read_frame(input: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
-    let mut len = [0u8; 4];
-    match input.read_exact(&mut len) {
+    /// Maximum allowed length for a single framed request, to prevent an
+    /// out-of-memory condition caused by a malicious or corrupted length field.
+    const MAX_FRAME_LEN: usize = 16 * 1024 * 1024; // 16 MiB
+
+    let mut len_buf = [0u8; 4];
+    match input.read_exact(&mut len_buf) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
-    let len = u32::from_le_bytes(len) as usize;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame length {len} exceeds maximum {MAX_FRAME_LEN} bytes"),
+        ));
+    }
     let mut frame = vec![0u8; len];
     input.read_exact(&mut frame)?;
     Ok(Some(frame))

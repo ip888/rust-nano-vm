@@ -288,7 +288,7 @@ impl Hypervisor for MockHypervisor {
         let output = child
             .wait_with_output()
             .map_err(|e| VmError::Backend(format!("exec wait {}: {e}", req.program)))?;
-        let duration_ms = start.elapsed().as_millis() as u64;
+        let duration_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
         if let Some(limit) = req.timeout_ms {
             if duration_ms > limit {
