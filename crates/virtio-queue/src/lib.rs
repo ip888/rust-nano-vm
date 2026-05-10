@@ -139,10 +139,8 @@ impl Descriptor {
         let flags = self.flags.to_le_bytes();
         let next = self.next.to_le_bytes();
         [
-            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
-            len[0], len[1], len[2], len[3],
-            flags[0], flags[1],
-            next[0], next[1],
+            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7], len[0], len[1],
+            len[2], len[3], flags[0], flags[1], next[0], next[1],
         ]
     }
 
@@ -214,7 +212,6 @@ impl Descriptor {
 /// 4 GiB would cause an OOM on the host; this cap prevents that while
 /// still being large enough for any realistic virtio payload.
 pub const MAX_DESC_READ_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
-
 
 ///
 /// The walker is cycle-safe: it stops after visiting `table.len()`
@@ -627,10 +624,8 @@ impl PackedDesc {
         let id = self.id.to_le_bytes();
         let flags = self.flags.to_le_bytes();
         [
-            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
-            len[0], len[1], len[2], len[3],
-            id[0], id[1],
-            flags[0], flags[1],
+            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7], len[0], len[1],
+            len[2], len[3], id[0], id[1], flags[0], flags[1],
         ]
     }
 
