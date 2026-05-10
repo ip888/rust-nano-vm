@@ -230,6 +230,45 @@ pub trait Hypervisor: Send + Sync {
     /// don't track per-VM state in-process may return
     /// [`VmError::Unsupported`].
     fn vm_meta(&self, id: VmId) -> VmResult<VmMeta>;
+
+    /// Execute a command in the guest and wait for it to finish.
+    ///
+    /// The VM must be in the `Running` state; callers that pass a
+    /// non-running VM id receive [`VmError::InvalidTransition`].
+    ///
+    /// The default implementation returns [`VmError::Unsupported`].
+    /// Backends that proxy the call to a real guest agent (M2+) or
+    /// run it locally (mock) should override this.
+    fn exec_in_guest(&self, _id: VmId, _req: GuestExecRequest) -> VmResult<GuestExecResult> {
+        Err(VmError::Unsupported(
+            "exec_in_guest: not implemented on this backend",
+        ))
+    }
+
+    /// Write a file into the guest filesystem. The VM must be `Running`.
+    ///
+    /// `path` is the absolute path inside the guest.  `mode` is the
+    /// UNIX permission bits (e.g. `0o644`); ignored on non-Unix hosts.
+    /// Returns the number of bytes written.
+    ///
+    /// The default implementation returns [`VmError::Unsupported`].
+    fn write_file(&self, _id: VmId, _path: String, _content: Vec<u8>, _mode: u32) -> VmResult<u64> {
+        Err(VmError::Unsupported(
+            "write_file: not implemented on this backend",
+        ))
+    }
+
+    /// Read a file from the guest filesystem. The VM must be `Running`.
+    ///
+    /// `path` is the absolute path inside the guest. Returns the raw
+    /// file bytes.
+    ///
+    /// The default implementation returns [`VmError::Unsupported`].
+    fn read_file(&self, _id: VmId, _path: String) -> VmResult<Vec<u8>> {
+        Err(VmError::Unsupported(
+            "read_file: not implemented on this backend",
+        ))
+    }
 }
 
 /// Metadata describing a VM's geometry. Read via
@@ -269,6 +308,37 @@ pub struct SnapshotMeta {
     /// Kernel command line captured at snapshot time. Empty when the
     /// VM was never given one (typical for the mock backend).
     pub kernel_cmdline: String,
+}
+
+/// Request parameters for [`Hypervisor::exec_in_guest`].
+#[derive(Debug, Clone)]
+pub struct GuestExecRequest {
+    /// Program to execute (absolute path or found on `$PATH`).
+    pub program: String,
+    /// Argument vector, NOT including `argv[0]`.
+    pub args: Vec<String>,
+    /// Optional working directory inside the guest (or on the host for
+    /// the mock backend).
+    pub cwd: Option<String>,
+    /// Extra environment variables to inject into the child.
+    pub env: Vec<(String, String)>,
+    /// Wall-clock timeout in milliseconds. `None` means no limit.
+    pub timeout_ms: Option<u64>,
+}
+
+/// Outcome of [`Hypervisor::exec_in_guest`].
+#[derive(Debug, Clone)]
+pub struct GuestExecResult {
+    /// Process exit code. `None` if the process was killed by a signal.
+    pub exit_code: Option<i32>,
+    /// Signal that terminated the process, if any (POSIX only).
+    pub signal: Option<i32>,
+    /// Captured standard output.
+    pub stdout: Vec<u8>,
+    /// Captured standard error.
+    pub stderr: Vec<u8>,
+    /// Wall-clock runtime in milliseconds.
+    pub duration_ms: u64,
 }
 
 #[cfg(test)]

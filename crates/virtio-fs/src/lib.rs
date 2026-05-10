@@ -36,10 +36,12 @@
 //!     - [`FuseReleaseIn`] — `Release` / `Releasedir` (drops a file handle)
 //!     - [`FuseStatfsOut`] — `Statfs` response body
 //!
-//! With the per-op body surface complete, the remaining M3 work is
-//! the dispatch loop that reads a [`FuseInHeader`] from a virtqueue
-//! descriptor chain, invokes the right handler, and writes a
-//! [`FuseOutHeader`] + body back.
+//! With the per-op body surface complete, the crate now also includes
+//! the dispatch loop (`dispatch`) and a real `std::fs`-backed handler
+//! (`StdFsHandler`). The remaining M3 work is the KVM/device side:
+//! reading a [`FuseInHeader`] from a virtqueue descriptor chain,
+//! invoking the handler, and writing a [`FuseOutHeader`] + body back
+//! through virtio-fs queues end-to-end.
 //!
 //! # Wire format
 //!
@@ -74,6 +76,7 @@
 
 pub mod body;
 pub mod dispatch;
+pub mod std_fs;
 
 pub use body::{
     dt, fattr, fopen, fuse_dirent_padded_size, DirentWriteError, FuseAttr, FuseAttrOut,
@@ -87,6 +90,7 @@ pub use body::{
     FUSE_OPEN_IN_LEN, FUSE_OPEN_OUT_LEN, FUSE_READ_IN_LEN, FUSE_RELEASE_IN_LEN, FUSE_RENAME_IN_LEN,
     FUSE_SETATTR_IN_LEN, FUSE_STATFS_OUT_LEN, FUSE_WRITE_IN_LEN, FUSE_WRITE_OUT_LEN,
 };
+pub use std_fs::StdFsHandler;
 
 use thiserror::Error;
 
