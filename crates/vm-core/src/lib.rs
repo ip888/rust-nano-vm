@@ -240,7 +240,9 @@ pub trait Hypervisor: Send + Sync {
     /// Backends that proxy the call to a real guest agent (M2+) or
     /// run it locally (mock) should override this.
     fn exec_in_guest(&self, _id: VmId, _req: GuestExecRequest) -> VmResult<GuestExecResult> {
-        Err(VmError::Unsupported("exec_in_guest: not implemented on this backend"))
+        Err(VmError::Unsupported(
+            "exec_in_guest: not implemented on this backend",
+        ))
     }
 
     /// Write a file into the guest filesystem. The VM must be `Running`.
@@ -250,14 +252,10 @@ pub trait Hypervisor: Send + Sync {
     /// Returns the number of bytes written.
     ///
     /// The default implementation returns [`VmError::Unsupported`].
-    fn write_file(
-        &self,
-        _id: VmId,
-        _path: String,
-        _content: Vec<u8>,
-        _mode: u32,
-    ) -> VmResult<u64> {
-        Err(VmError::Unsupported("write_file: not implemented on this backend"))
+    fn write_file(&self, _id: VmId, _path: String, _content: Vec<u8>, _mode: u32) -> VmResult<u64> {
+        Err(VmError::Unsupported(
+            "write_file: not implemented on this backend",
+        ))
     }
 
     /// Read a file from the guest filesystem. The VM must be `Running`.
@@ -267,7 +265,9 @@ pub trait Hypervisor: Send + Sync {
     ///
     /// The default implementation returns [`VmError::Unsupported`].
     fn read_file(&self, _id: VmId, _path: String) -> VmResult<Vec<u8>> {
-        Err(VmError::Unsupported("read_file: not implemented on this backend"))
+        Err(VmError::Unsupported(
+            "read_file: not implemented on this backend",
+        ))
     }
 }
 

@@ -44,8 +44,8 @@ fn parse_cp_endpoint(s: &str) -> Result<CpEndpoint, String> {
     if let Some(colon_pos) = s.find(":/") {
         let id_part = &s[..colon_pos];
         let path = &s[colon_pos + 1..]; // keep the leading '/'
-        let vm_id = parse_id(id_part, "vm")
-            .map_err(|e| format!("bad guest endpoint `{s}`: {e}"))?;
+        let vm_id =
+            parse_id(id_part, "vm").map_err(|e| format!("bad guest endpoint `{s}`: {e}"))?;
         return Ok(CpEndpoint::Guest {
             vm_id,
             path: path.to_owned(),
@@ -741,25 +741,24 @@ fn cmd_cp(client: &Client, src: &str, dst: &str) -> ExitCode {
 /// query string (`?path=/some/nested/path` could be parsed incorrectly
 /// by some HTTP middleware; `?path=%2Fsome%2Fnested%2Fpath` is safe).
 fn urlenc_path(path: &str) -> String {
-    path.chars()
-        .flat_map(|c| {
-            // RFC 3986 unreserved characters — safe to leave unencoded in
-            // a query value.  '/' is intentionally excluded so nested paths
-            // are unambiguous when embedded as a query parameter.
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
-                vec![c]
-            } else {
-                // Encode as percent-hex pairs for each UTF-8 byte.
-                let mut s = Vec::new();
-                let mut buf = [0u8; 4];
-                let encoded = c.encode_utf8(&mut buf);
-                for byte in encoded.bytes() {
-                    s.extend(format!("%{byte:02X}").chars());
-                }
-                s
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        // RFC 3986 unreserved characters — safe to leave unencoded in
+        // a query value.  '/' is intentionally excluded so nested paths
+        // are unambiguous when embedded as a query parameter.
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+            out.push(c);
+        } else {
+            let mut buf = [0u8; 4];
+            let encoded = c.encode_utf8(&mut buf);
+            for byte in encoded.bytes() {
+                let _ = write!(&mut out, "%{byte:02X}");
             }
-        })
-        .collect()
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
