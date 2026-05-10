@@ -1,4 +1,4 @@
-# Rust-nano-vm
+# rust-nano-vm
 
 > A purpose-built ephemeral code-execution sandbox microVM for LLM agents.
 
