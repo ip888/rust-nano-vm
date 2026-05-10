@@ -275,17 +275,22 @@ impl BackingFileHeader {
         if magic != BACKING_MAGIC {
             return Err(SnapshotError::BadMagic { found: magic });
         }
-        let format_version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        // Direct array construction — infallible after the bounds check above.
+        let format_version = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
         if format_version != FORMAT_VERSION {
             return Err(SnapshotError::VersionMismatch {
                 found: format_version,
                 expected: FORMAT_VERSION,
             });
         }
-        let page_size = u32::from_le_bytes(buf[12..16].try_into().unwrap());
-        let page_count = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-        let memory_bytes = u64::from_le_bytes(buf[24..32].try_into().unwrap());
-        let flags = u32::from_le_bytes(buf[32..36].try_into().unwrap());
+        let page_size = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        let page_count = u64::from_le_bytes([
+            buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+        ]);
+        let memory_bytes = u64::from_le_bytes([
+            buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
+        ]);
+        let flags = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
         // Reject zero page_size and overflow before the consistency check
         // so a malicious header that wraps `page_size * page_count` to
         // match `memory_bytes` cannot bypass validation.
@@ -335,9 +340,15 @@ impl BackingFileHeader {
 
     /// Serialize into a fresh fixed-size byte array.
     pub fn to_bytes(&self) -> [u8; BACKING_HDR_LEN] {
+        // Inline serialization — provably infallible, no expect() needed.
+        // The reserved tail bytes [36..64] are zero-initialized by default.
         let mut out = [0u8; BACKING_HDR_LEN];
-        self.write_to(&mut out)
-            .expect("serializing BackingFileHeader into a fixed-size buffer must succeed");
+        out[0..8].copy_from_slice(&BACKING_MAGIC);
+        out[8..12].copy_from_slice(&self.format_version.to_le_bytes());
+        out[12..16].copy_from_slice(&self.page_size.to_le_bytes());
+        out[16..24].copy_from_slice(&self.page_count.to_le_bytes());
+        out[24..32].copy_from_slice(&self.memory_bytes.to_le_bytes());
+        out[32..36].copy_from_slice(&self.flags.to_le_bytes());
         out
     }
 }
