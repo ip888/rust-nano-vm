@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use vm_core::{
-    Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError, VmHandle, VmId, VmMeta, VmResult,
-    VmState,
+    GuestExecRequest, GuestExecResult, Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError,
+    VmHandle, VmId, VmMeta, VmResult, VmState,
 };
 
 #[derive(Debug, Clone)]
@@ -242,6 +242,117 @@ impl Hypervisor for MockHypervisor {
             page_size: 4096,
             kernel_cmdline: s.config.cmdline.clone(),
         })
+    }
+
+    // ---- Guest operations (M2 offline-testable subset) -------------------
+
+    fn exec_in_guest(&self, id: VmId, req: GuestExecRequest) -> VmResult<GuestExecResult> {
+        // Verify the VM exists and is Running before we spawn anything.
+        {
+            let inner = self.inner.lock().expect("mock hypervisor poisoned");
+            let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+            if vm.state != VmState::Running {
+                return Err(VmError::InvalidTransition {
+                    id,
+                    from: vm.state,
+                    to: VmState::Running,
+                });
+            }
+        }
+
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+
+        let start = Instant::now();
+        let mut cmd = Command::new(&req.program);
+        cmd.args(&req.args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null());
+        if let Some(ref dir) = req.cwd {
+            cmd.current_dir(dir);
+        }
+        for (k, v) in &req.env {
+            cmd.env(k, v);
+        }
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| VmError::Backend(format!("exec spawn {}: {e}", req.program)))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|e| VmError::Backend(format!("exec wait {}: {e}", req.program)))?;
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        if let Some(limit) = req.timeout_ms {
+            if duration_ms > limit {
+                return Err(VmError::Backend(format!(
+                    "exec exceeded timeout {limit} ms (ran {duration_ms} ms)"
+                )));
+            }
+        }
+
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            output.status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal: Option<i32> = None;
+
+        Ok(GuestExecResult {
+            exit_code: output.status.code(),
+            signal,
+            stdout: output.stdout,
+            stderr: output.stderr,
+            duration_ms,
+        })
+    }
+
+    fn write_file(&self, id: VmId, path: String, content: Vec<u8>, mode: u32) -> VmResult<u64> {
+        {
+            let inner = self.inner.lock().expect("mock hypervisor poisoned");
+            let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+            if vm.state != VmState::Running {
+                return Err(VmError::InvalidTransition {
+                    id,
+                    from: vm.state,
+                    to: VmState::Running,
+                });
+            }
+        }
+
+        let bytes = content.len() as u64;
+        std::fs::write(&path, &content)
+            .map_err(|e| VmError::Backend(format!("write_file {path}: {e}")))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(mode);
+            std::fs::set_permissions(&path, perms)
+                .map_err(|e| VmError::Backend(format!("chmod {path}: {e}")))?;
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+
+        Ok(bytes)
+    }
+
+    fn read_file(&self, id: VmId, path: String) -> VmResult<Vec<u8>> {
+        {
+            let inner = self.inner.lock().expect("mock hypervisor poisoned");
+            let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+            if vm.state != VmState::Running {
+                return Err(VmError::InvalidTransition {
+                    id,
+                    from: vm.state,
+                    to: VmState::Running,
+                });
+            }
+        }
+
+        std::fs::read(&path).map_err(|e| VmError::Backend(format!("read_file {path}: {e}")))
     }
 }
 
@@ -587,5 +698,113 @@ mod tests {
         let hv = MockHypervisor::new();
         let err = hv.vm_meta(VmId(0xdead)).unwrap_err();
         assert!(matches!(err, VmError::UnknownVm(_)));
+    }
+
+    // ---- Guest operations -----------------------------------------------
+
+    #[test]
+    fn exec_in_guest_requires_running_state() {
+        let hv = MockHypervisor::new();
+        let h = hv.create_vm(&cfg()).unwrap();
+        // VM is Created, not Running
+        let err = hv
+            .exec_in_guest(
+                h.id,
+                GuestExecRequest {
+                    program: "echo".into(),
+                    args: vec!["hi".into()],
+                    cwd: None,
+                    env: vec![],
+                    timeout_ms: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, VmError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn exec_in_guest_runs_local_process_and_captures_output() {
+        let hv = MockHypervisor::new();
+        let h = hv.create_vm(&cfg()).unwrap();
+        hv.start(h.id).unwrap();
+
+        let result = hv
+            .exec_in_guest(
+                h.id,
+                GuestExecRequest {
+                    program: "echo".into(),
+                    args: vec!["hello mock".into()],
+                    cwd: None,
+                    env: vec![],
+                    timeout_ms: None,
+                },
+            )
+            .expect("exec");
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.stdout.starts_with(b"hello mock"));
+    }
+
+    #[test]
+    fn exec_in_guest_on_unknown_vm_returns_unknown_vm() {
+        let hv = MockHypervisor::new();
+        let err = hv
+            .exec_in_guest(
+                VmId(0xbad),
+                GuestExecRequest {
+                    program: "echo".into(),
+                    args: vec![],
+                    cwd: None,
+                    env: vec![],
+                    timeout_ms: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, VmError::UnknownVm(_)));
+    }
+
+    #[test]
+    fn write_and_read_file_roundtrip() {
+        let hv = MockHypervisor::new();
+        let h = hv.create_vm(&cfg()).unwrap();
+        hv.start(h.id).unwrap();
+
+        let path = format!(
+            "/tmp/rust-nano-vm-mock-test-{}-{}",
+            std::process::id(),
+            h.id.0
+        );
+        let content = b"hello from mock guest\n".to_vec();
+
+        let written = hv
+            .write_file(h.id, path.clone(), content.clone(), 0o644)
+            .expect("write_file");
+        assert_eq!(written, content.len() as u64);
+
+        let read = hv.read_file(h.id, path.clone()).expect("read_file");
+        assert_eq!(read, content);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_file_requires_running_state() {
+        let hv = MockHypervisor::new();
+        let h = hv.create_vm(&cfg()).unwrap();
+        let err = hv
+            .write_file(h.id, "/tmp/x".into(), b"data".to_vec(), 0o644)
+            .unwrap_err();
+        assert!(matches!(err, VmError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn read_file_missing_path_returns_backend_error() {
+        let hv = MockHypervisor::new();
+        let h = hv.create_vm(&cfg()).unwrap();
+        hv.start(h.id).unwrap();
+        let err = hv
+            .read_file(h.id, "/no/such/file/for/mock/test".into())
+            .unwrap_err();
+        assert!(matches!(err, VmError::Backend(_)));
     }
 }
