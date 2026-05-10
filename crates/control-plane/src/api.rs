@@ -279,6 +279,102 @@ impl SnapshotListEntry {
     }
 }
 
+/// Request body for `POST /v1/vms/{id}/exec`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ExecRequest {
+    /// Program to execute (absolute path or found on `$PATH`).
+    pub program: String,
+    /// Argument vector, NOT including `argv[0]`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional working directory.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Extra environment variables.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// Wall-clock timeout in milliseconds.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+impl From<ExecRequest> for vm_core::GuestExecRequest {
+    fn from(r: ExecRequest) -> Self {
+        vm_core::GuestExecRequest {
+            program: r.program,
+            args: r.args,
+            cwd: r.cwd,
+            env: r.env,
+            timeout_ms: r.timeout_ms,
+        }
+    }
+}
+
+/// Response body for `POST /v1/vms/{id}/exec`.
+#[derive(Debug, Serialize)]
+pub(crate) struct ExecResponse {
+    /// Process exit code. `null` when killed by a signal.
+    pub exit_code: Option<i32>,
+    /// Signal that terminated the process (POSIX). `null` on non-POSIX
+    /// or when the process exited normally.
+    pub signal: Option<i32>,
+    /// Captured standard output (UTF-8; non-UTF-8 bytes are replaced).
+    pub stdout: String,
+    /// Captured standard error (UTF-8; non-UTF-8 bytes are replaced).
+    pub stderr: String,
+    /// Wall-clock duration in milliseconds.
+    pub duration_ms: u64,
+}
+
+impl From<vm_core::GuestExecResult> for ExecResponse {
+    fn from(r: vm_core::GuestExecResult) -> Self {
+        Self {
+            exit_code: r.exit_code,
+            signal: r.signal,
+            stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
+            duration_ms: r.duration_ms,
+        }
+    }
+}
+
+/// Request body for `POST /v1/vms/{id}/files`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct FileWriteRequest {
+    /// Absolute path inside the guest (or on the host for the mock backend).
+    pub path: String,
+    /// Raw file content. JSON array of unsigned bytes (0–255).
+    pub content: Vec<u8>,
+    /// UNIX permission bits (e.g. 420 for `0o644`). Ignored on non-Unix.
+    #[serde(default = "default_file_mode")]
+    pub mode: u32,
+}
+
+fn default_file_mode() -> u32 {
+    0o644
+}
+
+/// Response body for `POST /v1/vms/{id}/files`.
+#[derive(Debug, Serialize)]
+pub(crate) struct FileWrittenResponse {
+    /// Number of bytes written.
+    pub bytes: u64,
+}
+
+/// Response body for `GET /v1/vms/{id}/files`.
+#[derive(Debug, Serialize)]
+pub(crate) struct FileReadResponse {
+    /// Raw file content. JSON array of unsigned bytes (0–255).
+    pub content: Vec<u8>,
+}
+
+/// Query parameters for `GET /v1/vms/{id}/files`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct FilePathQuery {
+    /// Absolute path inside the guest (or on the host for the mock backend).
+    pub path: String,
+}
+
 /// OpenAPI 3.1 document for the control-plane REST surface.
 pub fn openapi_spec() -> Value {
     json!({
@@ -434,6 +530,66 @@ pub fn openapi_spec() -> Value {
                         }
                     }
                 }
+            },
+            "/v1/vms/{id}/exec": {
+                "post": {
+                    "summary": "Execute a command in the guest",
+                    "parameters": [{ "$ref": "#/components/parameters/VmIdPath" }],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": { "schema": { "$ref": "#/components/schemas/ExecRequest" } }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Command result",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/ExecResponse" } }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/vms/{id}/files": {
+                "get": {
+                    "summary": "Read a file from the guest filesystem",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/VmIdPath" },
+                        {
+                            "name": "path",
+                            "in": "query",
+                            "required": true,
+                            "schema": { "type": "string" }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "File content",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/FileReadResponse" } }
+                            }
+                        }
+                    }
+                },
+                "post": {
+                    "summary": "Write a file into the guest filesystem",
+                    "parameters": [{ "$ref": "#/components/parameters/VmIdPath" }],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": { "schema": { "$ref": "#/components/schemas/FileWriteRequest" } }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Write result",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/FileWrittenResponse" } }
+                            }
+                        }
+                    }
+                }
             }
         },
         "components": {
@@ -549,6 +705,68 @@ pub fn openapi_spec() -> Value {
                         "snapshots": {
                             "type": "array",
                             "items": { "$ref": "#/components/schemas/SnapshotListEntry" }
+                        }
+                    }
+                },
+                "ExecRequest": {
+                    "type": "object",
+                    "required": ["program"],
+                    "properties": {
+                        "program": { "type": "string" },
+                        "args": { "type": "array", "items": { "type": "string" } },
+                        "cwd": { "type": "string" },
+                        "env": {
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "prefixItems": [
+                                    { "type": "string" },
+                                    { "type": "string" }
+                                ],
+                                "minItems": 2,
+                                "maxItems": 2
+                            }
+                        },
+                        "timeout_ms": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "ExecResponse": {
+                    "type": "object",
+                    "required": ["stdout", "stderr", "duration_ms"],
+                    "properties": {
+                        "exit_code": { "type": "integer" },
+                        "signal": { "type": "integer" },
+                        "stdout": { "type": "string" },
+                        "stderr": { "type": "string" },
+                        "duration_ms": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "FileWriteRequest": {
+                    "type": "object",
+                    "required": ["path", "content"],
+                    "properties": {
+                        "path": { "type": "string" },
+                        "content": {
+                            "type": "array",
+                            "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+                        },
+                        "mode": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "FileWrittenResponse": {
+                    "type": "object",
+                    "required": ["bytes"],
+                    "properties": {
+                        "bytes": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "FileReadResponse": {
+                    "type": "object",
+                    "required": ["content"],
+                    "properties": {
+                        "content": {
+                            "type": "array",
+                            "items": { "type": "integer", "minimum": 0, "maximum": 255 }
                         }
                     }
                 }

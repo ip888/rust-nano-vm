@@ -27,7 +27,7 @@ use axum::{
     body::Bytes,
     extract::{
         rejection::{JsonRejection, PathRejection},
-        Path, State,
+        Path, Query, State,
     },
     http::StatusCode,
     middleware,
@@ -38,7 +38,8 @@ use tower_http::trace::TraceLayer;
 use vm_core::{Hypervisor, SnapshotId, VmId};
 
 use crate::api::{
-    openapi_spec, CreateVmRequest, SnapshotDto, SnapshotListEntry, SnapshotListResponse,
+    openapi_spec, CreateVmRequest, ExecRequest, ExecResponse, FilePathQuery, FileReadResponse,
+    FileWriteRequest, FileWrittenResponse, SnapshotDto, SnapshotListEntry, SnapshotListResponse,
     SnapshotRequest, VmHandleDto, VmListEntry, VmListResponse, VmStateResponse,
 };
 use crate::auth;
@@ -91,6 +92,8 @@ pub fn router() -> Router<AppState> {
         .route("/vms/:id/start", post(start_vm))
         .route("/vms/:id/stop", post(stop_vm))
         .route("/vms/:id/snapshot", post(snapshot_vm))
+        .route("/vms/:id/exec", post(exec_vm))
+        .route("/vms/:id/files", get(read_file).post(write_file))
         .route("/snapshots", get(list_snapshots))
         .route("/snapshots/:id", axum::routing::delete(delete_snapshot))
         .route("/snapshots/:id/restore", post(restore_snapshot))
@@ -264,4 +267,39 @@ async fn delete_snapshot(
     let Path(id) = id?;
     state.hypervisor.delete_snapshot(SnapshotId(id))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn exec_vm(
+    State(state): State<AppState>,
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<ExecRequest>, JsonRejection>,
+) -> Result<Json<ExecResponse>, ApiError> {
+    let Path(id) = id?;
+    let Json(req) = body?;
+    let result = state.hypervisor.exec_in_guest(VmId(id), req.into())?;
+    Ok(Json(result.into()))
+}
+
+async fn write_file(
+    State(state): State<AppState>,
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<FileWriteRequest>, JsonRejection>,
+) -> Result<Json<FileWrittenResponse>, ApiError> {
+    let Path(id) = id?;
+    let Json(req) = body?;
+    let bytes = state
+        .hypervisor
+        .write_file(VmId(id), req.path, req.content, req.mode)?;
+    Ok(Json(FileWrittenResponse { bytes }))
+}
+
+async fn read_file(
+    State(state): State<AppState>,
+    id: Result<Path<u64>, PathRejection>,
+    query: Result<Query<FilePathQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<FileReadResponse>, ApiError> {
+    let Path(id) = id?;
+    let Query(q) = query.map_err(|e| ApiError::Bad(e.to_string()))?;
+    let content = state.hypervisor.read_file(VmId(id), q.path)?;
+    Ok(Json(FileReadResponse { content }))
 }

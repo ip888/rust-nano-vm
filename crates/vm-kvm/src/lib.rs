@@ -11,8 +11,8 @@
 #![warn(missing_docs)]
 
 use vm_core::{
-    Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError, VmHandle, VmId, VmMeta, VmResult,
-    VmState,
+    GuestExecRequest, GuestExecResult, Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError,
+    VmHandle, VmId, VmMeta, VmResult, VmState,
 };
 
 /// KVM-backed hypervisor.
@@ -84,6 +84,18 @@ impl Hypervisor for KvmHypervisor {
     fn vm_meta(&self, _id: VmId) -> VmResult<VmMeta> {
         Err(unsupported())
     }
+
+    fn exec_in_guest(&self, _id: VmId, _req: GuestExecRequest) -> VmResult<GuestExecResult> {
+        Err(unsupported())
+    }
+
+    fn write_file(&self, _id: VmId, _path: String, _content: Vec<u8>, _mode: u32) -> VmResult<u64> {
+        Err(unsupported())
+    }
+
+    fn read_file(&self, _id: VmId, _path: String) -> VmResult<Vec<u8>> {
+        Err(unsupported())
+    }
 }
 
 #[cfg(feature = "kvm")]
@@ -151,6 +163,29 @@ mod tests {
         ));
         assert!(matches!(
             hv.vm_meta(VmId(1)).unwrap_err(),
+            VmError::Unsupported(_)
+        ));
+        assert!(matches!(
+            hv.exec_in_guest(
+                VmId(1),
+                GuestExecRequest {
+                    program: "echo".into(),
+                    args: vec![],
+                    cwd: None,
+                    env: vec![],
+                    timeout_ms: None,
+                }
+            )
+            .unwrap_err(),
+            VmError::Unsupported(_)
+        ));
+        assert!(matches!(
+            hv.write_file(VmId(1), "/tmp/x".into(), vec![], 0o644)
+                .unwrap_err(),
+            VmError::Unsupported(_)
+        ));
+        assert!(matches!(
+            hv.read_file(VmId(1), "/tmp/x".into()).unwrap_err(),
             VmError::Unsupported(_)
         ));
     }

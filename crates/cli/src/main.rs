@@ -27,6 +27,33 @@ use reqwest::blocking::{Client as Http, RequestBuilder};
 use reqwest::Method;
 use serde_json::{json, Value};
 
+// ---------------------------------------------------------------------------
+// Copy endpoint helpers
+// ---------------------------------------------------------------------------
+
+/// A cp endpoint: either a local path or a guest path (`<vm-id>:/path`).
+enum CpEndpoint {
+    Local(String),
+    Guest { vm_id: u64, path: String },
+}
+
+fn parse_cp_endpoint(s: &str) -> Result<CpEndpoint, String> {
+    // Match `<prefix>:/rest-of-path`. Split on the *first* colon followed by
+    // a slash so we don't split on `C:\` on Windows or bare colons inside a
+    // path.
+    if let Some(colon_pos) = s.find(":/") {
+        let id_part = &s[..colon_pos];
+        let path = &s[colon_pos + 1..]; // keep the leading '/'
+        let vm_id = parse_id(id_part, "vm")
+            .map_err(|e| format!("bad guest endpoint `{s}`: {e}"))?;
+        return Ok(CpEndpoint::Guest {
+            vm_id,
+            path: path.to_owned(),
+        });
+    }
+    Ok(CpEndpoint::Local(s.to_owned()))
+}
+
 /// Ephemeral code-execution sandbox microVM for LLM agents.
 #[derive(Debug, Parser)]
 #[command(name = "nanovm", version, about, long_about = None)]
@@ -171,8 +198,8 @@ fn main() -> ExitCode {
             vcpus,
             no_start,
         } => cmd_run(&client, image, snapshot_dir, memory_mib, vcpus, no_start),
-        Command::Exec { .. } => unimplemented_for("exec", "M2"),
-        Command::Cp { .. } => unimplemented_for("cp", "M3"),
+        Command::Exec { id, argv } => cmd_exec(&client, &id, argv),
+        Command::Cp { src, dst } => cmd_cp(&client, &src, &dst),
         Command::Snapshot { id, to } => cmd_snapshot(&client, &id, to),
         Command::Fork { snapshot, count } => cmd_fork(&client, &snapshot, count),
         Command::Ps => cmd_ps(&client),
@@ -591,10 +618,146 @@ fn cmd_ps(client: &Client) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn unimplemented_for(cmd: &str, milestone: &str) -> ExitCode {
-    eprintln!("nanovm {cmd}: unimplemented — arrives in milestone {milestone}");
-    eprintln!("see docs/PLAN.md for the roadmap.");
-    ExitCode::from(2)
+fn cmd_exec(client: &Client, id: &str, argv: Vec<String>) -> ExitCode {
+    let vm_id = match parse_id(id, "vm") {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("nanovm exec: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if argv.is_empty() {
+        eprintln!("nanovm exec: at least one argument (the program) is required");
+        return ExitCode::from(2);
+    }
+    let body = json!({
+        "program": argv[0],
+        "args": &argv[1..],
+    });
+    let result = match client.post(&format!("/v1/vms/{vm_id}/exec"), Some(body)) {
+        Ok(v) => v,
+        Err(e) => return fail("exec", &e),
+    };
+
+    if let Some(stdout) = result["stdout"].as_str() {
+        if !stdout.is_empty() {
+            print!("{stdout}");
+        }
+    }
+    if let Some(stderr) = result["stderr"].as_str() {
+        if !stderr.is_empty() {
+            eprint!("{stderr}");
+        }
+    }
+
+    // Mirror the guest's exit code (clamped to u8 range).
+    let exit_code = result["exit_code"].as_i64().unwrap_or(0);
+    ExitCode::from(exit_code.clamp(0, 255) as u8)
+}
+
+fn cmd_cp(client: &Client, src: &str, dst: &str) -> ExitCode {
+    let src_ep = match parse_cp_endpoint(src) {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("nanovm cp: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let dst_ep = match parse_cp_endpoint(dst) {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("nanovm cp: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    match (src_ep, dst_ep) {
+        // host → guest
+        (CpEndpoint::Local(local), CpEndpoint::Guest { vm_id, path }) => {
+            let content = match std::fs::read(&local) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("nanovm cp: read {local}: {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            let body = json!({
+                "path": path,
+                "content": content,
+                "mode": 0o644u32,
+            });
+            match client.post(&format!("/v1/vms/{vm_id}/files"), Some(body)) {
+                Ok(_) => ExitCode::SUCCESS,
+                Err(e) => fail("cp", &e),
+            }
+        }
+        // guest → host
+        (CpEndpoint::Guest { vm_id, path }, CpEndpoint::Local(local)) => {
+            let result = match client.get(&format!(
+                "/v1/vms/{vm_id}/files?path={}",
+                urlenc_path(&path)
+            )) {
+                Ok(v) => v,
+                Err(e) => return fail("cp", &e),
+            };
+            let arr = match result["content"].as_array() {
+                Some(a) => a,
+                None => {
+                    eprintln!("nanovm cp: unexpected response shape: {result}");
+                    return ExitCode::from(1);
+                }
+            };
+            let bytes: Vec<u8> = arr
+                .iter()
+                .filter_map(|b| b.as_u64())
+                .map(|b| b as u8)
+                .collect();
+            match std::fs::write(&local, &bytes) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("nanovm cp: write {local}: {e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        // guest → guest: not supported
+        (CpEndpoint::Guest { .. }, CpEndpoint::Guest { .. }) => {
+            eprintln!(
+                "nanovm cp: guest-to-guest copy is not supported; \
+                 copy to a local path first, then copy to the second guest"
+            );
+            ExitCode::from(2)
+        }
+        // local → local: shell is better at this
+        (CpEndpoint::Local(_), CpEndpoint::Local(_)) => {
+            eprintln!("nanovm cp: both src and dst are local paths; use `cp` instead");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Percent-encode a guest path for use in a query string.
+/// Only the characters that would break URL parsing need encoding; for
+/// typical POSIX paths only `/` and a few special chars matter, but for
+/// safety we encode everything outside unreserved chars.
+fn urlenc_path(path: &str) -> String {
+    path.chars()
+        .flat_map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '/') {
+                vec![c]
+            } else {
+                // Encode as percent-hex pairs for each byte.
+                let mut s = Vec::new();
+                let mut buf = [0u8; 4];
+                let encoded = c.encode_utf8(&mut buf);
+                for byte in encoded.bytes() {
+                    // Convert each byte to a char sequence (safe ASCII)
+                    s.extend(format!("%{byte:02X}").chars());
+                }
+                s
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

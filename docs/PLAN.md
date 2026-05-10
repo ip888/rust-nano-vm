@@ -59,7 +59,7 @@ crates/
 | - | --- | --- | --- |
 | **M0** | Workspace scaffold, `Hypervisor` trait, `vm-mock` backend, CI without KVM, docs | **no** | ✅ complete |
 | M1 | `vm-kvm` boots minimal kernel; serial "hello from guest" | yes | 🔲 next on KVM host |
-| M2 | virtio-vsock transport + musl guest agent; `nanovm exec <id> -- echo hi` round-trips | yes | 🔲 partial (wire types, connection state, guest-agent stdin/stdout mode, and CLI `ps` done) |
+| M2 | virtio-vsock transport + musl guest agent; `nanovm exec <id> -- echo hi` round-trips | yes | 🔲 partial (wire types, connection state, streaming exec in guest-agent, CLI `exec`/`cp` wired, control-plane guest-op routes done) |
 | M3 | virtio-fs; `nanovm cp file.py <id>:/work/` | yes | 🔲 partial (FUSE framing done, per-op bodies done, dispatch scaffolding done) |
 | M4 | Python / Node run in guest; stdio streaming demo | yes | 🔲 depends M2 |
 | M5 | Snapshot + fork via userfaultfd; warm pool; p50 < 50 ms cold start | yes | 🔲 on-disk format done |
@@ -96,13 +96,15 @@ Stretch: M8 GPU passthrough, M9 multi-node, M10 confidential compute
 - [x] Full CRUD: `POST /v1/vms`, `GET /v1/vms`, `GET /v1/vms/:id`,
       `POST /v1/vms/:id/start`, `POST /v1/vms/:id/stop`,
       `POST /v1/vms/:id/snapshot`, `DELETE /v1/vms/:id`,
-      `POST /v1/snapshots/:id/restore`, `GET /healthz`.
+      `POST /v1/snapshots/:id/restore`, `GET /healthz`,
+      `POST /v1/vms/:id/exec`, `POST /v1/vms/:id/files`,
+      `GET /v1/vms/:id/files`.
 - [x] OpenAPI 3.1 JSON contract published at `GET /openapi.json`.
 - [x] Bearer-token auth middleware (`NANOVM_API_TOKENS` env).
 - [x] Structured JSON error envelope `{"error":{"code":"...","message":"..."}}`.
 - [x] `nanovm-control-plane` binary wrapping `MockHypervisor` (real KVM
       backend wired in M1 via `Arc<dyn Hypervisor>`).
-- [x] 22 end-to-end integration tests using `tower::ServiceExt::oneshot`
+- [x] 42 end-to-end integration tests using `tower::ServiceExt::oneshot`
       (no network, no KVM).
 
 ## M2 — partial progress (no KVM needed for wire-format work)
@@ -114,9 +116,28 @@ Stretch: M8 GPU passthrough, M9 multi-node, M10 confidential compute
 - [x] `virtio-vsock::Connection` state machine: `Closed → Listen/SynSent →
       Established → CloseWait/FinWait → Closed` with credit-based flow
       control fields.
-- [x] `guest-agent` binary scaffold: compiles as a static binary, processes
-      `Ping` and `Exec` requests over stdin/stdout (vsock wiring deferred
-      to M2 on a KVM host).
+- [x] `guest-agent` binary: streaming exec via `ExecStart` / `ExecWait`
+      in stdin/stdout mode (pseudo-streaming — buffers via `wait_with_output`,
+      emits `ExecStarted` + `ExecOutput` + `ExecExited` frames before next
+      request; vsock wiring deferred to M2 on a KVM host).
+- [x] `guest-agent`: `ExecStdin` and `Signal` return `NoSuchProcess` in
+      sequential mode with an informative message; exit info cached for
+      `ExecWait` after `ExecStart`.
+- [x] `vm-core::Hypervisor` trait extended with `exec_in_guest`,
+      `write_file`, `read_file` — default impls return `Unsupported`.
+- [x] `vm-mock::MockHypervisor` implements all three guest ops: `exec_in_guest`
+      spawns a real local process; `write_file` / `read_file` use the host
+      filesystem; all three check `Running` state.
+- [x] `vm-kvm::KvmHypervisor` has explicit `Unsupported` stubs for the three
+      new trait methods.
+- [x] Control-plane: `POST /v1/vms/:id/exec`, `POST /v1/vms/:id/files`,
+      `GET /v1/vms/:id/files` routes wired; 8 integration tests.
+- [x] CLI `exec` subcommand implemented: POSTs to `/v1/vms/:id/exec`, prints
+      stdout/stderr, exits with the guest's exit code.
+- [x] CLI `cp` subcommand implemented: parses `<id>:/path` guest endpoints,
+      drives `write_file` / `read_file` over HTTP.
+- [x] OpenAPI 3.1 spec updated with `ExecRequest`, `ExecResponse`,
+      `FileWriteRequest`, `FileWrittenResponse`, `FileReadResponse` schemas.
 
 ## M3 partial progress (no KVM needed for dispatch scaffolding)
 

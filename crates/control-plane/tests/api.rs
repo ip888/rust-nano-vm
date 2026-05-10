@@ -777,3 +777,181 @@ async fn snapshot_with_empty_body_still_works_legacy_shape() {
     assert!(body["display"].as_str().unwrap().starts_with("snap-"));
     assert!(body.get("dir").is_none() || body["dir"].is_null());
 }
+
+// ---- Guest operations ---------------------------------------------------
+
+/// Create a running VM and return its numeric id.
+async fn create_running_vm(app: Router) -> u64 {
+    let (_, h) = send(app.clone(), Method::POST, "/v1/vms", Some(json!({}))).await;
+    let id = h["id"].as_u64().unwrap();
+    send(app.clone(), Method::POST, &format!("/v1/vms/{id}/start"), None).await;
+    id
+}
+
+#[tokio::test]
+async fn exec_echo_returns_stdout_and_exit_code() {
+    let app = app();
+    let id = create_running_vm(app.clone()).await;
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        &format!("/v1/vms/{id}/exec"),
+        Some(json!({ "program": "echo", "args": ["hello exec"] })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "got body {body:?}");
+    assert_eq!(body["exit_code"], 0);
+    assert!(
+        body["stdout"].as_str().unwrap().contains("hello exec"),
+        "stdout was {:?}",
+        body["stdout"]
+    );
+}
+
+#[tokio::test]
+async fn exec_reflects_non_zero_exit_code() {
+    let app = app();
+    let id = create_running_vm(app.clone()).await;
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        &format!("/v1/vms/{id}/exec"),
+        Some(json!({ "program": "sh", "args": ["-c", "exit 42"] })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "got body {body:?}");
+    assert_eq!(body["exit_code"], 42);
+}
+
+#[tokio::test]
+async fn exec_on_created_vm_returns_conflict() {
+    let app = app();
+    let (_, h) = send(app.clone(), Method::POST, "/v1/vms", Some(json!({}))).await;
+    let id = h["id"].as_u64().unwrap();
+    // VM is Created, not Running
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        &format!("/v1/vms/{id}/exec"),
+        Some(json!({ "program": "echo", "args": [] })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "got body {body:?}");
+    assert_eq!(body["error"]["code"], "invalid_transition");
+}
+
+#[tokio::test]
+async fn exec_unknown_vm_is_not_found() {
+    let (status, body) = send(
+        app(),
+        Method::POST,
+        "/v1/vms/99999/exec",
+        Some(json!({ "program": "echo", "args": [] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "unknown_vm");
+}
+
+#[tokio::test]
+async fn exec_missing_program_field_is_bad_request() {
+    let app = app();
+    let id = create_running_vm(app.clone()).await;
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        &format!("/v1/vms/{id}/exec"),
+        Some(json!({ "args": ["hello"] })), // missing "program"
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "got body {body:?}");
+    assert_eq!(body["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn write_and_read_file_roundtrip_via_http() {
+    let app = app();
+    let id = create_running_vm(app.clone()).await;
+
+    let content: Vec<u8> = b"hello from http roundtrip".to_vec();
+    let path = format!(
+        "/tmp/rust-nano-vm-api-test-{}-{}",
+        std::process::id(),
+        id
+    );
+
+    // Write
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{id}/files"),
+        Some(json!({ "path": path, "content": content, "mode": 0o644u32 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "write: {body:?}");
+    assert_eq!(body["bytes"].as_u64().unwrap(), content.len() as u64);
+
+    // Read back
+    let (status, body) = send(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/vms/{id}/files?path={path}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "read: {body:?}");
+    let got: Vec<u8> = body["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b.as_u64().unwrap() as u8)
+        .collect();
+    assert_eq!(got, content);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn read_file_missing_path_query_is_bad_request() {
+    let app = app();
+    let id = create_running_vm(app.clone()).await;
+
+    // No `?path=` query parameter
+    let (status, body) = send(
+        app,
+        Method::GET,
+        &format!("/v1/vms/{id}/files"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body:?}");
+}
+
+#[tokio::test]
+async fn read_file_nonexistent_path_returns_backend_error() {
+    let app = app();
+    let id = create_running_vm(app.clone()).await;
+
+    let (status, body) = send(
+        app,
+        Method::GET,
+        &format!("/v1/vms/{id}/files?path=/no/such/file/api/test"),
+        None,
+    )
+    .await;
+    // The mock surfaces a backend error (IO error on the host) which maps to 500.
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "got {body:?}"
+    );
+    assert_eq!(body["error"]["code"], "backend");
+}
