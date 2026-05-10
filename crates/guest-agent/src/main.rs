@@ -650,7 +650,6 @@ mod tests {
                 result,
             };
             writeln!(out, "{}", serde_json::to_string(&resp).unwrap()).unwrap();
-            let _ = &mut state; // keep borrow alive
         }
         let resp: Response = serde_json::from_slice(&out).unwrap();
         assert!(matches!(
@@ -696,7 +695,7 @@ mod tests {
 
     #[test]
     fn exec_start_emits_started_output_exited() {
-        let (frames, state) = exec_start("echo", &["streaming"]);
+        let (frames, mut state) = exec_start("echo", &["streaming"]);
 
         // Frame 0: ExecStarted
         let pid = match &frames[0] {
@@ -714,7 +713,7 @@ mod tests {
 
         // ExecWait should resolve immediately from the cached state
         let mut dummy_out = Vec::new();
-        handle_exec_wait(proto::RequestId(2), pid, &mut dummy_out, &mut { state })
+        handle_exec_wait(proto::RequestId(2), pid, &mut dummy_out, &mut state)
             .expect("wait ok");
         let resp: Response = serde_json::from_slice(&dummy_out).unwrap();
         assert!(matches!(

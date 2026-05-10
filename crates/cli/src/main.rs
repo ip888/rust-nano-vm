@@ -736,22 +736,24 @@ fn cmd_cp(client: &Client, src: &str, dst: &str) -> ExitCode {
     }
 }
 
-/// Percent-encode a guest path for use in a query string.
-/// Only the characters that would break URL parsing need encoding; for
-/// typical POSIX paths only `/` and a few special chars matter, but for
-/// safety we encode everything outside unreserved chars.
+/// Percent-encode a guest path for use as a query parameter value.
+/// '/' is encoded so the path is unambiguous when embedded in a URL
+/// query string (`?path=/some/nested/path` could be parsed incorrectly
+/// by some HTTP middleware; `?path=%2Fsome%2Fnested%2Fpath` is safe).
 fn urlenc_path(path: &str) -> String {
     path.chars()
         .flat_map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '/') {
+            // RFC 3986 unreserved characters — safe to leave unencoded in
+            // a query value.  '/' is intentionally excluded so nested paths
+            // are unambiguous when embedded as a query parameter.
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
                 vec![c]
             } else {
-                // Encode as percent-hex pairs for each byte.
+                // Encode as percent-hex pairs for each UTF-8 byte.
                 let mut s = Vec::new();
                 let mut buf = [0u8; 4];
                 let encoded = c.encode_utf8(&mut buf);
                 for byte in encoded.bytes() {
-                    // Convert each byte to a char sequence (safe ASCII)
                     s.extend(format!("%{byte:02X}").chars());
                 }
                 s
