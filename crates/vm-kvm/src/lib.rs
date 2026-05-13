@@ -23,9 +23,9 @@ use std::io::{self, Write};
 #[cfg(feature = "kvm")]
 use std::mem;
 #[cfg(feature = "kvm")]
-use std::sync::{Arc, Mutex, OnceLock};
-#[cfg(feature = "kvm")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "kvm")]
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "kvm")]
 use std::thread::{self, JoinHandle};
 
@@ -50,8 +50,8 @@ use linux_loader::loader::bootparam::{boot_params, setup_header};
 use linux_loader::loader::{load_cmdline, BzImage, KernelLoader};
 #[cfg(feature = "kvm")]
 use vm_memory::{
-    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryBackend, GuestMemoryMmap,
-    GuestMemoryRegion, MemoryRegionAddress,
+    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
+    MemoryRegionAddress,
 };
 #[cfg(feature = "kvm")]
 use vmm_sys_util::signal::{register_signal_handler, Killable};
@@ -161,7 +161,7 @@ impl KvmHypervisor {
             .kernel
             .as_ref()
             .ok_or_else(|| VmError::Backend("vm-kvm: kernel path is required".into()))?;
-        let mut boot_plan = KvmBootPlan::from_config(cfg)?;
+        let boot_plan = KvmBootPlan::from_config(cfg)?;
         let vm_fd = self
             .kvm
             .create_vm()
@@ -241,7 +241,11 @@ impl KvmHypervisor {
 
     fn reap_finished_vcpus(inner: &mut Inner) -> VmResult<()> {
         for vm in inner.vms.values_mut() {
-            if vm.vcpu.as_ref().is_some_and(|vcpu| vcpu.handle.is_finished()) {
+            if vm
+                .vcpu
+                .as_ref()
+                .is_some_and(|vcpu| vcpu.handle.is_finished())
+            {
                 let vcpu = vm.vcpu.take().expect("checked is_some above");
                 vm.state = VmState::Stopped;
                 vm.last_run_error = Some(join_vcpu_thread(vcpu)?);
@@ -262,18 +266,6 @@ impl KvmHypervisor {
         vm.last_run_error = Some(join_vcpu_thread(vcpu)?);
         vm.state = VmState::Stopped;
         Ok(())
-    }
-
-    #[cfg(test)]
-    fn serial_output(&self, id: VmId) -> VmResult<Vec<u8>> {
-        let mut inner = self.lock_inner()?;
-        Self::reap_finished_vcpus(&mut inner)?;
-        let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
-        vm.runtime
-            .serial_output
-            .lock()
-            .map_err(|_| VmError::Backend("vm-kvm: serial output mutex poisoned".into()))
-            .map(|buf| buf.clone())
     }
 }
 
@@ -333,6 +325,17 @@ impl KvmBootPlan {
             .as_cstring()
             .map(|cmdline| cmdline.as_bytes_with_nul().len())
             .map_err(|e| VmError::Backend(format!("kernel cmdline CString: {e}")))
+    }
+
+    fn cmdline_string(&self) -> VmResult<String> {
+        self.cmdline
+            .as_cstring()
+            .map_err(|e| VmError::Backend(format!("kernel cmdline CString: {e}")))
+            .and_then(|cmdline| {
+                cmdline
+                    .into_string()
+                    .map_err(|e| VmError::Backend(format!("kernel cmdline UTF-8: {e}")))
+            })
     }
 
     fn memory_size_bytes(&self) -> u64 {
@@ -463,7 +466,7 @@ impl Hypervisor for KvmHypervisor {
             state: vm.state,
             vcpus: vm.config.vcpus,
             memory_mib: vm.config.memory_mib,
-            kernel_cmdline: vm.runtime.boot_plan.cmdline.to_string(),
+            kernel_cmdline: vm.runtime.boot_plan.cmdline_string()?,
             snapshot_dir: vm.config.snapshot_dir.clone(),
         })
     }
@@ -555,8 +558,9 @@ fn register_guest_memory(vm_fd: &VmFd, guest_mem: &GuestMemoryMmap) -> VmResult<
     for (slot, region) in guest_mem.iter().enumerate() {
         let userspace_addr = region
             .get_host_address(MemoryRegionAddress(0))
-            .map_err(|e| VmError::Backend(format!("resolve host address for memslot {slot}: {e}")))?
-            as u64;
+            .map_err(|e| {
+                VmError::Backend(format!("resolve host address for memslot {slot}: {e}"))
+            })? as u64;
         let mem_region = kvm_userspace_memory_region {
             slot: u32::try_from(slot)
                 .map_err(|_| VmError::Backend(format!("too many guest memory regions: {slot}")))?,
@@ -597,7 +601,12 @@ fn configure_linux_boot(
     params.hdr.cmdline_size = u32::try_from(cmdline_size)
         .map_err(|_| VmError::Backend("vm-kvm: cmdline size does not fit boot params".into()))?;
     add_e820_entry(&mut params, 0, SYSTEM_MEM_START, E820_RAM)?;
-    add_e820_entry(&mut params, SYSTEM_MEM_START, SYSTEM_MEM_SIZE, E820_RESERVED)?;
+    add_e820_entry(
+        &mut params,
+        SYSTEM_MEM_START,
+        SYSTEM_MEM_SIZE,
+        E820_RESERVED,
+    )?;
     let mem_end = guest_mem.last_addr().raw_value() + 1;
     if mem_end > HIMEM_START {
         add_e820_entry(&mut params, HIMEM_START, mem_end - HIMEM_START, E820_RAM)?;
@@ -677,7 +686,10 @@ fn setup_sregs(guest_mem: &GuestMemoryMmap, vcpu: &VcpuFd) -> VmResult<()> {
 }
 
 #[cfg(feature = "kvm")]
-fn configure_segments_and_sregs(guest_mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> VmResult<()> {
+fn configure_segments_and_sregs(
+    guest_mem: &GuestMemoryMmap,
+    sregs: &mut kvm_sregs,
+) -> VmResult<()> {
     let gdt_table = [
         gdt_entry(0, 0, 0),
         gdt_entry(0xa09b, 0, 0xfffff),
@@ -813,8 +825,8 @@ fn handle_io_in(port: u16, data: &mut [u8]) {
         return;
     }
     match port {
-        SERIAL_PORT_BASE + 5 => data[0] = 0x60,
-        SERIAL_PORT_BASE + 2 => data[0] = 0x01,
+        port if port == SERIAL_PORT_BASE + 5 => data[0] = 0x60,
+        port if port == SERIAL_PORT_BASE + 2 => data[0] = 0x01,
         _ => {}
     }
 }
@@ -926,8 +938,8 @@ fn get_base(entry: u64) -> u64 {
 
 #[cfg(feature = "kvm")]
 fn get_limit(entry: u64) -> u32 {
-    let limit = ((((entry) & 0x000f_0000_0000_0000) >> 32) | ((entry) & 0x0000_0000_0000_ffff))
-        as u32;
+    let limit =
+        ((((entry) & 0x000f_0000_0000_0000) >> 32) | ((entry) & 0x0000_0000_0000_ffff)) as u32;
     if get_g(entry) == 0 {
         limit
     } else {
@@ -1006,10 +1018,22 @@ mod tests {
             hv.create_vm(&VmConfig::default()).unwrap_err(),
             VmError::Unsupported(_)
         ));
-        assert!(matches!(hv.start(VmId(1)).unwrap_err(), VmError::Unsupported(_)));
-        assert!(matches!(hv.stop(VmId(1)).unwrap_err(), VmError::Unsupported(_)));
-        assert!(matches!(hv.state(VmId(1)).unwrap_err(), VmError::Unsupported(_)));
-        assert!(matches!(hv.snapshot(VmId(1)).unwrap_err(), VmError::Unsupported(_)));
+        assert!(matches!(
+            hv.start(VmId(1)).unwrap_err(),
+            VmError::Unsupported(_)
+        ));
+        assert!(matches!(
+            hv.stop(VmId(1)).unwrap_err(),
+            VmError::Unsupported(_)
+        ));
+        assert!(matches!(
+            hv.state(VmId(1)).unwrap_err(),
+            VmError::Unsupported(_)
+        ));
+        assert!(matches!(
+            hv.snapshot(VmId(1)).unwrap_err(),
+            VmError::Unsupported(_)
+        ));
         assert!(matches!(
             hv.restore(SnapshotId(1)).unwrap_err(),
             VmError::Unsupported(_)
@@ -1018,7 +1042,10 @@ mod tests {
             hv.destroy(VmId(1)).unwrap_err(),
             VmError::Unsupported(_)
         ));
-        assert!(matches!(hv.list_vms().unwrap_err(), VmError::Unsupported(_)));
+        assert!(matches!(
+            hv.list_vms().unwrap_err(),
+            VmError::Unsupported(_)
+        ));
         assert!(matches!(
             hv.list_snapshots().unwrap_err(),
             VmError::Unsupported(_)
@@ -1031,7 +1058,10 @@ mod tests {
             hv.snapshot_meta(SnapshotId(1)).unwrap_err(),
             VmError::Unsupported(_)
         ));
-        assert!(matches!(hv.vm_meta(VmId(1)).unwrap_err(), VmError::Unsupported(_)));
+        assert!(matches!(
+            hv.vm_meta(VmId(1)).unwrap_err(),
+            VmError::Unsupported(_)
+        ));
         assert!(matches!(
             hv.exec_in_guest(
                 VmId(1),
@@ -1096,17 +1126,28 @@ mod tests {
             .guest_mem
             .read_obj(GuestAddress(ZERO_PAGE_START))
             .expect("read zero page");
-        assert_eq!(params.hdr.boot_flag, KERNEL_BOOT_FLAG_MAGIC);
-        assert_eq!(params.hdr.header, KERNEL_HDR_MAGIC);
-        assert_eq!(params.hdr.cmd_line_ptr, CMDLINE_START as u32);
-        assert_eq!(params.hdr.cmdline_size, cmdline_size as u32);
-        assert_eq!(params.e820_entries, 3);
-        assert_eq!(params.e820_table[0].addr, 0);
-        assert_eq!(params.e820_table[0].type_, E820_RAM);
-        assert_eq!(params.e820_table[1].addr, SYSTEM_MEM_START);
-        assert_eq!(params.e820_table[1].type_, E820_RESERVED);
-        assert_eq!(params.e820_table[2].addr, HIMEM_START);
-        assert_eq!(params.e820_table[2].type_, E820_RAM);
+        let boot_flag = params.hdr.boot_flag;
+        let header = params.hdr.header;
+        let cmd_line_ptr = params.hdr.cmd_line_ptr;
+        let header_cmdline_size = params.hdr.cmdline_size;
+        let e820_entries = params.e820_entries;
+        let entry0_addr = params.e820_table[0].addr;
+        let entry0_type = params.e820_table[0].type_;
+        let entry1_addr = params.e820_table[1].addr;
+        let entry1_type = params.e820_table[1].type_;
+        let entry2_addr = params.e820_table[2].addr;
+        let entry2_type = params.e820_table[2].type_;
+        assert_eq!(boot_flag, KERNEL_BOOT_FLAG_MAGIC);
+        assert_eq!(header, KERNEL_HDR_MAGIC);
+        assert_eq!(cmd_line_ptr, CMDLINE_START as u32);
+        assert_eq!(header_cmdline_size, cmdline_size as u32);
+        assert_eq!(e820_entries, 3);
+        assert_eq!(entry0_addr, 0);
+        assert_eq!(entry0_type, E820_RAM);
+        assert_eq!(entry1_addr, SYSTEM_MEM_START);
+        assert_eq!(entry1_type, E820_RESERVED);
+        assert_eq!(entry2_addr, HIMEM_START);
+        assert_eq!(entry2_type, E820_RAM);
     }
 
     #[cfg(feature = "kvm")]

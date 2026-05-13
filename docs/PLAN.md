@@ -186,17 +186,27 @@ Stretch: M8 GPU passthrough, M9 multi-node, M10 confidential compute
 M1 is blocked on `/dev/kvm`. See [`kvm-host.md`](kvm-host.md) for the
 cheapest options. Once on a KVM host the steps are:
 
-1. Add `kvm-ioctls`, `vm-memory`, `linux-loader` behind the `kvm` feature. ✅
-   Done: dependencies are feature-gated in `crates/vm-kvm/Cargo.toml` and
-   `crates/vm-kvm/src/lib.rs` now contains a compile-time-validated
-   `KvmBootPlan` scaffold (guest memory + cmdline) that does not touch
-   `/dev/kvm`.
+1. Add `kvm-ioctls`, `kvm-bindings`, `vm-memory`, `linux-loader`, and the
+   signal helpers behind the `kvm` feature. ✅
+   Done: the `vm-kvm` crate now feature-gates the real KVM stack and
+   `KvmHypervisor::new()` opens `/dev/kvm` only when `--features kvm` is
+   enabled.
 2. Implement `KvmHypervisor::create_vm` (mmap guest RAM, load bzImage with
-   `linux-loader`).
-3. Implement `KvmHypervisor::start` (create vCPU, set registers, run loop).
-4. Attach a minimal 8250 UART device so the kernel can print to `ttyS0`.
+   `linux-loader`). ✅
+   Done for the M1 slice: guest RAM is registered with KVM, the bzImage is
+   loaded, the default `ttyS0`-oriented cmdline is written, and Linux boot
+   params/e820 are populated.
+3. Implement `KvmHypervisor::start` (create vCPU, set registers, run loop). ✅
+   Done for the M1 slice: one vCPU is created, CPUID/FPU/base regs/sregs/page
+   tables are configured for Linux direct boot, and the vCPU runs on a worker
+   thread with `start`/`stop`/`state`/`list_vms`/`vm_meta` wired through the
+   trait.
+4. Attach a minimal 8250 UART device so the kernel can print to `ttyS0`. ✅
+   Done for the M1 slice: a basic port-I/O serial path handles `0x3f8` output
+   plus the minimum input registers the guest kernel polls during UART init.
 5. Add seccomp-BPF filter to the VMM process.
-6. Smoke-test: `cargo run -p cli -- run bzImage` prints "hello from guest".
+6. Smoke-test on a real KVM host: boot a real kernel and confirm serial output
+   end-to-end through the control-plane/CLI stack.
 
 ## Verification
 
