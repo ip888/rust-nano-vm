@@ -123,8 +123,8 @@ dedicated CI runner once M5 benchmarks become part of merge gating.
 ```sh
 git clone https://github.com/ip888/Rust-nano-vm.git
 cd Rust-nano-vm
-cargo build --workspace --features kvm
-cargo test --workspace
+cargo build -p vm-kvm --features kvm
+cargo test -p vm-kvm --features kvm
 # M1:
-cargo run -p cli --features kvm -- run examples/hello-guest
+cargo clippy --workspace --all-targets --features vm-kvm/kvm -- -D warnings
 ```
