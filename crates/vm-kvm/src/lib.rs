@@ -6,6 +6,11 @@
 //! default build ensures `cargo build --workspace` stays portable — in
 //! particular this crate compiles cleanly in the gVisor sandbox that has no
 //! `/dev/kvm`.
+//!
+//! `vm-kvm` now contains a small amount of required `unsafe` code for the
+//! KVM userspace ABI: registering guest RAM requires passing a host virtual
+//! address to `KVM_SET_USER_MEMORY_REGION`, and the safety invariants are
+//! documented at each call site.
 
 #![warn(missing_docs)]
 
@@ -285,7 +290,7 @@ pub(crate) struct KvmBootPlan {
 impl KvmBootPlan {
     const CMDLINE_CAPACITY: usize = 4096;
     const KERNEL_LOAD_ADDR: u64 = 0x20_0000;
-    const DEFAULT_CMDLINE: &'static str = "console=ttyS0 reboot=k panic=1 pci=off";
+    const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=k panic=1 pci=off";
 
     fn from_config(cfg: &VmConfig) -> VmResult<Self> {
         let mem_size = cfg
