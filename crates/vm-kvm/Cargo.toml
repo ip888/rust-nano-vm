@@ -10,8 +10,11 @@ description = "KVM-backed Hypervisor implementation. Linux-only, feature-gated."
 [dependencies]
 vm-core.workspace = true
 kvm-ioctls = { version = "0.24.0", optional = true }
-vm-memory = { version = "0.18.0", default-features = false, features = ["backend-mmap"], optional = true }
+kvm-bindings = { version = "0.14.0", optional = true }
+vm-memory = { version = "0.17.1", default-features = false, features = ["backend-mmap"], optional = true }
 linux-loader = { version = "0.13.2", features = ["bzimage"], optional = true }
+libc = { version = "0.2.185", optional = true }
+vmm-sys-util = { version = "0.15.0", optional = true }
 
 # Real KVM deps (kvm-ioctls, vm-memory, linux-loader) arrive with the `kvm`
 # feature in M1. Keeping them out of the default build keeps
@@ -21,7 +24,7 @@ linux-loader = { version = "0.13.2", features = ["bzimage"], optional = true }
 [features]
 default = []
 # Enable the real KVM backend. Requires Linux + /dev/kvm at runtime.
-kvm = ["dep:kvm-ioctls", "dep:vm-memory", "dep:linux-loader"]
+kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:vm-memory", "dep:linux-loader", "dep:libc", "dep:vmm-sys-util"]
 
 [lints]
 workspace = true
