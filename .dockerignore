@@ -1,0 +1,17 @@
+# Stay in lockstep with what the Dockerfile actually `COPY`s.
+# Anything not listed below balloons the build context for no benefit.
+
+target/
+**/target/
+.git/
+.github/
+docs/
+public/
+README.md
+LICENSE-*
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

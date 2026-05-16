@@ -79,7 +79,25 @@ curl localhost:8080/openapi.json | jq '.info,.paths'  # OpenAPI 3.1 contract
 cargo run -p control-plane --bin nanovm-openapi > docs/openapi.json
 ```
 
-On a Linux host with `/dev/kvm` (M1+):
+### Container image
+
+The control plane ships as a distroless image (~25 MB + binary). The
+[`Dockerfile`](Dockerfile) builds with the same toolchain as the
+workspace and runs as uid 65532:
+
+```sh
+docker build -t nanovm-control-plane:dev .
+docker run --rm -p 8080:8080 \
+     -e NANOVM_API_TOKENS=dev-token \
+     -e NANOVM_RATE_LIMIT_RPS=100 \
+     nanovm-control-plane:dev
+```
+
+The image listens on `0.0.0.0:8080` by default so the `-p` mapping
+works out of the box; override with `NANOVM_CONTROL_PLANE_ADDR` for
+non-default ports.
+
+### On a Linux host with `/dev/kvm` (M1+)
 
 ```sh
 cargo run -p cli --features kvm -- run examples/hello-guest
