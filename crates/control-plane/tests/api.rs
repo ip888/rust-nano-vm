@@ -8,7 +8,7 @@ use axum::{
     http::{Method, Request, StatusCode},
     Extension, Router,
 };
-use control_plane::{router, ApiTokens, AppState};
+use control_plane::{router, ApiTokens, AppState, Metrics};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -25,6 +25,17 @@ fn app_with_tokens(tokens: ApiTokens) -> Router {
     let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
     router()
         .layer(Extension(Arc::new(tokens)))
+        .with_state(AppState::new(hv))
+}
+
+/// Router with a `Metrics` extension installed. Auth disabled — the
+/// tracking middleware sits outside the auth layer so it observes
+/// every request regardless of whether auth would have rejected it.
+fn app_with_metrics(metrics: Arc<Metrics>) -> Router {
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    router()
+        .layer(Extension(Arc::new(ApiTokens::default())))
+        .layer(Extension(metrics))
         .with_state(AppState::new(hv))
 }
 
@@ -950,4 +961,85 @@ async fn read_file_nonexistent_path_returns_backend_error() {
     // The mock surfaces a backend error (IO error on the host) which maps to 500.
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "got {body:?}");
     assert_eq!(body["error"]["code"], "backend");
+}
+
+#[tokio::test]
+async fn metrics_endpoint_returns_prometheus_text_with_correct_content_type() {
+    let metrics = Arc::new(Metrics::new());
+    let app = app_with_metrics(metrics);
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(ctype, "text/plain; version=0.0.4");
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(text.contains("# TYPE nanovm_http_requests_total counter"));
+    // inflight is `1` while /metrics itself is rendering — the
+    // tracking middleware has already incremented for this request.
+    assert!(text.contains("nanovm_http_inflight 1"), "text:\n{text}");
+}
+
+#[tokio::test]
+async fn metrics_endpoint_unauthenticated_even_when_tokens_are_set() {
+    // /metrics lives on the outer router, outside the auth layer.
+    let tokens = ApiTokens::new(["scrape-cant-have-this"]);
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    let app = router()
+        .layer(Extension(Arc::new(tokens)))
+        .layer(Extension(Arc::new(Metrics::new())))
+        .with_state(AppState::new(hv));
+    let (status, _) = send(app, Method::GET, "/metrics", None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn metrics_counts_requests_partitioned_by_status_class() {
+    let metrics = Arc::new(Metrics::new());
+    let app = app_with_metrics(metrics.clone());
+
+    // 201 (2xx), 404 (4xx) — two distinct status classes.
+    let (s1, _) = send(app.clone(), Method::POST, "/v1/vms", Some(json!({}))).await;
+    assert_eq!(s1, StatusCode::CREATED);
+    let (s2, _) = send(app.clone(), Method::GET, "/v1/vms/99999", None).await;
+    assert_eq!(s2, StatusCode::NOT_FOUND);
+    // Scrape /metrics — that itself is a 200, so 2xx must be >= 2.
+    let (sm, body) = send(app, Method::GET, "/metrics", None).await;
+    assert_eq!(sm, StatusCode::OK);
+    let text = body.as_str().unwrap();
+    // 3 requests so far (POST, GET, GET /metrics) — but /metrics' own
+    // 200 is recorded AFTER render. Render captures state just before
+    // record(), so total here is at least 2.
+    assert!(
+        text.contains("nanovm_http_requests_total 2")
+            || text.contains("nanovm_http_requests_total 3"),
+        "unexpected total in:\n{text}"
+    );
+    assert!(text.contains("class=\"2xx\"} 1"));
+    assert!(text.contains("class=\"4xx\"} 1"));
+}
+
+#[tokio::test]
+async fn metrics_extension_absent_returns_empty_200() {
+    // The `app()` helper installs no Metrics extension. /metrics
+    // degrades to an empty 200 rather than 500.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(body.is_empty());
 }

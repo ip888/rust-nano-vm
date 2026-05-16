@@ -44,6 +44,7 @@ use crate::api::{
 };
 use crate::auth;
 use crate::error::ApiError;
+use crate::metrics;
 
 /// Shared state plumbed into every handler.
 #[derive(Clone)]
@@ -102,7 +103,13 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/openapi.json", get(openapi))
+        .route("/metrics", get(metrics::metrics_handler))
         .nest("/v1", v1)
+        // `track_request` is outermost so it sees every route — including
+        // `/healthz` and `/metrics` — and records the final status after
+        // any inner middleware has had its say. No-op when the `Metrics`
+        // extension isn't installed (library consumers / tests).
+        .layer(middleware::from_fn(metrics::track_request))
         .layer(TraceLayer::new_for_http())
 }
 

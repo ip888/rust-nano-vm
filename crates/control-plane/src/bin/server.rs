@@ -7,13 +7,18 @@
 //! - `NANOVM_CONTROL_PLANE_ADDR` — bind address (default `127.0.0.1:8080`).
 //! - `NANOVM_API_TOKENS` — comma-separated bearer tokens. **Empty disables
 //!   auth** and emits a `WARN` log line on startup.
+//!
+//! `GET /metrics` exposes a Prometheus 0.0.4 text exposition with
+//! request totals, per-status-class counters, and an in-flight gauge.
+//! No auth — operators who don't want it publicly reachable should
+//! bind to `127.0.0.1` or block at their reverse proxy.
 
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
 
 use axum::Extension;
-use control_plane::{router, ApiTokens, AppState};
+use control_plane::{router, ApiTokens, AppState, Metrics};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{info, warn};
@@ -41,9 +46,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!(count = tokens.len(), "bearer-token auth enabled");
     }
 
+    let metrics = Arc::new(Metrics::new());
+
     let hypervisor: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
     let app = router()
         .layer(Extension(tokens))
+        .layer(Extension(metrics))
         .with_state(AppState::new(hypervisor));
 
     let listener = TcpListener::bind(&addr).await?;

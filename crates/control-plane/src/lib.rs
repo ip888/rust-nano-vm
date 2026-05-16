@@ -42,8 +42,10 @@
 mod api;
 mod auth;
 mod error;
+mod metrics;
 mod routes;
 
 pub use api::openapi_spec;
 pub use auth::ApiTokens;
+pub use metrics::Metrics;
 pub use routes::{router, AppState};
