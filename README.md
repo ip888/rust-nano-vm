@@ -146,6 +146,12 @@ crates/
 
 Full plan: [`docs/PLAN.md`](docs/PLAN.md).
 
+## Security
+
+Threat model, mitigations in place, and tracked gaps live in
+[`docs/threat-model.md`](docs/threat-model.md). Report vulnerabilities
+privately via GitHub Security Advisories — do not open a public issue.
+
 ## Contributing
 
 Pre-alpha, expect churn. File issues first; large PRs without prior
