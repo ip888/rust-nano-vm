@@ -8,7 +8,7 @@ use axum::{
     http::{Method, Request, StatusCode},
     Extension, Router,
 };
-use control_plane::{router, ApiTokens, AppState};
+use control_plane::{router, ApiTokens, AppState, RateLimit};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -950,4 +950,144 @@ async fn read_file_nonexistent_path_returns_backend_error() {
     // The mock surfaces a backend error (IO error on the host) which maps to 500.
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "got {body:?}");
     assert_eq!(body["error"]["code"], "backend");
+}
+
+// --- Rate limit ----------------------------------------------------
+
+/// Router with both an explicit token set AND an explicit rate limit
+/// installed — used to exercise the /v1/* throttle.
+fn app_with_tokens_and_limit(tokens: ApiTokens, limit: RateLimit) -> Router {
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    router()
+        .layer(Extension(Arc::new(tokens)))
+        .layer(Extension(Arc::new(limit)))
+        .with_state(AppState::new(hv))
+}
+
+#[tokio::test]
+async fn rate_limit_returns_429_with_envelope_and_retry_after() {
+    let app = app_with_tokens_and_limit(ApiTokens::new(["s3cret"]), RateLimit::new(1, 1));
+    // First request consumes the only token in the burst.
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/vms")
+        .header("authorization", "Bearer s3cret")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Second request immediately after — bucket empty.
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/vms")
+        .header("authorization", "Bearer s3cret")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .map(|v| v.to_str().unwrap().to_owned());
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"]["code"], "too_many_requests");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("rate limit"),
+        "message was {body:?}"
+    );
+    // Retry-After is in whole seconds per RFC 9110; ceil(1.0 / 1rps).
+    assert_eq!(retry_after.as_deref(), Some("1"));
+}
+
+#[tokio::test]
+async fn rate_limit_buckets_are_per_token() {
+    let app = app_with_tokens_and_limit(ApiTokens::new(["alice", "bob"]), RateLimit::new(1, 1));
+    for token in ["alice", "bob"] {
+        // Each token gets its own burst-of-1.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/vms")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "first request for {token}"
+        );
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/vms")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "second request for {token}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rate_limit_disabled_with_rps_zero_passes_all_requests() {
+    let app = app_with_tokens_and_limit(ApiTokens::new(["s3cret"]), RateLimit::new(0, 0));
+    for _ in 0..50 {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/vms")
+            .header("authorization", "Bearer s3cret")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+}
+
+#[tokio::test]
+async fn rate_limit_extension_absent_passes_all_requests() {
+    // Legacy callers that don't install a RateLimit Extension must
+    // still work — degrade-gracefully, same shape as the auth fix.
+    let app = app(); // no rate limit
+    for _ in 0..50 {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/vms")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+}
+
+#[tokio::test]
+async fn rate_limit_healthz_exempt() {
+    // /healthz is on the outer router (no /v1/* layers) so the rate
+    // limit never sees it.
+    let app = app_with_tokens_and_limit(ApiTokens::new(["s3cret"]), RateLimit::new(1, 1));
+    for _ in 0..50 {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }

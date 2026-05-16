@@ -7,13 +7,16 @@
 //! - `NANOVM_CONTROL_PLANE_ADDR` — bind address (default `127.0.0.1:8080`).
 //! - `NANOVM_API_TOKENS` — comma-separated bearer tokens. **Empty disables
 //!   auth** and emits a `WARN` log line on startup.
+//! - `NANOVM_RATE_LIMIT_RPS` — per-token rate limit (refills per second).
+//!   `0` disables the limiter; default is 100. The matching burst can be
+//!   tuned via `NANOVM_RATE_LIMIT_BURST` (default = rps).
 
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
 
 use axum::Extension;
-use control_plane::{router, ApiTokens, AppState};
+use control_plane::{router, ApiTokens, AppState, RateLimit};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{info, warn};
@@ -41,9 +44,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!(count = tokens.len(), "bearer-token auth enabled");
     }
 
+    let limiter = Arc::new(RateLimit::from_env());
+    if limiter.is_disabled() {
+        warn!(
+            "NANOVM_RATE_LIMIT_RPS=0 — /v1/* is unthrottled. \
+             A misbehaving client (or a credential leak) will exhaust \
+             the backend. Pick a conservative rps before exposing this \
+             service to the network."
+        );
+    } else {
+        info!(
+            rps = limiter.rps(),
+            burst = limiter.burst(),
+            "per-token rate limit enabled",
+        );
+    }
+
     let hypervisor: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
     let app = router()
         .layer(Extension(tokens))
+        .layer(Extension(limiter))
         .with_state(AppState::new(hypervisor));
 
     let listener = TcpListener::bind(&addr).await?;

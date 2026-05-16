@@ -44,6 +44,7 @@ use crate::api::{
 };
 use crate::auth;
 use crate::error::ApiError;
+use crate::rate_limit;
 
 /// Shared state plumbed into every handler.
 #[derive(Clone)]
@@ -97,6 +98,12 @@ pub fn router() -> Router<AppState> {
         .route("/snapshots", get(list_snapshots))
         .route("/snapshots/:id", axum::routing::delete(delete_snapshot))
         .route("/snapshots/:id/restore", post(restore_snapshot))
+        // Layer ordering: `.route_layer` is bottom-up — the last call
+        // produces the OUTERMOST layer that runs first. We want auth
+        // to reject bogus tokens *before* the rate limiter spawns a
+        // bucket for them, so `require_rate` goes in first (inner)
+        // and `require_token` goes in after (outer = runs first).
+        .route_layer(middleware::from_fn(rate_limit::require_rate))
         .route_layer(middleware::from_fn(auth::require_token));
 
     Router::new()

@@ -43,6 +43,14 @@ pub(crate) enum ApiError {
     /// parses the request body itself (bypassing axum's JSON extractor).
     /// Renders as 400 with `code: "bad_request"`.
     Bad(String),
+    /// Per-token rate limit exceeded. Renders as 429 with
+    /// `code: "too_many_requests"` and a `Retry-After` header carrying
+    /// the seconds-until-refill hint.
+    TooManyRequests {
+        /// Estimated time the client should wait before retrying, in
+        /// fractional seconds.
+        retry_after_secs: f64,
+    },
 }
 
 impl From<VmError> for ApiError {
@@ -98,6 +106,24 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "unauthorized", msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", msg.into()),
             ApiError::Bad(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg),
+            ApiError::TooManyRequests { retry_after_secs } => {
+                // Round up so a 0.1s wait becomes "1" not "0" in the
+                // Retry-After header (which is a non-negative integer
+                // count of seconds per RFC 9110).
+                let secs = retry_after_secs.ceil().max(1.0) as u64;
+                let body = Json(ErrorEnvelope {
+                    error: ErrorBody {
+                        code: "too_many_requests",
+                        message: format!("rate limit exceeded; retry after {retry_after_secs:.3}s"),
+                    },
+                });
+                let mut resp = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+                resp.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from(secs),
+                );
+                return resp;
+            }
         };
         let body = Json(ErrorEnvelope {
             error: ErrorBody { code, message },

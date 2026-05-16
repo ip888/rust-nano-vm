@@ -42,8 +42,10 @@
 mod api;
 mod auth;
 mod error;
+mod rate_limit;
 mod routes;
 
 pub use api::openapi_spec;
 pub use auth::ApiTokens;
+pub use rate_limit::{RateLimit, DEFAULT_RATE_LIMIT_BURST, DEFAULT_RATE_LIMIT_RPS};
 pub use routes::{router, AppState};
