@@ -44,6 +44,7 @@ use crate::api::{
 };
 use crate::auth;
 use crate::error::ApiError;
+use crate::request_id;
 
 /// Shared state plumbed into every handler.
 #[derive(Clone)]
@@ -103,6 +104,10 @@ pub fn router() -> Router<AppState> {
         .route("/healthz", get(healthz))
         .route("/openapi.json", get(openapi))
         .nest("/v1", v1)
+        // `propagate` sits outside TraceLayer so the request_id is in
+        // request extensions before tracing spans are emitted, and is
+        // set on the response after handlers return.
+        .layer(middleware::from_fn(request_id::propagate))
         .layer(TraceLayer::new_for_http())
 }
 

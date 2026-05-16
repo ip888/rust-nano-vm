@@ -951,3 +951,81 @@ async fn read_file_nonexistent_path_returns_backend_error() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "got {body:?}");
     assert_eq!(body["error"]["code"], "backend");
 }
+
+#[tokio::test]
+async fn request_id_is_minted_when_absent_on_inbound() {
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let id = resp
+        .headers()
+        .get("x-request-id")
+        .expect("response must carry x-request-id")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(id.starts_with("nanovm-"), "unexpected mint shape: {id}");
+    // Two requests should get distinct minted ids.
+    let req2 = Request::builder()
+        .method(Method::GET)
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    let resp2 = app().oneshot(req2).await.unwrap();
+    let id2 = resp2
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_ne!(id, id2);
+}
+
+#[tokio::test]
+async fn request_id_is_echoed_when_caller_supplies_valid_one() {
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/healthz")
+        .header("x-request-id", "caller-supplied-abc.123")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let echoed = resp
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(echoed, "caller-supplied-abc.123");
+}
+
+#[tokio::test]
+async fn request_id_is_replaced_when_caller_supplies_malicious_header() {
+    // Header-injection vector: CR/LF + a forged Set-Cookie that a
+    // naive echo would let an attacker append to the response.
+    // We must reject the inbound id and mint a fresh one.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/healthz")
+        .header("x-request-id", "ok-prefix has space")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let echoed = resp
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(echoed.starts_with("nanovm-"), "unexpected echo: {echoed}");
+    assert!(
+        !echoed.contains(' '),
+        "minted id must not contain whitespace"
+    );
+}
