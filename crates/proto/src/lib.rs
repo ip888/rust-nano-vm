@@ -43,6 +43,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod frame;
+pub use frame::{
+    decode_request, decode_response, encode_request, encode_response, FrameError, HEADER_BYTES,
+    MAX_FRAME_BYTES,
+};
+
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version. Bump on any backwards-incompatible change.
