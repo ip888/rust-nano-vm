@@ -1,0 +1,103 @@
+name: kvm-ci
+
+# Exercises the `kvm` feature against a real /dev/kvm. Runs on a
+# self-hosted runner with the `kvm` label — see
+# `docs/kvm-runner.md` for the host-setup walkthrough. The runner
+# does **not** need to be online for PRs to merge: the job will
+# simply not start (status `expected` → `success` once a runner
+# picks it up, or `skipped` if labelled paths don't change).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/vm-kvm/**'
+      - 'crates/vm-core/**'
+      - 'crates/snapshot/**'
+      - 'crates/virtio-fs/**'
+      - 'crates/virtio-vsock/**'
+      - 'crates/virtio-queue/**'
+      - 'crates/guest-agent/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/kvm-ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/vm-kvm/**'
+      - 'crates/vm-core/**'
+      - 'crates/snapshot/**'
+      - 'crates/virtio-fs/**'
+      - 'crates/virtio-vsock/**'
+      - 'crates/virtio-queue/**'
+      - 'crates/guest-agent/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/kvm-ci.yml'
+  # Allow on-demand re-runs from the Actions UI when the runner
+  # comes online after a fleet outage.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+  RUST_BACKTRACE: 1
+
+jobs:
+  kvm-test:
+    name: kvm test
+    runs-on: [self-hosted, linux, kvm]
+    # The hardware bring-up step is rare and slow; allow it 25
+    # minutes before timing out (vs the default 6h, which would let
+    # a wedged guest pin the runner all day).
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify /dev/kvm
+        run: |
+          if [ ! -c /dev/kvm ]; then
+            echo "/dev/kvm not present — runner mislabelled?"
+            exit 1
+          fi
+          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            echo "/dev/kvm not RW for the runner user; check group membership"
+            ls -l /dev/kvm
+            exit 1
+          fi
+          # Print CPU virt extension and KVM module info for triage.
+          lscpu | grep -iE 'virtualization|model name' || true
+          lsmod | grep -E '^kvm' || true
+
+      - name: Install toolchain
+        run: rustup show
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-kvm-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-kvm-
+
+      - name: cargo build --features kvm
+        run: cargo build --workspace --features vm-kvm/kvm --locked
+
+      - name: cargo test --features kvm
+        # Only the vm-kvm crate's `kvm`-gated tests should actually
+        # touch /dev/kvm — the rest of the workspace builds against
+        # the default features. `-p vm-kvm` keeps the surface tight
+        # so a flaky vsock test (M2+) can't redden this job.
+        run: cargo test -p vm-kvm --features kvm -- --test-threads=1
+
+      - name: cargo test (smoke against vm-mock under default features)
+        # Belt-and-braces: re-run the default-feature suite on this
+        # runner so we catch any platform-specific test regression
+        # the ubuntu-latest job missed.
+        run: cargo test --workspace

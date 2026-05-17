@@ -65,8 +65,10 @@ jobs:
         run: cargo build --workspace --locked
       - name: cargo test
         run: cargo test --workspace
-      # The `kvm` feature is NOT exercised in CI — GitHub runners don't
-      # expose /dev/kvm. M1+ will wire up a self-hosted KVM runner.
+      # The `kvm` feature is NOT exercised in this job — GitHub-hosted
+      # runners don't expose /dev/kvm. The `kvm-ci.yml` workflow
+      # targets a self-hosted runner labelled `[self-hosted, linux, kvm]`
+      # for that — see docs/kvm-runner.md.
 
   deny:
     name: cargo-deny
