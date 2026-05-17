@@ -1,0 +1,25 @@
+[package]
+name = "bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "nanovm-bench — perf regression harness for the control-plane create/start/snapshot/fork loop."
+
+[[bin]]
+name = "nanovm-bench"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Blocking HTTP client. default-features = false drops the bundled TLS
+# backend — bench targets localhost or an in-VPC control plane, plain
+# HTTP is sufficient. Mirrors what `cli` does.
+reqwest.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true
