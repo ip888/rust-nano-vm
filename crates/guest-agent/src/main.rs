@@ -585,39 +585,30 @@ fn write_response(out: &mut impl Write, resp: &Response) -> Result<(), ()> {
 }
 
 fn read_frame(input: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
-    /// Maximum allowed length for a single framed request, to prevent an
-    /// out-of-memory condition caused by a malicious or corrupted length field.
-    const MAX_FRAME_LEN: usize = 16 * 1024 * 1024; // 16 MiB
-
-    let mut len_buf = [0u8; 4];
+    // Length-prefix + payload-read split via the shared `proto`
+    // codec so the host and guest stay byte-for-byte compatible.
+    // proto::parse_len enforces the MAX_FRAME_BYTES cap; we map its
+    // `InvalidLength` error to io::ErrorKind::InvalidData.
+    let mut len_buf = [0u8; proto::HEADER_BYTES];
     match input.read_exact(&mut len_buf) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_FRAME_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("frame length {len} exceeds maximum {MAX_FRAME_LEN} bytes"),
-        ));
-    }
+    let len = proto::parse_len(&len_buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let mut frame = vec![0u8; len];
     input.read_exact(&mut frame)?;
     Ok(Some(frame))
 }
 
 fn write_frame(out: &mut impl Write, resp: &Response) -> Result<(), ()> {
-    let json = match serde_json::to_vec(resp) {
-        Ok(buf) => buf,
-        Err(e) => {
-            eprintln!("nanovm-agent: serialize error: {e}");
-            return Err(());
-        }
-    };
-    let len = u32::try_from(json.len()).map_err(|_| ())?;
-    out.write_all(&len.to_le_bytes()).map_err(|_| ())?;
-    out.write_all(&json).map_err(|_| ())?;
+    let mut buf = Vec::new();
+    if let Err(e) = proto::encode_response(resp, &mut buf) {
+        eprintln!("nanovm-agent: encode error: {e}");
+        return Err(());
+    }
+    out.write_all(&buf).map_err(|_| ())?;
     out.flush().map_err(|_| ())
 }
 
