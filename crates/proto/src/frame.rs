@@ -6,13 +6,15 @@
 //!
 //! ```text
 //! ┌────────────────────┬──────────────────────────┐
-//! │ length (u32 BE)    │ JSON payload (length B)  │
+//! │ length (u32 LE)    │ JSON payload (length B)  │
 //! └────────────────────┴──────────────────────────┘
 //! ```
 //!
-//! - **4-byte big-endian** length prefix. BE because every other
-//!   wire-format we're going to look at (TCP headers, virtio
-//!   features, gRPC) is BE — saves cognitive load.
+//! - **4-byte little-endian** length prefix. LE matches the virtio
+//!   convention (every `__le32` / `__le64` in
+//!   `include/uapi/linux/virtio_vsock.h`) and is what the existing
+//!   `guest-agent` framed-stdio mode emits. Consistent across host
+//!   and guest, no byte-swap on either side.
 //! - **No magic, no version byte** in the frame itself. Version is
 //!   already part of every [`Request`] / [`Response`] payload via
 //!   the `version` field; duplicating it framing-side just costs
@@ -105,7 +107,7 @@ fn encode_value<T: serde::Serialize>(v: &T, out: &mut Vec<u8>) -> Result<usize, 
         out.truncate(header_start);
         return Err(FrameError::PayloadTooLarge { bytes: payload_len });
     }
-    let len_bytes = (payload_len as u32).to_be_bytes();
+    let len_bytes = (payload_len as u32).to_le_bytes();
     out[header_start..header_start + HEADER_BYTES].copy_from_slice(&len_bytes);
     Ok(HEADER_BYTES + payload_len)
 }
@@ -132,7 +134,7 @@ fn decode_value<T: for<'de> serde::Deserialize<'de>>(buf: &[u8]) -> Result<(T, u
             need: HEADER_BYTES,
         });
     }
-    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     if (len as usize) > MAX_FRAME_BYTES {
         return Err(FrameError::InvalidLength(len));
     }
@@ -222,7 +224,7 @@ mod tests {
     #[test]
     fn announced_length_over_cap_is_rejected_without_buffering() {
         // 4-byte BE length = MAX_FRAME_BYTES + 1, no payload.
-        let bad_len = (MAX_FRAME_BYTES as u32 + 1).to_be_bytes();
+        let bad_len = (MAX_FRAME_BYTES as u32 + 1).to_le_bytes();
         let err = decode_request(&bad_len).unwrap_err();
         assert!(matches!(err, FrameError::InvalidLength(_)));
     }
@@ -231,7 +233,7 @@ mod tests {
     fn malformed_payload_is_bad_payload_not_incomplete() {
         // 4-byte BE length = 5, payload = "junk!" → not a Request JSON.
         let mut buf = Vec::new();
-        buf.extend_from_slice(&5u32.to_be_bytes());
+        buf.extend_from_slice(&5u32.to_le_bytes());
         buf.extend_from_slice(b"junk!");
         let err = decode_request(&buf).unwrap_err();
         assert!(matches!(err, FrameError::BadPayload(_)), "got {err:?}");
@@ -257,7 +259,7 @@ mod tests {
     fn header_length_is_payload_length() {
         let mut buf = Vec::new();
         encode_request(&ping(), &mut buf).unwrap();
-        let header = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let header = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         assert_eq!(header as usize, buf.len() - HEADER_BYTES);
     }
 
@@ -304,6 +306,44 @@ mod tests {
             buf2.is_empty(),
             "buffer was not cleaned up: {} bytes",
             buf2.len()
+        );
+    }
+
+    #[test]
+    fn encoded_header_is_little_endian() {
+        // Pin the byte order against an external observer (the
+        // existing guest-agent framed-stdio mode). Both sides MUST
+        // agree on LE, so this is a wire-format contract test —
+        // changing it is a protocol break.
+        //
+        // Construct a Request whose JSON serializes to a length
+        // that's distinguishable BE vs LE. PROTOCOL_VERSION = 1 →
+        // the smallest unambiguous example is the standard `Ping`,
+        // which renders to a ~50-byte payload. Read the header
+        // bytes and assert the first byte (LSB in LE) is the low
+        // byte of the length and byte 3 (MSB in LE) is 0.
+        let mut buf = Vec::new();
+        encode_request(&ping(), &mut buf).unwrap();
+        let payload_len = (buf.len() - HEADER_BYTES) as u32;
+        assert!(
+            payload_len > 0 && payload_len < 256,
+            "expected a small payload, got {payload_len}"
+        );
+        assert_eq!(
+            buf[0] as u32, payload_len,
+            "byte 0 must be the LE low byte of the length"
+        );
+        assert_eq!(
+            buf[1], 0,
+            "byte 1 of LE length should be 0 for small payload"
+        );
+        assert_eq!(
+            buf[2], 0,
+            "byte 2 of LE length should be 0 for small payload"
+        );
+        assert_eq!(
+            buf[3], 0,
+            "byte 3 of LE length should be 0 for small payload"
         );
     }
 }
