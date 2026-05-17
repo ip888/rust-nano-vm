@@ -40,10 +40,12 @@
 #![warn(missing_docs)]
 
 mod api;
+mod audit;
 mod auth;
 mod error;
 mod routes;
 
 pub use api::openapi_spec;
+pub use audit::AuditLog;
 pub use auth::ApiTokens;
 pub use routes::{router, AppState};

@@ -8,7 +8,7 @@ use axum::{
     http::{Method, Request, StatusCode},
     Extension, Router,
 };
-use control_plane::{router, ApiTokens, AppState};
+use control_plane::{router, ApiTokens, AppState, AuditLog};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -950,4 +950,107 @@ async fn read_file_nonexistent_path_returns_backend_error() {
     // The mock surfaces a backend error (IO error on the host) which maps to 500.
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "got {body:?}");
     assert_eq!(body["error"]["code"], "backend");
+}
+
+#[tokio::test]
+async fn audit_log_captures_post_to_v1_vms() {
+    // Open a tmp audit log, run one POST, read it back.
+    let dir = std::env::temp_dir().join("nanovm-audit-int");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("audit-create-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let audit = Arc::new(AuditLog::open(&path).unwrap());
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    let app = router()
+        .layer(Extension(Arc::new(ApiTokens::default())))
+        .layer(Extension(audit))
+        .with_state(AppState::new(hv));
+
+    let (status, _) = send(app, Method::POST, "/v1/vms", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Give the OS a beat to flush the appended line.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let body = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let line = body.lines().next().expect("expected at least one line");
+    let rec: Value = serde_json::from_str(line).unwrap();
+    assert_eq!(rec["method"], "POST");
+    assert_eq!(rec["path"], "/v1/vms");
+    assert_eq!(rec["status"], 201);
+    assert_eq!(rec["token"], "-"); // auth disabled in this test
+    assert!(rec["ts"].as_str().unwrap().ends_with('Z'));
+}
+
+#[tokio::test]
+async fn audit_log_skips_get_requests() {
+    let dir = std::env::temp_dir().join("nanovm-audit-int");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("audit-get-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let audit = Arc::new(AuditLog::open(&path).unwrap());
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    let app = router()
+        .layer(Extension(Arc::new(ApiTokens::default())))
+        .layer(Extension(audit))
+        .with_state(AppState::new(hv));
+
+    let (status, _) = send(app, Method::GET, "/v1/vms", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let body = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        body.is_empty(),
+        "GET should not produce audit entries; got: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn audit_log_records_token_fingerprint_not_raw_token() {
+    let dir = std::env::temp_dir().join("nanovm-audit-int");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("audit-token-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let audit = Arc::new(AuditLog::open(&path).unwrap());
+    let tokens = ApiTokens::new(["super-secret-bearer-token-xyz789"]);
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    let app = router()
+        .layer(Extension(Arc::new(tokens)))
+        .layer(Extension(audit))
+        .with_state(AppState::new(hv));
+
+    let (status, _) = send_with(
+        app,
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        Some("super-secret-bearer-token-xyz789"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let body = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    // The whole point: the raw token MUST NOT appear in the log.
+    assert!(
+        !body.contains("xyz789") && !body.contains("super-secret"),
+        "audit log leaked the bearer token: {body}"
+    );
+    let line = body.lines().next().unwrap();
+    let rec: Value = serde_json::from_str(line).unwrap();
+    assert_eq!(rec["token"], "tok-supe-32");
+}
+
+#[tokio::test]
+async fn audit_log_extension_absent_passes_through() {
+    // No AuditLog extension installed → middleware short-circuits,
+    // request still succeeds.
+    let (status, _) = send(app(), Method::POST, "/v1/vms", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::CREATED);
 }

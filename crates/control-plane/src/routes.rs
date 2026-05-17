@@ -42,6 +42,7 @@ use crate::api::{
     FileWriteRequest, FileWrittenResponse, SnapshotDto, SnapshotListEntry, SnapshotListResponse,
     SnapshotRequest, VmHandleDto, VmListEntry, VmListResponse, VmStateResponse,
 };
+use crate::audit;
 use crate::auth;
 use crate::error::ApiError;
 
@@ -97,6 +98,13 @@ pub fn router() -> Router<AppState> {
         .route("/snapshots", get(list_snapshots))
         .route("/snapshots/:id", axum::routing::delete(delete_snapshot))
         .route("/snapshots/:id/restore", post(restore_snapshot))
+        // Layer ordering: `.route_layer` is bottom-up — the LAST
+        // call is the OUTERMOST layer (runs first). We want auth to
+        // reject bogus tokens *before* the audit middleware ever
+        // sees them, so register audit first (inner) and auth
+        // second (outer = runs first). That way the audit log only
+        // contains lines from authenticated callers.
+        .route_layer(middleware::from_fn(audit::audit_mutating))
         .route_layer(middleware::from_fn(auth::require_token));
 
     Router::new()
