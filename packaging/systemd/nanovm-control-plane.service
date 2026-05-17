@@ -1,0 +1,94 @@
+# systemd unit for `nanovm-control-plane`.
+#
+# Install:
+#   sudo cp packaging/systemd/nanovm-control-plane.service /etc/systemd/system/
+#   sudo cp packaging/systemd/nanovm-control-plane.env.example /etc/nanovm/control-plane.env
+#   sudo vi /etc/nanovm/control-plane.env     # set NANOVM_API_TOKENS at minimum
+#   sudo install -m 0755 target/release/nanovm-control-plane /usr/local/bin/
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin nanovm
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nanovm-control-plane.service
+#
+# All operator-tunable knobs live in the EnvironmentFile so a config
+# change doesn't require touching this unit. See
+# packaging/systemd/nanovm-control-plane.env.example for the set.
+
+[Unit]
+Description=rust-nano-vm control plane (REST API)
+Documentation=https://github.com/ip888/Rust-nano-vm
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/nanovm-control-plane
+EnvironmentFile=-/etc/nanovm/control-plane.env
+
+# Identity
+User=nanovm
+Group=nanovm
+
+# Restart
+Restart=on-failure
+RestartSec=2s
+
+# Send SIGTERM, give the binary's bounded-drain window to finish.
+# Should match (or exceed) NANOVM_SHUTDOWN_GRACE_SECS in the env file.
+KillSignal=SIGTERM
+TimeoutStopSec=45s
+
+# Resource budget — adjust per host. Conservative defaults below.
+LimitNOFILE=65536
+TasksMax=4096
+
+# --- Hardening ----------------------------------------------------------
+# These sandboxing options reduce blast radius if the binary is ever
+# compromised. They are conservative — only what the control plane
+# actually needs is allowed. See `systemd.exec(5)` for details.
+
+# Filesystem
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/nanovm
+
+# Network — the control plane only listens; it does not call out.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+# Operators that need to call out (snapshot upload, OIDC) should
+# override IPAddressAllow= via a drop-in file under
+# /etc/systemd/system/nanovm-control-plane.service.d/.
+
+# Process
+NoNewPrivileges=true
+PrivateUsers=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+
+# Capabilities — none. The control plane runs unprivileged.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Syscall filter — a conservative default. Covers what tokio + the
+# blocking pool need on Linux. If `nanovm-control-plane` fails with
+# SIGSYS, add the missing class via a drop-in rather than removing
+# the filter wholesale.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @raw-io @reboot @swap @mount @cpu-emulation @obsolete
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
