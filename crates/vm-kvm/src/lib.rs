@@ -104,6 +104,10 @@ struct KvmVmRuntime {
     boot_plan: KvmBootPlan,
     entry_point: GuestAddress,
     serial_output: Arc<Mutex<Vec<u8>>>,
+    /// When `true`, the vCPU starts in 16-bit real mode at
+    /// `CS:IP = 0000:0000`. Used by [`VmConfig::flat_binary`].
+    /// `false` selects the existing protected-mode Linux boot path.
+    real_mode: bool,
 }
 
 #[cfg(feature = "kvm")]
@@ -128,6 +132,31 @@ impl KvmHypervisor {
     #[cfg(not(feature = "kvm"))]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Snapshot the bytes the guest has emitted to the serial port
+    /// (COM1, `0x3f8`) so far. Returns an empty `Vec` if the VM has
+    /// not written anything; returns [`VmError::UnknownVm`] if `id`
+    /// is not tracked. Used by tests / integration harnesses that
+    /// need to assert what the guest produced.
+    #[cfg(feature = "kvm")]
+    pub fn serial_output(&self, id: VmId) -> VmResult<Vec<u8>> {
+        let inner = self.lock_inner()?;
+        let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+        let buf = vm
+            .runtime
+            .serial_output
+            .lock()
+            .map_err(|_| VmError::Backend("vm-kvm: serial output mutex poisoned".into()))?;
+        Ok(buf.clone())
+    }
+
+    /// Stub for non-KVM builds. Always returns `Unsupported`.
+    #[cfg(not(feature = "kvm"))]
+    pub fn serial_output(&self, _id: VmId) -> VmResult<Vec<u8>> {
+        Err(VmError::Unsupported(
+            "vm-kvm: serial_output requires the `kvm` feature",
+        ))
     }
 
     /// Build a minimal, compile-time-validated boot plan without touching
@@ -161,6 +190,14 @@ impl KvmHypervisor {
             return Err(VmError::Unsupported(
                 "vm-kvm: M1 currently supports exactly one vCPU",
             ));
+        }
+        if cfg.flat_binary.is_some() && cfg.kernel.is_some() {
+            return Err(VmError::Backend(
+                "vm-kvm: VmConfig.kernel and VmConfig.flat_binary are mutually exclusive".into(),
+            ));
+        }
+        if let Some(bytes) = cfg.flat_binary.as_ref() {
+            return self.build_flat_runtime(cfg, bytes);
         }
         let kernel = cfg
             .kernel
@@ -217,6 +254,56 @@ impl KvmHypervisor {
             boot_plan,
             entry_point: kernel_load.kernel_load,
             serial_output: Arc::new(Mutex::new(Vec::new())),
+            real_mode: false,
+        })
+    }
+
+    /// Build a runtime that executes `bytes` directly in 16-bit real
+    /// mode at GPA 0. Skips the Linux bzImage / cmdline / GDT setup
+    /// entirely — purely for tests / examples that exercise the KVM
+    /// bring-up surface without a real kernel.
+    fn build_flat_runtime(&self, cfg: &VmConfig, bytes: &[u8]) -> VmResult<KvmVmRuntime> {
+        let boot_plan = KvmBootPlan::from_config(cfg)?;
+        if (bytes.len() as u64) > boot_plan.memory_size_bytes() {
+            return Err(VmError::Backend(format!(
+                "vm-kvm: flat_binary ({} bytes) exceeds guest memory ({} bytes)",
+                bytes.len(),
+                boot_plan.memory_size_bytes(),
+            )));
+        }
+        let vm_fd = self
+            .kvm
+            .create_vm()
+            .map_err(|e| VmError::Backend(format!("create VM: {e}")))?;
+        vm_fd
+            .set_tss_address(
+                usize::try_from(KVM_TSS_ADDRESS)
+                    .map_err(|_| VmError::Backend("vm-kvm: TSS address overflow".into()))?,
+            )
+            .map_err(|e| VmError::Backend(format!("set TSS address: {e}")))?;
+        let pit_config = kvm_pit_config {
+            flags: KVM_PIT_SPEAKER_DUMMY,
+            ..Default::default()
+        };
+        vm_fd
+            .create_irq_chip()
+            .map_err(|e| VmError::Backend(format!("create irqchip: {e}")))?;
+        vm_fd
+            .create_pit2(pit_config)
+            .map_err(|e| VmError::Backend(format!("create PIT: {e}")))?;
+        register_guest_memory(&vm_fd, &boot_plan.guest_mem)?;
+        // Write the program at GPA 0 via vm-memory's checked write —
+        // no unsafe required at this layer.
+        boot_plan
+            .guest_mem
+            .write_slice(bytes, GuestAddress(0))
+            .map_err(|e| VmError::Backend(format!("write flat_binary at GPA 0: {e}")))?;
+        Ok(KvmVmRuntime {
+            vm_fd,
+            boot_plan,
+            entry_point: GuestAddress(0),
+            serial_output: Arc::new(Mutex::new(Vec::new())),
+            real_mode: true,
         })
     }
 
@@ -225,12 +312,16 @@ impl KvmHypervisor {
             .vm_fd
             .create_vcpu(0)
             .map_err(|e| VmError::Backend(format!("create vCPU for {id}: {e}")))?;
-        configure_boot_vcpu(
-            &self.kvm,
-            &mut vcpu,
-            &runtime.boot_plan.guest_mem,
-            runtime.entry_point,
-        )?;
+        if runtime.real_mode {
+            configure_boot_vcpu_realmode(&self.kvm, &mut vcpu, runtime.entry_point)?;
+        } else {
+            configure_boot_vcpu(
+                &self.kvm,
+                &mut vcpu,
+                &runtime.boot_plan.guest_mem,
+                runtime.entry_point,
+            )?;
+        }
         let stop_requested = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop_requested);
         let serial_output = Arc::clone(&runtime.serial_output);
@@ -651,6 +742,42 @@ fn configure_boot_vcpu(
     setup_fpu(vcpu)?;
     setup_regs(vcpu, entry_point)?;
     setup_sregs(guest_mem, vcpu)?;
+    Ok(())
+}
+
+/// Bring up a vCPU in 16-bit real mode at `CS:base=0, selector=0,
+/// rip=entry_point`. Mirrors what the `hello_kvm` example does for
+/// the raw kvm-ioctls path, just shared through the Hypervisor
+/// trait. Skips the protected-mode / long-mode / paging setup
+/// `setup_sregs` does for kernel boots — propagating that to a
+/// hand-rolled real-mode binary would leave the vCPU unable to
+/// execute the program at GPA 0.
+#[cfg(feature = "kvm")]
+fn configure_boot_vcpu_realmode(
+    kvm: &Kvm,
+    vcpu: &mut VcpuFd,
+    entry_point: GuestAddress,
+) -> VmResult<()> {
+    let cpuid = kvm
+        .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+        .map_err(|e| VmError::Backend(format!("get supported CPUID: {e}")))?;
+    vcpu.set_cpuid2(&cpuid)
+        .map_err(|e| VmError::Backend(format!("set CPUID: {e}")))?;
+    setup_fpu(vcpu)?;
+    let mut sregs = vcpu
+        .get_sregs()
+        .map_err(|e| VmError::Backend(format!("get sregs (realmode): {e}")))?;
+    sregs.cs.base = 0;
+    sregs.cs.selector = 0;
+    vcpu.set_sregs(&sregs)
+        .map_err(|e| VmError::Backend(format!("set sregs (realmode): {e}")))?;
+    let regs = kvm_regs {
+        rip: entry_point.raw_value(),
+        rflags: 0x2,
+        ..Default::default()
+    };
+    vcpu.set_regs(&regs)
+        .map_err(|e| VmError::Backend(format!("set regs (realmode): {e}")))?;
     Ok(())
 }
 
