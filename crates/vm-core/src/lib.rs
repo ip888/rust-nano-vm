@@ -78,6 +78,15 @@ pub struct VmConfig {
     /// also when [`Self::snapshot_dir`] is set (the snapshot supplies the
     /// kernel state).
     pub kernel: Option<PathBuf>,
+    /// Raw bytes to load at guest physical address 0, executed in 16-bit
+    /// real mode at `CS:IP = 0000:0000`. Intended for tiny hand-rolled
+    /// test programs that exercise the KVM bring-up path without dragging
+    /// in a full Linux kernel build — see
+    /// `crates/vm-kvm/tests/flat_binary.rs` for the canonical use.
+    ///
+    /// Mutually exclusive with [`Self::kernel`]; backends that see both
+    /// set return [`VmError::Backend`].
+    pub flat_binary: Option<Vec<u8>>,
     /// Path to the root filesystem image.
     pub rootfs: Option<PathBuf>,
     /// Kernel command line to pass at boot. Empty is allowed for mocks.
@@ -96,6 +105,7 @@ impl Default for VmConfig {
             vcpus: 1,
             memory_mib: 128,
             kernel: None,
+            flat_binary: None,
             rootfs: None,
             cmdline: String::new(),
             vsock_cid: None,
