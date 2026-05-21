@@ -263,7 +263,10 @@ impl KvmHypervisor {
     /// entirely — purely for tests / examples that exercise the KVM
     /// bring-up surface without a real kernel.
     fn build_flat_runtime(&self, cfg: &VmConfig, bytes: &[u8]) -> VmResult<KvmVmRuntime> {
-        let boot_plan = KvmBootPlan::from_config(cfg)?;
+        // `from_config_flat` skips the 2 MiB kernel-load-address
+        // floor that the bzImage path requires — for a hand-rolled
+        // real-mode test program, even a 4 KiB guest is plenty.
+        let boot_plan = KvmBootPlan::from_config_flat(cfg)?;
         if (bytes.len() as u64) > boot_plan.memory_size_bytes() {
             return Err(VmError::Backend(format!(
                 "vm-kvm: flat_binary ({} bytes) exceeds guest memory ({} bytes)",
@@ -275,22 +278,13 @@ impl KvmHypervisor {
             .kvm
             .create_vm()
             .map_err(|e| VmError::Backend(format!("create VM: {e}")))?;
-        vm_fd
-            .set_tss_address(
-                usize::try_from(KVM_TSS_ADDRESS)
-                    .map_err(|_| VmError::Backend("vm-kvm: TSS address overflow".into()))?,
-            )
-            .map_err(|e| VmError::Backend(format!("set TSS address: {e}")))?;
-        let pit_config = kvm_pit_config {
-            flags: KVM_PIT_SPEAKER_DUMMY,
-            ..Default::default()
-        };
-        vm_fd
-            .create_irq_chip()
-            .map_err(|e| VmError::Backend(format!("create irqchip: {e}")))?;
-        vm_fd
-            .create_pit2(pit_config)
-            .map_err(|e| VmError::Backend(format!("create PIT: {e}")))?;
+        // Deliberately NOT calling create_irq_chip / create_pit2
+        // here. With an in-kernel LAPIC active, `HLT` enters
+        // halted-waiting-for-interrupt and KVM_RUN doesn't return
+        // VcpuExit::Hlt to userspace — the vCPU thread would block
+        // forever. Real-mode test code doesn't poke the PIC anyway,
+        // so the minimal-bring-up that `hello_kvm` uses is correct
+        // here too.
         register_guest_memory(&vm_fd, &boot_plan.guest_mem)?;
         // Write the program at GPA 0 via vm-memory's checked write —
         // no unsafe required at this layer.
@@ -411,6 +405,35 @@ impl KvmBootPlan {
         Ok(Self {
             guest_mem,
             kernel_load_addr: GuestAddress(Self::KERNEL_LOAD_ADDR),
+            initrd_load_addr: None,
+            cmdline,
+        })
+    }
+
+    /// Like [`Self::from_config`] but skips the kernel-load-address
+    /// floor and the kernel cmdline plumbing. Intended for the
+    /// `flat_binary` boot mode — a hand-rolled real-mode program at
+    /// GPA 0 doesn't need either, and the floor would reject the
+    /// tiny guest sizes flat-binary tests use.
+    fn from_config_flat(cfg: &VmConfig) -> VmResult<Self> {
+        let mem_size = cfg
+            .memory_mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| VmError::Backend("memory size overflow".into()))?;
+        let mem_len = usize::try_from(mem_size)
+            .map_err(|_| VmError::Backend(format!("memory size {mem_size} does not fit usize")))?;
+        if mem_len == 0 {
+            return Err(VmError::Backend(
+                "vm-kvm: flat_binary mode requires memory_mib >= 1".into(),
+            ));
+        }
+        let guest_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_len)])
+            .map_err(|e| VmError::Backend(format!("guest memory layout: {e}")))?;
+        let cmdline = Cmdline::new(Self::CMDLINE_CAPACITY)
+            .map_err(|e| VmError::Backend(format!("kernel cmdline capacity: {e}")))?;
+        Ok(Self {
+            guest_mem,
+            kernel_load_addr: GuestAddress(0),
             initrd_load_addr: None,
             cmdline,
         })
