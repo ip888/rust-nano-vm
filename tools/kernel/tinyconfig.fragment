@@ -1,0 +1,49 @@
+# Config fragment appended after `make tinyconfig` and resolved via
+# `make olddefconfig`. The goal is to keep tinyconfig's near-minimum
+# footprint but turn ON what vm-kvm's bring-up assumes is present.
+#
+# Specifically: vm-kvm sets CS:IP, switches to long mode via the GDT
+# written by configure_linux_boot, and expects the kernel to:
+#   1. accept the Linux 64-bit boot protocol (default for bzImage);
+#   2. print to the 8250 UART at 0x3f8 (where handle_io_out captures
+#      output for serial_output and our integration test asserts);
+#   3. panic loudly when it fails to mount root (we have no rootfs).
+#
+# Everything else stays disabled to keep boot fast and the binary small.
+
+# ------- early-printk and 8250 UART -----------------------------------
+# Without these we get no output, and the test has nothing to assert.
+CONFIG_PRINTK=y
+CONFIG_PRINTK_TIME=y
+CONFIG_EARLY_PRINTK=y
+CONFIG_TTY=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_SERIAL_8250_PCI=n
+CONFIG_SERIAL_8250_NR_UARTS=1
+CONFIG_SERIAL_8250_RUNTIME_UARTS=1
+
+# ------- x86 essentials -----------------------------------------------
+# 64-bit boot; vm-kvm only supports x86_64 today.
+CONFIG_64BIT=y
+# Use the lightweight halt loop so HLT exits propagate to userspace
+# the way vm-kvm's vCPU loop expects.
+CONFIG_HZ_100=y
+
+# ------- panic behavior -----------------------------------------------
+# Without a rootfs, the kernel hits "VFS: Unable to mount root fs".
+# We want that to panic immediately (and HLT) so vm-kvm's vCPU
+# thread terminates cleanly and the test observes Stopped.
+CONFIG_PANIC_TIMEOUT=-1
+CONFIG_PANIC_ON_OOPS=y
+
+# ------- explicitly OFF: things tinyconfig sometimes enables ---------
+# Modules: we have nothing to load.
+CONFIG_MODULES=n
+# IPv4/IPv6: no networking on the boot path.
+CONFIG_NET=n
+# Block / FS: no rootfs.
+CONFIG_BLOCK=n
+# Sound / input / framebuffer: pure serial-console boot.
+CONFIG_INPUT=n
+CONFIG_VT=n
