@@ -60,6 +60,23 @@ readonly CONFIG_FRAGMENT="${HERE}/tinyconfig.fragment"
 mkdir -p "${CACHE}"
 
 # ----------------------------------------------------------------------
+# Preflight: fail fast if a required build tool is missing, rather
+# than dying several minutes into the compile. `bc` in particular is
+# easy to miss — base-devel / build-essential don't pull it in, and
+# the kernel only needs it midway through `prepare0`.
+# ----------------------------------------------------------------------
+missing=()
+for tool in make gcc ld bc bison flex perl; do
+  command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
+done
+if (( ${#missing[@]} > 0 )); then
+  echo "tiny-kernel: missing required build tools: ${missing[*]}" >&2
+  echo "tiny-kernel:   Debian/Ubuntu: sudo apt-get install build-essential libssl-dev libelf-dev bison flex bc xz-utils" >&2
+  echo "tiny-kernel:   Arch:          sudo pacman -S --needed base-devel bc bison flex" >&2
+  exit 1
+fi
+
+# ----------------------------------------------------------------------
 # Short-circuit: if the bzImage already exists and the symlink points
 # at it, we're done.
 # ----------------------------------------------------------------------
