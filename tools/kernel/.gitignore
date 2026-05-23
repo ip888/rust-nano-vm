@@ -1,0 +1,4 @@
+# Downloaded tarball + extracted source + built artefacts. Anything
+# below cache/ is reproducible from build-tiny-kernel.sh, so it
+# never belongs in the repo.
+cache/
