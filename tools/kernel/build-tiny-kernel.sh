@@ -142,9 +142,21 @@ fi
 
 # ----------------------------------------------------------------------
 # Step 4: build. -j defaults to nproc; override with MAKEFLAGS.
+#
+# We force `-std=gnu11` onto the compiler binary itself. Linux 6.12
+# predates the kernel's C23 readiness, and modern toolchains (GCC 15,
+# recent Clang) default to `-std=gnu23` where `bool` / `true` /
+# `false` are reserved keywords — which breaks headers like
+# `include/linux/stddef.h`. The main Makefile sets `-std=gnu11`, but
+# `arch/x86/boot/compressed/Makefile` *resets* KBUILD_CFLAGS, so the
+# decompressor stub would otherwise compile under the compiler
+# default. Baking the flag into CC reaches every compilation unit
+# regardless of which sub-Makefile clobbers the flag set. Host tools
+# (HOSTCC) already build fine under gnu23, so they're left alone.
 # ----------------------------------------------------------------------
-echo "tiny-kernel: building bzImage"
-make -j"$(nproc 2>/dev/null || echo 2)" bzImage
+readonly CC_BASE="${CC:-gcc}"
+echo "tiny-kernel: building bzImage (CC=\"${CC_BASE} -std=gnu11\")"
+make CC="${CC_BASE} -std=gnu11" -j"$(nproc 2>/dev/null || echo 2)" bzImage
 
 # ----------------------------------------------------------------------
 # Step 5: make the result easy for the test harness to find.
