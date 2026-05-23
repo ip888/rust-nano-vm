@@ -159,6 +159,26 @@ impl KvmHypervisor {
         ))
     }
 
+    /// The reason the VM's vCPU thread last terminated, if it has.
+    /// `None` while still running or never started; `Some("")` after
+    /// a clean `HLT`; `Some(msg)` carrying the diagnostic (e.g. a
+    /// triple-fault register dump) when the vCPU stopped abnormally.
+    /// Used by tests / triage to see *why* a guest stopped.
+    #[cfg(feature = "kvm")]
+    pub fn last_run_error(&self, id: VmId) -> VmResult<Option<String>> {
+        let inner = self.lock_inner()?;
+        let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+        Ok(vm.last_run_error.clone())
+    }
+
+    /// Stub for non-KVM builds. Always returns `Unsupported`.
+    #[cfg(not(feature = "kvm"))]
+    pub fn last_run_error(&self, _id: VmId) -> VmResult<Option<String>> {
+        Err(VmError::Unsupported(
+            "vm-kvm: last_run_error requires the `kvm` feature",
+        ))
+    }
+
     /// Build a minimal, compile-time-validated boot plan without touching
     /// `/dev/kvm`.
     ///
@@ -235,6 +255,28 @@ impl KvmHypervisor {
             Some(GuestAddress(HIMEM_START)),
         )
         .map_err(|e| VmError::Backend(format!("load bzImage {}: {e}", kernel.display())))?;
+        // linux-loader returns the load base in `kernel_load`; the
+        // 64-bit entry (`startup_64`) is BZIMAGE_64BIT_ENTRY_OFFSET
+        // past it. We enter the vCPU already in long mode, so jumping
+        // to the load base (offset 0 = the 32-bit `startup_32`) would
+        // decode 32-bit boot code as 64-bit instructions and triple-
+        // fault. Add the offset to land on `startup_64`.
+        let entry_point = GuestAddress(
+            kernel_load
+                .kernel_load
+                .raw_value()
+                .checked_add(BZIMAGE_64BIT_ENTRY_OFFSET)
+                .ok_or_else(|| VmError::Backend("vm-kvm: entry point overflow".into()))?,
+        );
+        // Diagnostic: surface where linux-loader placed the kernel and
+        // the computed 64-bit entry. Shown under `cargo test
+        // --nocapture`; cheap and only on the kernel-boot path.
+        eprintln!(
+            "vm-kvm: bzImage loaded — load_base={:#x} entry(startup_64)={:#x} himem={:#x}",
+            kernel_load.kernel_load.raw_value(),
+            entry_point.raw_value(),
+            HIMEM_START,
+        );
         let cmdline_size = boot_plan.cmdline_size()?;
         load_cmdline(
             &boot_plan.guest_mem,
@@ -252,7 +294,7 @@ impl KvmHypervisor {
         Ok(KvmVmRuntime {
             vm_fd,
             boot_plan,
-            entry_point: kernel_load.kernel_load,
+            entry_point,
             serial_output: Arc::new(Mutex::new(Vec::new())),
             real_mode: false,
         })
@@ -934,7 +976,42 @@ fn run_vcpu_loop(
             Ok(VcpuExit::IoIn(port, data)) => handle_io_in(port, data),
             Ok(VcpuExit::MmioRead(_, data)) => data.fill(0),
             Ok(VcpuExit::MmioWrite(_, _)) => {}
-            Ok(VcpuExit::Hlt | VcpuExit::Shutdown) => break,
+            Ok(VcpuExit::Hlt) => break,
+            Ok(VcpuExit::Shutdown) => {
+                // Shutdown == triple fault (or an explicit guest
+                // shutdown). During kernel bring-up it almost always
+                // means the guest faulted on or near entry. Capture
+                // register state so the failure is diagnosable rather
+                // than a silent "0 bytes, Stopped". A real-mode test
+                // program that HLTs hits the Hlt arm above, so this
+                // path is kernel-boot-specific.
+                let regs_diag = match vcpu.get_regs() {
+                    Ok(r) => format!(
+                        "rip={:#x} rsp={:#x} rflags={:#x} rax={:#x} rbx={:#x} rsi={:#x} rdi={:#x}",
+                        r.rip, r.rsp, r.rflags, r.rax, r.rbx, r.rsi, r.rdi,
+                    ),
+                    Err(e) => format!("get_regs failed: {e}"),
+                };
+                let sregs_diag = match vcpu.get_sregs() {
+                    Ok(s) => format!(
+                        "cr0={:#x} cr3={:#x} cr4={:#x} efer={:#x} \
+                         cs.base={:#x} cs.sel={:#x} cs.l={} cs.db={} cs.present={}",
+                        s.cr0,
+                        s.cr3,
+                        s.cr4,
+                        s.efer,
+                        s.cs.base,
+                        s.cs.selector,
+                        s.cs.l,
+                        s.cs.db,
+                        s.cs.present,
+                    ),
+                    Err(e) => format!("get_sregs failed: {e}"),
+                };
+                return Err(VmError::Backend(format!(
+                    "vcpu SHUTDOWN (triple fault?): {regs_diag} | {sregs_diag}"
+                )));
+            }
             Ok(VcpuExit::Intr) if stop_requested.load(Ordering::SeqCst) => break,
             Ok(VcpuExit::FailEntry(reason, cpu)) => {
                 return Err(VmError::Backend(format!(
@@ -1034,6 +1111,16 @@ const CMDLINE_START: u64 = 0x20_000;
 const ZERO_PAGE_START: u64 = 0x7000;
 #[cfg(feature = "kvm")]
 const HIMEM_START: u64 = 0x10_0000;
+/// Offset of the 64-bit entry point (`startup_64`) from the start of
+/// the protected-mode kernel in a bzImage. The Linux x86 boot
+/// protocol places the 32-bit entry (`startup_32`) at offset 0 and
+/// the 64-bit entry at offset 0x200 (see
+/// `arch/x86/boot/compressed/head_64.S`). Since vm-kvm hands the
+/// vCPU to KVM already in long mode, we must enter at `startup_64`,
+/// not `startup_32` — `linux-loader` returns the load base in
+/// `kernel_load`, so we add this offset ourselves.
+#[cfg(feature = "kvm")]
+const BZIMAGE_64BIT_ENTRY_OFFSET: u64 = 0x200;
 #[cfg(feature = "kvm")]
 const SYSTEM_MEM_START: u64 = 0x9fc00;
 #[cfg(feature = "kvm")]
