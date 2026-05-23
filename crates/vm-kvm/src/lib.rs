@@ -255,13 +255,26 @@ impl KvmHypervisor {
             Some(GuestAddress(HIMEM_START)),
         )
         .map_err(|e| VmError::Backend(format!("load bzImage {}: {e}", kernel.display())))?;
+        // linux-loader returns the load base in `kernel_load`; the
+        // 64-bit entry (`startup_64`) is BZIMAGE_64BIT_ENTRY_OFFSET
+        // past it. We enter the vCPU already in long mode, so jumping
+        // to the load base (offset 0 = the 32-bit `startup_32`) would
+        // decode 32-bit boot code as 64-bit instructions and triple-
+        // fault. Add the offset to land on `startup_64`.
+        let entry_point = GuestAddress(
+            kernel_load
+                .kernel_load
+                .raw_value()
+                .checked_add(BZIMAGE_64BIT_ENTRY_OFFSET)
+                .ok_or_else(|| VmError::Backend("vm-kvm: entry point overflow".into()))?,
+        );
         // Diagnostic: surface where linux-loader placed the kernel and
-        // what it reports as the 64-bit entry. Shown under `cargo test
+        // the computed 64-bit entry. Shown under `cargo test
         // --nocapture`; cheap and only on the kernel-boot path.
         eprintln!(
-            "vm-kvm: bzImage loaded — entry(kernel_load)={:#x} load_addr={:#x} himem={:#x}",
+            "vm-kvm: bzImage loaded — load_base={:#x} entry(startup_64)={:#x} himem={:#x}",
             kernel_load.kernel_load.raw_value(),
-            boot_plan.kernel_load_addr.raw_value(),
+            entry_point.raw_value(),
             HIMEM_START,
         );
         let cmdline_size = boot_plan.cmdline_size()?;
@@ -281,7 +294,7 @@ impl KvmHypervisor {
         Ok(KvmVmRuntime {
             vm_fd,
             boot_plan,
-            entry_point: kernel_load.kernel_load,
+            entry_point,
             serial_output: Arc::new(Mutex::new(Vec::new())),
             real_mode: false,
         })
@@ -1098,6 +1111,16 @@ const CMDLINE_START: u64 = 0x20_000;
 const ZERO_PAGE_START: u64 = 0x7000;
 #[cfg(feature = "kvm")]
 const HIMEM_START: u64 = 0x10_0000;
+/// Offset of the 64-bit entry point (`startup_64`) from the start of
+/// the protected-mode kernel in a bzImage. The Linux x86 boot
+/// protocol places the 32-bit entry (`startup_32`) at offset 0 and
+/// the 64-bit entry at offset 0x200 (see
+/// `arch/x86/boot/compressed/head_64.S`). Since vm-kvm hands the
+/// vCPU to KVM already in long mode, we must enter at `startup_64`,
+/// not `startup_32` — `linux-loader` returns the load base in
+/// `kernel_load`, so we add this offset ourselves.
+#[cfg(feature = "kvm")]
+const BZIMAGE_64BIT_ENTRY_OFFSET: u64 = 0x200;
 #[cfg(feature = "kvm")]
 const SYSTEM_MEM_START: u64 = 0x9fc00;
 #[cfg(feature = "kvm")]
