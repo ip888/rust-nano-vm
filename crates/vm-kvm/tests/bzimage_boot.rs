@@ -111,15 +111,20 @@ fn bzimage_boots_far_enough_to_print_linux_version() {
     let final_state = wait_for_terminal(&hv, handle.id, Duration::from_secs(30));
     let out = hv.serial_output(handle.id).expect("serial_output");
     let out_str = String::from_utf8_lossy(&out);
+    let run_err = hv.last_run_error(handle.id).ok().flatten();
 
     // What we always want to see: the kernel banner. Anything before
     // a "Linux version" string means the bzImage didn't even get to
-    // its `start_kernel` and we have a vm-kvm bring-up bug.
+    // its `start_kernel` and we have a vm-kvm bring-up bug. On a
+    // triple fault the vCPU loop records a register dump in
+    // last_run_error — surface it so the failure is diagnosable.
     assert!(
         out_str.contains("Linux version"),
-        "serial output did not contain 'Linux version' (state={:?}, {} bytes captured):\n{}",
+        "serial output did not contain 'Linux version'\n  \
+         state={:?}\n  bytes captured={}\n  last_run_error={:?}\n  serial:\n{}",
         final_state,
         out.len(),
+        run_err,
         out_str,
     );
 

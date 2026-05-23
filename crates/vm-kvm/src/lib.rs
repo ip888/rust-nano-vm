@@ -159,6 +159,26 @@ impl KvmHypervisor {
         ))
     }
 
+    /// The reason the VM's vCPU thread last terminated, if it has.
+    /// `None` while still running or never started; `Some("")` after
+    /// a clean `HLT`; `Some(msg)` carrying the diagnostic (e.g. a
+    /// triple-fault register dump) when the vCPU stopped abnormally.
+    /// Used by tests / triage to see *why* a guest stopped.
+    #[cfg(feature = "kvm")]
+    pub fn last_run_error(&self, id: VmId) -> VmResult<Option<String>> {
+        let inner = self.lock_inner()?;
+        let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+        Ok(vm.last_run_error.clone())
+    }
+
+    /// Stub for non-KVM builds. Always returns `Unsupported`.
+    #[cfg(not(feature = "kvm"))]
+    pub fn last_run_error(&self, _id: VmId) -> VmResult<Option<String>> {
+        Err(VmError::Unsupported(
+            "vm-kvm: last_run_error requires the `kvm` feature",
+        ))
+    }
+
     /// Build a minimal, compile-time-validated boot plan without touching
     /// `/dev/kvm`.
     ///
@@ -934,7 +954,25 @@ fn run_vcpu_loop(
             Ok(VcpuExit::IoIn(port, data)) => handle_io_in(port, data),
             Ok(VcpuExit::MmioRead(_, data)) => data.fill(0),
             Ok(VcpuExit::MmioWrite(_, _)) => {}
-            Ok(VcpuExit::Hlt | VcpuExit::Shutdown) => break,
+            Ok(VcpuExit::Hlt) => break,
+            Ok(VcpuExit::Shutdown) => {
+                // Shutdown == triple fault (or an explicit guest
+                // shutdown). During kernel bring-up it almost always
+                // means the guest faulted on or near entry. Capture
+                // register state so the failure is diagnosable rather
+                // than a silent "0 bytes, Stopped". A real-mode test
+                // program that HLTs hits the Hlt arm above, so this
+                // path is kernel-boot-specific.
+                let diag = match vcpu.get_regs() {
+                    Ok(r) => format!(
+                        "vcpu SHUTDOWN (triple fault?): rip={:#x} rsp={:#x} rflags={:#x} \
+                         rax={:#x} rbx={:#x} rsi={:#x} rdi={:#x}",
+                        r.rip, r.rsp, r.rflags, r.rax, r.rbx, r.rsi, r.rdi,
+                    ),
+                    Err(e) => format!("vcpu SHUTDOWN (triple fault?); get_regs failed: {e}"),
+                };
+                return Err(VmError::Backend(diag));
+            }
             Ok(VcpuExit::Intr) if stop_requested.load(Ordering::SeqCst) => break,
             Ok(VcpuExit::FailEntry(reason, cpu)) => {
                 return Err(VmError::Backend(format!(
