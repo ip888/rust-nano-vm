@@ -255,6 +255,15 @@ impl KvmHypervisor {
             Some(GuestAddress(HIMEM_START)),
         )
         .map_err(|e| VmError::Backend(format!("load bzImage {}: {e}", kernel.display())))?;
+        // Diagnostic: surface where linux-loader placed the kernel and
+        // what it reports as the 64-bit entry. Shown under `cargo test
+        // --nocapture`; cheap and only on the kernel-boot path.
+        eprintln!(
+            "vm-kvm: bzImage loaded — entry(kernel_load)={:#x} load_addr={:#x} himem={:#x}",
+            kernel_load.kernel_load.raw_value(),
+            boot_plan.kernel_load_addr.raw_value(),
+            HIMEM_START,
+        );
         let cmdline_size = boot_plan.cmdline_size()?;
         load_cmdline(
             &boot_plan.guest_mem,
@@ -963,15 +972,32 @@ fn run_vcpu_loop(
                 // than a silent "0 bytes, Stopped". A real-mode test
                 // program that HLTs hits the Hlt arm above, so this
                 // path is kernel-boot-specific.
-                let diag = match vcpu.get_regs() {
+                let regs_diag = match vcpu.get_regs() {
                     Ok(r) => format!(
-                        "vcpu SHUTDOWN (triple fault?): rip={:#x} rsp={:#x} rflags={:#x} \
-                         rax={:#x} rbx={:#x} rsi={:#x} rdi={:#x}",
+                        "rip={:#x} rsp={:#x} rflags={:#x} rax={:#x} rbx={:#x} rsi={:#x} rdi={:#x}",
                         r.rip, r.rsp, r.rflags, r.rax, r.rbx, r.rsi, r.rdi,
                     ),
-                    Err(e) => format!("vcpu SHUTDOWN (triple fault?); get_regs failed: {e}"),
+                    Err(e) => format!("get_regs failed: {e}"),
                 };
-                return Err(VmError::Backend(diag));
+                let sregs_diag = match vcpu.get_sregs() {
+                    Ok(s) => format!(
+                        "cr0={:#x} cr3={:#x} cr4={:#x} efer={:#x} \
+                         cs.base={:#x} cs.sel={:#x} cs.l={} cs.db={} cs.present={}",
+                        s.cr0,
+                        s.cr3,
+                        s.cr4,
+                        s.efer,
+                        s.cs.base,
+                        s.cs.selector,
+                        s.cs.l,
+                        s.cs.db,
+                        s.cs.present,
+                    ),
+                    Err(e) => format!("get_sregs failed: {e}"),
+                };
+                return Err(VmError::Backend(format!(
+                    "vcpu SHUTDOWN (triple fault?): {regs_diag} | {sregs_diag}"
+                )));
             }
             Ok(VcpuExit::Intr) if stop_requested.load(Ordering::SeqCst) => break,
             Ok(VcpuExit::FailEntry(reason, cpu)) => {
