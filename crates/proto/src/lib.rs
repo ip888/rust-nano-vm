@@ -45,8 +45,8 @@
 
 pub mod frame;
 pub use frame::{
-    decode_request, decode_response, encode_request, encode_response, FrameError, HEADER_BYTES,
-    MAX_FRAME_BYTES,
+    decode_request, decode_request_payload, decode_response, decode_response_payload,
+    encode_request, encode_response, parse_len, FrameError, HEADER_BYTES, MAX_FRAME_BYTES,
 };
 
 use serde::{Deserialize, Serialize};

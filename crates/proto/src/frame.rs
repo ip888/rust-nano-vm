@@ -127,6 +127,36 @@ pub fn decode_response(buf: &[u8]) -> Result<(Response, usize), FrameError> {
     decode_value(buf)
 }
 
+/// Parse the length prefix from a 4-byte header. Returns the
+/// payload length the caller should read next, or
+/// [`FrameError::InvalidLength`] if it exceeds [`MAX_FRAME_BYTES`].
+///
+/// Useful for stream-based readers (e.g. an `io::Read` loop) that
+/// want to read the header first, allocate a payload buffer of the
+/// right size, then read the body — rather than buffering the
+/// whole stream and calling [`decode_request`] / [`decode_response`].
+pub fn parse_len(header: &[u8; HEADER_BYTES]) -> Result<usize, FrameError> {
+    let len = u32::from_le_bytes(*header);
+    if (len as usize) > MAX_FRAME_BYTES {
+        return Err(FrameError::InvalidLength(len));
+    }
+    Ok(len as usize)
+}
+
+/// Decode a [`Request`] from a payload whose length-prefix header
+/// has already been stripped by the caller. Pairs with
+/// [`parse_len`].
+pub fn decode_request_payload(payload: &[u8]) -> Result<Request, FrameError> {
+    serde_json::from_slice(payload).map_err(FrameError::BadPayload)
+}
+
+/// Decode a [`Response`] from a payload whose length-prefix header
+/// has already been stripped by the caller. Pairs with
+/// [`parse_len`].
+pub fn decode_response_payload(payload: &[u8]) -> Result<Response, FrameError> {
+    serde_json::from_slice(payload).map_err(FrameError::BadPayload)
+}
+
 fn decode_value<T: for<'de> serde::Deserialize<'de>>(buf: &[u8]) -> Result<(T, usize), FrameError> {
     if buf.len() < HEADER_BYTES {
         return Err(FrameError::Incomplete {
@@ -345,5 +375,39 @@ mod tests {
             buf[3], 0,
             "byte 3 of LE length should be 0 for small payload"
         );
+    }
+
+    #[test]
+    fn parse_len_round_trips_with_encode_header() {
+        let mut buf = Vec::new();
+        encode_request(&ping(), &mut buf).unwrap();
+        let header: [u8; HEADER_BYTES] = buf[..HEADER_BYTES].try_into().unwrap();
+        let payload_len = parse_len(&header).unwrap();
+        assert_eq!(payload_len, buf.len() - HEADER_BYTES);
+    }
+
+    #[test]
+    fn parse_len_rejects_oversize_announcement() {
+        let oversize = (MAX_FRAME_BYTES as u32 + 1).to_le_bytes();
+        let err = parse_len(&oversize).unwrap_err();
+        assert!(matches!(err, FrameError::InvalidLength(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_payload_helpers_pair_with_parse_len() {
+        // Simulate a stream reader: read 4-byte header, then read
+        // exactly `parse_len()` more bytes, then call decode_*_payload.
+        let mut buf = Vec::new();
+        let resp = Response {
+            version: PROTOCOL_VERSION,
+            id: RequestId(7),
+            result: Ok(ResponseBody::Pong),
+        };
+        encode_response(&resp, &mut buf).unwrap();
+        let header: [u8; HEADER_BYTES] = buf[..HEADER_BYTES].try_into().unwrap();
+        let n = parse_len(&header).unwrap();
+        let payload = &buf[HEADER_BYTES..HEADER_BYTES + n];
+        let back = decode_response_payload(payload).unwrap();
+        assert_eq!(back, resp);
     }
 }
