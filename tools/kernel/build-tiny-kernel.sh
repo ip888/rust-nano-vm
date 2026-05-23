@@ -38,11 +38,12 @@ set -euo pipefail
 # ----------------------------------------------------------------------
 readonly KERNEL_VERSION="6.12"
 readonly KERNEL_MAJOR="v6.x"
-readonly KERNEL_SHA256="d8c8d6f33d24a8c1d31f8c8d2bf42f4d56720a31cc1c9fa30c63b659e98ab9d3"
-# NB: the SHA above is a placeholder. Verify against
-# https://www.kernel.org/category/signatures.html on first build, then
-# update this line. Operators can also `export NANOVM_KERNEL_SKIP_SHA=1`
-# to bypass the check (NOT recommended outside a one-off bootstrap).
+# SHA256 of linux-6.12.tar.xz as served by cdn.kernel.org. Cross-check
+# against https://www.kernel.org/category/signatures.html if you're
+# security-sensitive. Operators bumping KERNEL_VERSION should rebuild
+# with `NANOVM_KERNEL_SKIP_SHA=1` once, then paste the printed `actual`
+# value here.
+readonly KERNEL_SHA256="b1a2562be56e42afb3f8489d4c2a7ac472ac23098f1ef1c1e40da601f54625eb"
 
 # ----------------------------------------------------------------------
 # Paths.
