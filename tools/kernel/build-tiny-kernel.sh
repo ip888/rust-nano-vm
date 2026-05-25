@@ -77,13 +77,20 @@ if (( ${#missing[@]} > 0 )); then
 fi
 
 # ----------------------------------------------------------------------
-# Short-circuit: if the bzImage already exists and the symlink points
-# at it, we're done.
+# Short-circuit: skip only if the bzImage exists, the symlink points
+# at it, AND it's newer than the config fragment. A fragment change
+# (e.g. enabling CONFIG_BLK_DEV_INITRD) must force a rebuild —
+# otherwise a stale kernel silently lacks the new feature. `git
+# checkout` bumps the fragment's mtime to "now", so switching to a
+# branch that edited the fragment correctly invalidates the cache.
 # ----------------------------------------------------------------------
-if [[ -f "${BZIMAGE_OUT}" && -L "${BZIMAGE_LINK}" ]]; then
-  echo "tiny-kernel: bzImage already built at ${BZIMAGE_OUT}"
-  echo "tiny-kernel: removing the file or 'rm -rf ${CACHE}' forces a rebuild"
+if [[ -f "${BZIMAGE_OUT}" && -L "${BZIMAGE_LINK}" && "${BZIMAGE_OUT}" -nt "${CONFIG_FRAGMENT}" ]]; then
+  echo "tiny-kernel: bzImage already built at ${BZIMAGE_OUT} (newer than the config fragment)"
+  echo "tiny-kernel: 'rm -rf ${CACHE}' forces a full rebuild"
   exit 0
+fi
+if [[ -f "${BZIMAGE_OUT}" ]]; then
+  echo "tiny-kernel: config fragment changed since the last build — rebuilding"
 fi
 
 # ----------------------------------------------------------------------
@@ -131,7 +138,10 @@ fi
 # bits vm-kvm assumes are present.
 # ----------------------------------------------------------------------
 cd "${SRC_DIR}"
-if [[ ! -f .config ]]; then
+# Regenerate .config when it's missing OR older than the fragment, so
+# a fragment edit actually takes effect rather than reusing a stale
+# .config.
+if [[ ! -f .config || "${CONFIG_FRAGMENT}" -nt .config ]]; then
   echo "tiny-kernel: running make tinyconfig"
   make tinyconfig
   echo "tiny-kernel: merging ${CONFIG_FRAGMENT}"

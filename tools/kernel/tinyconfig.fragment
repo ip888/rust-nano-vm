@@ -11,6 +11,17 @@
 #
 # Everything else stays disabled to keep boot fast and the binary small.
 
+# ------- userspace ELF support ----------------------------------------
+# `make tinyconfig` (allnoconfig) turns OFF CONFIG_BINFMT_ELF, so the
+# kernel boots but cannot exec ANY userspace ELF — `/init` fails with
+# "Failed to execute /init (error -2)". Required the moment we run a
+# guest userspace program (D1's init, D2's agent). MULTIUSER is needed
+# for the uid/gid syscalls a libc/musl runtime touches during startup.
+CONFIG_MULTIUSER=y
+CONFIG_BINFMT_ELF=y
+CONFIG_BINFMT_SCRIPT=y
+CONFIG_ELFCORE=y
+
 # ------- early-printk and 8250 UART -----------------------------------
 # Without these we get no output, and the test has nothing to assert.
 CONFIG_PRINTK=y
