@@ -99,10 +99,15 @@ fi
 
 # ---- write the archive spec -----------------------------------------
 # Format reference: usr/gen_init_cpio.c in the kernel tree.
+# /dev/kmsg (1:11) is how early userspace logs reliably: writes go
+# straight through printk to the serial console, even when init's
+# stdio isn't wired to a tty. /dev/console (5:1) is kept for the
+# kernel's own init-console wiring.
 CPIO_LIST="${CACHE}/${VARIANT}.list"
 cat > "${CPIO_LIST}" <<EOF
 dir /dev 0755 0 0
 nod /dev/console 0600 0 0 c 5 1
+nod /dev/kmsg 0644 0 0 c 1 11
 file /init ${INIT_BIN} 0755 0 0
 EOF
 
