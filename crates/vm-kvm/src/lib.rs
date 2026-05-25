@@ -108,6 +108,10 @@ struct KvmVmRuntime {
     /// `CS:IP = 0000:0000`. Used by [`VmConfig::flat_binary`].
     /// `false` selects the existing protected-mode Linux boot path.
     real_mode: bool,
+    /// virtio-MMIO vsock device, present when `VmConfig.vsock_cid` is
+    /// set. Shared with the vCPU thread, which routes MMIO exits in
+    /// the device's register window into it. `None` = no vsock device.
+    vsock: Option<Arc<Mutex<virtio_vsock::MmioTransport>>>,
 }
 
 #[cfg(feature = "kvm")]
@@ -176,6 +180,31 @@ impl KvmHypervisor {
     pub fn last_run_error(&self, _id: VmId) -> VmResult<Option<String>> {
         Err(VmError::Unsupported(
             "vm-kvm: last_run_error requires the `kvm` feature",
+        ))
+    }
+
+    /// The vsock device's virtio status register, if this VM has a
+    /// vsock device (`VmConfig.vsock_cid` was set). `None` when there
+    /// is no device. The guest's virtio core sets `ACKNOWLEDGE` |
+    /// `DRIVER` once it recognizes the device during probe, so a
+    /// non-zero status is a host-observable signal that the guest
+    /// discovered our virtio-vsock device.
+    #[cfg(feature = "kvm")]
+    pub fn vsock_status(&self, id: VmId) -> VmResult<Option<u32>> {
+        let inner = self.lock_inner()?;
+        let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+        Ok(vm
+            .runtime
+            .vsock
+            .as_ref()
+            .map(|t| t.lock().map(|g| g.status()).unwrap_or(0)))
+    }
+
+    /// Stub for non-KVM builds. Always returns `Unsupported`.
+    #[cfg(not(feature = "kvm"))]
+    pub fn vsock_status(&self, _id: VmId) -> VmResult<Option<u32>> {
+        Err(VmError::Unsupported(
+            "vm-kvm: vsock_status requires the `kvm` feature",
         ))
     }
 
@@ -304,12 +333,26 @@ impl KvmHypervisor {
             initrd,
         )?;
 
+        // virtio-MMIO vsock device. The guest discovers it via the
+        // `virtio_mmio.device=` cmdline param that from_config appends
+        // when vsock_cid is set (the kernel has no device-tree/ACPI in
+        // this minimal boot). The transport is shared with the vCPU
+        // thread, which routes MMIO exits in VSOCK_MMIO_BASE..+SIZE
+        // into it.
+        let vsock = cfg.vsock_cid.map(|cid| {
+            eprintln!("vm-kvm: virtio-vsock device at {VSOCK_MMIO_BASE:#x} (guest_cid={cid})",);
+            Arc::new(Mutex::new(virtio_vsock::MmioTransport::new_vsock(
+                u64::from(cid),
+            )))
+        });
+
         Ok(KvmVmRuntime {
             vm_fd,
             boot_plan,
             entry_point,
             serial_output: Arc::new(Mutex::new(Vec::new())),
             real_mode: false,
+            vsock,
         })
     }
 
@@ -353,6 +396,8 @@ impl KvmHypervisor {
             entry_point: GuestAddress(0),
             serial_output: Arc::new(Mutex::new(Vec::new())),
             real_mode: true,
+            // Real-mode flat binaries don't get a virtio device.
+            vsock: None,
         })
     }
 
@@ -374,9 +419,10 @@ impl KvmHypervisor {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop_requested);
         let serial_output = Arc::clone(&runtime.serial_output);
+        let vsock = runtime.vsock.clone();
         let handle = thread::Builder::new()
             .name(format!("kvm-vcpu-{}", id.0))
-            .spawn(move || run_vcpu_loop(vcpu, serial_output, stop_for_thread))
+            .spawn(move || run_vcpu_loop(vcpu, serial_output, stop_for_thread, vsock))
             .map_err(|e| VmError::Backend(format!("spawn vCPU thread for {id}: {e}")))?;
         Ok(KvmVcpuThread {
             stop_requested,
@@ -456,6 +502,17 @@ impl KvmBootPlan {
             cmdline
                 .insert_str(&cfg.cmdline)
                 .map_err(|e| VmError::Backend(format!("kernel cmdline: {e}")))?;
+        }
+        // Tell the guest's virtio_mmio driver where to find our vsock
+        // device. Format: <size>@<base>:<irq>. No device-tree/ACPI in
+        // this minimal boot, so this cmdline param is how the guest
+        // discovers an MMIO virtio device.
+        if cfg.vsock_cid.is_some() {
+            cmdline
+                .insert_str(format!(
+                    "virtio_mmio.device={VSOCK_MMIO_SIZE:#x}@{VSOCK_MMIO_BASE:#x}:{VSOCK_MMIO_IRQ}"
+                ))
+                .map_err(|e| VmError::Backend(format!("vsock cmdline: {e}")))?;
         }
         Ok(Self {
             guest_mem,
@@ -1032,13 +1089,14 @@ fn run_vcpu_loop(
     mut vcpu: VcpuFd,
     serial_output: Arc<Mutex<Vec<u8>>>,
     stop_requested: Arc<AtomicBool>,
+    vsock: Option<Arc<Mutex<virtio_vsock::MmioTransport>>>,
 ) -> VmResult<()> {
     loop {
         match vcpu.run() {
             Ok(VcpuExit::IoOut(port, data)) => handle_io_out(port, data, &serial_output)?,
             Ok(VcpuExit::IoIn(port, data)) => handle_io_in(port, data),
-            Ok(VcpuExit::MmioRead(_, data)) => data.fill(0),
-            Ok(VcpuExit::MmioWrite(_, _)) => {}
+            Ok(VcpuExit::MmioRead(addr, data)) => handle_mmio_read(addr, data, vsock.as_deref()),
+            Ok(VcpuExit::MmioWrite(addr, data)) => handle_mmio_write(addr, data, vsock.as_deref()),
             Ok(VcpuExit::Hlt) => break,
             Ok(VcpuExit::Shutdown) => {
                 // Shutdown == triple fault (or an explicit guest
@@ -1126,6 +1184,56 @@ fn handle_io_in(port: u16, data: &mut [u8]) {
     }
 }
 
+/// Service a guest MMIO read. If `addr` falls in the vsock device's
+/// register window, satisfy it from the transport; otherwise return
+/// zeros (the prior default for unbacked MMIO).
+#[cfg(feature = "kvm")]
+fn handle_mmio_read(
+    addr: u64,
+    data: &mut [u8],
+    vsock: Option<&Mutex<virtio_vsock::MmioTransport>>,
+) {
+    data.fill(0);
+    if let Some((transport, offset)) = vsock_window(addr, vsock) {
+        let val = transport
+            .lock()
+            .expect("vm-kvm: vsock transport mutex poisoned")
+            .read(offset, data.len());
+        let bytes = val.to_le_bytes();
+        for (i, slot) in data.iter_mut().enumerate() {
+            *slot = bytes.get(i).copied().unwrap_or(0);
+        }
+    }
+}
+
+/// Service a guest MMIO write. Writes outside the vsock window are
+/// ignored (the prior default).
+#[cfg(feature = "kvm")]
+fn handle_mmio_write(addr: u64, data: &[u8], vsock: Option<&Mutex<virtio_vsock::MmioTransport>>) {
+    if let Some((transport, offset)) = vsock_window(addr, vsock) {
+        let mut buf = [0u8; 8];
+        for (i, b) in data.iter().take(buf.len()).enumerate() {
+            buf[i] = *b;
+        }
+        transport
+            .lock()
+            .expect("vm-kvm: vsock transport mutex poisoned")
+            .write(offset, data.len(), u64::from_le_bytes(buf));
+    }
+}
+
+/// If `addr` is within the vsock MMIO register window and a vsock
+/// device exists, return the transport and the register offset.
+#[cfg(feature = "kvm")]
+fn vsock_window(
+    addr: u64,
+    vsock: Option<&Mutex<virtio_vsock::MmioTransport>>,
+) -> Option<(&Mutex<virtio_vsock::MmioTransport>, u64)> {
+    let transport = vsock?;
+    let offset = addr.checked_sub(VSOCK_MMIO_BASE)?;
+    (offset < VSOCK_MMIO_SIZE).then_some((transport, offset))
+}
+
 #[cfg(feature = "kvm")]
 fn join_vcpu_thread(vcpu: KvmVcpuThread) -> VmResult<String> {
     match vcpu.handle.join() {
@@ -1166,6 +1274,21 @@ fn unsupported() -> VmError {
 
 #[cfg(feature = "kvm")]
 const SERIAL_PORT_BASE: u16 = 0x3f8;
+/// Guest-physical base of the virtio-MMIO vsock device register
+/// window. Chosen well above guest RAM (≤128 MiB here) in the
+/// PCI-hole area, so accesses miss every memory slot and KVM
+/// delivers them as MMIO exits. Matches the `virtio_mmio.device=`
+/// cmdline param `from_config` appends.
+#[cfg(feature = "kvm")]
+const VSOCK_MMIO_BASE: u64 = 0xd000_0000;
+/// Size of the vsock device's MMIO register window (one page; the
+/// register block + config space fit well within 0x1000).
+#[cfg(feature = "kvm")]
+const VSOCK_MMIO_SIZE: u64 = 0x1000;
+/// IRQ (GSI) the vsock device raises. Advertised to the guest via
+/// the `virtio_mmio.device=` cmdline param.
+#[cfg(feature = "kvm")]
+const VSOCK_MMIO_IRQ: u32 = 5;
 /// Guest page size. Used to page-align the initramfs load address.
 #[cfg(feature = "kvm")]
 const PAGE_SIZE: u64 = 0x1000;
