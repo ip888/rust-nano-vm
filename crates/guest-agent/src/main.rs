@@ -89,13 +89,43 @@ impl AgentState {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    let framed = std::env::var_os("NANOVM_AGENT_FRAMED").is_some();
+    log_banner(framed);
+
     let stdin = io::stdin();
     let stdout = io::stdout();
-    if std::env::var_os("NANOVM_AGENT_FRAMED").is_some() {
+    if framed {
         run_length_prefixed_session(stdin.lock(), stdout.lock());
     } else {
         run_line_delimited_session(stdin.lock(), stdout.lock());
     }
+}
+
+/// Emit the startup banner so the host can confirm the agent
+/// launched and learn its protocol version before any request
+/// round-trip.
+///
+/// Routed through `/dev/kmsg` (the kernel ring buffer) first: when
+/// the agent runs as the guest's PID 1 in a minimal initramfs, its
+/// stdio is often NOT wired to a usable tty, so a plain write to
+/// stderr fails — and `eprintln!` *panics* on that failure, which
+/// would kill init. Writing to `/dev/kmsg` goes straight through
+/// printk to the serial console (the path that reliably reaches the
+/// host's serial capture). Both writes are best-effort: a guest
+/// without `/dev/kmsg` or a broken stderr must not crash the agent.
+fn log_banner(framed: bool) {
+    let line = format!(
+        "nanovm-agent: ready (proto v{}, framed={}, pid={})\n",
+        PROTOCOL_VERSION,
+        framed,
+        std::process::id(),
+    );
+    if let Ok(mut kmsg) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+        let _ = kmsg.write_all(line.as_bytes());
+    }
+    // Non-panicking stderr attempt (unlike eprintln!) — harmless when
+    // stderr is a working console, ignored when it isn't.
+    let _ = io::stderr().write_all(line.as_bytes());
 }
 
 fn run_line_delimited_session(input: impl BufRead, mut out: impl Write) {
