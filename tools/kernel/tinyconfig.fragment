@@ -22,6 +22,20 @@ CONFIG_BINFMT_ELF=y
 CONFIG_BINFMT_SCRIPT=y
 CONFIG_ELFCORE=y
 
+# ------- virtio-MMIO transport (D3) -----------------------------------
+# Lets the guest discover and probe vm-kvm's virtio-vsock device.
+# CMDLINE_DEVICES is load-bearing: it's what makes the
+# `virtio_mmio.device=<size>@<base>:<irq>` kernel parameter (which
+# from_config appends when vsock_cid is set) actually instantiate the
+# device — there's no device-tree/ACPI in this minimal boot. The
+# vsock-specific driver (VSOCKETS / VIRTIO_VSOCKETS, which need NET)
+# arrives with the queue plumbing in a later slice; the virtio core
+# still probes the device and sets ACKNOWLEDGE without it.
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MENU=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+
 # ------- early-printk and 8250 UART -----------------------------------
 # Without these we get no output, and the test has nothing to assert.
 CONFIG_PRINTK=y
