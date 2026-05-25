@@ -37,13 +37,24 @@ CONFIG_HZ_100=y
 CONFIG_PANIC_TIMEOUT=-1
 CONFIG_PANIC_ON_OOPS=y
 
+# ------- initramfs support --------------------------------------------
+# Lets the kernel accept an external initramfs via the boot params'
+# ramdisk_image/ramdisk_size (what vm-kvm's load_initrd sets) and
+# unpack it as the root filesystem. Required for the M2 path that
+# runs the guest-agent as init. The cpio + gzip decompressors below
+# cover the formats tools/initramfs/build-initramfs.sh emits
+# (uncompressed newc cpio by default).
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_GZIP=y
+
 # ------- explicitly OFF: things tinyconfig sometimes enables ---------
 # Modules: we have nothing to load.
 CONFIG_MODULES=n
 # IPv4/IPv6: no networking on the boot path.
 CONFIG_NET=n
-# Block / FS: no rootfs.
-CONFIG_BLOCK=n
+# Block device drivers stay off (initramfs lives in RAM, not on a
+# block device) — but CONFIG_BLK_DEV_INITRD above does NOT require
+# CONFIG_BLOCK, so leaving block drivers off is fine.
 # Sound / input / framebuffer: pure serial-console boot.
 CONFIG_INPUT=n
 CONFIG_VT=n

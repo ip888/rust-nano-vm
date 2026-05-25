@@ -87,6 +87,13 @@ pub struct VmConfig {
     /// Mutually exclusive with [`Self::kernel`]; backends that see both
     /// set return [`VmError::Backend`].
     pub flat_binary: Option<Vec<u8>>,
+    /// Path to an initramfs/initrd image to hand the kernel at boot.
+    /// The backend loads it into guest RAM and points the boot
+    /// params' `ramdisk_image`/`ramdisk_size` at it. Only meaningful
+    /// alongside [`Self::kernel`]; ignored for `flat_binary` and mock
+    /// backends. `None` cold-boots with no initramfs (the kernel
+    /// panics on no init unless a rootfs is supplied another way).
+    pub initrd: Option<PathBuf>,
     /// Path to the root filesystem image.
     pub rootfs: Option<PathBuf>,
     /// Kernel command line to pass at boot. Empty is allowed for mocks.
@@ -106,6 +113,7 @@ impl Default for VmConfig {
             memory_mib: 128,
             kernel: None,
             flat_binary: None,
+            initrd: None,
             rootfs: None,
             cmdline: String::new(),
             vsock_cid: None,
