@@ -52,8 +52,12 @@ case "${VARIANT}" in
     INIT_SRC="${HERE}/init.c"
     INIT_BIN="${CACHE}/init"
     OUT="${CACHE}/initramfs.cpio"
-    echo "initramfs: variant=test — compiling init.c (static)"
-    gcc -static -Os -s -o "${INIT_BIN}" "${INIT_SRC}"
+    # -no-pie is load-bearing: the tinyconfig kernel can't load a
+    # static-PIE (ET_DYN) init — execve returns ENOENT. Distros with
+    # a default-PIE toolchain (Arch, recent Ubuntu) produce static-PIE
+    # from `-static` alone, so force ET_EXEC explicitly.
+    echo "initramfs: variant=test — compiling init.c (static, non-PIE)"
+    gcc -static -no-pie -Os -s -o "${INIT_BIN}" "${INIT_SRC}"
     ;;
   agent)
     OUT="${CACHE}/initramfs-agent.cpio"
@@ -62,8 +66,14 @@ case "${VARIANT}" in
       echo "initramfs:   rustup target add ${MUSL_TARGET}" >&2
       exit 1
     fi
-    echo "initramfs: variant=agent — building guest-agent (static musl)"
-    ( cd "${WORKSPACE}" && cargo build -p guest-agent --target "${MUSL_TARGET}" --release )
+    # relocation-model=static forces a non-PIE (ET_EXEC) binary. The
+    # musl target defaults to static-PIE (ET_DYN), which the
+    # tinyconfig kernel can't exec as init (ENOENT). See the `test`
+    # variant note above.
+    echo "initramfs: variant=agent — building guest-agent (static musl, non-PIE)"
+    ( cd "${WORKSPACE}" \
+        && RUSTFLAGS="-C relocation-model=static" \
+           cargo build -p guest-agent --target "${MUSL_TARGET}" --release )
     INIT_BIN="${WORKSPACE}/target/${MUSL_TARGET}/release/nanovm-agent"
     INIT_SRC="${INIT_BIN}"
     ;;
