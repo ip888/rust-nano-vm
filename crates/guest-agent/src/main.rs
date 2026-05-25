@@ -89,9 +89,23 @@ impl AgentState {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // Startup banner to stderr. When the agent runs as the guest's
+    // PID 1 with `console=ttyS0`, stderr is wired to the serial
+    // console, so this line reaches the host's serial capture — the
+    // signal that the Rust agent actually launched inside the guest.
+    // `proto v{N}` lets the host confirm the protocol version before
+    // any request round-trip.
+    let framed = std::env::var_os("NANOVM_AGENT_FRAMED").is_some();
+    eprintln!(
+        "nanovm-agent: ready (proto v{}, framed={}, pid={})",
+        PROTOCOL_VERSION,
+        framed,
+        std::process::id(),
+    );
+
     let stdin = io::stdin();
     let stdout = io::stdout();
-    if std::env::var_os("NANOVM_AGENT_FRAMED").is_some() {
+    if framed {
         run_length_prefixed_session(stdin.lock(), stdout.lock());
     } else {
         run_line_delimited_session(stdin.lock(), stdout.lock());
