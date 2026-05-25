@@ -50,6 +50,7 @@ impl From<CreateVmRequest> for VmConfig {
             memory_mib: r.memory_mib,
             kernel: r.kernel,
             flat_binary: None,
+            initrd: None,
             rootfs: r.rootfs,
             cmdline: r.cmdline,
             vsock_cid: r.vsock_cid,
