@@ -284,11 +284,24 @@ impl KvmHypervisor {
             &boot_plan.cmdline,
         )
         .map_err(|e| VmError::Backend(format!("load kernel cmdline: {e}")))?;
+        // Optional initramfs: load high in guest RAM and tell the
+        // kernel about it via the boot params' ramdisk fields.
+        let initrd = match cfg.initrd.as_ref() {
+            Some(path) => Some(load_initrd(&boot_plan.guest_mem, path)?),
+            None => None,
+        };
+        if let Some((addr, size)) = initrd {
+            eprintln!(
+                "vm-kvm: initramfs loaded — addr={:#x} size={size}",
+                addr.raw_value(),
+            );
+        }
         configure_linux_boot(
             &boot_plan.guest_mem,
             kernel_load.setup_header,
             GuestAddress(CMDLINE_START),
             cmdline_size,
+            initrd,
         )?;
 
         Ok(KvmVmRuntime {
@@ -748,6 +761,7 @@ fn configure_linux_boot(
     setup_header: Option<setup_header>,
     cmdline_addr: GuestAddress,
     cmdline_size: usize,
+    initrd: Option<(GuestAddress, usize)>,
 ) -> VmResult<()> {
     let mut params = boot_params::default();
     if let Some(header) = setup_header {
@@ -761,6 +775,17 @@ fn configure_linux_boot(
         .map_err(|_| VmError::Backend("vm-kvm: cmdline address does not fit boot params".into()))?;
     params.hdr.cmdline_size = u32::try_from(cmdline_size)
         .map_err(|_| VmError::Backend("vm-kvm: cmdline size does not fit boot params".into()))?;
+    if let Some((addr, size)) = initrd {
+        // The 32-bit ramdisk fields only reach 4 GiB; our guests are
+        // far smaller, and load_initrd places the image well under
+        // that, but check anyway so a future large-RAM guest fails
+        // loudly instead of truncating the pointer.
+        params.hdr.ramdisk_image = u32::try_from(addr.raw_value()).map_err(|_| {
+            VmError::Backend("vm-kvm: initrd address does not fit boot params".into())
+        })?;
+        params.hdr.ramdisk_size = u32::try_from(size)
+            .map_err(|_| VmError::Backend("vm-kvm: initrd size does not fit boot params".into()))?;
+    }
     add_e820_entry(&mut params, 0, SYSTEM_MEM_START, E820_RAM)?;
     add_e820_entry(
         &mut params,
@@ -790,6 +815,44 @@ fn add_e820_entry(params: &mut boot_params, addr: u64, size: u64, mem_type: u32)
     entry.type_ = mem_type;
     params.e820_entries += 1;
     Ok(())
+}
+
+/// Read an initramfs from `path` and copy it into guest RAM as high
+/// as it'll fit, page-aligned. Returns `(load_addr, size)` for the
+/// caller to stuff into the boot params' ramdisk fields.
+///
+/// Placing it high keeps it clear of the kernel image (loaded at
+/// `KERNEL_LOAD_ADDR`), the cmdline, and the zero page — all of
+/// which live low. The kernel relocates/unpacks it during early
+/// boot, so the exact address only needs to be valid RAM the kernel
+/// won't clobber before it consumes the ramdisk.
+#[cfg(feature = "kvm")]
+fn load_initrd(
+    guest_mem: &GuestMemoryMmap,
+    path: &std::path::Path,
+) -> VmResult<(GuestAddress, usize)> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| VmError::Backend(format!("read initrd {}: {e}", path.display())))?;
+    let size = bytes.len();
+    if size == 0 {
+        return Err(VmError::Backend("vm-kvm: initrd is empty".into()));
+    }
+    let mem_end = guest_mem.last_addr().raw_value() + 1;
+    // Page-align the load address down from the top of RAM.
+    let raw = mem_end
+        .checked_sub(size as u64)
+        .ok_or_else(|| VmError::Backend("vm-kvm: initrd larger than guest memory".into()))?;
+    let load_addr = raw & !(PAGE_SIZE - 1);
+    if load_addr < HIMEM_START {
+        return Err(VmError::Backend(format!(
+            "vm-kvm: initrd ({size} bytes) leaves no room above himem {HIMEM_START:#x} \
+             in a {mem_end:#x}-byte guest",
+        )));
+    }
+    guest_mem
+        .write_slice(&bytes, GuestAddress(load_addr))
+        .map_err(|e| VmError::Backend(format!("write initrd into guest memory: {e}")))?;
+    Ok((GuestAddress(load_addr), size))
 }
 
 #[cfg(feature = "kvm")]
@@ -1103,6 +1166,9 @@ fn unsupported() -> VmError {
 
 #[cfg(feature = "kvm")]
 const SERIAL_PORT_BASE: u16 = 0x3f8;
+/// Guest page size. Used to page-align the initramfs load address.
+#[cfg(feature = "kvm")]
+const PAGE_SIZE: u64 = 0x1000;
 #[cfg(feature = "kvm")]
 const BOOT_STACK_POINTER: u64 = 0x8ff0;
 #[cfg(feature = "kvm")]
@@ -1362,6 +1428,7 @@ mod tests {
             Some(setup_header::default()),
             GuestAddress(CMDLINE_START),
             cmdline_size,
+            None,
         )
         .expect("boot params");
         let params: boot_params = plan
