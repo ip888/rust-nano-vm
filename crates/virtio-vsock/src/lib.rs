@@ -50,6 +50,9 @@ pub use conn_table::{ConnectionTable, Reply, TableConfig};
 pub mod mmio;
 pub use mmio::{MmioTransport, QueueConfig, QueueNotify};
 
+pub mod queue;
+pub use queue::{DescChain, Descriptor, GuestRam, QueueError, SplitQueue};
+
 /// On-the-wire size of the virtio-vsock packet header in bytes.
 pub const VSOCK_HDR_LEN: usize = 44;
 
