@@ -262,6 +262,30 @@ impl ConnectionTable {
         Reply::None
     }
 
+    /// Build an outbound `Rw` data header for an established connection,
+    /// charging `len` bytes against its send credit (`tx_cnt`). Returns
+    /// `None` when there's no such connection or it isn't `Established`
+    /// (so the caller can't push data onto a half-open or unknown stream).
+    ///
+    /// The caller ships the returned header followed by the `len` payload
+    /// bytes over the rx queue.
+    pub fn prepare_data(&mut self, id: &ConnectionId, len: u32) -> Option<VsockHeader> {
+        let conn = self.connections.get_mut(id)?;
+        conn.record_send(len).ok()?;
+        Some(VsockHeader {
+            src_cid: id.local.cid,
+            dst_cid: id.remote.cid,
+            src_port: id.local.port,
+            dst_port: id.remote.port,
+            len,
+            vtype: VsockType::Stream,
+            op: VsockOp::Rw,
+            flags: 0,
+            buf_alloc: conn.local_buf_alloc,
+            fwd_cnt: conn.fwd_cnt,
+        })
+    }
+
     /// Synthesize a header to ship a control packet *back* to the
     /// peer. Used for Response / Shutdown / CreditUpdate.
     fn reply_header(&self, conn_id: &ConnectionId, op: VsockOp) -> VsockHeader {
