@@ -121,6 +121,16 @@ impl ConnectionTable {
         self.connections.get(id)
     }
 
+    /// The id of some currently-`Established` connection, if any. Used
+    /// by a single-agent host that just needs "the" live connection.
+    /// When several are established the choice is unspecified.
+    pub fn first_established(&self) -> Option<ConnectionId> {
+        self.connections
+            .iter()
+            .find(|(_, c)| c.state == ConnectionState::Established)
+            .map(|(id, _)| *id)
+    }
+
     /// Register a passive listener on `local_port`. Returns `true`
     /// if the port was newly registered, `false` if it was already
     /// in the set.

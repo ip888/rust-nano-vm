@@ -184,6 +184,45 @@ impl VsockBackend {
         Ok(())
     }
 
+    /// The id of the guest agent's connection once it has connected, or
+    /// `None` if no connection is established yet.
+    fn established_connection(&self) -> Option<virtio_vsock::ConnectionId> {
+        self.lock_device().established_connection()
+    }
+
+    /// Frame already-encoded `bytes` to the guest on `conn`, then run a
+    /// device cycle so the data lands in the guest's rx ring and inject
+    /// the IRQ if any buffer completed.
+    fn host_send(&self, conn: virtio_vsock::ConnectionId, bytes: &[u8]) -> VmResult<()> {
+        let mut device = self.lock_device();
+        if !device.send(conn, bytes) {
+            return Err(VmError::Backend(
+                "vm-kvm: vsock send on a non-established connection".into(),
+            ));
+        }
+        let mem = GuestRamMem(&self.guest_mem);
+        let completed = device
+            .process(&mem)
+            .map_err(|e| VmError::Backend(format!("vm-kvm: vsock process during send: {e}")))?;
+        drop(device);
+        if completed {
+            self.pulse_irq()?;
+        }
+        Ok(())
+    }
+
+    /// Append any guest→host stream payloads received so far to `buf`.
+    /// The vCPU thread fills the inbound queue as the guest sends; this
+    /// drains it. Returns the number of bytes appended.
+    fn drain_inbound(&self, buf: &mut Vec<u8>) -> usize {
+        let mut device = self.lock_device();
+        let before = buf.len();
+        while let Some((_conn, data)) = device.recv() {
+            buf.extend_from_slice(&data);
+        }
+        buf.len() - before
+    }
+
     /// Inject an edge on the device's IRQ line. GSI 5 is a legacy ISA
     /// line on the in-kernel PIC (edge-triggered), so raise-then-lower
     /// delivers one interrupt; the guest's ISR reads `InterruptStatus`,
@@ -196,6 +235,107 @@ impl VsockBackend {
             .set_irq_line(self.irq, false)
             .map_err(|e| VmError::Backend(format!("deassert vsock IRQ {}: {e}", self.irq)))?;
         Ok(())
+    }
+}
+
+/// Drive one host→guest exec RPC over the vsock device: wait for the
+/// agent to connect, send a one-shot `Exec` request, and read back the
+/// `ExecResult`.
+///
+/// Runs on the caller's thread (not the vCPU thread). The vCPU thread
+/// fills the inbound queue as the guest agent replies; we poll it. All
+/// device access is serialized by the device mutex inside `backend`.
+#[cfg(feature = "kvm")]
+fn exec_over_vsock(backend: &VsockBackend, req: GuestExecRequest) -> VmResult<GuestExecResult> {
+    use std::time::{Duration, Instant};
+
+    // 1. Wait for the guest agent to connect out to our listener.
+    let connect_deadline = Instant::now() + Duration::from_secs(15);
+    let conn = loop {
+        if let Some(c) = backend.established_connection() {
+            break c;
+        }
+        if Instant::now() >= connect_deadline {
+            return Err(VmError::Backend(
+                "vm-kvm: guest agent did not connect over vsock within 15s".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // 2. Encode and send the one-shot Exec request.
+    let request = proto::Request {
+        version: proto::PROTOCOL_VERSION,
+        id: proto::RequestId(1),
+        body: proto::RequestBody::Exec {
+            program: req.program,
+            args: req.args,
+            cwd: req.cwd,
+            env: req.env,
+            timeout_ms: req.timeout_ms,
+        },
+    };
+    let mut frame = Vec::new();
+    proto::frame::encode_request(&request, &mut frame)
+        .map_err(|e| VmError::Backend(format!("vm-kvm: encode exec request: {e}")))?;
+    backend.host_send(conn, &frame)?;
+
+    // 3. Reassemble and decode the response. A one-shot Exec yields a
+    //    single Response frame, possibly split across several rx packets.
+    let reply_timeout = req
+        .timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(30))
+        // Allow headroom over the guest-side timeout for transport latency.
+        .saturating_add(Duration::from_secs(5));
+    let reply_deadline = Instant::now() + reply_timeout;
+    let mut buf = Vec::new();
+    loop {
+        backend.drain_inbound(&mut buf);
+        match proto::frame::decode_response(&buf) {
+            Ok((resp, _consumed)) => return response_to_exec_result(resp),
+            Err(e) if e.is_incomplete() => {
+                if Instant::now() >= reply_deadline {
+                    return Err(VmError::Backend(
+                        "vm-kvm: timed out waiting for the agent's exec response".into(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => {
+                return Err(VmError::Backend(format!(
+                    "vm-kvm: decode exec response: {e}"
+                )))
+            }
+        }
+    }
+}
+
+/// Map the agent's `Response` to a [`GuestExecResult`], surfacing an
+/// `RpcError` or an unexpected response body as a backend error.
+#[cfg(feature = "kvm")]
+fn response_to_exec_result(resp: proto::Response) -> VmResult<GuestExecResult> {
+    match resp.result {
+        Ok(proto::ResponseBody::ExecResult {
+            exit_code,
+            signal,
+            stdout,
+            stderr,
+            duration_ms,
+        }) => Ok(GuestExecResult {
+            exit_code,
+            signal,
+            stdout,
+            stderr,
+            duration_ms,
+        }),
+        Ok(other) => Err(VmError::Backend(format!(
+            "vm-kvm: unexpected exec response body: {other:?}"
+        ))),
+        Err(rpc) => Err(VmError::Backend(format!(
+            "vm-kvm: agent exec error [{:?}]: {}",
+            rpc.code, rpc.message
+        ))),
     }
 }
 
@@ -671,6 +811,13 @@ impl KvmBootPlan {
                     "virtio_mmio.device={VSOCK_MMIO_SIZE:#x}@{VSOCK_MMIO_BASE:#x}:{VSOCK_MMIO_IRQ}"
                 ))
                 .map_err(|e| VmError::Backend(format!("vsock cmdline: {e}")))?;
+            // The Linux init path hands unknown `key=value` cmdline
+            // tokens to PID 1 as environment variables. The guest agent
+            // reads NANOVM_AGENT_VSOCK to switch its transport from
+            // stdio to AF_VSOCK and connect to (HOST_CID, this port).
+            cmdline
+                .insert_str(format!("NANOVM_AGENT_VSOCK={VSOCK_HOST_PORT}"))
+                .map_err(|e| VmError::Backend(format!("vsock agent cmdline: {e}")))?;
         }
         Ok(Self {
             guest_mem,
@@ -860,10 +1007,17 @@ impl Hypervisor for KvmHypervisor {
         })
     }
 
-    fn exec_in_guest(&self, _id: VmId, _req: GuestExecRequest) -> VmResult<GuestExecResult> {
-        Err(VmError::Unsupported(
-            "vm-kvm: guest exec requires the M2 vsock/agent path",
-        ))
+    fn exec_in_guest(&self, id: VmId, req: GuestExecRequest) -> VmResult<GuestExecResult> {
+        // Clone the backend out so we don't hold the hypervisor-wide
+        // lock while polling for the agent connection and its reply.
+        let backend = {
+            let inner = self.lock_inner()?;
+            let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+            vm.runtime.vsock.clone().ok_or(VmError::Unsupported(
+                "vm-kvm: exec_in_guest requires a vsock device (set VmConfig.vsock_cid)",
+            ))?
+        };
+        exec_over_vsock(&backend, req)
     }
 
     fn write_file(&self, _id: VmId, _path: String, _content: Vec<u8>, _mode: u32) -> VmResult<u64> {
