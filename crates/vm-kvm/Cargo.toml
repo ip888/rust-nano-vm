@@ -18,6 +18,9 @@ vmm-sys-util = { version = "0.15.0", optional = true }
 # virtio-vsock's MmioTransport is pure logic (no KVM), but it's only
 # used by the KVM backend's device model, so gate it behind `kvm`.
 virtio-vsock = { workspace = true, optional = true }
+# proto framing/messages for the host side of the vsock exec path; only
+# the KVM backend speaks it, so gate it behind `kvm` too.
+proto = { workspace = true, optional = true }
 
 # Real KVM deps (kvm-ioctls, vm-memory, linux-loader) arrive with the `kvm`
 # feature in M1. Keeping them out of the default build keeps
@@ -27,7 +30,7 @@ virtio-vsock = { workspace = true, optional = true }
 [features]
 default = []
 # Enable the real KVM backend. Requires Linux + /dev/kvm at runtime.
-kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:vm-memory", "dep:linux-loader", "dep:libc", "dep:vmm-sys-util", "dep:virtio-vsock"]
+kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:vm-memory", "dep:linux-loader", "dep:libc", "dep:vmm-sys-util", "dep:virtio-vsock", "dep:proto"]
 
 [lints]
 workspace = true
