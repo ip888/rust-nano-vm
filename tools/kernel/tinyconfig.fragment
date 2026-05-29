@@ -27,14 +27,24 @@ CONFIG_ELFCORE=y
 # CMDLINE_DEVICES is load-bearing: it's what makes the
 # `virtio_mmio.device=<size>@<base>:<irq>` kernel parameter (which
 # from_config appends when vsock_cid is set) actually instantiate the
-# device — there's no device-tree/ACPI in this minimal boot. The
-# vsock-specific driver (VSOCKETS / VIRTIO_VSOCKETS, which need NET)
-# arrives with the queue plumbing in a later slice; the virtio core
-# still probes the device and sets ACKNOWLEDGE without it.
+# device — there's no device-tree/ACPI in this minimal boot.
 CONFIG_VIRTIO=y
 CONFIG_VIRTIO_MENU=y
 CONFIG_VIRTIO_MMIO=y
 CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+
+# ------- virtio-vsock guest driver (D3 slice 3c) ----------------------
+# The generic virtio-MMIO core probes any virtio device and sets
+# ACKNOWLEDGE|DRIVER, but to negotiate features, set up the rx/tx/event
+# virtqueues, and reach DRIVER_OK, the guest needs the vsock-specific
+# driver. VIRTIO_VSOCKETS is that driver; it depends on VSOCKETS (the
+# AF_VSOCK socket family), which in turn depends on NET. Enabling these
+# is what makes vm-kvm's `vsock_driver_ok` flip true and the data path
+# come alive. NET here is the core socket layer only — the IP stack and
+# NIC drivers stay off (INET is not set, no ethernet below).
+CONFIG_NET=y
+CONFIG_VSOCKETS=y
+CONFIG_VIRTIO_VSOCKETS=y
 
 # ------- early-printk and 8250 UART -----------------------------------
 # Without these we get no output, and the test has nothing to assert.
@@ -75,8 +85,9 @@ CONFIG_RD_GZIP=y
 # ------- explicitly OFF: things tinyconfig sometimes enables ---------
 # Modules: we have nothing to load.
 CONFIG_MODULES=n
-# IPv4/IPv6: no networking on the boot path.
-CONFIG_NET=n
+# NET core is ON above (vsock needs it), but the IPv4/IPv6 stack and
+# all NIC drivers stay OFF — vsock is the only socket family we use.
+CONFIG_INET=n
 # Block device drivers stay off (initramfs lives in RAM, not on a
 # block device) — but CONFIG_BLK_DEV_INITRD above does NOT require
 # CONFIG_BLOCK, so leaving block drivers off is fine.
