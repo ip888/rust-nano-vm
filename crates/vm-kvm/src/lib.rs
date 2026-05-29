@@ -14,6 +14,9 @@
 
 #![warn(missing_docs)]
 
+#[cfg(feature = "kvm")]
+mod vmstate;
+
 use vm_core::{
     GuestExecRequest, GuestExecResult, Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError,
     VmHandle, VmId, VmMeta, VmResult, VmState,
