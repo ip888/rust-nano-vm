@@ -148,6 +148,13 @@ impl VsockDevice {
         self.inbound.pop_front()
     }
 
+    /// The id of some currently-established connection, if any. A host
+    /// with a single guest agent uses this to find "the" connection to
+    /// send requests on after the agent connects.
+    pub fn established_connection(&self) -> Option<ConnectionId> {
+        self.table.first_established()
+    }
+
     /// Number of host→guest packets still waiting for an rx buffer.
     pub fn pending_outbound(&self) -> usize {
         self.outbound.len()

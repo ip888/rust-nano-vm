@@ -102,12 +102,17 @@ fi
 # /dev/kmsg (1:11) is how early userspace logs reliably: writes go
 # straight through printk to the serial console, even when init's
 # stdio isn't wired to a tty. /dev/console (5:1) is kept for the
-# kernel's own init-console wiring.
+# kernel's own init-console wiring. /dev/null (1:3) and /dev/zero
+# (1:5) are required the moment the agent spawns a child: Rust's
+# `Command` opens /dev/null for any null stdio (e.g. `Stdio::null()`),
+# and a missing node makes the spawn fail with ENOENT.
 CPIO_LIST="${CACHE}/${VARIANT}.list"
 cat > "${CPIO_LIST}" <<EOF
 dir /dev 0755 0 0
 nod /dev/console 0600 0 0 c 5 1
 nod /dev/kmsg 0644 0 0 c 1 11
+nod /dev/null 0666 0 0 c 1 3
+nod /dev/zero 0666 0 0 c 1 5
 file /init ${INIT_BIN} 0755 0 0
 EOF
 
