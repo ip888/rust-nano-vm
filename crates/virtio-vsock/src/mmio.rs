@@ -73,6 +73,10 @@ pub const STATUS_DEVICE_NEEDS_RESET: u32 = 64;
 /// Something went wrong; driver has given up.
 pub const STATUS_FAILED: u32 = 128;
 
+/// `InterruptStatus` bit: the device updated a used ring and the driver
+/// should process completed buffers (virtio spec §4.2.2).
+pub const VIRTIO_MMIO_INT_VRING: u32 = 1;
+
 // Register offsets.
 mod reg {
     pub const MAGIC: u64 = 0x000;
@@ -196,6 +200,18 @@ impl MmioTransport {
     /// guest kicked.
     pub fn take_notify(&mut self) -> Option<QueueNotify> {
         self.pending_notify.take()
+    }
+
+    /// Assert the used-buffer interrupt by setting the `VRING` bit in
+    /// `InterruptStatus`. After this the host injects the device's IRQ
+    /// into the guest; the guest clears it by writing `InterruptACK`.
+    pub fn raise_interrupt(&mut self) {
+        self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
+    }
+
+    /// `true` while any `InterruptStatus` bit is set (the IRQ line is high).
+    pub fn interrupt_asserted(&self) -> bool {
+        self.interrupt_status != 0
     }
 
     /// Handle an MMIO read of `size` bytes at `offset` within the
