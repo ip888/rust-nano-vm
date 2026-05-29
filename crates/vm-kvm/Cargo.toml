@@ -21,6 +21,13 @@ virtio-vsock = { workspace = true, optional = true }
 # proto framing/messages for the host side of the vsock exec path; only
 # the KVM backend speaks it, so gate it behind `kvm` too.
 proto = { workspace = true, optional = true }
+# Snapshot format (manifest + memory backing file). The vm-kvm backend
+# captures/restores KVM state into this layout; gate behind `kvm`.
+snapshot = { workspace = true, optional = true }
+# serde for serializing the captured vCPU/machine state sidecars; the
+# kvm-bindings `serde` feature derives (de)serialize on the KVM structs.
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 # Real KVM deps (kvm-ioctls, vm-memory, linux-loader) arrive with the `kvm`
 # feature in M1. Keeping them out of the default build keeps
@@ -30,7 +37,7 @@ proto = { workspace = true, optional = true }
 [features]
 default = []
 # Enable the real KVM backend. Requires Linux + /dev/kvm at runtime.
-kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:vm-memory", "dep:linux-loader", "dep:libc", "dep:vmm-sys-util", "dep:virtio-vsock", "dep:proto"]
+kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:vm-memory", "dep:linux-loader", "dep:libc", "dep:vmm-sys-util", "dep:virtio-vsock", "dep:proto", "dep:snapshot", "dep:serde", "dep:serde_json"]
 
 [lints]
 workspace = true
