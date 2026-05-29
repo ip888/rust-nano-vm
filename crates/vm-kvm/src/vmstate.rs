@@ -15,10 +15,6 @@
 //! restore is caught loudly instead of corrupting vCPU state.
 
 #![cfg(feature = "kvm")]
-// This slice lands the state codec; `snapshot()` / `restore()` wire it in
-// the next slice (the vCPU pause mechanism + VM reconstruction). Until then
-// the capture/restore entry points have no in-crate caller.
-#![allow(dead_code)]
 
 use std::path::Path;
 

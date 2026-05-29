@@ -27,13 +27,15 @@ use std::collections::HashMap;
 #[cfg(feature = "kvm")]
 use std::fs::File;
 #[cfg(feature = "kvm")]
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(feature = "kvm")]
 use std::mem;
 #[cfg(feature = "kvm")]
+use std::path::{Path, PathBuf};
+#[cfg(feature = "kvm")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "kvm")]
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 #[cfg(feature = "kvm")]
 use std::thread::{self, JoinHandle};
 
@@ -57,6 +59,8 @@ use linux_loader::loader::bootparam::{boot_params, setup_header};
 #[cfg(feature = "kvm")]
 use linux_loader::loader::{load_cmdline, BzImage, KernelLoader};
 #[cfg(feature = "kvm")]
+use snapshot::Manifest;
+#[cfg(feature = "kvm")]
 use vm_memory::{
     Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
     MemoryRegionAddress,
@@ -75,6 +79,8 @@ pub struct KvmHypervisor {
     kvm: Kvm,
     inner: Mutex<Inner>,
     kick_signal: c_int,
+    /// MSR indices to capture in a snapshot, queried once from the kernel.
+    msr_indices: Arc<Vec<u32>>,
 }
 
 /// KVM-backed hypervisor stub when built without the `kvm` feature.
@@ -88,6 +94,16 @@ pub struct KvmHypervisor {
 #[derive(Debug, Default)]
 struct Inner {
     vms: HashMap<VmId, KvmVm>,
+    /// Captured snapshots, keyed by id → on-disk directory + metadata.
+    snapshots: HashMap<SnapshotId, SnapshotEntry>,
+}
+
+/// A snapshot the hypervisor captured this session.
+#[cfg(feature = "kvm")]
+#[derive(Debug, Clone)]
+struct SnapshotEntry {
+    dir: PathBuf,
+    meta: SnapshotMeta,
 }
 
 #[cfg(feature = "kvm")]
@@ -372,18 +388,50 @@ impl virtio_vsock::GuestRam for GuestRamMem<'_> {
 #[cfg(feature = "kvm")]
 #[derive(Debug)]
 struct KvmVcpuThread {
-    stop_requested: Arc<AtomicBool>,
+    control: Arc<VcpuControl>,
     handle: JoinHandle<VmResult<()>>,
+}
+
+/// Coordination channel between the hypervisor and a running vCPU thread.
+///
+/// `stop` and `pause` are polled by the loop; a kick signal (`SIGRTMIN`)
+/// breaks the vCPU out of a blocking `KVM_RUN` so it notices a flag
+/// promptly. On a pause request the thread captures its own [`VcpuState`]
+/// (only it owns the `VcpuFd`) into `slot`, signals `cvar`, and parks until
+/// the controller takes the state and sets `resume`.
+#[cfg(feature = "kvm")]
+#[derive(Debug, Default)]
+struct VcpuControl {
+    stop: AtomicBool,
+    pause: AtomicBool,
+    slot: Mutex<PauseSlot>,
+    cvar: Condvar,
+}
+
+/// The pause hand-off slot guarded by [`VcpuControl::slot`].
+#[cfg(feature = "kvm")]
+#[derive(Debug, Default)]
+struct PauseSlot {
+    /// Set by the vCPU thread once parked: `Ok(state)` or `Err(msg)` if the
+    /// capture ioctls failed. The controller `take()`s it.
+    captured: Option<Result<vmstate::VcpuState, String>>,
+    /// `true` while the thread is parked in the pause wait loop.
+    parked: bool,
+    /// Set by the controller to release a parked thread.
+    resume: bool,
 }
 
 impl KvmHypervisor {
     /// Construct a new KVM hypervisor handle.
     #[cfg(feature = "kvm")]
     pub fn new() -> VmResult<Self> {
+        let kvm = KvmBootPlan::open_kvm()?;
+        let msr_indices = Arc::new(vmstate::snapshotable_msr_indices(&kvm)?);
         Ok(Self {
-            kvm: KvmBootPlan::open_kvm()?,
+            kvm,
             inner: Mutex::new(Inner::default()),
             kick_signal: vcpu_kick_signal()?,
+            msr_indices,
         })
     }
 
@@ -717,18 +765,26 @@ impl KvmHypervisor {
                 runtime.entry_point,
             )?;
         }
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let stop_for_thread = Arc::clone(&stop_requested);
+        Ok(self.spawn_vcpu_thread(id, vcpu, runtime))
+    }
+
+    /// Spawn the vCPU run loop for an already-created-and-configured `vcpu`
+    /// (boot-configured or snapshot-restored). Wires up the stop/pause
+    /// control channel, the serial sink, the vsock backend, and the MSR
+    /// index list the pause path captures.
+    fn spawn_vcpu_thread(&self, id: VmId, vcpu: VcpuFd, runtime: &KvmVmRuntime) -> KvmVcpuThread {
+        let control = Arc::new(VcpuControl::default());
+        let control_for_thread = Arc::clone(&control);
         let serial_output = Arc::clone(&runtime.serial_output);
         let vsock = runtime.vsock.clone();
+        let msr_indices = Arc::clone(&self.msr_indices);
         let handle = thread::Builder::new()
             .name(format!("kvm-vcpu-{}", id.0))
-            .spawn(move || run_vcpu_loop(vcpu, serial_output, stop_for_thread, vsock))
-            .map_err(|e| VmError::Backend(format!("spawn vCPU thread for {id}: {e}")))?;
-        Ok(KvmVcpuThread {
-            stop_requested,
-            handle,
-        })
+            .spawn(move || {
+                run_vcpu_loop(vcpu, serial_output, control_for_thread, vsock, msr_indices)
+            })
+            .expect("spawn vCPU thread");
+        KvmVcpuThread { control, handle }
     }
 
     fn reap_finished_vcpus(inner: &mut Inner) -> VmResult<()> {
@@ -751,13 +807,135 @@ impl KvmHypervisor {
             vm.state = VmState::Stopped;
             return Ok(());
         };
-        vcpu.stop_requested.store(true, Ordering::SeqCst);
+        vcpu.control.stop.store(true, Ordering::SeqCst);
+        // Wake a paused thread too, so a stop during snapshot unblocks it.
+        vcpu.control.cvar.notify_all();
         vcpu.handle
             .kill(kick_signal)
             .map_err(|e| VmError::Backend(format!("kick vCPU thread: {e}")))?;
         vm.last_run_error = Some(join_vcpu_thread(vcpu)?);
         vm.state = VmState::Stopped;
         Ok(())
+    }
+
+    /// On-disk directory for a snapshot id, under the process temp dir.
+    fn snapshot_dir(&self, id: SnapshotId) -> PathBuf {
+        std::env::temp_dir()
+            .join("nanovm-snapshots")
+            .join(id.0.to_string())
+    }
+
+    /// Request a pause, kick the vCPU out of `KVM_RUN`, and wait for the
+    /// thread to park with its captured state. Returns that state; the
+    /// caller must call [`resume_vcpu`](Self::resume_vcpu) afterwards.
+    fn pause_and_take_state(&self, thread: &KvmVcpuThread) -> VmResult<vmstate::VcpuState> {
+        use std::time::{Duration, Instant};
+        thread.control.pause.store(true, Ordering::SeqCst);
+        thread
+            .handle
+            .kill(self.kick_signal)
+            .map_err(|e| VmError::Backend(format!("vm-kvm: kick vCPU for snapshot: {e}")))?;
+
+        let mut slot = thread
+            .control
+            .slot
+            .lock()
+            .map_err(|_| VmError::Backend("vm-kvm: vcpu pause slot poisoned".into()))?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while slot.captured.is_none() {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| VmError::Backend("vm-kvm: timed out pausing vCPU".into()))?;
+            let (next, timeout) = thread
+                .control
+                .cvar
+                .wait_timeout(slot, remaining)
+                .map_err(|_| VmError::Backend("vm-kvm: vcpu pause slot poisoned".into()))?;
+            slot = next;
+            if timeout.timed_out() && slot.captured.is_none() {
+                return Err(VmError::Backend("vm-kvm: timed out pausing vCPU".into()));
+            }
+        }
+        let captured = slot.captured.take().expect("captured is Some");
+        drop(slot);
+        captured.map_err(VmError::Backend)
+    }
+
+    /// Release a vCPU thread parked by [`pause_and_take_state`].
+    fn resume_vcpu(&self, thread: &KvmVcpuThread) {
+        if let Ok(mut slot) = thread.control.slot.lock() {
+            slot.resume = true;
+            thread.control.cvar.notify_all();
+        }
+    }
+
+    /// Rebuild a VM from a snapshot directory: fresh `VmFd` + irqchip/PIT,
+    /// guest RAM loaded from the memory image, machine + vCPU state restored.
+    /// Returns the runtime and the configured `VcpuFd` ready to run.
+    fn restore_runtime(&self, manifest: &Manifest, dir: &Path) -> VmResult<(KvmVmRuntime, VcpuFd)> {
+        let mem_len = usize::try_from(manifest.memory_bytes)
+            .map_err(|_| VmError::Backend("vm-kvm: snapshot memory size overflows usize".into()))?;
+        let guest_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_len)])
+            .map_err(|e| VmError::Backend(format!("vm-kvm: restore guest memory: {e}")))?;
+        let vm_fd = Arc::new(
+            self.kvm
+                .create_vm()
+                .map_err(|e| VmError::Backend(format!("create VM: {e}")))?,
+        );
+        vm_fd
+            .set_tss_address(
+                usize::try_from(KVM_TSS_ADDRESS)
+                    .map_err(|_| VmError::Backend("vm-kvm: TSS address overflow".into()))?,
+            )
+            .map_err(|e| VmError::Backend(format!("set TSS address: {e}")))?;
+        let pit_config = kvm_pit_config {
+            flags: KVM_PIT_SPEAKER_DUMMY,
+            ..Default::default()
+        };
+        vm_fd
+            .create_irq_chip()
+            .map_err(|e| VmError::Backend(format!("create irqchip: {e}")))?;
+        vm_fd
+            .create_pit2(pit_config)
+            .map_err(|e| VmError::Backend(format!("create PIT: {e}")))?;
+        register_guest_memory(&vm_fd, &guest_mem)?;
+        load_memory(&manifest.backing_file_path(dir), &guest_mem)?;
+
+        // Machine devices first (irqchip/PIT/clock), then the vCPU.
+        vmstate::MachineState::read_from_dir(dir)?.restore(&vm_fd)?;
+        let vcpu = vm_fd
+            .create_vcpu(0)
+            .map_err(|e| VmError::Backend(format!("create vCPU: {e}")))?;
+        let cpuid = self
+            .kvm
+            .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+            .map_err(|e| VmError::Backend(format!("get supported CPUID: {e}")))?;
+        vcpu.set_cpuid2(&cpuid)
+            .map_err(|e| VmError::Backend(format!("set CPUID: {e}")))?;
+        vmstate::VcpuState::read_from_dir(dir)?.restore(&vcpu)?;
+
+        let mut cmdline = Cmdline::new(KvmBootPlan::CMDLINE_CAPACITY)
+            .map_err(|e| VmError::Backend(format!("kernel cmdline capacity: {e}")))?;
+        if !manifest.kernel_cmdline.is_empty() {
+            cmdline
+                .insert_str(&manifest.kernel_cmdline)
+                .map_err(|e| VmError::Backend(format!("restore kernel cmdline: {e}")))?;
+        }
+        let boot_plan = KvmBootPlan {
+            guest_mem,
+            kernel_load_addr: GuestAddress(0),
+            initrd_load_addr: None,
+            cmdline,
+        };
+        let runtime = KvmVmRuntime {
+            vm_fd,
+            boot_plan,
+            entry_point: GuestAddress(0),
+            serial_output: Arc::new(Mutex::new(Vec::new())),
+            real_mode: false,
+            vsock: None,
+        };
+        Ok((runtime, vcpu))
     }
 }
 
@@ -953,12 +1131,115 @@ impl Hypervisor for KvmHypervisor {
             .ok_or(VmError::UnknownVm(id))
     }
 
-    fn snapshot(&self, _id: VmId) -> VmResult<SnapshotId> {
-        Err(unsupported_snapshot())
+    fn snapshot(&self, id: VmId) -> VmResult<SnapshotId> {
+        let mut inner = self.lock_inner()?;
+        Self::reap_finished_vcpus(&mut inner)?;
+        let snap_id = SnapshotId::next();
+        let dir = self.snapshot_dir(snap_id);
+
+        let meta = {
+            let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+            if vm.runtime.real_mode {
+                return Err(VmError::Unsupported(
+                    "vm-kvm: snapshot of a flat-binary VM is not supported",
+                ));
+            }
+            if vm.runtime.vsock.is_some() {
+                return Err(VmError::Unsupported(
+                    "vm-kvm: snapshot of a VM with a vsock device is not yet supported \
+                     (device-state capture lands in a later slice)",
+                ));
+            }
+            if vm.state != VmState::Running {
+                return Err(VmError::Backend(
+                    "vm-kvm: snapshot requires a Running VM".into(),
+                ));
+            }
+            let thread = vm
+                .vcpu
+                .as_ref()
+                .ok_or_else(|| VmError::Backend("vm-kvm: Running VM has no vCPU thread".into()))?;
+
+            // Pause the vCPU and take its self-captured architectural state.
+            let vcpu_state = self.pause_and_take_state(thread)?;
+            // The vCPU is parked: capture machine + memory consistently.
+            let machine = vmstate::MachineState::capture(&vm.runtime.vm_fd);
+            let mem_bytes = vm.runtime.boot_plan.memory_size_bytes();
+            let cmdline = vm.runtime.boot_plan.cmdline_string().unwrap_or_default();
+
+            // Write the snapshot dir; resume the vCPU regardless of the result.
+            let write_result = (|| -> VmResult<()> {
+                std::fs::create_dir_all(&dir)
+                    .map_err(|e| VmError::Backend(format!("vm-kvm: create snapshot dir: {e}")))?;
+                let mut manifest =
+                    Manifest::new(snap_id.0, mem_bytes, PAGE_SIZE as u32, vm.config.vcpus);
+                manifest.created_at_unix_ms = now_unix_ms();
+                manifest.kernel_cmdline = cmdline.clone();
+                manifest
+                    .write_to_dir(&dir)
+                    .map_err(|e| VmError::Backend(format!("vm-kvm: write manifest: {e}")))?;
+                dump_memory(
+                    &vm.runtime.boot_plan.guest_mem,
+                    mem_bytes,
+                    &manifest.backing_file_path(&dir),
+                )?;
+                vcpu_state.write_to_dir(&dir)?;
+                machine?.write_to_dir(&dir)?;
+                Ok(())
+            })();
+
+            self.resume_vcpu(thread);
+            write_result?;
+
+            SnapshotMeta {
+                id: snap_id,
+                vcpu_count: vm.config.vcpus,
+                memory_bytes: mem_bytes,
+                page_size: PAGE_SIZE as u32,
+                kernel_cmdline: cmdline,
+            }
+        };
+
+        inner.snapshots.insert(snap_id, SnapshotEntry { dir, meta });
+        Ok(snap_id)
     }
 
-    fn restore(&self, _snap: SnapshotId) -> VmResult<VmHandle> {
-        Err(unsupported_snapshot())
+    fn restore(&self, snap: SnapshotId) -> VmResult<VmHandle> {
+        let (dir, meta) = {
+            let inner = self.lock_inner()?;
+            let entry = inner
+                .snapshots
+                .get(&snap)
+                .ok_or(VmError::UnknownSnapshot(snap))?;
+            (entry.dir.clone(), entry.meta.clone())
+        };
+        let manifest = Manifest::read_from_dir(&dir)
+            .map_err(|e| VmError::Backend(format!("vm-kvm: read snapshot manifest: {e}")))?;
+        // Reconstruct the VM and resume it from the captured rip.
+        let (runtime, vcpu) = self.restore_runtime(&manifest, &dir)?;
+        let id = VmId::next();
+        let thread = self.spawn_vcpu_thread(id, vcpu, &runtime);
+        let config = VmConfig {
+            vcpus: meta.vcpu_count,
+            memory_mib: meta.memory_bytes / (1024 * 1024),
+            cmdline: meta.kernel_cmdline.clone(),
+            ..VmConfig::default()
+        };
+        let mut inner = self.lock_inner()?;
+        inner.vms.insert(
+            id,
+            KvmVm {
+                config,
+                state: VmState::Running,
+                runtime,
+                vcpu: Some(thread),
+                last_run_error: None,
+            },
+        );
+        Ok(VmHandle {
+            id,
+            state: VmState::Running,
+        })
     }
 
     fn destroy(&self, id: VmId) -> VmResult<()> {
@@ -985,15 +1266,27 @@ impl Hypervisor for KvmHypervisor {
     }
 
     fn list_snapshots(&self) -> VmResult<Vec<SnapshotId>> {
-        Err(unsupported_snapshot())
+        Ok(self.lock_inner()?.snapshots.keys().copied().collect())
     }
 
-    fn delete_snapshot(&self, _snap: SnapshotId) -> VmResult<()> {
-        Err(unsupported_snapshot())
+    fn delete_snapshot(&self, snap: SnapshotId) -> VmResult<()> {
+        let mut inner = self.lock_inner()?;
+        let entry = inner
+            .snapshots
+            .remove(&snap)
+            .ok_or(VmError::UnknownSnapshot(snap))?;
+        // Best-effort directory removal: the id is already gone from the map,
+        // so a leftover directory is a disk-space concern, not a correctness one.
+        let _ = std::fs::remove_dir_all(&entry.dir);
+        Ok(())
     }
 
-    fn snapshot_meta(&self, _snap: SnapshotId) -> VmResult<SnapshotMeta> {
-        Err(unsupported_snapshot())
+    fn snapshot_meta(&self, snap: SnapshotId) -> VmResult<SnapshotMeta> {
+        self.lock_inner()?
+            .snapshots
+            .get(&snap)
+            .map(|e| e.meta.clone())
+            .ok_or(VmError::UnknownSnapshot(snap))
     }
 
     fn vm_meta(&self, id: VmId) -> VmResult<VmMeta> {
@@ -1403,10 +1696,20 @@ fn setup_page_tables(guest_mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> VmRe
 fn run_vcpu_loop(
     mut vcpu: VcpuFd,
     serial_output: Arc<Mutex<Vec<u8>>>,
-    stop_requested: Arc<AtomicBool>,
+    control: Arc<VcpuControl>,
     vsock: Option<VsockBackend>,
+    msr_indices: Arc<Vec<u32>>,
 ) -> VmResult<()> {
     loop {
+        // A snapshot request parks the thread here after capturing its own
+        // state; this is the only place that owns the VcpuFd.
+        if control.pause.load(Ordering::SeqCst) {
+            pause_and_capture(&vcpu, &control, &msr_indices);
+            if control.stop.load(Ordering::SeqCst) {
+                break;
+            }
+            continue;
+        }
         match vcpu.run() {
             Ok(VcpuExit::IoOut(port, data)) => handle_io_out(port, data, &serial_output)?,
             Ok(VcpuExit::IoIn(port, data)) => handle_io_in(port, data),
@@ -1461,7 +1764,9 @@ fn run_vcpu_loop(
                     "vcpu SHUTDOWN (triple fault?): {regs_diag} | {sregs_diag}"
                 )));
             }
-            Ok(VcpuExit::Intr) if stop_requested.load(Ordering::SeqCst) => break,
+            Ok(VcpuExit::Intr) if control.stop.load(Ordering::SeqCst) => break,
+            // A kick that's a pause request: loop back to the pause check.
+            Ok(VcpuExit::Intr) => continue,
             Ok(VcpuExit::FailEntry(reason, cpu)) => {
                 return Err(VmError::Backend(format!(
                     "KVM fail entry: reason={reason:#x} cpu={cpu}",
@@ -1475,12 +1780,32 @@ fn run_vcpu_loop(
                     "unexpected KVM vCPU exit: {other:?}",
                 )))
             }
-            Err(err) if err.errno() == EINTR && stop_requested.load(Ordering::SeqCst) => break,
+            Err(err) if err.errno() == EINTR && control.stop.load(Ordering::SeqCst) => break,
             Err(err) if err.errno() == EINTR => continue,
             Err(err) => return Err(VmError::Backend(format!("KVM_RUN failed: {err}"))),
         }
     }
     Ok(())
+}
+
+/// Capture the vCPU's state and park until the controller resumes or stops.
+/// Runs on the vCPU thread (the sole owner of `vcpu`); the controller drives
+/// it via `control.pause` + a kick signal and collects the state from the
+/// slot.
+#[cfg(feature = "kvm")]
+fn pause_and_capture(vcpu: &VcpuFd, control: &VcpuControl, msr_indices: &[u32]) {
+    let captured = vmstate::VcpuState::capture(vcpu, msr_indices).map_err(|e| e.to_string());
+    let mut slot = control.slot.lock().expect("vcpu pause slot poisoned");
+    slot.captured = Some(captured);
+    slot.parked = true;
+    control.cvar.notify_all();
+    while !slot.resume && !control.stop.load(Ordering::SeqCst) {
+        slot = control.cvar.wait(slot).expect("vcpu pause slot poisoned");
+    }
+    slot.parked = false;
+    slot.resume = false;
+    slot.captured = None;
+    control.pause.store(false, Ordering::SeqCst);
 }
 
 #[cfg(feature = "kvm")]
@@ -1512,6 +1837,68 @@ fn handle_io_in(port: u16, data: &mut [u8]) {
     }
 }
 
+/// Dump the whole guest RAM to a snapshot memory image: a
+/// [`snapshot::BackingFileHeader`] followed by the raw page data.
+#[cfg(feature = "kvm")]
+fn dump_memory(guest_mem: &GuestMemoryMmap, mem_bytes: u64, path: &Path) -> VmResult<()> {
+    let page_count = mem_bytes / PAGE_SIZE;
+    let header = snapshot::BackingFileHeader::new(PAGE_SIZE as u32, page_count)
+        .map_err(|e| VmError::Backend(format!("vm-kvm: snapshot memory header: {e}")))?;
+    let mut file = File::create(path)
+        .map_err(|e| VmError::Backend(format!("vm-kvm: create memory image: {e}")))?;
+    file.write_all(&header.to_bytes())
+        .map_err(|e| VmError::Backend(format!("vm-kvm: write memory header: {e}")))?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut off = 0u64;
+    while off < mem_bytes {
+        let n = ((mem_bytes - off) as usize).min(buf.len());
+        guest_mem
+            .read_slice(&mut buf[..n], GuestAddress(off))
+            .map_err(|e| VmError::Backend(format!("vm-kvm: read guest memory: {e}")))?;
+        file.write_all(&buf[..n])
+            .map_err(|e| VmError::Backend(format!("vm-kvm: write memory image: {e}")))?;
+        off += n as u64;
+    }
+    Ok(())
+}
+
+/// Load a snapshot memory image back into freshly mapped guest RAM.
+#[cfg(feature = "kvm")]
+fn load_memory(path: &Path, guest_mem: &GuestMemoryMmap) -> VmResult<()> {
+    let mut file = File::open(path)
+        .map_err(|e| VmError::Backend(format!("vm-kvm: open memory image: {e}")))?;
+    let mut hdr = [0u8; snapshot::BACKING_HDR_LEN];
+    file.read_exact(&mut hdr)
+        .map_err(|e| VmError::Backend(format!("vm-kvm: read memory header: {e}")))?;
+    let header = snapshot::BackingFileHeader::from_bytes(&hdr)
+        .map_err(|e| VmError::Backend(format!("vm-kvm: parse memory header: {e}")))?;
+    header
+        .validate()
+        .map_err(|e| VmError::Backend(format!("vm-kvm: invalid memory header: {e}")))?;
+    let mem_bytes = header.memory_bytes;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut off = 0u64;
+    while off < mem_bytes {
+        let n = ((mem_bytes - off) as usize).min(buf.len());
+        file.read_exact(&mut buf[..n])
+            .map_err(|e| VmError::Backend(format!("vm-kvm: read memory image: {e}")))?;
+        guest_mem
+            .write_slice(&buf[..n], GuestAddress(off))
+            .map_err(|e| VmError::Backend(format!("vm-kvm: write guest memory: {e}")))?;
+        off += n as u64;
+    }
+    Ok(())
+}
+
+/// Milliseconds since the UNIX epoch, or 0 if the clock is before it.
+#[cfg(feature = "kvm")]
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[cfg(feature = "kvm")]
 fn join_vcpu_thread(vcpu: KvmVcpuThread) -> VmResult<String> {
     match vcpu.handle.join() {
@@ -1539,11 +1926,6 @@ fn vcpu_kick_signal() -> VmResult<c_int> {
 
 #[cfg(feature = "kvm")]
 extern "C" fn handle_vcpu_kick(_: c_int, _: *mut siginfo_t, _: *mut c_void) {}
-
-#[cfg(feature = "kvm")]
-fn unsupported_snapshot() -> VmError {
-    VmError::Unsupported("vm-kvm: snapshot lifecycle is not implemented in M1")
-}
 
 #[cfg(not(feature = "kvm"))]
 fn unsupported() -> VmError {
