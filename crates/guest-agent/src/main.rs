@@ -88,7 +88,25 @@ impl AgentState {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// `VMADDR_CID_HOST` — the well-known vsock context id of the host
+/// (the VMM). The agent always connects *out* to the host.
+const VMADDR_CID_HOST: u32 = 2;
+/// Default host port the agent connects to when `NANOVM_AGENT_VSOCK` is
+/// set without an explicit port.
+const DEFAULT_VSOCK_PORT: u32 = 1024;
+
 fn main() {
+    // The host passes `NANOVM_AGENT_VSOCK[=<port>]` on the kernel
+    // cmdline when it attaches a vsock device; the Linux init path
+    // hands unknown `key=value` cmdline tokens to PID 1 as environment
+    // variables, so the agent picks it up here. When present we use the
+    // virtio-vsock transport; otherwise we fall back to the stdio modes
+    // that make the agent testable without a guest.
+    if let Some(port) = vsock_port_from_env() {
+        run_vsock_session(port);
+        return;
+    }
+
     let framed = std::env::var_os("NANOVM_AGENT_FRAMED").is_some();
     log_banner(framed);
 
@@ -99,6 +117,81 @@ fn main() {
     } else {
         run_line_delimited_session(stdin.lock(), stdout.lock());
     }
+}
+
+/// Parse the host port from `NANOVM_AGENT_VSOCK`. `None` disables vsock
+/// mode. A bare/`1`/non-numeric value selects [`DEFAULT_VSOCK_PORT`]; a
+/// numeric value sets the port explicitly.
+fn vsock_port_from_env() -> Option<u32> {
+    let val = std::env::var("NANOVM_AGENT_VSOCK").ok()?;
+    Some(val.trim().parse::<u32>().unwrap_or(DEFAULT_VSOCK_PORT))
+}
+
+/// Connect to the host over AF_VSOCK and serve the length-prefixed
+/// request/response protocol over that stream.
+///
+/// As the guest's PID 1 the agent must not exit (that panics the
+/// kernel), so connect failures and a closed session both fall through
+/// to a parked halt loop rather than returning.
+fn run_vsock_session(port: u32) {
+    use std::time::Duration;
+    use vsock::VsockStream;
+
+    kmsg_log(&format!(
+        "nanovm-agent: vsock mode (proto v{PROTOCOL_VERSION}, host_cid={VMADDR_CID_HOST}, port={port}, pid={})\n",
+        std::process::id(),
+    ));
+
+    // The host device + listener are up by the time the guest driver
+    // probes, but the agent may race ahead of the host accepting; retry
+    // briefly before giving up.
+    let mut stream = None;
+    for attempt in 1..=50u32 {
+        match VsockStream::connect_with_cid_port(VMADDR_CID_HOST, port) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => {
+                if attempt == 1 || attempt % 10 == 0 {
+                    kmsg_log(&format!(
+                        "nanovm-agent: vsock connect attempt {attempt} failed: {e}\n"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+    let Some(stream) = stream else {
+        kmsg_log("nanovm-agent: vsock connect gave up; parking\n");
+        park_forever();
+    };
+
+    kmsg_log("nanovm-agent: vsock connected; serving requests\n");
+    match stream.try_clone() {
+        Ok(reader) => run_length_prefixed_session(reader, stream),
+        Err(e) => kmsg_log(&format!("nanovm-agent: vsock try_clone failed: {e}\n")),
+    }
+    kmsg_log("nanovm-agent: vsock session ended; parking\n");
+    park_forever();
+}
+
+/// Sleep indefinitely. Used after the agent's work is done so PID 1
+/// never returns (which would panic the guest kernel); the host tears
+/// the VM down when it's finished.
+fn park_forever() -> ! {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// Best-effort log line to the kernel ring buffer (reaches the host
+/// serial console) and stderr. Never panics — see [`log_banner`].
+fn kmsg_log(line: &str) {
+    if let Ok(mut kmsg) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+        let _ = kmsg.write_all(line.as_bytes());
+    }
+    let _ = io::stderr().write_all(line.as_bytes());
 }
 
 /// Emit the startup banner so the host can confirm the agent
@@ -114,18 +207,12 @@ fn main() {
 /// host's serial capture). Both writes are best-effort: a guest
 /// without `/dev/kmsg` or a broken stderr must not crash the agent.
 fn log_banner(framed: bool) {
-    let line = format!(
+    kmsg_log(&format!(
         "nanovm-agent: ready (proto v{}, framed={}, pid={})\n",
         PROTOCOL_VERSION,
         framed,
         std::process::id(),
-    );
-    if let Ok(mut kmsg) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
-        let _ = kmsg.write_all(line.as_bytes());
-    }
-    // Non-panicking stderr attempt (unlike eprintln!) — harmless when
-    // stderr is a working console, ignored when it isn't.
-    let _ = io::stderr().write_all(line.as_bytes());
+    ));
 }
 
 fn run_line_delimited_session(input: impl BufRead, mut out: impl Write) {
@@ -302,6 +389,7 @@ fn handle_exec_start(
         .stderr(Stdio::piped())
         // stdin is not wired in sequential mode
         .stdin(Stdio::null());
+    strip_agent_transport_env(&mut cmd);
     if let Some(ref dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -486,12 +574,13 @@ fn handle_exec(
     env: Vec<(String, String)>,
     timeout_ms: Option<u64>,
 ) -> Result<ResponseBody, RpcError> {
-    use std::process::Command;
+    use std::process::{Command, Stdio};
 
     let start = Instant::now();
 
     let mut cmd = Command::new(&program);
-    cmd.args(&args);
+    cmd.args(&args).stdin(Stdio::null());
+    strip_agent_transport_env(&mut cmd);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -593,6 +682,16 @@ fn handle_stat(path: String) -> Result<ResponseBody, RpcError> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Remove the agent's own transport-selection env vars from a child
+/// command's environment. Guest processes the agent spawns must not
+/// inherit these — otherwise exec'ing the agent binary (or any program
+/// that checks them) would re-enter vsock mode and connect back to the
+/// host, which is never what the caller wants.
+fn strip_agent_transport_env(cmd: &mut std::process::Command) {
+    cmd.env_remove("NANOVM_AGENT_VSOCK");
+    cmd.env_remove("NANOVM_AGENT_FRAMED");
+}
 
 fn error_response(id: RequestId, code: ErrorCode, message: String) -> Response {
     Response {
