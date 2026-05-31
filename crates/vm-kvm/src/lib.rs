@@ -1705,6 +1705,12 @@ fn run_vcpu_loop(
     msr_indices: Arc<Vec<u32>>,
 ) -> VmResult<()> {
     loop {
+        // Re-check stop before every KVM_RUN. The kick signal handler is a
+        // no-op; if a kick lands between KVM_RUN calls it's consumed
+        // silently, leaving only this check to surface a stop request.
+        if control.stop.load(Ordering::SeqCst) {
+            break;
+        }
         // A snapshot request parks the thread here after capturing its own
         // state; this is the only place that owns the VcpuFd.
         if control.pause.load(Ordering::SeqCst) {
