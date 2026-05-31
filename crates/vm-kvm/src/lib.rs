@@ -61,9 +61,11 @@ use linux_loader::loader::{load_cmdline, BzImage, KernelLoader};
 #[cfg(feature = "kvm")]
 use snapshot::Manifest;
 #[cfg(feature = "kvm")]
+use vm_memory::mmap::MmapRegion;
+#[cfg(feature = "kvm")]
 use vm_memory::{
-    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
-    MemoryRegionAddress,
+    Address, Bytes, FileOffset, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
+    GuestRegionMmap, MemoryRegionAddress,
 };
 #[cfg(feature = "kvm")]
 use vmm_sys_util::signal::{register_signal_handler, Killable};
@@ -873,10 +875,11 @@ impl KvmHypervisor {
     /// guest RAM loaded from the memory image, machine + vCPU state restored.
     /// Returns the runtime and the configured `VcpuFd` ready to run.
     fn restore_runtime(&self, manifest: &Manifest, dir: &Path) -> VmResult<(KvmVmRuntime, VcpuFd)> {
-        let mem_len = usize::try_from(manifest.memory_bytes)
-            .map_err(|_| VmError::Backend("vm-kvm: snapshot memory size overflows usize".into()))?;
-        let guest_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_len)])
-            .map_err(|e| VmError::Backend(format!("vm-kvm: restore guest memory: {e}")))?;
+        // Lazy CoW mapping: pages fault in from the snapshot file as the
+        // guest touches them, and writes go to private anonymous copies.
+        // N restores of the same snapshot share the read pages via the
+        // page cache — "snapshot once, fork many".
+        let guest_mem = cow_guest_memory(&manifest.backing_file_path(dir), manifest.memory_bytes)?;
         let vm_fd = Arc::new(
             self.kvm
                 .create_vm()
@@ -898,8 +901,9 @@ impl KvmHypervisor {
         vm_fd
             .create_pit2(pit_config)
             .map_err(|e| VmError::Backend(format!("create PIT: {e}")))?;
+        // Guest memory is already populated via the file-backed CoW mmap
+        // built above — no eager load step.
         register_guest_memory(&vm_fd, &guest_mem)?;
-        load_memory(&manifest.backing_file_path(dir), &guest_mem)?;
 
         // Machine devices first (irqchip/PIT/clock), then the vCPU.
         vmstate::MachineState::read_from_dir(dir)?.restore(&vm_fd)?;
@@ -1701,6 +1705,12 @@ fn run_vcpu_loop(
     msr_indices: Arc<Vec<u32>>,
 ) -> VmResult<()> {
     loop {
+        // Re-check stop before every KVM_RUN. The kick signal handler is a
+        // no-op; if a kick lands between KVM_RUN calls it's consumed
+        // silently, leaving only this check to surface a stop request.
+        if control.stop.load(Ordering::SeqCst) {
+            break;
+        }
         // A snapshot request parks the thread here after capturing its own
         // state; this is the only place that owns the VcpuFd.
         if control.pause.load(Ordering::SeqCst) {
@@ -1838,7 +1848,10 @@ fn handle_io_in(port: u16, data: &mut [u8]) {
 }
 
 /// Dump the whole guest RAM to a snapshot memory image: a
-/// [`snapshot::BackingFileHeader`] followed by the raw page data.
+/// [`snapshot::BackingFileHeader`] followed by zero padding to
+/// [`snapshot::MEMORY_DATA_OFFSET`] (so the page data is page-aligned in the
+/// file and can be `mmap(MAP_PRIVATE)`-ed directly on restore — the
+/// foundation of fork-many CoW).
 #[cfg(feature = "kvm")]
 fn dump_memory(guest_mem: &GuestMemoryMmap, mem_bytes: u64, path: &Path) -> VmResult<()> {
     let page_count = mem_bytes / PAGE_SIZE;
@@ -1848,6 +1861,10 @@ fn dump_memory(guest_mem: &GuestMemoryMmap, mem_bytes: u64, path: &Path) -> VmRe
         .map_err(|e| VmError::Backend(format!("vm-kvm: create memory image: {e}")))?;
     file.write_all(&header.to_bytes())
         .map_err(|e| VmError::Backend(format!("vm-kvm: write memory header: {e}")))?;
+    // Pad header → MEMORY_DATA_OFFSET so the page data is page-aligned.
+    let pad_len = snapshot::MEMORY_DATA_OFFSET as usize - snapshot::BACKING_HDR_LEN;
+    file.write_all(&vec![0u8; pad_len])
+        .map_err(|e| VmError::Backend(format!("vm-kvm: write memory header pad: {e}")))?;
     let mut buf = vec![0u8; 1 << 20];
     let mut off = 0u64;
     while off < mem_bytes {
@@ -1862,32 +1879,50 @@ fn dump_memory(guest_mem: &GuestMemoryMmap, mem_bytes: u64, path: &Path) -> VmRe
     Ok(())
 }
 
-/// Load a snapshot memory image back into freshly mapped guest RAM.
+/// Build a guest-memory view that lazily reads pages from `path` and
+/// copies-on-write on the first guest store: `mmap(MAP_PRIVATE, fd, …)` on
+/// the memory image. Multiple forks of the same snapshot share their
+/// unmodified pages via the kernel's page cache and only diverge for
+/// pages they actually dirty — the unit-economics win.
 #[cfg(feature = "kvm")]
-fn load_memory(path: &Path, guest_mem: &GuestMemoryMmap) -> VmResult<()> {
-    let mut file = File::open(path)
+fn cow_guest_memory(path: &Path, mem_bytes: u64) -> VmResult<GuestMemoryMmap> {
+    let file = File::open(path)
         .map_err(|e| VmError::Backend(format!("vm-kvm: open memory image: {e}")))?;
-    let mut hdr = [0u8; snapshot::BACKING_HDR_LEN];
-    file.read_exact(&mut hdr)
-        .map_err(|e| VmError::Backend(format!("vm-kvm: read memory header: {e}")))?;
-    let header = snapshot::BackingFileHeader::from_bytes(&hdr)
-        .map_err(|e| VmError::Backend(format!("vm-kvm: parse memory header: {e}")))?;
-    header
-        .validate()
-        .map_err(|e| VmError::Backend(format!("vm-kvm: invalid memory header: {e}")))?;
-    let mem_bytes = header.memory_bytes;
-    let mut buf = vec![0u8; 1 << 20];
-    let mut off = 0u64;
-    while off < mem_bytes {
-        let n = ((mem_bytes - off) as usize).min(buf.len());
-        file.read_exact(&mut buf[..n])
-            .map_err(|e| VmError::Backend(format!("vm-kvm: read memory image: {e}")))?;
-        guest_mem
-            .write_slice(&buf[..n], GuestAddress(off))
-            .map_err(|e| VmError::Backend(format!("vm-kvm: write guest memory: {e}")))?;
-        off += n as u64;
+    // Quick header sanity check (validates magic, page-count consistency)
+    // so we fail loudly on a foreign or corrupt file before mmap'ing.
+    {
+        let mut hdr = [0u8; snapshot::BACKING_HDR_LEN];
+        let mut h = &file;
+        h.read_exact(&mut hdr)
+            .map_err(|e| VmError::Backend(format!("vm-kvm: read memory header: {e}")))?;
+        let header = snapshot::BackingFileHeader::from_bytes(&hdr)
+            .map_err(|e| VmError::Backend(format!("vm-kvm: parse memory header: {e}")))?;
+        header
+            .validate()
+            .map_err(|e| VmError::Backend(format!("vm-kvm: invalid memory header: {e}")))?;
+        if header.memory_bytes != mem_bytes {
+            return Err(VmError::Backend(format!(
+                "vm-kvm: snapshot memory size {} does not match manifest {mem_bytes}",
+                header.memory_bytes,
+            )));
+        }
     }
-    Ok(())
+    let mem_len = usize::try_from(mem_bytes)
+        .map_err(|_| VmError::Backend("vm-kvm: snapshot memory size overflows usize".into()))?;
+    let file_offset = FileOffset::new(file, snapshot::MEMORY_DATA_OFFSET);
+    // PRIVATE so guest writes CoW into the fork's own anonymous pages.
+    // NORESERVE matches vm-memory's anonymous default (no overcommit reservation).
+    let region = MmapRegion::build(
+        Some(file_offset),
+        mem_len,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_NORESERVE | libc::MAP_PRIVATE,
+    )
+    .map_err(|e| VmError::Backend(format!("vm-kvm: mmap snapshot memory: {e}")))?;
+    let region = GuestRegionMmap::new(region, GuestAddress(0))
+        .ok_or_else(|| VmError::Backend("vm-kvm: build guest region failed".into()))?;
+    GuestMemoryMmap::from_regions(vec![region])
+        .map_err(|e| VmError::Backend(format!("vm-kvm: build guest memory: {e}")))
 }
 
 /// Milliseconds since the UNIX epoch, or 0 if the clock is before it.
