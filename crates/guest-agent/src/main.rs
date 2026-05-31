@@ -96,6 +96,15 @@ const VMADDR_CID_HOST: u32 = 2;
 const DEFAULT_VSOCK_PORT: u32 = 1024;
 
 fn main() {
+    // Tick mode: a busy-spin loop that periodically logs a monotonically
+    // increasing counter. Used by the snapshot/restore test as a guest that
+    // (a) stays runnable (never HLT-idles, so the VM doesn't stop) and
+    // (b) makes forward progress observable on the serial console — a
+    // restored snapshot resumes the counter where it froze.
+    if std::env::var_os("NANOVM_AGENT_TICK").is_some() {
+        run_tick_loop();
+    }
+
     // The host passes `NANOVM_AGENT_VSOCK[=<port>]` on the kernel
     // cmdline when it attaches a vsock device; the Linux init path
     // hands unknown `key=value` cmdline tokens to PID 1 as environment
@@ -174,6 +183,27 @@ fn run_vsock_session(port: u32) {
     }
     kmsg_log("nanovm-agent: vsock session ended; parking\n");
     park_forever();
+}
+
+/// Busy-spin loop that logs `nanovm-tick <n>` to `/dev/kmsg` forever.
+///
+/// Spins (rather than sleeps) between logs so the vCPU never HLT-idles —
+/// an idle guest would exit to the host and stop the VM, which a snapshot
+/// target must not do. The counter lives in guest memory and the loop's
+/// instruction pointer in vCPU state, so a restored snapshot resumes
+/// counting from where it was frozen.
+fn run_tick_loop() -> ! {
+    kmsg_log("nanovm-agent: tick mode\n");
+    let mut n: u64 = 0;
+    loop {
+        let mut x: u64 = 0;
+        for i in 0..300_000_000u64 {
+            x = x.wrapping_add(i);
+        }
+        std::hint::black_box(x);
+        kmsg_log(&format!("nanovm-tick {n}\n"));
+        n = n.wrapping_add(1);
+    }
 }
 
 /// Sleep indefinitely. Used after the agent's work is done so PID 1
