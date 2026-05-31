@@ -15,10 +15,6 @@
 //! restore is caught loudly instead of corrupting vCPU state.
 
 #![cfg(feature = "kvm")]
-// This slice lands the state codec; `snapshot()` / `restore()` wire it in
-// the next slice (the vCPU pause mechanism + VM reconstruction). Until then
-// the capture/restore entry points have no in-crate caller.
-#![allow(dead_code)]
 
 use std::path::Path;
 
@@ -166,7 +162,7 @@ impl MachineState {
             pic_slave: capture_irqchip(vm, KVM_IRQCHIP_PIC_SLAVE)?,
             ioapic: capture_irqchip(vm, KVM_IRQCHIP_IOAPIC)?,
             pit: pod_to_bytes(&vm.get_pit2().map_err(kvm_err("get_pit2"))?),
-            clock: pod_to_bytes(&vm.get_clock()),
+            clock: pod_to_bytes(&vm.get_clock().map_err(kvm_err("get_clock"))?),
         })
     }
 
