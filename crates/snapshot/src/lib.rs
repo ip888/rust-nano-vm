@@ -54,6 +54,16 @@ pub use runtime::{
 /// refuse files whose `format_version` doesn't match a version they know.
 pub const FORMAT_VERSION: u32 = 1;
 
+/// Byte offset within the memory backing file where the page data starts.
+///
+/// Page-aligned (4 KiB) so a fork can `mmap(MAP_PRIVATE, fd, offset = …)`
+/// the file directly and let the kernel CoW pages on first write —
+/// the foundation of "snapshot once, fork many". The 64-byte
+/// [`BackingFileHeader`] lives at offset 0; bytes `[64, 4096)` are reserved
+/// zero padding so the data section is `mmap`-able without a buffered
+/// pre-read.
+pub const MEMORY_DATA_OFFSET: u64 = 4096;
+
 // ---------------------------------------------------------------------------
 // Manifest (manifest.json)
 // ---------------------------------------------------------------------------
