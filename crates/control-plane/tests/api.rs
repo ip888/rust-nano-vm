@@ -1102,3 +1102,109 @@ async fn usage_without_bearer_returns_unauthorized() {
     assert_eq!(usage_status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"]["code"], "unauthorized");
 }
+
+// ---- /v1/snapshots/:id/fork quota ---------------------------------------
+
+/// Router with auth on AND a tight fork quota (1 fork burst, ~0 refill).
+/// Used by quota tests so the second fork must 429.
+fn app_with_tight_quota(tokens: ApiTokens) -> Router {
+    use control_plane::ForkQuota;
+    use std::sync::Arc as A;
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    let quota = A::new(ForkQuota::new(0.001, 1)); // burst 1, ~no refill in test window
+    control_plane::router()
+        .layer(Extension(Arc::new(tokens)))
+        .with_state(AppState::with_fork_quota(hv, quota))
+}
+
+async fn send_with_headers(
+    app: Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> (StatusCode, Value, axum::http::HeaderMap) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(tok) = bearer {
+        builder = builder.header("authorization", format!("Bearer {tok}"));
+    }
+    let req = match body {
+        Some(v) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&v).unwrap()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, json, headers)
+}
+
+#[tokio::test]
+async fn fork_returns_429_with_retry_after_when_quota_exhausted() {
+    let app = app_with_tight_quota(ApiTokens::from_csv("alpha"));
+    let snap = snapshot_a_fresh_vm(&app, Some("alpha")).await;
+    let path = format!("/v1/snapshots/{snap}/fork");
+
+    // First fork burns the burst.
+    let (s1, _) = send_with(app.clone(), Method::POST, &path, None, Some("alpha")).await;
+    assert_eq!(s1, StatusCode::CREATED);
+
+    // Second fork in the same tick should be throttled.
+    let (s2, body, headers) =
+        send_with_headers(app.clone(), Method::POST, &path, None, Some("alpha")).await;
+    assert_eq!(s2, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"]["code"], "fork_quota_exceeded");
+    let retry = headers
+        .get("retry-after")
+        .expect("Retry-After header on 429")
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
+        .expect("Retry-After parses as u64 seconds");
+    assert!(retry >= 1, "Retry-After is at least 1 second");
+}
+
+#[tokio::test]
+async fn fork_quota_is_per_token() {
+    let app = app_with_tight_quota(ApiTokens::from_csv("alpha,beta"));
+    let snap = snapshot_a_fresh_vm(&app, Some("alpha")).await;
+    let path = format!("/v1/snapshots/{snap}/fork");
+
+    let (sa, _) = send_with(app.clone(), Method::POST, &path, None, Some("alpha")).await;
+    assert_eq!(sa, StatusCode::CREATED);
+
+    // beta's bucket is untouched — should pass.
+    let (sb, _) = send_with(app.clone(), Method::POST, &path, None, Some("beta")).await;
+    assert_eq!(sb, StatusCode::CREATED);
+
+    // alpha is now throttled.
+    let (sa2, _) = send_with(app.clone(), Method::POST, &path, None, Some("alpha")).await;
+    assert_eq!(sa2, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn fork_with_disabled_quota_passes_through() {
+    use control_plane::ForkQuota;
+    use std::sync::Arc as A;
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    let quota = A::new(ForkQuota::new(0.0, 0)); // disabled
+    let app = control_plane::router()
+        .layer(Extension(Arc::new(ApiTokens::from_csv("alpha"))))
+        .with_state(AppState::with_fork_quota(hv, quota));
+    let snap = snapshot_a_fresh_vm(&app, Some("alpha")).await;
+    let path = format!("/v1/snapshots/{snap}/fork");
+
+    // 50 forks back-to-back, no throttling.
+    for _ in 0..50 {
+        let (status, _) = send_with(app.clone(), Method::POST, &path, None, Some("alpha")).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+}
