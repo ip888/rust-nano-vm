@@ -23,13 +23,17 @@
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Instant;
+
 use axum::{
     body::Bytes,
     extract::{
         rejection::{JsonRejection, PathRejection},
         Path, Query, State,
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware,
     routing::{get, post},
     Json, Router,
@@ -39,22 +43,35 @@ use vm_core::{Hypervisor, SnapshotId, VmId};
 
 use crate::api::{
     openapi_spec, CreateVmRequest, ExecRequest, ExecResponse, FilePathQuery, FileReadResponse,
-    FileWriteRequest, FileWrittenResponse, SnapshotDto, SnapshotListEntry, SnapshotListResponse,
-    SnapshotRequest, VmHandleDto, VmListEntry, VmListResponse, VmStateResponse,
+    FileWriteRequest, FileWrittenResponse, ForkResponseDto, SnapshotDto, SnapshotListEntry,
+    SnapshotListResponse, SnapshotRequest, UsageResponseDto, VmHandleDto, VmListEntry,
+    VmListResponse, VmStateResponse,
 };
 use crate::auth;
 use crate::error::ApiError;
+
+/// Per-token fork usage — the basis for usage-based billing on the fork API.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ForkUsage {
+    /// Number of successful forks this token has performed.
+    pub count: u64,
+    /// Total wall-time (ms) spent restoring those forks.
+    pub total_ms: u64,
+}
 
 /// Shared state plumbed into every handler.
 #[derive(Clone)]
 pub struct AppState {
     hypervisor: Arc<dyn Hypervisor>,
+    /// Per-token fork counters keyed by bearer-token. Locked briefly per call.
+    fork_usage: Arc<Mutex<HashMap<String, ForkUsage>>>,
 }
 
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
             .field("hypervisor", &"<dyn Hypervisor>")
+            .field("fork_usage", &"<Arc<Mutex<HashMap>>>")
             .finish()
     }
 }
@@ -62,7 +79,10 @@ impl std::fmt::Debug for AppState {
 impl AppState {
     /// Construct a new [`AppState`] wrapping the given hypervisor.
     pub fn new(hypervisor: Arc<dyn Hypervisor>) -> Self {
-        Self { hypervisor }
+        Self {
+            hypervisor,
+            fork_usage: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -97,6 +117,11 @@ pub fn router() -> Router<AppState> {
         .route("/snapshots", get(list_snapshots))
         .route("/snapshots/:id", axum::routing::delete(delete_snapshot))
         .route("/snapshots/:id/restore", post(restore_snapshot))
+        // `/fork` is the metered, customer-facing form of `/restore`: same op
+        // under the hood (CoW fork from the snapshot), plus per-token usage
+        // accounting so we can bill on fork count + latency.
+        .route("/snapshots/:id/fork", post(fork_snapshot))
+        .route("/usage", get(usage))
         .route_layer(middleware::from_fn(auth::require_token));
 
     Router::new()
@@ -230,6 +255,89 @@ async fn restore_snapshot(
     let Path(id) = id?;
     let handle = state.hypervisor.restore(SnapshotId(id))?;
     Ok((StatusCode::CREATED, Json(handle.into())))
+}
+
+/// `POST /v1/snapshots/:id/fork` — the metered customer-facing form of
+/// restore. Same operation under the hood, but the response carries the
+/// per-fork latency (the headline product number) and per-token usage is
+/// accumulated for billing. Auth-off mode (no bearer) still serves the
+/// fork; only the usage counter is skipped.
+async fn fork_snapshot(
+    State(state): State<AppState>,
+    id: Result<Path<u64>, PathRejection>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<ForkResponseDto>), ApiError> {
+    let Path(id) = id?;
+    let started = Instant::now();
+    let handle = state.hypervisor.restore(SnapshotId(id))?;
+    let fork_ms = started.elapsed().as_millis() as u64;
+
+    let mut fork_count = 1u64;
+    let mut fork_total_ms = fork_ms;
+    if let Some(token) = extract_bearer(&headers) {
+        let mut usage = state
+            .fork_usage
+            .lock()
+            .map_err(|_| ApiError::Internal("fork_usage mutex poisoned"))?;
+        let entry = usage.entry(token).or_default();
+        entry.count = entry.count.saturating_add(1);
+        entry.total_ms = entry.total_ms.saturating_add(fork_ms);
+        fork_count = entry.count;
+        fork_total_ms = entry.total_ms;
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ForkResponseDto {
+            vm: handle.into(),
+            fork_ms,
+            fork_count,
+            fork_total_ms,
+        }),
+    ))
+}
+
+/// `GET /v1/usage` — the caller's fork-usage counters. The token is
+/// reported as a non-cryptographic fingerprint so the response is safe to
+/// log / show to the caller, never the raw bearer.
+async fn usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<UsageResponseDto>, ApiError> {
+    let token = extract_bearer(&headers)
+        .ok_or_else(|| ApiError::Unauthorized("missing bearer for usage query".into()))?;
+    let entry = state
+        .fork_usage
+        .lock()
+        .map_err(|_| ApiError::Internal("fork_usage mutex poisoned"))?
+        .get(&token)
+        .copied()
+        .unwrap_or_default();
+    Ok(Json(UsageResponseDto {
+        token: token_fingerprint(&token),
+        fork_count: entry.count,
+        fork_total_ms: entry.total_ms,
+    }))
+}
+
+/// Pull the bearer token out of the `Authorization: Bearer …` header, if
+/// present. Returns `None` for missing / malformed headers (auth-off mode
+/// or unauthenticated probes).
+fn extract_bearer(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(|s| s.to_owned())
+}
+
+/// Non-cryptographic fingerprint of a token: `tok-<first4>-<len>`. Lets
+/// operators correlate audit/usage entries without ever logging the raw
+/// secret. Same shape the audit log uses.
+fn token_fingerprint(token: &str) -> String {
+    let head: String = token.chars().take(4).collect();
+    format!("tok-{head}-{}", token.len())
 }
 
 async fn list_snapshots(
