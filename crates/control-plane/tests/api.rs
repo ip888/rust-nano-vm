@@ -1142,7 +1142,8 @@ async fn send_with_headers(
     let json = if bytes.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
     };
     (status, json, headers)
 }
@@ -1207,4 +1208,72 @@ async fn fork_with_disabled_quota_passes_through() {
         let (status, _) = send_with(app.clone(), Method::POST, &path, None, Some("alpha")).await;
         assert_eq!(status, StatusCode::CREATED);
     }
+}
+
+// ---- /metrics ----------------------------------------------------------
+
+#[tokio::test]
+async fn metrics_endpoint_serves_prometheus_text_without_auth() {
+    let app = app_with_tokens(ApiTokens::from_csv("alpha"));
+    let (status, body, headers) =
+        send_with_headers(app.clone(), Method::GET, "/metrics", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let ctype = headers.get("content-type").unwrap().to_str().unwrap();
+    assert!(ctype.starts_with("text/plain"), "got {ctype}");
+    // Body is the rendered Prometheus text; even with no activity we get
+    // the heartbeat gauge and zero-valued latency lines.
+    let text = match body {
+        Value::String(s) => s,
+        other => panic!("expected plain-text body, got JSON: {other}"),
+    };
+    assert!(text.contains("nanovm_up 1"));
+    assert!(text.contains("nanovm_fork_latency_ms_count 0"));
+}
+
+#[tokio::test]
+async fn metrics_records_successful_fork_per_token() {
+    let app = app_with_tokens(ApiTokens::from_csv("alpha"));
+    let snap = snapshot_a_fresh_vm(&app, Some("alpha")).await;
+    let _ = send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/snapshots/{snap}/fork"),
+        None,
+        Some("alpha"),
+    )
+    .await;
+
+    let (status, body, _) = send_with_headers(app, Method::GET, "/metrics", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = match body {
+        Value::String(s) => s,
+        other => panic!("expected plain-text body: {other}"),
+    };
+    assert!(
+        text.contains("nanovm_forks_total{token=\"tok-alph-5\"} 1"),
+        "missing per-token fork counter:\n{text}"
+    );
+    assert!(text.contains("nanovm_fork_latency_ms_count 1"));
+}
+
+#[tokio::test]
+async fn metrics_records_throttled_attempts() {
+    let app = app_with_tight_quota(ApiTokens::from_csv("alpha"));
+    let snap = snapshot_a_fresh_vm(&app, Some("alpha")).await;
+    let path = format!("/v1/snapshots/{snap}/fork");
+
+    // First fork drains the burst; second throttles.
+    let _ = send_with(app.clone(), Method::POST, &path, None, Some("alpha")).await;
+    let _ = send_with(app.clone(), Method::POST, &path, None, Some("alpha")).await;
+
+    let (_, body, _) = send_with_headers(app, Method::GET, "/metrics", None, None).await;
+    let text = match body {
+        Value::String(s) => s,
+        other => panic!("expected plain-text body: {other}"),
+    };
+    assert!(
+        text.contains("nanovm_fork_quota_throttled_total{token=\"tok-alph-5\"} 1"),
+        "missing throttle counter:\n{text}"
+    );
+    assert!(text.contains("nanovm_forks_total{token=\"tok-alph-5\"} 1"));
 }
