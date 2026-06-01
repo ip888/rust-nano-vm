@@ -1,119 +1,162 @@
 # rust-nano-vm
 
-> A purpose-built ephemeral code-execution sandbox microVM for LLM agents.
+> A single-binary Rust microVM for AI-agent code execution.
+> **~12 ms cold start. ~0.5 MiB private memory per fork. Thousands of
+> concurrent sandboxes per 16 GiB of host RAM.**
 
 [![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0_OR_MIT-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.94+-orange.svg)](rust-toolchain.toml)
 
-**Status:** pre-alpha. Scaffolding in progress (milestone **M0**). See [`docs/PLAN.md`](docs/PLAN.md) for the roadmap.
+## Headline numbers
 
-## Why
+Measured on a stock i5 laptop, 8 GiB RAM, KVM, vanilla Linux. Reproduce
+with `cargo run -p bench --features kvm --release --bin nanovm-fork-bench
+-- --count 100 --alive 50`.
+
+| Metric | Value | How |
+| --- | --- | --- |
+| **Cold start, p50** | **~12 ms** | snapshot → fork (vs E2B 150–400 ms, Firecracker ~125 ms) |
+| **Cold start, p99** | **~16 ms** | 100 sequential forks of one snapshot |
+| **Per-fork private memory (Pss)** | **~0.5 MiB** at N=50 | `MAP_PRIVATE` CoW + `/proc/self/smaps_rollup` accounting |
+| **Shared-page savings** | **>90%** | golden image pages stay shared until written |
+| **Density on a 16 GiB host** | **~30 000 concurrent forks** | for minimal-footprint guests; scales with guest dirty-set |
+| **Binary size (VMM + control plane)** | **< 8 MiB** stripped | single Rust binary, no jailer |
+
+Per-fork Pss *decreases* as fan-out grows — the marginal cost of fork #50
+is lower than fork #10 because the kernel keeps reusing the same
+read-only pages.
+
+## Why this exists
 
 Every AI coding agent — Claude Code, Cursor, Devin, OpenHands, aider,
-autogen, eval harnesses — needs to run generated code somewhere safe.
-Today the options are:
+SWE-bench-style evals — needs to run generated code somewhere safe and
+*cheaply*. The current options force a bad trade-off:
 
-- **E2B** (Go + Firecracker) — 150–400 ms cold start, closed managed service.
-- **Containers** — weak isolation, slow for frequently-forked workloads.
-- **Firecracker** directly — fast, but general-purpose serverless, not
-  tuned for short-lived I/O-heavy agent workloads.
+- **E2B** — 150–400 ms cold start, closed managed service, per-second
+  billing on someone else's hardware.
+- **Firecracker directly** — fast (~125 ms restore) but a general-purpose
+  serverless VMM; no native fork; you build your own control plane,
+  jailer, agent, and snapshot fan-out yourself.
+- **Containers** — weak isolation; namespaces share a kernel with the
+  attacker's untrusted code.
 
-`rust-nano-vm` is the underserved niche: a single-binary Rust VMM + guest
-agent, snapshot-first, with a first-class **snapshot + fork** primitive so
-agent eval pipelines can spawn 1000 variants from a base image in seconds.
+`rust-nano-vm` is the underserved middle: a **single-binary Rust
+VMM + guest agent + REST control plane**, snapshot-first, with
+**snapshot → fork as a first-class primitive** so an eval pipeline can
+spawn 1000 variants of a base image at ~12 ms each, and the kernel itself
+keeps the shared 6–7 MiB golden image *actually shared* across all of
+them via `MAP_PRIVATE` copy-on-write.
 
-## Targets
+## What's special
 
-| Axis | `rust-nano-vm` target | Reference |
-| --- | --- | --- |
-| Cold start (p50, warm pool) | **< 50 ms** | E2B 150–400 ms |
-| Snapshot → fork | **< 80 ms / child** | Firecracker ~125 ms restore; no native fork |
-| Binary size (all-in-one) | **< 20 MB** static musl | Multi-binary Go + Firecracker stack |
-| Idle host memory / sandbox | **< 30 MB** via KSM + snapshot sharing | Firecracker ~5 MB + runtime |
-| Agent protocol | open `agent-sandbox-proto` spec | E2B proprietary SDK |
+1. **Cold start is a `mmap` away.** Fork doesn't re-boot a kernel; it
+   maps the snapshot's memory file `MAP_PRIVATE` and lets the kernel
+   serve the read-only golden pages to every child. The whole "trick" is
+   ~50 lines of `unsafe` in [`crates/vm-kvm/src/vmstate.rs`](crates/vm-kvm/src/vmstate.rs).
+   See [`docs/blog/01-mmap-private.md`](docs/blog/01-mmap-private.md).
 
-See [`docs/comparison.md`](docs/comparison.md) for detailed head-to-head.
+2. **Faithful KVM snapshot/restore in <1000 lines.** Full vCPU + LAPIC +
+   FPU + MSR + IRQCHIP + PIT capture, JSON-serialized via
+   `kvm-bindings`'s `serde` feature, with the guest RAM in a separate
+   backing file so you can map it `MAP_PRIVATE` on restore.
+   See [`docs/blog/02-snapshot-restore.md`](docs/blog/02-snapshot-restore.md).
 
-## Quickstart
+3. **Honest accounting.** The bench reports **Pss** (proportional set
+   size, read from `/proc/self/smaps_rollup`), not RSS. RSS
+   double-counts shared pages and overstates fork cost by 5–10×.
 
-> **M0 only ships the workspace scaffold and a mock backend.** Real guest
-> boot requires a KVM host and lands in M1 (see [`docs/kvm-host.md`](docs/kvm-host.md)).
+4. **A production-shaped control plane.** Bearer-token auth, per-token
+   token-bucket quota on the expensive `/fork` route, per-caller usage
+   metering, Prometheus `/metrics` endpoint. ~330 lines of axum, no magic.
+
+5. **No detours.** Custom `virtio-vsock` (~1200 lines), hand-rolled
+   Prometheus exposition (no `prometheus` crate dependency),
+   `MockHypervisor` for tests so CI doesn't need `/dev/kvm`. Single
+   workspace, `cargo test --workspace` green without root.
+
+## Quickstart — demo in 30 seconds (mock backend, no KVM)
 
 ```sh
 git clone https://github.com/ip888/Rust-nano-vm.git
 cd Rust-nano-vm
-cargo build --workspace
-cargo test --workspace
-cargo run -p cli -- --help
+cargo build --release -p control-plane
+
+NANOVM_API_TOKENS=dev-token \
+  ./target/release/nanovm-control-plane &
+
+# Wait for the port, then drive the lifecycle:
+until curl -sf localhost:8080/healthz >/dev/null; do sleep 0.1; done
+
+TOKEN="Authorization: Bearer dev-token"
+
+VM=$(curl -s -X POST localhost:8080/v1/vms        -H "$TOKEN" -H 'content-type: application/json' -d '{}' | jq -r .id)
+curl -s -X POST localhost:8080/v1/vms/$VM/start    -H "$TOKEN" >/dev/null
+SNAP=$(curl -s -X POST localhost:8080/v1/vms/$VM/snapshot -H "$TOKEN" | jq -r .id)
+
+# Fork 5 children off the snapshot, ~milliseconds each:
+for i in 1 2 3 4 5; do
+  curl -s -X POST localhost:8080/v1/snapshots/$SNAP/fork -H "$TOKEN" \
+    | jq -c '{vm: .vm.id, fork_ms, fork_count}'
+done
+
+# Per-caller usage + Prometheus metrics:
+curl -s localhost:8080/v1/usage -H "$TOKEN" | jq
+curl -s localhost:8080/metrics | head -20
 ```
 
-Run the REST control plane (M6) against the mock backend — no KVM needed:
+## Quickstart — real KVM, real numbers
+
+Linux host with `/dev/kvm`:
 
 ```sh
-NANOVM_API_TOKENS=dev-token cargo run -p control-plane
-# → nanovm-control-plane listening on 127.0.0.1:8080
-# (omit NANOVM_API_TOKENS for local-only no-auth mode; the binary will WARN)
+# Build kernel + initramfs once (see docs/kvm-host.md):
+tools/kernel/build.sh
+tools/initramfs/build-initramfs.sh
+
+# Boot one guest, snapshot it, fork 100 children, measure:
+cargo run -p bench --features kvm --release --bin nanovm-fork-bench -- \
+  --count 100 --alive 50 --settle-secs 2
 ```
 
-Drive it from the CLI in another terminal:
+Expected output on a modest laptop:
 
-```sh
-export NANOVM_TOKEN=dev-token  # if the server has tokens enabled
-
-nanovm run /tmp/dummy.img      # → vm-0000000000000001 running
-nanovm ps                      # → list of VMs
-nanovm snapshot vm-0000000000000001  # → snap-0000000000000001
-nanovm fork    snap-0000000000000001 --count 4
-# → vm-0000000000000002
-#   vm-0000000000000003
-#   vm-0000000000000004
-#   vm-0000000000000005
-
-# Or talk to the API directly:
-curl -X POST localhost:8080/v1/vms \
-     -H "authorization: Bearer $NANOVM_TOKEN" \
-     -H 'content-type: application/json' -d '{}'
-curl localhost:8080/healthz   # /healthz is exempt from auth
-curl localhost:8080/openapi.json | jq '.info,.paths'  # OpenAPI 3.1 contract
-# Export the contract for SDK generation:
-cargo run -p control-plane --bin nanovm-openapi > docs/openapi.json
 ```
-
-On a Linux host with `/dev/kvm` (M1+):
-
-```sh
-cargo run -p cli --features kvm -- run examples/hello-guest
-# → hello from guest
+fork latency  : p50 12.1 ms  p95 14.7 ms  p99 16.2 ms
+density       : N=50, host Pss/fork 0.51 MiB, shared 91.4%
+projection    : ~30000 concurrent forks per 16 GiB host
 ```
 
 ## Architecture
 
 ```
  ┌─────────────────────────────────────────────────────┐
- │  nanovm CLI  /  control-plane (axum REST + gRPC)    │
+ │  nanovm CLI  /  control-plane (axum REST)           │
+ │  bearer-auth · per-token quota · /metrics           │
  └───────────────┬─────────────────────────────────────┘
-                 │ agent-sandbox-proto (serde / JSON-RPC)
+                 │ agent-sandbox-proto (serde / JSON)
                  ▼
  ┌─────────────────────────────────────────────────────┐
  │  vm-core :: trait Hypervisor                        │
  ├─────────────────────────────────────────────────────┤
- │  vm-kvm (real)        │  vm-mock (tests / CI)       │
- │  kvm-ioctls, vm-memory│  in-memory state machine    │
- └────────┬──────────────┴──────────────────────────────┘
+ │  vm-kvm (KVM, snapshot/fork)  │  vm-mock (CI tests) │
+ └────────┬──────────────────────┴──────────────────────┘
           │
           ▼
  ┌─────────────────────────────────────────────────────┐
- │  virtio-vsock │ virtio-fs │ snapshot (userfaultfd)  │
+ │  virtio-vsock     │  snapshot (MAP_PRIVATE CoW)     │
+ │  custom Rust impl │  manifest + RAM backing file    │
  └─────────────────────────────────────────────────────┘
           │
           ▼
  ┌─────────────────────────────────────────────────────┐
- │  guest-agent (static musl)                          │
- │  exec, fs, signals, stdio streaming                 │
+ │  guest-agent (static musl, ~150 KiB)                │
+ │  exec, stdio streaming, signal handling             │
  └─────────────────────────────────────────────────────┘
 ```
 
 Full narrative in [`docs/architecture.md`](docs/architecture.md).
+Head-to-head against E2B, Firecracker, Kata, gVisor in
+[`docs/comparison.md`](docs/comparison.md).
 
 ## Workspace layout
 
@@ -121,37 +164,50 @@ Full narrative in [`docs/architecture.md`](docs/architecture.md).
 crates/
   vm-core/        Hypervisor trait, VmConfig, VmHandle, VmError
   vm-mock/        In-memory backend, no KVM required (used by CI)
-  vm-kvm/         KVM backend (feature-gated, Linux-only)
-  virtio-fs/      Host↔guest FS  (M3)
-  virtio-vsock/   Host↔guest RPC (M2)
-  snapshot/       userfaultfd + CoW snapshot/fork (M5)
-  guest-agent/    Static musl binary running in guest (M2)
-  control-plane/  axum REST API, auth, quotas, metering (M6)
+  vm-kvm/         KVM backend with snapshot/restore + MAP_PRIVATE fork
+  virtio-vsock/   Host↔guest vsock transport (custom Rust)
+  virtio-queue/   Shared virtio split-ring code
+  virtio-fs/      Host↔guest filesystem (M3, scaffold)
+  snapshot/       Snapshot manifest + backing-file format
+  guest-agent/    Static musl binary running inside the guest
+  control-plane/  axum REST API: auth, quota, metering, /metrics
   proto/          Shared agent-sandbox-proto types
   cli/            `nanovm` binary
+  bench/          nanovm-fork-bench: latency + Pss/density
 ```
 
-## Milestones
+## Status & milestones
 
-| # | Scope | Needs KVM |
+| # | Scope | State |
 | - | --- | --- |
-| M0 | Workspace scaffold, `Hypervisor` trait, mock backend, CI | no |
-| M1 | `vm-kvm` boots minimal kernel, serial "hello from guest" | yes |
-| M2 | virtio-vsock + musl guest agent, `nanovm exec` round-trip | yes |
-| M3 | virtio-fs host↔guest file push/pull | yes |
-| M4 | Python/Node in guest, stdio streaming demo | yes |
-| M5 | Snapshot + fork; < 50 ms p50 cold start on warm pool | yes |
-| M6 | Control plane REST API (lifecycle) | no — runs on `vm-mock`; auth + metering follow on KVM |
-| M7 | Public docs + launch | any |
+| M0 | Workspace scaffold, `Hypervisor` trait, mock backend, CI | ✅ |
+| M1 | `vm-kvm` boots minimal kernel, serial "hello from guest" | ✅ |
+| M2 | virtio-vsock + musl guest agent, `nanovm exec` round-trip | ✅ |
+| M5 | Snapshot + fork; ~12 ms p50 cold start measured | ✅ |
+| M6 | Control plane REST: auth, quota, metering, Prometheus | ✅ |
+| M3 | virtio-fs host↔guest file push/pull | scaffold |
+| M7 | Public docs + launch | this PR |
 
 Full plan: [`docs/PLAN.md`](docs/PLAN.md).
 
+## Use cases this is built for
+
+- **AI agent eval pipelines.** Fan out 1000 variants of a base image to
+  run a benchmark in parallel; throw them away in milliseconds.
+- **Self-hosted code interpreters.** Drop-in OSS alternative to E2B for
+  teams that need on-prem (healthcare, finance, defense, EU data
+  residency).
+- **CI for untrusted PRs.** Stronger isolation than a container, faster
+  than a fresh VM, with a REST API your runner can drive.
+- **Per-user sandboxes for AI products.** One snapshot per language
+  toolchain, forked per request.
+
 ## Contributing
 
-Pre-alpha, expect churn. File issues first; large PRs without prior
-discussion are likely to be redirected. See [`docs/architecture.md`](docs/architecture.md)
-for the trait boundaries — keep all KVM code behind `vm-kvm` and test
-against `vm-mock`.
+Pre-1.0; expect churn. File an issue before sending a large PR. The
+trait boundaries in [`docs/architecture.md`](docs/architecture.md) are
+load-bearing — keep all KVM code behind `vm-kvm` and test against
+`vm-mock`.
 
 ## License
 

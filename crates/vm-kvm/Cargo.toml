@@ -5,7 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "KVM-backed Hypervisor implementation. Linux-only, feature-gated."
+description = "KVM-backed microVM with snapshot/restore and MAP_PRIVATE fork-many. Linux-only, feature-gated."
+keywords = ["kvm", "microvm", "snapshot", "fork", "virtualization"]
+categories = ["virtualization", "os::linux-apis"]
+readme = "../../README.md"
 
 [dependencies]
 vm-core.workspace = true
