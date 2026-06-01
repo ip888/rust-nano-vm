@@ -951,3 +951,154 @@ async fn read_file_nonexistent_path_returns_backend_error() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "got {body:?}");
     assert_eq!(body["error"]["code"], "backend");
 }
+
+// ---- /v1/snapshots/:id/fork + /v1/usage --------------------------------
+
+async fn snapshot_a_fresh_vm(app: &Router, bearer: Option<&str>) -> u64 {
+    let (_, vm) = send_with(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        bearer,
+    )
+    .await;
+    let vm_id = vm["id"].as_u64().unwrap();
+    let (status, snap) = send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm_id}/snapshot"),
+        None,
+        bearer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    snap["id"].as_u64().unwrap()
+}
+
+#[tokio::test]
+async fn fork_returns_handle_with_latency_and_per_token_count() {
+    let app = app_with_tokens(ApiTokens::from_csv("customer-alpha"));
+    let snap = snapshot_a_fresh_vm(&app, Some("customer-alpha")).await;
+
+    let (status, body) = send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/snapshots/{snap}/fork"),
+        None,
+        Some("customer-alpha"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body["vm"]["id"].is_u64(), "fork returns a new VM handle");
+    assert!(body["fork_ms"].is_u64(), "fork carries latency in ms");
+    assert_eq!(body["fork_count"], 1, "first fork bumps the counter to 1");
+    assert!(body["fork_total_ms"].is_u64());
+}
+
+#[tokio::test]
+async fn two_forks_accumulate_per_token() {
+    let app = app_with_tokens(ApiTokens::from_csv("customer-alpha"));
+    let snap = snapshot_a_fresh_vm(&app, Some("customer-alpha")).await;
+
+    let path = format!("/v1/snapshots/{snap}/fork");
+    let (_, a) = send_with(
+        app.clone(),
+        Method::POST,
+        &path,
+        None,
+        Some("customer-alpha"),
+    )
+    .await;
+    let (_, b) = send_with(
+        app.clone(),
+        Method::POST,
+        &path,
+        None,
+        Some("customer-alpha"),
+    )
+    .await;
+    assert_eq!(a["fork_count"], 1);
+    assert_eq!(b["fork_count"], 2);
+    assert!(
+        b["fork_total_ms"].as_u64().unwrap() >= a["fork_total_ms"].as_u64().unwrap(),
+        "fork_total_ms is monotonic"
+    );
+}
+
+#[tokio::test]
+async fn usage_endpoint_reports_per_token_counts() {
+    let app = app_with_tokens(ApiTokens::from_csv("customer-alpha"));
+    let snap = snapshot_a_fresh_vm(&app, Some("customer-alpha")).await;
+
+    // Fork twice as alpha.
+    let path = format!("/v1/snapshots/{snap}/fork");
+    let _ = send_with(
+        app.clone(),
+        Method::POST,
+        &path,
+        None,
+        Some("customer-alpha"),
+    )
+    .await;
+    let _ = send_with(
+        app.clone(),
+        Method::POST,
+        &path,
+        None,
+        Some("customer-alpha"),
+    )
+    .await;
+
+    let (status, usage) = send_with(
+        app.clone(),
+        Method::GET,
+        "/v1/usage",
+        None,
+        Some("customer-alpha"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(usage["fork_count"], 2);
+    assert!(usage["fork_total_ms"].is_u64());
+    // Fingerprint never leaks the raw bearer token.
+    let token_field = usage["token"].as_str().unwrap();
+    assert!(token_field.starts_with("tok-"));
+    assert!(!token_field.contains("customer-alpha"));
+}
+
+#[tokio::test]
+async fn fork_counts_are_isolated_between_tokens() {
+    let app = app_with_tokens(ApiTokens::from_csv("alpha,beta"));
+    let snap = snapshot_a_fresh_vm(&app, Some("alpha")).await;
+
+    let path = format!("/v1/snapshots/{snap}/fork");
+    let _ = send_with(app.clone(), Method::POST, &path, None, Some("alpha")).await;
+    let _ = send_with(app.clone(), Method::POST, &path, None, Some("alpha")).await;
+    let _ = send_with(app.clone(), Method::POST, &path, None, Some("beta")).await;
+
+    let (_, ua) = send_with(app.clone(), Method::GET, "/v1/usage", None, Some("alpha")).await;
+    let (_, ub) = send_with(app.clone(), Method::GET, "/v1/usage", None, Some("beta")).await;
+    assert_eq!(ua["fork_count"], 2);
+    assert_eq!(ub["fork_count"], 1);
+}
+
+#[tokio::test]
+async fn usage_without_bearer_returns_unauthorized() {
+    // Auth disabled (empty token set) — fork itself works, but /usage still
+    // demands a bearer because counts are keyed on it.
+    let app = app();
+    let snap = snapshot_a_fresh_vm(&app, None).await;
+    let (fork_status, _) = send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/snapshots/{snap}/fork"),
+        None,
+    )
+    .await;
+    assert_eq!(fork_status, StatusCode::CREATED);
+
+    let (usage_status, body) = send(app.clone(), Method::GET, "/v1/usage", None).await;
+    assert_eq!(usage_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["code"], "unauthorized");
+}

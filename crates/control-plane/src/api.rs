@@ -100,6 +100,34 @@ impl From<VmHandle> for VmHandleDto {
     }
 }
 
+/// Response body for `POST /v1/snapshots/{id}/fork`. Carries the new VM
+/// handle plus the per-fork latency (the headline product number) and the
+/// caller's running fork-usage totals so a client can show live billing
+/// without a separate `GET /v1/usage` round-trip.
+#[derive(Debug, Serialize)]
+pub(crate) struct ForkResponseDto {
+    pub vm: VmHandleDto,
+    /// Wall-time of the fork in milliseconds (server-measured).
+    pub fork_ms: u64,
+    /// Total successful forks performed by this caller's token.
+    pub fork_count: u64,
+    /// Sum of `fork_ms` across this caller's history (rough cost basis).
+    pub fork_total_ms: u64,
+}
+
+/// Response body for `GET /v1/usage` — the caller's per-token fork counts.
+/// The token is reported as a non-cryptographic fingerprint so the body is
+/// safe to log; the raw bearer never leaves the request.
+#[derive(Debug, Serialize)]
+pub(crate) struct UsageResponseDto {
+    /// `tok-<first4>-<len>` fingerprint of the caller's bearer token.
+    pub token: String,
+    /// Total successful forks performed by this token.
+    pub fork_count: u64,
+    /// Sum of per-fork wall-time (ms) charged to this token.
+    pub fork_total_ms: u64,
+}
+
 /// Response body for `GET /v1/vms`. Wraps a list rather than returning a
 /// bare JSON array so we can add pagination / filter metadata at the
 /// envelope level later without breaking clients.
