@@ -10,16 +10,37 @@
 //! process RSS before/after the run.
 //!
 //! This is the "what to put in front of a customer" artifact for the
-//! snapshot-once-fork-many moat.
+//! snapshot-once-fork-many moat. Build with `--features kvm`:
+//!
+//!     cargo run -p bench --release --features kvm --bin nanovm-fork-bench
+//!
+//! Without the feature the binary builds (so it lands in default workspace
+//! checks) but refuses to run.
 
+#[cfg(not(feature = "kvm"))]
+fn main() {
+    eprintln!(
+        "nanovm-fork-bench: build with --features kvm, e.g. \
+         `cargo run -p bench --release --features kvm --bin nanovm-fork-bench`",
+    );
+    std::process::exit(2);
+}
+
+#[cfg(feature = "kvm")]
 use std::path::PathBuf;
+#[cfg(feature = "kvm")]
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "kvm")]
 use anyhow::{anyhow, Context, Result};
+#[cfg(feature = "kvm")]
 use clap::Parser;
+#[cfg(feature = "kvm")]
 use vm_core::{Hypervisor, VmConfig, VmId};
+#[cfg(feature = "kvm")]
 use vm_kvm::KvmHypervisor;
 
+#[cfg(feature = "kvm")]
 #[derive(Parser, Debug)]
 #[command(version, about = "Measure nanovm fork latency and host RSS")]
 struct Args {
@@ -49,6 +70,7 @@ struct Args {
     progress_every: usize,
 }
 
+#[cfg(feature = "kvm")]
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.forks == 0 {
@@ -148,11 +170,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "kvm")]
 fn finalize(hv: &KvmHypervisor, id: VmId) {
     let _ = hv.stop(id);
     let _ = hv.destroy(id);
 }
 
+#[cfg(feature = "kvm")]
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
     if sorted.is_empty() {
         return Duration::ZERO;
@@ -163,6 +187,7 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
 
 /// Read this process's resident-set size from `/proc/self/status` in KiB.
 /// `None` if the file is unavailable or the field is missing.
+#[cfg(feature = "kvm")]
 fn rss_kib() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {
@@ -173,6 +198,7 @@ fn rss_kib() -> Option<u64> {
     None
 }
 
+#[cfg(feature = "kvm")]
 fn print_results(
     latencies: &[Duration],
     total: Duration,
