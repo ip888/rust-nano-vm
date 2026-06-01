@@ -5,7 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Snapshot format and CoW backing-file layout for rust-nano-vm."
+description = "Snapshot format and CoW backing-file layout for rust-nano-vm: portable manifest + page-aligned RAM image suitable for mmap(MAP_PRIVATE)."
+keywords = ["snapshot", "microvm", "cow", "mmap", "virtualization"]
+categories = ["virtualization", "filesystem"]
+readme = "../../README.md"
 
 [dependencies]
 thiserror.workspace = true

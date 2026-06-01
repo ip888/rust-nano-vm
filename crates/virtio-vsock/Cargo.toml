@@ -5,7 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "virtio-vsock transport for host<->guest-agent RPC."
+description = "Custom virtio-vsock device for host<->guest-agent RPC inside a microVM."
+keywords = ["virtio", "vsock", "microvm", "kvm", "virtualization"]
+categories = ["virtualization", "network-programming"]
+readme = "../../README.md"
 
 [dependencies]
 thiserror.workspace = true
