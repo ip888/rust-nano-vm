@@ -68,6 +68,20 @@ struct Args {
     /// Print every Nth fork's per-fork latency for visibility.
     #[arg(long, default_value_t = 10)]
     progress_every: usize,
+
+    /// Density mode: spin up this many forks and keep them alive while we
+    /// sample host RSS + Pss. `0` skips the density phase. The Pss number
+    /// (proportional set size; `/proc/self/smaps_rollup`) is the right
+    /// per-fork accounting because pages shared via the snapshot file's
+    /// `mmap(MAP_PRIVATE)` count fractionally — exactly the unit
+    /// economics of fork-many.
+    #[arg(long, default_value_t = 0)]
+    alive: usize,
+
+    /// Seconds to let the alive forks settle before sampling memory so
+    /// the page cache + guest working set stabilise.
+    #[arg(long, default_value_t = 5)]
+    settle_secs: u64,
 }
 
 #[cfg(feature = "kvm")]
@@ -161,13 +175,134 @@ fn main() -> Result<()> {
     let total = bench_start.elapsed();
     let rss_after_kib = rss_kib();
 
-    // 4) Cleanup.
+    // 4) Latency report.
+    print_results(&latencies, total, rss_before_kib, rss_after_kib);
+
+    // 5) Density phase: spin up `--alive N` forks, keep them alive, sample.
+    if args.alive > 0 {
+        run_density_phase(&hv, snap, args.alive, args.settle_secs)?;
+    }
+
+    // 6) Cleanup.
     finalize(&hv, golden.id);
     let _ = hv.delete_snapshot(snap);
 
-    // 5) Report.
-    print_results(&latencies, total, rss_before_kib, rss_after_kib);
     Ok(())
+}
+
+/// Spin up `n` forks, keep them alive for `settle_secs`, sample the host's
+/// RSS + Pss, then tear them down. Reports per-fork Pss (the
+/// page-cache-aware accounting) plus the "savings vs. naive N × baseline"
+/// — the headline density number.
+#[cfg(feature = "kvm")]
+fn run_density_phase(
+    hv: &KvmHypervisor,
+    snap: vm_core::SnapshotId,
+    n: usize,
+    settle_secs: u64,
+) -> Result<()> {
+    println!();
+    println!("=== density phase ===");
+    println!("forks alive: {n}");
+    let baseline_rss = rss_kib();
+    let baseline_pss = pss_kib();
+
+    let mut alive = Vec::with_capacity(n);
+    let phase_start = Instant::now();
+    for i in 0..n {
+        let fork = hv
+            .restore(snap)
+            .with_context(|| format!("density fork #{i} restore"))?;
+        alive.push(fork);
+    }
+    let restore_total = phase_start.elapsed();
+
+    println!("settling for {settle_secs}s while {n} forks busy-spin...");
+    std::thread::sleep(Duration::from_secs(settle_secs));
+
+    let after_rss = rss_kib();
+    let after_pss = pss_kib();
+
+    // Tear the forks down before printing — keeps the host clean even if
+    // the report panics.
+    for h in &alive {
+        finalize(hv, h.id);
+    }
+
+    println!();
+    println!("alive forks restore total: {restore_total:?}");
+    print_density(n, baseline_rss, after_rss, baseline_pss, after_pss);
+    Ok(())
+}
+
+/// Pretty-print the density numbers, including the shared-page savings
+/// ratio — the headline product number for "how many sandboxes fit".
+#[cfg(feature = "kvm")]
+fn print_density(
+    n: usize,
+    baseline_rss_kib: Option<u64>,
+    after_rss_kib: Option<u64>,
+    baseline_pss_kib: Option<u64>,
+    after_pss_kib: Option<u64>,
+) {
+    let report = |label: &str, before: Option<u64>, after: Option<u64>| -> Option<f64> {
+        match (before, after) {
+            (Some(b), Some(a)) => {
+                let delta = a as i64 - b as i64;
+                let per_fork_kib = delta as f64 / n as f64;
+                let per_fork_mib = per_fork_kib / 1024.0;
+                println!(
+                    "{label:>7}: before {} KiB → after {} KiB (Δ {:+} KiB; per fork {:.1} KiB = {:.2} MiB)",
+                    b, a, delta, per_fork_kib, per_fork_mib,
+                );
+                Some(per_fork_kib)
+            }
+            _ => {
+                println!("{label:>7}: (unavailable)");
+                None
+            }
+        }
+    };
+    let per_fork_rss = report("RSS", baseline_rss_kib, after_rss_kib);
+    let per_fork_pss = report("Pss", baseline_pss_kib, after_pss_kib);
+
+    if let (Some(rss), Some(pss)) = (per_fork_rss, per_fork_pss) {
+        if rss > 0.0 {
+            let savings = (rss - pss) / rss * 100.0;
+            println!();
+            println!(
+                "shared-page savings (RSS → Pss): {savings:.1}%  \
+                 (per-fork Pss {pss:.1} KiB vs. RSS {rss:.1} KiB)"
+            );
+        }
+        // Project density: how many fit in 16 GiB after subtracting the
+        // baseline (kernel + control-plane + golden VM).
+        if let (Some(base), Some(per)) = (baseline_pss_kib, Some(pss)) {
+            let host_budget_kib: f64 = 16.0 * 1024.0 * 1024.0;
+            let usable_kib = host_budget_kib - base as f64;
+            if per > 0.0 {
+                let fits = (usable_kib / per).floor();
+                println!(
+                    "projection (16 GiB host, Pss accounting): \
+                     ~{fits:.0} concurrent forks fit"
+                );
+            }
+        }
+    }
+}
+
+/// Read this process's Pss (proportional set size, accounting for shared
+/// pages fractionally) from `/proc/self/smaps_rollup`. `None` if the file
+/// or field is missing (kernels < 4.14 didn't expose this).
+#[cfg(feature = "kvm")]
+fn pss_kib() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("Pss:") {
+            return rest.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
 }
 
 #[cfg(feature = "kvm")]
