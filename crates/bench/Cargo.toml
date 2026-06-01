@@ -1,0 +1,31 @@
+[package]
+name = "bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "nanovm-fork-bench: measures fork latency (P50/P95/P99) and host RSS for the snapshot/fork data plane."
+
+[[bin]]
+name = "nanovm-fork-bench"
+path = "src/main.rs"
+
+[dependencies]
+vm-core.workspace = true
+vm-kvm = { workspace = true }
+clap.workspace = true
+anyhow.workspace = true
+
+# The bench is a KVM-only tool, but enabling `vm-kvm/kvm` *unconditionally*
+# turns the feature on for every other workspace member that depends on
+# `vm-kvm` — including `cargo test --workspace` runs of `vm-kvm`'s own
+# integration tests, which then require `/dev/kvm` in CI. Keep `kvm`
+# opt-in here so `cargo build --workspace` (and CI's default test job)
+# stays portable; users build the bench with `--features kvm`.
+[features]
+default = []
+kvm = ["vm-kvm/kvm"]
+
+[lints]
+workspace = true

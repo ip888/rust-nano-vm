@@ -12,6 +12,7 @@ members = [
     "crates/control-plane",
     "crates/proto",
     "crates/cli",
+    "crates/bench",
 ]
 
 [workspace.package]
