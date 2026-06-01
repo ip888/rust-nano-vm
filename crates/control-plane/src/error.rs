@@ -43,6 +43,17 @@ pub(crate) enum ApiError {
     /// parses the request body itself (bypassing axum's JSON extractor).
     /// Renders as 400 with `code: "bad_request"`.
     Bad(String),
+    /// Per-token quota exceeded. Renders as 429 with the `Retry-After`
+    /// header set to `retry_after_secs` and the structured envelope
+    /// `{ error: { code, message } }`.
+    TooManyRequests {
+        /// Stable machine-readable code (e.g. `"fork_quota_exceeded"`).
+        code: &'static str,
+        /// Human-readable detail surfaced to the client.
+        message: String,
+        /// Seconds the client should wait before retrying.
+        retry_after_secs: u64,
+    },
 }
 
 impl From<VmError> for ApiError {
@@ -76,6 +87,23 @@ struct ErrorBody<'a> {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // 429 needs a Retry-After header in addition to the JSON envelope, so
+        // build it directly rather than going through the (status, body) path.
+        if let ApiError::TooManyRequests {
+            code,
+            message,
+            retry_after_secs,
+        } = self
+        {
+            let body = Json(ErrorEnvelope {
+                error: ErrorBody { code, message },
+            });
+            let mut resp = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+            if let Ok(v) = retry_after_secs.to_string().parse() {
+                resp.headers_mut().insert("retry-after", v);
+            }
+            return resp;
+        }
         let (status, code, message) = match self {
             ApiError::Vm(e) => {
                 let msg = e.to_string();
@@ -98,6 +126,9 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "unauthorized", msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", msg.into()),
             ApiError::Bad(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg),
+            ApiError::TooManyRequests { .. } => {
+                unreachable!("TooManyRequests handled above with Retry-After header")
+            }
         };
         let body = Json(ErrorEnvelope {
             error: ErrorBody { code, message },
