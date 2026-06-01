@@ -65,6 +65,9 @@ pub struct AppState {
     hypervisor: Arc<dyn Hypervisor>,
     /// Per-token fork counters keyed by bearer-token. Locked briefly per call.
     fork_usage: Arc<Mutex<HashMap<String, ForkUsage>>>,
+    /// Per-token fork rate limiter. Shared `Arc` so handlers can poll
+    /// without contending on `AppState`'s clone.
+    fork_quota: Arc<crate::ForkQuota>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -77,11 +80,24 @@ impl std::fmt::Debug for AppState {
 }
 
 impl AppState {
-    /// Construct a new [`AppState`] wrapping the given hypervisor.
+    /// Construct a new [`AppState`] wrapping the given hypervisor. The
+    /// fork quota defaults to the values from
+    /// [`ForkQuota::from_env`](crate::ForkQuota::from_env); use
+    /// [`with_fork_quota`](Self::with_fork_quota) for an explicit override.
     pub fn new(hypervisor: Arc<dyn Hypervisor>) -> Self {
+        Self::with_fork_quota(hypervisor, Arc::new(crate::ForkQuota::from_env()))
+    }
+
+    /// Construct an [`AppState`] with an explicit [`ForkQuota`]. Useful
+    /// in tests that want a tight bucket without env juggling.
+    pub fn with_fork_quota(
+        hypervisor: Arc<dyn Hypervisor>,
+        fork_quota: Arc<crate::ForkQuota>,
+    ) -> Self {
         Self {
             hypervisor,
             fork_usage: Arc::new(Mutex::new(HashMap::new())),
+            fork_quota,
         }
     }
 }
@@ -268,13 +284,23 @@ async fn fork_snapshot(
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<ForkResponseDto>), ApiError> {
     let Path(id) = id?;
+    let bearer = extract_bearer(&headers);
+    // Gate before doing any work — quota exhaustion is the common bad-day
+    // signal, so it should be cheap to surface.
+    if let Err(retry_after_secs) = state.fork_quota.try_acquire(bearer.as_deref()) {
+        return Err(ApiError::TooManyRequests {
+            code: "fork_quota_exceeded",
+            message: format!("fork quota exceeded; retry after {retry_after_secs} second(s)"),
+            retry_after_secs,
+        });
+    }
     let started = Instant::now();
     let handle = state.hypervisor.restore(SnapshotId(id))?;
     let fork_ms = started.elapsed().as_millis() as u64;
 
     let mut fork_count = 1u64;
     let mut fork_total_ms = fork_ms;
-    if let Some(token) = extract_bearer(&headers) {
+    if let Some(token) = bearer {
         let mut usage = state
             .fork_usage
             .lock()
