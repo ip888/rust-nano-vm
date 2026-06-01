@@ -68,6 +68,8 @@ pub struct AppState {
     /// Per-token fork rate limiter. Shared `Arc` so handlers can poll
     /// without contending on `AppState`'s clone.
     fork_quota: Arc<crate::ForkQuota>,
+    /// Prometheus counters exposed at `/metrics`.
+    metrics: Arc<crate::Metrics>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -98,7 +100,15 @@ impl AppState {
             hypervisor,
             fork_usage: Arc::new(Mutex::new(HashMap::new())),
             fork_quota,
+            metrics: Arc::new(crate::Metrics::new()),
         }
+    }
+
+    /// Borrow the metrics collector. Test-only API for asserting on
+    /// recorded counters without going through `/metrics`.
+    #[doc(hidden)]
+    pub fn metrics(&self) -> &Arc<crate::Metrics> {
+        &self.metrics
     }
 }
 
@@ -143,6 +153,10 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/openapi.json", get(openapi))
+        // /metrics is on the outer router (no auth). Operators that don't
+        // want it publicly reachable should bind to 127.0.0.1 or restrict
+        // at the reverse proxy — same convention as Prometheus exporters.
+        .route("/metrics", get(metrics_text))
         .nest("/v1", v1)
         .layer(TraceLayer::new_for_http())
 }
@@ -153,6 +167,17 @@ async fn healthz() -> &'static str {
 
 async fn openapi() -> Json<serde_json::Value> {
     Json(openapi_spec())
+}
+
+/// `GET /metrics` — Prometheus text exposition. Unauthenticated by design
+/// so scrapers don't carry secrets.
+async fn metrics_text(
+    State(state): State<AppState>,
+) -> ([(&'static str, &'static str); 1], String) {
+    (
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        state.metrics.render_text(),
+    )
 }
 
 // Each handler takes extractors as `Result<Extractor, Rejection>` and `?`s the
@@ -288,6 +313,11 @@ async fn fork_snapshot(
     // Gate before doing any work — quota exhaustion is the common bad-day
     // signal, so it should be cheap to surface.
     if let Err(retry_after_secs) = state.fork_quota.try_acquire(bearer.as_deref()) {
+        let fp = bearer
+            .as_deref()
+            .map(token_fingerprint)
+            .unwrap_or_else(|| "anonymous".to_owned());
+        state.metrics.record_throttled(&fp);
         return Err(ApiError::TooManyRequests {
             code: "fork_quota_exceeded",
             message: format!("fork quota exceeded; retry after {retry_after_secs} second(s)"),
@@ -300,6 +330,11 @@ async fn fork_snapshot(
 
     let mut fork_count = 1u64;
     let mut fork_total_ms = fork_ms;
+    let fp = bearer
+        .as_deref()
+        .map(token_fingerprint)
+        .unwrap_or_else(|| "anonymous".to_owned());
+    state.metrics.record_fork(&fp, fork_ms);
     if let Some(token) = bearer {
         let mut usage = state
             .fork_usage

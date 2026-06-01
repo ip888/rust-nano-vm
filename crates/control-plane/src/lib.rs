@@ -43,9 +43,11 @@ mod api;
 mod auth;
 mod error;
 pub mod fork_quota;
+pub mod metrics;
 mod routes;
 
 pub use api::openapi_spec;
 pub use auth::ApiTokens;
 pub use fork_quota::ForkQuota;
+pub use metrics::Metrics;
 pub use routes::{router, AppState};
