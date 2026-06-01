@@ -13,9 +13,19 @@ path = "src/main.rs"
 
 [dependencies]
 vm-core.workspace = true
-vm-kvm = { workspace = true, features = ["kvm"] }
+vm-kvm = { workspace = true }
 clap.workspace = true
 anyhow.workspace = true
+
+# The bench is a KVM-only tool, but enabling `vm-kvm/kvm` *unconditionally*
+# turns the feature on for every other workspace member that depends on
+# `vm-kvm` — including `cargo test --workspace` runs of `vm-kvm`'s own
+# integration tests, which then require `/dev/kvm` in CI. Keep `kvm`
+# opt-in here so `cargo build --workspace` (and CI's default test job)
+# stays portable; users build the bench with `--features kvm`.
+[features]
+default = []
+kvm = ["vm-kvm/kvm"]
 
 [lints]
 workspace = true
