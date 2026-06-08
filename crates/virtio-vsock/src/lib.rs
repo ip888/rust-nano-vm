@@ -12,8 +12,9 @@
 //!   that transitions between `Closed`, `Listen`, `SynSent`, `Established`,
 //!   `CloseWait`, `FinWait`, and `TimeWait` in response to incoming packets.
 //!
-//! Deferred to follow-up PRs: the virtqueue consumer loop, packet buffer
-//! pool, vm-kvm wiring.
+//! The virtqueue consumer loop and `vm-kvm` device wiring live in the
+//! `vm-kvm` crate; this crate is the transport-independent protocol and
+//! connection state.
 //!
 //! # Wire format
 //!

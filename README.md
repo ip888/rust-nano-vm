@@ -167,7 +167,7 @@ crates/
   vm-kvm/         KVM backend with snapshot/restore + MAP_PRIVATE fork
   virtio-vsock/   Host↔guest vsock transport (custom Rust)
   virtio-queue/   Shared virtio split-ring code
-  virtio-fs/      Host↔guest filesystem (M3, scaffold)
+  virtio-fs/      Host↔guest filesystem (in progress)
   snapshot/       Snapshot manifest + backing-file format
   guest-agent/    Static musl binary running inside the guest
   control-plane/  axum REST API: auth, quota, metering, /metrics
@@ -176,19 +176,18 @@ crates/
   bench/          nanovm-fork-bench: latency + Pss/density
 ```
 
-## Status & milestones
+## Status
 
-| # | Scope | State |
-| - | --- | --- |
-| M0 | Workspace scaffold, `Hypervisor` trait, mock backend, CI | ✅ |
-| M1 | `vm-kvm` boots minimal kernel, serial "hello from guest" | ✅ |
-| M2 | virtio-vsock + musl guest agent, `nanovm exec` round-trip | ✅ |
-| M5 | Snapshot + fork; ~12 ms p50 cold start measured | ✅ |
-| M6 | Control plane REST: auth, quota, metering, Prometheus | ✅ |
-| M3 | virtio-fs host↔guest file push/pull | scaffold |
-| M7 | Public docs + launch | this PR |
+| Component | State |
+| --- | --- |
+| Workspace, `Hypervisor` trait, mock backend, CI | ✅ |
+| `vm-kvm` boots minimal kernel; serial output end-to-end | ✅ |
+| virtio-vsock + musl guest agent, `nanovm exec` round-trip | ✅ |
+| Snapshot + fork; ~12 ms p50 cold start, measured | ✅ |
+| Control plane REST: auth, quota, metering, Prometheus | ✅ |
+| virtio-fs host↔guest file push/pull | in progress |
 
-Full plan: [`docs/PLAN.md`](docs/PLAN.md).
+Pre-1.0. Full roadmap in [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Use cases this is built for
 
@@ -201,6 +200,24 @@ Full plan: [`docs/PLAN.md`](docs/PLAN.md).
   than a fresh VM, with a REST API your runner can drive.
 - **Per-user sandboxes for AI products.** One snapshot per language
   toolchain, forked per request.
+
+## Built with AI assistance
+
+This project is developed by one engineer with substantial
+pair-programming help from Claude (Anthropic) and GitHub Copilot. The
+agentic workflow is visible in `git log` — many line-level changes were
+drafted by an AI agent, then reviewed, tested, integrated, and committed
+by me.
+
+Architecture decisions, the choice of the snapshot-fork primitive as
+the wedge, the wire format, the API surface, the performance targets,
+and what ships when are mine. The code is the artifact — to evaluate
+the project, read
+[`crates/vm-kvm/src/vmstate.rs`](crates/vm-kvm/src/vmstate.rs)
+(`MAP_PRIVATE` fork-many, snapshot/restore),
+[`crates/snapshot/`](crates/snapshot/) (on-disk format, userfaultfd CoW
+fault handler), and [`crates/bench/`](crates/bench/) (the headline
+numbers above are reproducible on any KVM host).
 
 ## Contributing
 

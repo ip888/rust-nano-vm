@@ -82,7 +82,7 @@
   <div class="cta">
     <a class="btn primary" href="https://github.com/ip888/Rust-nano-vm">Star on GitHub</a>
     <a class="btn" href="https://github.com/ip888/Rust-nano-vm#quickstart--demo-in-30-seconds-mock-backend-no-kvm">30-second demo</a>
-    <a class="btn" href="blog/01-mmap-private.html">Read the trick</a>
+    <a class="btn" href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/blog/01-mmap-private.md">Read the trick</a>
   </div>
 </header>
 
@@ -137,12 +137,12 @@ all of them via <code>MAP_PRIVATE</code> copy-on-write.
   <li><strong>Cold start is a <code>mmap</code> away.</strong> Fork doesn't re-boot a
   kernel — it maps the snapshot's RAM file <code>MAP_PRIVATE</code> and lets
   the kernel serve the read-only golden pages to every child.
-  <a href="blog/01-mmap-private.html">Read the write-up →</a></li>
+  <a href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/blog/01-mmap-private.md">Read the write-up →</a></li>
 
   <li><strong>Faithful KVM snapshot/restore in &lt;1000 lines.</strong> Full vCPU +
   LAPIC + FPU + MSR + IRQCHIP + PIT capture, JSON-serialized via
   <code>kvm-bindings</code>'s <code>serde</code> feature.
-  <a href="blog/02-snapshot-restore.html">Read the write-up →</a></li>
+  <a href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/blog/02-snapshot-restore.md">Read the write-up →</a></li>
 
   <li><strong>Honest accounting.</strong> The bench reports <strong>Pss</strong>
   (proportional set size, from <code>/proc/self/smaps_rollup</code>), not RSS.
@@ -195,8 +195,8 @@ curl -s localhost:8080/metrics  | head -20</code></pre>
     <a href="https://github.com/ip888/Rust-nano-vm">GitHub</a> ·
     <a href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/architecture.md">Architecture</a> ·
     <a href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/comparison.md">Comparison</a> ·
-    <a href="blog/01-mmap-private.html">Blog: MAP_PRIVATE</a> ·
-    <a href="blog/02-snapshot-restore.html">Blog: snapshot/restore</a>
+    <a href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/blog/01-mmap-private.md">Blog: MAP_PRIVATE</a> ·
+    <a href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/blog/02-snapshot-restore.md">Blog: snapshot/restore</a>
   </p>
   <p>Apache-2.0 OR MIT. Issues and discussion on <a href="https://github.com/ip888/Rust-nano-vm/issues">GitHub</a>.</p>
 </footer>

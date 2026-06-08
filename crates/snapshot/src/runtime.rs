@@ -1,4 +1,4 @@
-//! Snapshot runtime scaffolding for userfaultfd-driven CoW paging.
+//! Snapshot runtime for userfaultfd-driven CoW paging.
 //!
 //! This module is intentionally Linux-agnostic at the syscall boundary so it
 //! remains unit-testable on any host. It provides:
