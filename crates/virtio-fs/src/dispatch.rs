@@ -1,4 +1,4 @@
-//! FUSE request dispatch scaffolding.
+//! FUSE request dispatch.
 //!
 //! This module bridges the wire format (byte slices from virtqueue descriptor
 //! chains) and host-side filesystem logic:

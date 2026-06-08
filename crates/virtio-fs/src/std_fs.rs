@@ -1,9 +1,5 @@
 //! `FuseHandler` backed by the host filesystem via `std::fs`.
 //!
-//! This is the first offline-implementable step toward end-to-end `virtio-fs`:
-//! the request parsing and dispatch loop already exist, so a real handler gives
-//! us unit-testable semantics before any KVM/virtqueue plumbing lands.
-//!
 //! Scope:
 //! - Rooted at a caller-provided host directory.
 //! - Supports the common file-copy path (`Lookup`, `Getattr`, `Open`, `Read`,
@@ -11,8 +7,8 @@
 //!   `Readdir`, `Statfs`, `Release`, `Releasedir`, `Flush`, `Fsync`).
 //! - Uses internal node IDs / file handles; they do not attempt to mirror the
 //!   host inode number / file descriptor values.
-//! - Deliberately keeps special files (`mknod` for device nodes, ownership /
-//!   timestamp updates in `setattr`, ...) out of scope for now.
+//! - Special files (`mknod` for device nodes, ownership / timestamp updates in
+//!   `setattr`, ...) are out of scope.
 
 #![allow(clippy::struct_excessive_bools)]
 
