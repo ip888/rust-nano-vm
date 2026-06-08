@@ -8,6 +8,21 @@ the launch is to get the project in front of:
 3. Hiring managers at companies that *need* this primitive (E2B, Modal,
    Replit, Together, regulated-industry MLOps).
 
+## Files in this directory
+
+| File | When to use it |
+| --- | --- |
+| [`public-flip.md`](public-flip.md) | **READ FIRST.** The exact GitHub clicks to make the repo public and protect `main`. ~20 min. Do this before anything else. |
+| [`launch-day.md`](launch-day.md) | The minute-by-minute runbook for the day you launch. Open it as a tab and follow start to finish. |
+| [`hn-show.md`](hn-show.md) | Show HN submission: title + first-author-comment, ready to paste. |
+| [`reddit-rust.md`](reddit-rust.md) | /r/rust post body + posting notes. |
+| [`twitter-thread.md`](twitter-thread.md) | 7-tweet X thread, ≤280 chars each. |
+| [`response-templates.md`](response-templates.md) | Pre-written replies for the top 20 things people will ask in the first week. Open as a tab on launch day. |
+
+Also relevant — lives outside `docs/launch/`:
+
+- [`docs/integration/nanolambda-readme-draft.md`](../integration/nanolambda-readme-draft.md) — repositioning draft for your other repo (`ip888/nanolambda`), so the two projects launch as a single stack story.
+
 ## Targets
 
 | Channel | File | Notes |
@@ -97,19 +112,22 @@ Don't skip it. Don't make it longer.
 
 ## Checklist for launch day
 
+The full minute-by-minute version lives in
+[`launch-day.md`](launch-day.md) — open it as a tab on launch day and
+follow start to finish. The short version:
+
+- [ ] Repo is public + branch-protected (do this **before** launch day; see [`public-flip.md`](public-flip.md))
 - [ ] Pull main locally; verify the bench reproduces (`cargo run -p bench --features kvm --release -- --count 100 --alive 50`)
-- [ ] Open the README in GitHub web view and spot-check that the
-      anchors in this playbook still resolve
+- [ ] Open the README in GitHub web view and spot-check that the anchors still resolve
 - [ ] Open `docs/landing.html` in a browser and spot-check rendering
-- [ ] Have GitHub notifications on (you want to see the first stars in
-      real-time so you can reply to "I starred this because…" issues)
-- [ ] Submit to HN (title from [`hn-show.md`](hn-show.md))
+- [ ] Have GitHub notifications on
+- [ ] At T+0: submit to HN (title from [`hn-show.md`](hn-show.md))
 - [ ] Immediately paste the first-author-comment from [`hn-show.md`](hn-show.md)
-- [ ] Post the X thread from [`twitter-thread.md`](twitter-thread.md)
+- [ ] At T+5: post the X thread from [`twitter-thread.md`](twitter-thread.md)
 - [ ] 2 hours later: post to `/r/rust` from [`reddit-rust.md`](reddit-rust.md)
-- [ ] Reply to every top-level HN comment in the first hour
-- [ ] After 24 hours: write down the top 3 questions you got; turn them
-      into a `docs/faq.md` for next time
+- [ ] Reply to every top-level HN comment in the first hour, using [`response-templates.md`](response-templates.md)
+- [ ] Reply within 24h to every cold email from a recruiter / company
+- [ ] After 24h: write down the top 3 questions you got; turn them into `docs/faq.md` for next time
 
 ## After the launch
 
