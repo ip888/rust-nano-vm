@@ -38,5 +38,5 @@ or `mknod` privilege is needed.
 ## Note
 
 `init.c` is a **test fixture**, not the product. The real guest
-agent (Rust static-musl `nanovm-agent`) replaces it in the next M2
-step.
+agent (Rust static-musl `nanovm-agent`) replaces it for the
+production boot path.

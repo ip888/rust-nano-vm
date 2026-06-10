@@ -6,8 +6,8 @@
 //! byte buffers. Device-specific logic (vsock packet framing, virtio-fs
 //! FUSE framing, ...) lives in each device crate.
 //!
-//! Deferred to follow-up PRs: full indirect-descriptor walking and KVM
-//! eventfd/ioeventfd plumbing.
+//! Not in scope here: full indirect-descriptor walking, and KVM
+//! eventfd/ioeventfd plumbing (which lives in `vm-kvm`).
 //!
 //! # Wire format
 //!

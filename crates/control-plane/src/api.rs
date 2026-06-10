@@ -138,9 +138,9 @@ pub(crate) struct VmListResponse {
 
 /// Per-VM row in `GET /v1/vms`. Carries the same id + display + state
 /// as [`VmHandleDto`] plus the geometry pulled from
-/// [`vm_core::Hypervisor::vm_meta`]. Backends that don't track per-VM
-/// state (e.g. the placeholder `vm-kvm`) return `Unsupported` and
-/// the metadata fields are omitted, leaving id/display/state usable.
+/// [`vm_core::Hypervisor::vm_meta`]. Backends that don't expose per-VM
+/// geometry return `Unsupported` and the metadata fields are omitted,
+/// leaving id/display/state usable.
 #[derive(Debug, Serialize)]
 pub(crate) struct VmListEntry {
     pub id: u64,
@@ -255,10 +255,9 @@ pub(crate) struct SnapshotListResponse {
 
 /// Per-snapshot row in `GET /v1/snapshots`. Carries the same id +
 /// display as [`SnapshotDto`] plus the captured geometry pulled from
-/// [`vm_core::Hypervisor::snapshot_meta`]. Backends that don't track
-/// geometry (e.g. the placeholder `vm-kvm`) return `Unsupported` and
-/// the metadata fields are simply omitted, leaving id + display
-/// usable.
+/// [`vm_core::Hypervisor::snapshot_meta`]. Backends that don't expose
+/// captured geometry return `Unsupported` and the metadata fields are
+/// simply omitted, leaving id + display usable.
 #[derive(Debug, Serialize)]
 pub(crate) struct SnapshotListEntry {
     pub id: u64,

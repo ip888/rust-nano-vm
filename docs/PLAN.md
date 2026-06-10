@@ -1,39 +1,30 @@
 # Rust-nano-vm — roadmap
 
-> This file is the single source of truth for the project roadmap.
-> Committed into the repo so future sessions (or reviewers) can pick up
-> the plan without relying on external state.
-
-## Context
-
-`rust-nano-vm` is a purpose-built ephemeral code-execution sandbox microVM
-for LLM agents. The wedge against incumbents (E2B on Go+Firecracker,
-ad-hoc containers) is:
+`rust-nano-vm` is a purpose-built ephemeral code-execution sandbox
+microVM for LLM-agent workloads. The wedge against general-purpose
+VMMs and ad-hoc container sandboxes is:
 
 - Single-binary all-Rust VMM + guest agent.
-- Snapshot-first cold starts (< 50 ms via warm pools).
+- Snapshot-first cold starts via warm pools.
 - A first-class **snapshot + fork** primitive that lets agent eval
-  pipelines spawn 1000 variants from a base image in seconds.
+  pipelines spawn many variants from a base image in milliseconds.
 
-Open-core business model: OSS core (Apache-2.0 / MIT), managed cloud,
-enterprise self-hosted.
+## Target numbers
 
-### Target numbers
-
-| Axis | Target | Baseline |
-| --- | --- | --- |
-| Cold start (p50, warm pool) | < 50 ms | E2B 150–400 ms |
-| Snapshot → fork | < 80 ms / child | Firecracker ~125 ms restore; no native fork |
-| Binary size (single binary) | < 20 MB static musl | Multi-binary Go + Firecracker stack |
-| Idle host RAM / sandbox | < 30 MB via KSM + snapshot sharing | Firecracker ~5 MB + runtime |
-| Agent protocol | open `agent-sandbox-proto` spec | E2B proprietary SDK |
+| Axis                          | Target                              | Baseline                                          |
+| ---                           | ---                                 | ---                                               |
+| Cold start (p50, warm pool)   | < 50 ms                             | E2B 150–400 ms                                    |
+| Snapshot → fork               | < 80 ms / child                     | Firecracker ~125 ms restore; no native fork       |
+| Binary size (single binary)   | < 20 MB static musl                 | Multi-binary Go + Firecracker stack               |
+| Idle host RAM / sandbox       | < 30 MB via KSM + snapshot sharing  | Firecracker ~5 MB + runtime                       |
+| Agent protocol                | open `agent-sandbox-proto` spec     | E2B proprietary SDK                               |
 
 ## Architecture
 
-Every backend implements the `vm-core::Hypervisor` trait. M0 ships two
-implementations: `vm-kvm` (real, Linux + /dev/kvm) and `vm-mock` (in-memory,
-test/CI). Consumers (CLI, control plane) program against the trait, never
-the concrete backend.
+Every backend implements the `vm-core::Hypervisor` trait. Two backends
+exist: `vm-kvm` (real, Linux + `/dev/kvm`) and `vm-mock` (in-memory,
+test/CI). Consumers (CLI, control plane) program against the trait,
+never the concrete backend.
 
 See [`architecture.md`](architecture.md) for the full diagram + narrative.
 
@@ -42,171 +33,87 @@ See [`architecture.md`](architecture.md) for the full diagram + narrative.
 ```
 crates/
   vm-core/        Hypervisor trait, VmConfig, VmHandle, VmError, SnapshotId
-  vm-mock/        In-memory backend (M0, complete)
-  vm-kvm/         KVM backend (M0 skeleton, M1 real)
-  virtio-fs/      Host↔guest FS (M3)
-  virtio-vsock/   Host↔guest RPC transport (M2)
-  snapshot/       userfaultfd + CoW snapshot/fork (M5)
-  guest-agent/    Static musl binary running in guest (M2)
-  control-plane/  axum REST/gRPC API, auth, metering (M6)
-  proto/          Shared agent-sandbox-proto types (M0, defined)
-  cli/            `nanovm` binary, clap subcommands (M0 shell, M1+ real)
+  vm-mock/        In-memory backend
+  vm-kvm/         KVM backend
+  virtio-fs/      Host↔guest FS
+  virtio-vsock/   Host↔guest RPC transport
+  snapshot/       On-disk format + userfaultfd CoW runtime
+  guest-agent/    Static musl binary running in guest
+  control-plane/  axum REST API, auth, quotas, metering
+  proto/          Shared agent-sandbox-proto types
+  cli/            `nanovm` binary
 ```
 
-## Milestones
+## Current capabilities
 
-| # | Scope | Needs KVM host | Status |
-| - | --- | --- | --- |
-| **M0** | Workspace scaffold, `Hypervisor` trait, `vm-mock` backend, CI without KVM, docs | **no** | ✅ complete |
-| M1 | `vm-kvm` boots minimal kernel; serial "hello from guest" | yes | 🔲 next on KVM host |
-| M2 | virtio-vsock transport + musl guest agent; `nanovm exec <id> -- echo hi` round-trips | yes | 🔲 partial (wire types, connection state, streaming exec in guest-agent, CLI `exec`/`cp` wired, control-plane guest-op routes done) |
-| M3 | virtio-fs; `nanovm cp file.py <id>:/work/` | yes | 🔲 partial (FUSE framing done, per-op bodies done, dispatch scaffolding done) |
-| M4 | Python / Node run in guest; stdio streaming demo | yes | 🔲 depends M2 |
-| M5 | Snapshot + fork via userfaultfd; warm pool; p50 < 50 ms cold start | yes | 🔲 on-disk format done |
-| M6 | Control plane lifecycle API on `vm-mock`; quotas, metering, and KVM wiring follow on top | **no** | ✅ complete (axum REST + bearer auth + integration tests) |
-| M7 | Docs polish + public launch (HN / r/rust / r/MachineLearning) | any | 🔲 |
+- **Hypervisor trait + mock backend** (`vm-core`, `vm-mock`): full
+  state-machine, snapshot/fork semantics, exhaustive unit tests.
+- **KVM backend** (`vm-kvm`, behind the `kvm` feature):
+  - Minimal kernel boot, vCPU run loop, 8250 UART, MMIO virtio bus.
+  - Initramfs loading and userspace boot.
+  - virtio-vsock device wired into the run loop with IRQ injection.
+  - KVM vCPU + machine-state snapshot capture and restore.
+  - Snapshot fan-out via `MAP_PRIVATE` CoW on the snapshot memory image.
+- **virtio-vsock**: 44-byte header parse/serialize, all op and type
+  codes, well-known CIDs, full connection state machine with
+  credit-based flow control, split-virtqueue traversal over guest RAM,
+  length-prefixed framed transport.
+- **virtio-fs**: FUSE protocol framing, per-op body types (24 opcodes),
+  dispatch scaffolding with a `FuseHandler` trait, `StdFsHandler`
+  backed by `std::fs` covering the common copy path.
+- **virtio-queue**: split-ring (avail / used / descriptor) and packed
+  virtqueue parsers; guest-memory integration trait.
+- **Snapshot format**: on-disk file format, JSON-serialised vCPU and
+  machine state, userfaultfd-driven CoW page-fault handler.
+- **Guest agent**: static musl `/init` running inside the guest;
+  framed RPC over vsock; streaming `exec_in_guest`.
+- **Control plane**: axum REST with bearer-token auth, per-token
+  token-bucket quota on the expensive `/fork` route, per-caller usage
+  metering, Prometheus `/metrics`, OpenAPI 3.1 contract,
+  integration-tested against `vm-mock`.
+- **CLI**: `nanovm run`, `exec`, `cp`, `snapshot`, `fork`, `ps` driven
+  through the control plane.
+- **Fuzzing**: `cargo-fuzz` harnesses for `virtio-queue`,
+  `virtio-vsock`, `virtio-fs`, and `snapshot` parsers.
 
-Stretch: M8 GPU passthrough, M9 multi-node, M10 confidential compute
-(SEV-SNP / TDX).
+## Roadmap
 
-## M0 — workspace scaffold (complete)
+The next pieces of work, roughly in dependency order:
 
-- [x] Cargo workspace with 11 crates spanning hypervisor core/backends,
-      protocol + device-model foundations, guest agent, CLI, and control plane.
-- [x] `vm-core::Hypervisor` trait + supporting types (`VmConfig`,
-      `VmHandle`, `VmState`, `VmError`, `VmId`, `SnapshotId`).
-- [x] `vm-mock::MockHypervisor` with full state-machine + snapshot/fork
-      semantics and unit tests covering all transitions.
-- [x] `vm-kvm::KvmHypervisor` skeleton; all methods return
-      `VmError::Unsupported` until M1; heavy deps gated behind the `kvm`
-      feature flag so CI stays fast.
-- [x] `proto` crate with `Request`/`Response` envelopes, `RequestBody`,
-      `ResponseBody`, `ErrorCode`, and serde roundtrip tests.
-- [x] `nanovm` CLI with `run`, `exec`, `cp`, `snapshot`, `fork`, `ps`
-      subcommands; each prints "unimplemented: milestone Mx" and exits 2.
-- [x] GitHub Actions CI: `fmt --check`, `clippy -D warnings`,
-      `test --workspace`, `build --workspace`. No KVM device required.
-- [x] Docs: `PLAN.md` (this file), `architecture.md`, `comparison.md`,
-      `kvm-host.md`.
-- [x] Dual Apache-2.0 / MIT licensing (Rust convention).
+1. **End-to-end exec on a KVM host.** The vsock device is attached and
+   the guest agent runs; binding a real `AF_VSOCK` listener and routing
+   the full handler set (WriteFile, ReadFile, Stat, Signal, streaming
+   ExecStart) closes the round-trip from `nanovm exec` to a real Linux
+   guest.
+2. **virtio-fs end-to-end.** The dispatch and `StdFsHandler` are
+   complete; remaining work is wiring the virtqueue (MMIO interrupt
+   and ioeventfd) into the dispatch loop so `nanovm cp` round-trips.
+3. **Warm pool + snapshot-fork benchmarks.** The snapshot CoW path
+   works; the next milestone is a warm-pool front-end on the control
+   plane and a benchmark suite that reports cold-start p50 / fork
+   latency / per-fork Pss against the target numbers above.
+4. **Seccomp-BPF on the VMM process.** Tightens the host-side syscall
+   surface to a Firecracker-equivalent filter.
 
-## M6 — control plane REST API (complete, no KVM needed)
+Stretch (not committed): GPU passthrough, multi-node, confidential
+compute (SEV-SNP / TDX).
 
-- [x] `control-plane` crate with axum 0.7 REST router.
-- [x] Full CRUD: `POST /v1/vms`, `GET /v1/vms`, `GET /v1/vms/:id`,
-      `POST /v1/vms/:id/start`, `POST /v1/vms/:id/stop`,
-      `POST /v1/vms/:id/snapshot`, `DELETE /v1/vms/:id`,
-      `POST /v1/snapshots/:id/restore`, `GET /healthz`,
-      `POST /v1/vms/:id/exec`, `POST /v1/vms/:id/files`,
-      `GET /v1/vms/:id/files`.
-- [x] OpenAPI 3.1 JSON contract published at `GET /openapi.json`.
-- [x] Bearer-token auth middleware (`NANOVM_API_TOKENS` env).
-- [x] Structured JSON error envelope `{"error":{"code":"...","message":"..."}}`.
-- [x] `nanovm-control-plane` binary wrapping `MockHypervisor` (real KVM
-      backend wired in M1 via `Arc<dyn Hypervisor>`).
-- [x] 42 end-to-end integration tests using `tower::ServiceExt::oneshot`
-      (no network, no KVM).
+## Differentiation & non-goals
 
-## M2 — partial progress (no KVM needed for wire-format work)
+**Wedge:** the snapshot-fork primitive for agent eval pipelines. This
+is the one capability Firecracker and E2B do not offer natively.
 
-- [x] `virtio-queue`: descriptor table, flag constants, cycle-safe
-      `DescriptorChain` iterator with bounds + cycle detection.
-- [x] `virtio-vsock`: 44-byte `VsockHeader` parse/serialize, all op codes
-      and type codes, well-known CIDs, shutdown flags.
-- [x] `virtio-vsock::Connection` state machine: `Closed → Listen/SynSent →
-      Established → CloseWait/FinWait → Closed` with credit-based flow
-      control fields.
-- [x] `guest-agent` binary: streaming exec via `ExecStart` / `ExecWait`
-      in stdin/stdout mode (pseudo-streaming — buffers via `wait_with_output`,
-      emits `ExecStarted` + `ExecOutput` + `ExecExited` frames before next
-      request; vsock wiring deferred to M2 on a KVM host).
-- [x] `guest-agent`: `ExecStdin` and `Signal` return `NoSuchProcess` in
-      sequential mode with an informative message; exit info cached for
-      `ExecWait` after `ExecStart`.
-- [x] `vm-core::Hypervisor` trait extended with `exec_in_guest`,
-      `write_file`, `read_file` — default impls return `Unsupported`.
-- [x] `vm-mock::MockHypervisor` implements all three guest ops: `exec_in_guest`
-      spawns a real local process; `write_file` / `read_file` use the host
-      filesystem; all three check `Running` state.
-- [x] `vm-kvm::KvmHypervisor` has explicit `Unsupported` stubs for the three
-      new trait methods.
-- [x] Control-plane: `POST /v1/vms/:id/exec`, `POST /v1/vms/:id/files`,
-      `GET /v1/vms/:id/files` routes wired; 8 integration tests.
-- [x] CLI `exec` subcommand implemented: POSTs to `/v1/vms/:id/exec`, prints
-      stdout/stderr, exits with the guest's exit code.
-- [x] CLI `cp` subcommand implemented: parses `<id>:/path` guest endpoints,
-      drives `write_file` / `read_file` over HTTP.
-- [x] OpenAPI 3.1 spec updated with `ExecRequest`, `ExecResponse`,
-      `FileWriteRequest`, `FileWrittenResponse`, `FileReadResponse` schemas.
+**Non-goals (v1):** GPU passthrough, live migration, Windows/macOS
+guests, multi-tenant hard SLA, confidential compute. Revisit v2.
 
-## M3 partial progress (no KVM needed for dispatch scaffolding)
+## Risks & mitigations
 
-- [x] `virtio-fs`: FUSE protocol framing (`FuseInHeader`, `FuseOutHeader`,
-      `FuseOpcode`, all M3 spec constants).
-- [x] `virtio-fs`: Per-op body types (all request and response structs for
-      `Init`, `Forget`, `Getattr`, `Setattr`, `Lookup`, `Readlink`, `Mknod`,
-      `Mkdir`, `Unlink`, `Rmdir`, `Symlink`, `Rename`, `Link`, `Open`, `Read`,
-      `Write`, `Statfs`, `Release`, `Fsync`, `Flush`, `Opendir`, `Readdir`,
-      `Releasedir`, `Destroy`).
-- [x] `virtio-fs`: Dispatch scaffolding (`dispatch` module):
-      - `FuseRequest<'a>` enum — one zero-copy-parsed variant per opcode.
-      - `parse_request` — parses a raw byte slice into `(FuseInHeader, FuseRequest)`.
-      - `split_nul` — helper for extracting NUL-terminated names from payloads.
-      - `FuseHandler` trait — one method per opcode; all default to ENOSYS.
-      - `dispatch` — calls handler, serialises `FuseOutHeader` + body or
-        returns `None` for no-reply ops (`Forget`, `Destroy`).
-      - 19 unit tests (parse roundtrips, no-reply invariants, ENOSYS default).
-- [x] `virtio-fs`: `StdFsHandler` — a real `FuseHandler` backed by `std::fs`
-      rooted at a host directory. Supports the common copy path immediately
-      offline: `Init`, `Lookup`, `Getattr`, `Setattr` (size/mode), `Open`,
-      `Read`, `Write`, `Mkdir`, `Rename`, `Unlink`, `Rmdir`, `Symlink`,
-      `Readlink`, `Opendir`, `Readdir`, `Release`, `Releasedir`, `Flush`,
-      `Fsync`, `Statfs`. Unit-tested via existing `parse_request` + `dispatch`
-      scaffolding.
-- [x] `virtio-fs`: `StdFsHandler` now handles lifecycle bookkeeping offline:
-      `Forget` decrements/drops node mappings and `Destroy` resets nodes and
-      closes open file/dir handles.
-
-## M3 — still needs KVM host
-
-- [ ] Wire the virtqueue (MMIO/PCI) interrupt and ioeventfd plumbing into
-      the dispatch loop.
-- [ ] `nanovm cp file.py <id>:/work/` round-trips end-to-end.
-
-- [ ] Wire `virtio-vsock` into the KVM vCPU run loop (eventfd, virtqueue
-      consumer, ioeventfd).
-- [ ] `guest-agent` reads/writes on a real AF_VSOCK socket and routes requests
-      to the full handler set (WriteFile, ReadFile, Stat, Signal, ExecStart
-      streaming). The length-prefixed framed transport path is in place; the
-      remaining work is binding/accepting a real vsock listener on a KVM host.
-- [ ] `nanovm exec <id> -- echo hi` round-trips end-to-end.
-
-## M1 — needs KVM host
-
-M1 is blocked on `/dev/kvm`. See [`kvm-host.md`](kvm-host.md) for the
-cheapest options. Once on a KVM host the steps are:
-
-1. Add `kvm-ioctls`, `kvm-bindings`, `vm-memory`, `linux-loader`, and the
-   signal helpers behind the `kvm` feature. ✅
-   Done: the `vm-kvm` crate now feature-gates the real KVM stack and
-   `KvmHypervisor::new()` opens `/dev/kvm` only when `--features kvm` is
-   enabled.
-2. Implement `KvmHypervisor::create_vm` (mmap guest RAM, load bzImage with
-   `linux-loader`). ✅
-   Done for the M1 slice: guest RAM is registered with KVM, the bzImage is
-   loaded, the default `ttyS0`-oriented cmdline is written, and Linux boot
-   params/e820 are populated.
-3. Implement `KvmHypervisor::start` (create vCPU, set registers, run loop). ✅
-   Done for the M1 slice: one vCPU is created, CPUID/FPU/base regs/sregs/page
-   tables are configured for Linux direct boot, and the vCPU runs on a worker
-   thread with `start`/`stop`/`state`/`list_vms`/`vm_meta` wired through the
-   trait.
-4. Attach a minimal 8250 UART device so the kernel can print to `ttyS0`. ✅
-   Done for the M1 slice: a basic port-I/O serial path handles `0x3f8` output
-   plus the minimum input registers the guest kernel polls during UART init.
-5. Add seccomp-BPF filter to the VMM process.
-6. Smoke-test on a real KVM host: boot a real kernel and confirm serial output
-   end-to-end through the control-plane/CLI stack.
+| Risk                                                                | Mitigation                                                                                                |
+| ---                                                                 | ---                                                                                                       |
+| KVM cannot be exercised from every dev environment                  | `Hypervisor` trait + `vm-mock` keep CI green without `/dev/kvm`; KVM tests gated behind a feature flag    |
+| rust-vmm learning curve                                             | Firecracker + Cloud Hypervisor as reference implementations; start from minimal kernel + serial           |
+| Adjacent projects ship faster                                       | Stay narrow on the snapshot-fork wedge instead of competing across the whole FaaS surface                 |
+| Security posture                                                    | Mirror Firecracker threat model; `cargo-fuzz` on virtio queue parsers; `cargo-deny` advisories in CI      |
 
 ## Verification
 
@@ -220,157 +127,6 @@ cargo fmt --all -- --check
 cargo run -p cli -- --help
 ```
 
-All five commands must succeed without `/dev/kvm`.
-
-## Differentiation & non-goals
-
-**Wedge:** the snapshot-fork primitive for agent eval pipelines. This is
-the one capability Firecracker and E2B do not offer natively.
-
-**Non-goals (v1):** GPU passthrough, live migration, Windows/macOS
-guests, multi-tenant hard SLA, confidential compute. Revisit v2.
-
-## Risks & mitigations
-
-| Risk | Mitigation |
-| --- | --- |
-| Cannot test KVM from the dev sandbox (gVisor, no `/dev/kvm`) | `Hypervisor` trait + `vm-mock`; real tests run on a KVM host (see `kvm-host.md`) |
-| rust-vmm learning curve | Firecracker + Cloud Hypervisor as reference implementations; start from minimal kernel + serial |
-| E2B ships faster | Niche: "the sandbox for agent eval pipelines"; snapshot+fork is the hook |
-| Security posture | Mirror Firecracker threat model; `cargo-fuzz` on virtio queue parsers from day 1; RustSec audit in CI |
-| Solo burnout | Ship M0–M4 publicly before M5; treat M5 as the v0.1 launch gate |
-
-## Current codebase assessment
-
-The workspace baseline is green on a non-KVM host:
-
-- `cargo build --workspace`
-- `cargo test --workspace`
-- `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo fmt --all -- --check`
-
-That baseline means the project has already moved beyond a pure scaffold.
-Today the strongest foundations are:
-
-- `vm-core`: the stable trait boundary every backend and entry point depends
-  on.
-- `vm-mock`: a fully tested state-machine backend that keeps CI and API work
-  independent from `/dev/kvm`.
-- `proto`, `virtio-queue`, `virtio-vsock`, and `snapshot`: wire-format and
-  file-format crates with focused serialization and parser coverage.
-- `control-plane`: a working REST lifecycle API with auth and integration
-  tests against `vm-mock`.
-
-The main gaps are now concentrated in the execution path rather than the
-interfaces:
-
-- `vm-kvm` is still an M0 skeleton, so there is no real boot path yet.
-- `virtio-vsock` and `guest-agent` now have protocol handling plus a
-  length-prefixed framed transport path, but the real AF_VSOCK socket and KVM
-  wiring are still missing, so exec cannot run
-  end-to-end inside a guest yet.
-- `virtio-fs` now has FUSE framing, dispatch, and a real `std::fs`-backed
-  handler, but it still needs virtqueue / device plumbing before `nanovm cp`
-  can work end-to-end inside a guest.
-- `cli` has a working `ps` command against the control plane, but the
-  guest-facing subcommands are split between real mock-backed flows (`exec`,
-  `cp`) and still-blocked KVM-host flows (`run`, `snapshot`, `fork`).
-
-## Continuation priorities
-
-1. **Finish M1 first: real KVM boot.** This is the critical path because it
-   validates the `vm-core` abstraction against a real backend and unblocks all
-   later guest-facing work. The minimum useful slice is: open `/dev/kvm`,
-   create a VM from `VmConfig`, boot a tiny guest, and make `nanovm run`
-   print the serial "hello from guest" path end-to-end.
-2. **Then finish M2: vsock + guest-agent exec.** The protocol crate is already
-   defined, so the next high-leverage step is wiring `virtio-vsock` into
-   `vm-kvm`, implementing a tiny musl `guest-agent`, and making `nanovm exec`
-   and the control-plane speak the existing `proto` contract.
-3. **Treat snapshot/fork as the first performance milestone, not the first
-   implementation milestone.** The `snapshot` crate already pins the on-disk
-   format, so the next step there should be a benchmark-backed runtime
-   prototype (`userfaultfd`, warm pool, fork latency) once M1/M2 give a real
-   guest to snapshot.
-4. **Keep offline-preparable pieces moving in parallel.** `virtio-fs`
-   request/response bodies, `virtio-queue` ring work, fuzzing, and snapshot
-   runtime prep are valuable because they are unit-testable without `/dev/kvm`,
-   but they should still support — not displace — the boot + exec critical
-   path.
-
-## Next up
-
-**M1 on a KVM host.** Use `vm-mock` to preserve fast CI, but do the next round
-of implementation work around a single end-to-end KVM success criterion:
-create → boot → serial output. See [`kvm-host.md`](kvm-host.md) for the
-cheapest options (local Linux, GCP nested virt, AWS bare metal, Hetzner
-dedicated).
-
-The M2 vsock wiring can overlap with M1 development — once the kernel boots
-and a `ttyS0` line appears, plugging in virtio-vsock is the immediate next
-step so the agent can receive commands.
-
-## Development without a KVM host
-
-While a KVM host is being sourced, these items advance the project:
-
-1. **Snapshot runtime (M5 prep)** — add `userfaultfd` bindings and the CoW
-   page-fault handler to the `snapshot` crate. The on-disk format is done;
-   the page-fault interception is the hard part.
-
-   **Done.** Added `snapshot::runtime` with:
-   - userfaultfd protocol constants (`UFFD_API`,
-     `UFFDIO_REGISTER_MODE_MISSING`, `UFFD_PAGEFAULT_FLAG_WRITE`)
-   - `UffdPagefaultEvent` normalized fault type
-   - `CowPager` fault-resolution state machine mapping guest fault addresses
-     to `memory.cow` page offsets (`PopulateFromBacking` / `AlreadyMapped`)
-   - runtime error model for alignment, bounds, and arithmetic-overflow safety
-   - unit tests for write-flag semantics, alignment, in-range checks, repeated
-     faults, and event flow
-
-2. **virtio-queue ring parsers** — complete the available/used ring, packed
-   virtqueue, and guest-memory integration in `virtio-queue`. These are unit-
-   testable with synthetic byte slices.
-
-   **Done.** `virtio-queue` now includes:
-   - packed virtqueue descriptor wire type and parser (`PackedDesc`,
-     `packed_ring_size`, `parse_packed_ring`)
-   - packed descriptor flag constants (`PACKED_DESC_F_*`)
-   - minimal guest-memory integration trait (`GuestMemory`) plus
-     `SliceGuestMemory` test/prototyping backend
-   - descriptor guest-memory helpers (`Descriptor::read_from`,
-     `Descriptor::write_to_guest`) with bounds/overflow checks
-   - split-ring support (`AvailRing`, `UsedRing`, iterators, push/accessors)
-     plus descriptor-table parsing (`desc_table_size`, `parse_descriptor_table`)
-
-3. **virtio-fs (M3 prep)** — add per-op FUSE request/response bodies and the
-   dispatch scaffolding on top of the framing already in `virtio-fs`.
-
-   **Done.** All per-op body types and the full dispatch scaffolding are
-   complete and reflected in the M3 partial progress checklist above.
-
-4. **cargo-fuzz harnesses** — add fuzzing targets for `virtio-queue`,
-   `virtio-vsock`, and `snapshot` parsers. Run locally with `cargo fuzz`.
-
-   **Done.** Six fuzz targets added:
-   - `crates/virtio-queue/fuzz/`: `desc_chain`, `avail_ring`, `used_ring`,
-     `packed_ring` (covers the new packed-ring parsing added in item 2)
-   - `crates/virtio-vsock/fuzz/`: `vsock_header` (with roundtrip property)
-   - `crates/snapshot/fuzz/`: `backing_header` (with roundtrip property),
-     `manifest_json`
-   - `crates/virtio-fs/fuzz/`: `fuse_request` (full FUSE packet parsing +
-     dispatch through a no-op handler; covers all 24 opcodes)
-
-   Run any target locally with `cargo +nightly fuzz run <target-name>` from
-   the relevant `fuzz/` directory. CI uses the xorshift smoke-fuzz unit tests
-   on stable; the cargo-fuzz harnesses are the deeper, guided fuzzing layer.
-
-5. **OpenAPI / Swagger spec** — auto-generate from the `control-plane`
-   routes for external consumers and SDK generation.
-
-   **Done.** Added `nanovm-openapi` (`crates/control-plane/src/bin/openapi.rs`)
-   which emits the current OpenAPI 3.1 document from `openapi_spec()`.
-   Generated spec is checked in at `docs/openapi.json`.
-
-   Regenerate with:
-   `cargo run -p control-plane --bin nanovm-openapi > docs/openapi.json`.
+All five commands must succeed without `/dev/kvm`. The KVM-backed
+integration tests live behind `cargo test -p vm-kvm --features kvm`
+and require a Linux host with `/dev/kvm`.

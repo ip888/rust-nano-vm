@@ -12,9 +12,6 @@
 //! nanovm fork snap-0000000000000001 --count 4
 //! ```
 //!
-//! Subcommands that require a real KVM guest (`exec`, `cp`) are still
-//! stubs and exit 2. They land in M2 / M3 alongside the guest agent.
-//!
 //! Failures from the server are surfaced via the structured error
 //! envelope produced by the control plane.
 
@@ -102,7 +99,7 @@ enum Command {
         #[arg(long)]
         no_start: bool,
     },
-    /// Execute a command inside an already-running sandbox. (milestone M2)
+    /// Execute a command inside an already-running sandbox.
     Exec {
         /// Target sandbox id (raw u64 or `vm-...` display form).
         id: String,
@@ -110,7 +107,7 @@ enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         argv: Vec<String>,
     },
-    /// Copy a file into or out of a sandbox. (milestone M3)
+    /// Copy a file into or out of a sandbox.
     Cp {
         /// Source (either local path or `<id>:/path`).
         src: String,

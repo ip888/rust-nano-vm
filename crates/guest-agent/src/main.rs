@@ -43,7 +43,7 @@
 //! This is "pseudo-streaming": the output is buffered internally (via
 //! `Child::wait_with_output`) and flushed as frames after the child exits.
 //! True streaming (emitting output as it arrives) requires async I/O or
-//! threads and is deferred to the virtio-vsock wiring.
+//! threads on top of the vsock transport.
 //!
 //! `ExecWait` for a pid that completed during a previous `ExecStart` returns
 //! `ExecExited` immediately from the cached exit status.

@@ -85,7 +85,9 @@ pub struct KvmHypervisor {
     msr_indices: Arc<Vec<u32>>,
 }
 
-/// KVM-backed hypervisor stub when built without the `kvm` feature.
+/// Non-KVM build of [`KvmHypervisor`]. All methods return
+/// [`VmError::Unsupported`]; build with `--features kvm` on a Linux
+/// host with `/dev/kvm` to enable the real backend.
 #[cfg(not(feature = "kvm"))]
 #[derive(Debug, Default)]
 pub struct KvmHypervisor {
@@ -437,7 +439,8 @@ impl KvmHypervisor {
         })
     }
 
-    /// Construct a new KVM hypervisor stub handle.
+    /// Construct a non-KVM build handle; all methods return
+    /// [`VmError::Unsupported`].
     #[cfg(not(feature = "kvm"))]
     pub fn new() -> Self {
         Self::default()
@@ -460,7 +463,7 @@ impl KvmHypervisor {
         Ok(buf.clone())
     }
 
-    /// Stub for non-KVM builds. Always returns `Unsupported`.
+    /// Non-KVM build: returns [`VmError::Unsupported`].
     #[cfg(not(feature = "kvm"))]
     pub fn serial_output(&self, _id: VmId) -> VmResult<Vec<u8>> {
         Err(VmError::Unsupported(
@@ -480,7 +483,7 @@ impl KvmHypervisor {
         Ok(vm.last_run_error.clone())
     }
 
-    /// Stub for non-KVM builds. Always returns `Unsupported`.
+    /// Non-KVM build: returns [`VmError::Unsupported`].
     #[cfg(not(feature = "kvm"))]
     pub fn last_run_error(&self, _id: VmId) -> VmResult<Option<String>> {
         Err(VmError::Unsupported(
@@ -505,7 +508,7 @@ impl KvmHypervisor {
             .map(|b| b.device.lock().map(|d| d.transport().status()).unwrap_or(0)))
     }
 
-    /// Stub for non-KVM builds. Always returns `Unsupported`.
+    /// Non-KVM build: returns [`VmError::Unsupported`].
     #[cfg(not(feature = "kvm"))]
     pub fn vsock_status(&self, _id: VmId) -> VmResult<Option<u32>> {
         Err(VmError::Unsupported(
@@ -533,7 +536,7 @@ impl KvmHypervisor {
         }))
     }
 
-    /// Stub for non-KVM builds. Always returns `Unsupported`.
+    /// Non-KVM build: returns [`VmError::Unsupported`].
     #[cfg(not(feature = "kvm"))]
     pub fn vsock_driver_ok(&self, _id: VmId) -> VmResult<Option<bool>> {
         Err(VmError::Unsupported(

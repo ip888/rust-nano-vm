@@ -1,9 +1,9 @@
 //! Control plane: REST API in front of a [`Hypervisor`] backend.
 //!
-//! Scope: **M6**. Ships the HTTP surface for sandbox lifecycle operations
-//! (create, start, stop, snapshot, restore, destroy), plus bearer-token
-//! auth guarding every `/v1/*` route. Quotas and metering are deferred to
-//! follow-up PRs on top of this foundation.
+//! Ships the HTTP surface for sandbox lifecycle operations (create,
+//! start, stop, snapshot, restore, destroy), bearer-token auth on every
+//! `/v1/*` route, a per-token token-bucket quota on the `/fork` route,
+//! per-caller usage metering, and a Prometheus `/metrics` endpoint.
 //!
 //! Typical wiring:
 //!
