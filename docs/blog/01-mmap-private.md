@@ -161,7 +161,7 @@ Projection: ~30 000 concurrent minimal-footprint forks per 16 GiB host.
 
 ```sh
 # One-time: build kernel + initramfs (Linux + /dev/kvm required)
-tools/kernel/build.sh
+tools/kernel/build-tiny-kernel.sh
 tools/initramfs/build-initramfs.sh
 
 cargo run -p bench --features kvm --release --bin nanovm-fork-bench -- \

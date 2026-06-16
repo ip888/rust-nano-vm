@@ -158,7 +158,7 @@ identical to the captured one.
 - **No live migration.** No pre-copy, no post-copy, no dirty-page
   tracking. The use case is "snapshot once, fork many", not "move
   workload between hosts".
-- **No userfaultfd.** Originally planned in M5; turned out
+- **No userfaultfd.** Originally planned; turned out
   `mmap(MAP_PRIVATE)` is enough for sub-15 ms cold starts on its own.
   See [post #1](01-mmap-private.md).
 

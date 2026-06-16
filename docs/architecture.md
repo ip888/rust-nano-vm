@@ -81,7 +81,7 @@ Versioned at the envelope so the host can refuse a mismatched guest. Tag
 names (`op`, `kind`) are part of the wire contract — the `proto` crate's
 tests pin them.
 
-## Memory / snapshot model (M5)
+## Memory / snapshot model
 
 A base image is booted once, language runtimes loaded (Python + uv + Node),
 and the VM is quiesced. Guest memory is captured via `userfaultfd` into a
@@ -97,7 +97,7 @@ E2B (which layers its own solution on top).
 ## Security posture
 
 - Mirror the Firecracker threat model (documented there thoroughly).
-- Seccomp-BPF filter on the VMM process (M1+).
+- Seccomp-BPF filter on the VMM process (planned).
 - Randomized smoke fuzz tests on every wire parser (vsock packet
   header, virtqueue descriptor + chain walker, FUSE in/out headers and
   body types, snapshot backing-file header, snapshot manifest JSON) run

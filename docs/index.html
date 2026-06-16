@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rust-nano-vm — 12 ms cold-start microVMs for AI agents</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%230d1117'/%3E%3Cpath d='M14 46V18h6l16 19V18h6v28h-6L20 27v19z' fill='%23f78166'/%3E%3C/svg%3E">
 <meta name="description" content="A single-binary Rust microVM with ~12 ms cold start and ~0.5 MiB per-fork memory. Built for AI agent code execution.">
 <meta property="og:title" content="rust-nano-vm — 12 ms cold-start microVMs">
 <meta property="og:description" content="Single-binary Rust microVM. ~12 ms cold start, ~0.5 MiB Pss per fork, thousands per 16 GiB host.">
@@ -155,6 +156,11 @@ all of them via <code>MAP_PRIVATE</code> copy-on-write.
 </ol>
 
 <h2>30-second demo</h2>
+<p style="color: var(--muted); font-size: 0.95rem;">
+Prerequisites: a Rust toolchain and <code>jq</code>
+(<code>brew install jq</code> on macOS, <code>apt install jq</code> on
+Debian/Ubuntu). Mock backend — works on Linux and macOS, no KVM required.
+</p>
 <pre><code>git clone https://github.com/ip888/Rust-nano-vm.git
 cd Rust-nano-vm
 cargo build --release -p control-plane
