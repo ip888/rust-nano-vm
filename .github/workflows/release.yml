@@ -1,0 +1,93 @@
+name: release
+
+# Triggered by pushing a tag matching v*.*.* (e.g. v0.0.1).
+# Builds release binaries for Linux x86_64, packages them into a tarball
+# alongside SHA256 checksums, and attaches the result to a GitHub Release
+# auto-created from the tag.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write  # create release + upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: rustup show && rustup target add ${{ matrix.target }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-release-${{ matrix.target }}-
+
+      - name: Build binaries
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} \
+            -p control-plane --bin nanovm-control-plane \
+            -p cli           --bin nanovm
+
+      - name: Package tarball
+        id: package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          stage="rust-nano-vm-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${stage}"
+          cp target/${{ matrix.target }}/release/nanovm-control-plane "dist/${stage}/"
+          cp target/${{ matrix.target }}/release/nanovm                "dist/${stage}/"
+          cp README.md LICENSE-APACHE LICENSE-MIT                      "dist/${stage}/"
+          ( cd dist && tar czf "${stage}.tar.gz" "${stage}" )
+          ( cd dist && sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256" )
+          echo "tarball=dist/${stage}.tar.gz"        >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${stage}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.tarball }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
