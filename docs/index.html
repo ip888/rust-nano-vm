@@ -157,31 +157,19 @@ all of them via <code>MAP_PRIVATE</code> copy-on-write.
 
 <h2>30-second demo</h2>
 <p style="color: var(--muted); font-size: 0.95rem;">
-Prerequisites: a Rust toolchain and <code>jq</code>
-(<code>brew install jq</code> on macOS, <code>apt install jq</code> on
-Debian/Ubuntu). Mock backend — works on Linux and macOS, no KVM required.
+One command — works identically on Linux, macOS, and Windows. Only
+prerequisite is a Rust toolchain (<a href="https://rustup.rs">rustup</a>).
+Boots an in-process control plane backed by the mock hypervisor and
+drives the full create → snapshot → fork lifecycle.
 </p>
 <pre><code>git clone https://github.com/ip888/Rust-nano-vm.git
 cd Rust-nano-vm
-cargo build --release -p control-plane
-
-NANOVM_API_TOKENS=dev-token \
-  ./target/release/nanovm-control-plane &amp;
-until curl -sf localhost:8080/healthz &gt;/dev/null; do sleep 0.1; done
-
-TOKEN="Authorization: Bearer dev-token"
-VM=$(curl -s -X POST localhost:8080/v1/vms      -H "$TOKEN" -H 'content-type: application/json' -d '{}' | jq -r .id)
-curl -s -X POST localhost:8080/v1/vms/$VM/start  -H "$TOKEN" &gt;/dev/null
-SNAP=$(curl -s -X POST localhost:8080/v1/vms/$VM/snapshot -H "$TOKEN" | jq -r .id)
-
-# Fork 5 children, ~milliseconds each:
-for i in 1 2 3 4 5; do
-  curl -s -X POST localhost:8080/v1/snapshots/$SNAP/fork -H "$TOKEN" \
-    | jq -c '{vm: .vm.id, fork_ms, fork_count}'
-done
-
-curl -s localhost:8080/v1/usage -H "$TOKEN" | jq
-curl -s localhost:8080/metrics  | head -20</code></pre>
+cargo run -p control-plane --example demo --release</code></pre>
+<p style="color: var(--muted); font-size: 0.95rem;">
+Prints a per-step report. To see the wire calls instead, see the
+<a href="https://github.com/ip888/Rust-nano-vm#driving-the-rest-api-by-hand">"Driving the REST API by hand"</a>
+section of the README.
+</p>
 
 <h2>Use cases this is built for</h2>
 <ul>
