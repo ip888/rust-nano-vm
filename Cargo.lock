@@ -261,6 +261,7 @@ version = "0.0.1"
 dependencies = [
  "axum",
  "http-body-util",
+ "reqwest",
  "serde",
  "serde_json",
  "snapshot",

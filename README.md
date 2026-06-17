@@ -76,19 +76,46 @@ them via `MAP_PRIVATE` copy-on-write.
 
 ## Quickstart — demo in 30 seconds (mock backend, no KVM)
 
-Prerequisites: a Rust toolchain (`rustup` or `brew install rust`) and
-`jq` (`brew install jq` on macOS, `apt install jq` on Debian/Ubuntu).
-Works on Linux and macOS — no KVM required for this path.
+One command, identical on Linux, macOS, and Windows. Only prerequisite
+is a Rust toolchain (`rustup` from https://rustup.rs).
 
 ```sh
 git clone https://github.com/ip888/Rust-nano-vm.git
 cd Rust-nano-vm
+cargo run -p control-plane --example demo --release
+```
+
+The example boots an in-process control plane backed by the
+`MockHypervisor`, drives the full lifecycle, and prints a report:
+
+```
+✔ control-plane up on http://127.0.0.1:54231
+✔ created   vm-0000000000000001
+✔ started   vm-0000000000000001
+✔ snapshot  snap-0000000000000001
+✔ forked    vm-0000000000000002 in 0 ms
+✔ forked    vm-0000000000000003 in 0 ms
+✔ forked    vm-0000000000000004 in 0 ms
+✔ forked    vm-0000000000000005 in 0 ms
+✔ forked    vm-0000000000000006 in 0 ms
+
+usage     : fork_count=5 fork_total_ms=0
+metrics   : nanovm_forks_total{token="tok-demo-10"} 5
+```
+
+### Driving the REST API by hand
+
+If you'd rather see the wire calls, run the binary and `curl` it. This
+path needs `jq` (`brew install jq` on macOS, `apt install jq` on
+Debian/Ubuntu) and a POSIX shell (`bash` or `zsh` with
+`setopt interactivecomments`):
+
+```sh
 cargo build --release -p control-plane
 
 NANOVM_API_TOKENS=dev-token \
   ./target/release/nanovm-control-plane &
 
-# Wait for the port, then drive the lifecycle:
 until curl -sf localhost:8080/healthz >/dev/null; do sleep 0.1; done
 
 TOKEN="Authorization: Bearer dev-token"
@@ -97,13 +124,11 @@ VM=$(curl -s -X POST localhost:8080/v1/vms        -H "$TOKEN" -H 'content-type: 
 curl -s -X POST localhost:8080/v1/vms/$VM/start    -H "$TOKEN" >/dev/null
 SNAP=$(curl -s -X POST localhost:8080/v1/vms/$VM/snapshot -H "$TOKEN" | jq -r .id)
 
-# Fork 5 children off the snapshot, ~milliseconds each:
 for i in 1 2 3 4 5; do
   curl -s -X POST localhost:8080/v1/snapshots/$SNAP/fork -H "$TOKEN" \
     | jq -c '{vm: .vm.id, fork_ms, fork_count}'
 done
 
-# Per-caller usage + Prometheus metrics:
 curl -s localhost:8080/v1/usage -H "$TOKEN" | jq
 curl -s localhost:8080/metrics | head -20
 ```
