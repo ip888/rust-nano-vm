@@ -76,6 +76,10 @@ them via `MAP_PRIVATE` copy-on-write.
 
 ## Quickstart — demo in 30 seconds (mock backend, no KVM)
 
+Prerequisites: a Rust toolchain (`rustup` or `brew install rust`) and
+`jq` (`brew install jq` on macOS, `apt install jq` on Debian/Ubuntu).
+Works on Linux and macOS — no KVM required for this path.
+
 ```sh
 git clone https://github.com/ip888/Rust-nano-vm.git
 cd Rust-nano-vm
@@ -110,7 +114,7 @@ Linux host with `/dev/kvm`:
 
 ```sh
 # Build kernel + initramfs once (see docs/kvm-host.md):
-tools/kernel/build.sh
+tools/kernel/build-tiny-kernel.sh
 tools/initramfs/build-initramfs.sh
 
 # Boot one guest, snapshot it, fork 100 children, measure:

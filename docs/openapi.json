@@ -52,6 +52,150 @@
         },
         "type": "object"
       },
+      "ExecRequest": {
+        "properties": {
+          "args": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "env": {
+            "items": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "program": {
+            "type": "string"
+          },
+          "timeout_ms": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "program"
+        ],
+        "type": "object"
+      },
+      "ExecResponse": {
+        "properties": {
+          "duration_ms": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "signal": {
+            "type": "integer"
+          },
+          "stderr": {
+            "type": "string"
+          },
+          "stdout": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "stdout",
+          "stderr",
+          "duration_ms"
+        ],
+        "type": "object"
+      },
+      "FileReadResponse": {
+        "properties": {
+          "content": {
+            "items": {
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "type": "object"
+      },
+      "FileWriteRequest": {
+        "properties": {
+          "content": {
+            "items": {
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "mode": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ],
+        "type": "object"
+      },
+      "FileWrittenResponse": {
+        "properties": {
+          "bytes": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bytes"
+        ],
+        "type": "object"
+      },
+      "ForkResponse": {
+        "properties": {
+          "fork_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fork_ms": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fork_total_ms": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "vm": {
+            "$ref": "#/components/schemas/VmHandleDto"
+          }
+        },
+        "required": [
+          "vm",
+          "fork_ms",
+          "fork_count",
+          "fork_total_ms"
+        ],
+        "type": "object"
+      },
       "SnapshotDto": {
         "properties": {
           "dir": {
@@ -117,6 +261,27 @@
             "type": "string"
           }
         },
+        "type": "object"
+      },
+      "UsageResponse": {
+        "properties": {
+          "fork_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fork_total_ms": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "fork_count",
+          "fork_total_ms"
+        ],
         "type": "object"
       },
       "VmHandleDto": {
@@ -293,6 +458,32 @@
         "summary": "Delete snapshot"
       }
     },
+    "/v1/snapshots/{id}/fork": {
+      "post": {
+        "description": "MAP_PRIVATE CoW fork of the snapshot. Subject to per-token token-bucket quota; throttled callers get 429 with Retry-After.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SnapshotIdPath"
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForkResponse"
+                }
+              }
+            },
+            "description": "Forked child VM plus per-fork latency and caller usage totals"
+          },
+          "429": {
+            "description": "Rate-limited by per-token fork quota"
+          }
+        },
+        "summary": "Fork a child VM from a snapshot (metered)"
+      }
+    },
     "/v1/snapshots/{id}/restore": {
       "post": {
         "parameters": [
@@ -313,6 +504,23 @@
           }
         },
         "summary": "Restore snapshot into VM"
+      }
+    },
+    "/v1/usage": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageResponse"
+                }
+              }
+            },
+            "description": "Token fingerprint plus running fork totals"
+          }
+        },
+        "summary": "Caller's per-token fork-usage counters"
       }
     },
     "/v1/vms": {
@@ -390,6 +598,98 @@
           }
         },
         "summary": "Get VM state"
+      }
+    },
+    "/v1/vms/{id}/exec": {
+      "post": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/VmIdPath"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecResponse"
+                }
+              }
+            },
+            "description": "Command result"
+          }
+        },
+        "summary": "Execute a command in the guest"
+      }
+    },
+    "/v1/vms/{id}/files": {
+      "get": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/VmIdPath"
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileReadResponse"
+                }
+              }
+            },
+            "description": "File content"
+          }
+        },
+        "summary": "Read a file from the guest filesystem"
+      },
+      "post": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/VmIdPath"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FileWriteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileWrittenResponse"
+                }
+              }
+            },
+            "description": "Write result"
+          }
+        },
+        "summary": "Write a file into the guest filesystem"
       }
     },
     "/v1/vms/{id}/snapshot": {

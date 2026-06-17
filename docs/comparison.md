@@ -12,9 +12,9 @@ differences:
 | Distribution | VMM binary + jailer + API server | Single binary (`nanovm`) |
 | Cold start | ~125 ms (snapshot restore) | < 50 ms target (warm pool + CoW fork) |
 | Snapshot | Full save/restore; no native fork | **First-class snapshot + fork** |
-| Device model | virtio-block, virtio-net, vsock | Same + virtio-fs (M3) for agent file exchange |
-| Control plane | Out-of-scope (bring your own) | Included (`control-plane` crate, M6) |
-| Guest agent | Out-of-scope | Included (`guest-agent`, M2, static musl) |
+| Device model | virtio-block, virtio-net, vsock | Same + virtio-fs for agent file exchange |
+| Control plane | Out-of-scope (bring your own) | Included (`control-plane` crate, axum REST) |
+| Guest agent | Out-of-scope | Included (`guest-agent`, static musl) |
 
 Firecracker remains the right choice for general serverless. `rust-nano-vm`
 only wins for the agent workload.
@@ -28,7 +28,7 @@ E2B is the closest commercial incumbent.
 | Language | Go + Firecracker | All-Rust |
 | License | Proprietary managed service | Apache-2.0 / MIT dual |
 | Cold start | 150–400 ms | < 50 ms target |
-| Snapshot + fork | Layered on top of Firecracker | Native in `snapshot` crate (M5) |
+| Snapshot + fork | Layered on top of Firecracker | Native in `snapshot` crate |
 | Self-host | Limited | First-class; single binary |
 | Protocol | Proprietary SDK | Open `agent-sandbox-proto` spec |
 | Pricing | Managed per-second | OSS free; optional managed cloud |

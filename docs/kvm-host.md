@@ -1,6 +1,6 @@
 # KVM host setup
 
-Everything from **M1** onward requires a host with `/dev/kvm` accessible.
+The real (non-mock) backend requires a host with `/dev/kvm` accessible.
 This document lists the cheapest viable options.
 
 ## Quick check
@@ -31,18 +31,13 @@ You can still make high-value progress before you have a KVM-capable host:
 
 ## When `/dev/kvm` becomes mandatory
 
-You must switch to a KVM-capable host at the **M1 execution boundary**:
-first real `create → boot → serial output`.
-
-That means `/dev/kvm` is no longer optional once you need to implement or
+You must switch to a KVM-capable host once you need to implement or
 verify:
 
 - opening `/dev/kvm`
 - a real VM/vCPU run loop
 - UART serial output path (`ttyS0`, "hello from guest")
-
-After M1 bring-up, M2 end-to-end exec also strictly needs KVM because the
-real `virtio-vsock` + `/dev/vsock` guest path must be exercised.
+- end-to-end `nanovm exec` over real `virtio-vsock` + `/dev/vsock`
 
 ### Practical “you now need KVM” signals
 
@@ -95,7 +90,7 @@ aws ec2 run-instances \
 ```
 
 Real KVM performance, no nested-virt tax. Use for weekly benchmark runs
-and the M5 cold-start measurements that define the v0.1 launch gate.
+and reproducing the headline cold-start numbers.
 
 `m5.metal` and `c7i.metal-*` are also good; pick whichever region is
 cheapest on-demand the week you need it.
@@ -103,7 +98,7 @@ cheapest on-demand the week you need it.
 ## Option 4 — Hetzner dedicated (~€40/month)
 
 Cheapest continuous bare-metal host. `AX41-NVMe` or similar. Good for a
-dedicated CI runner once M5 benchmarks become part of merge gating.
+dedicated CI runner once KVM-backed benchmarks become part of merge gating.
 
 ## Option 5 — Free tier / credits stacking
 
@@ -115,8 +110,8 @@ dedicated CI runner once M5 benchmarks become part of merge gating.
 
 - **Development**: local Linux if available, else GCP nested virt.
 - **Benchmarks**: AWS c5n.metal on demand, run weekly.
-- **CI**: Ubuntu runners (no KVM) for the M0 trait/mock tests; a self-
-  hosted Hetzner or AWS instance once M1+ tests land.
+- **CI**: Ubuntu runners (no KVM) for trait/mock tests; a self-hosted
+  Hetzner or AWS instance for KVM-gated integration tests.
 
 ## Once you have a host
 
@@ -125,6 +120,5 @@ git clone https://github.com/ip888/Rust-nano-vm.git
 cd Rust-nano-vm
 cargo build -p vm-kvm --features kvm
 cargo test -p vm-kvm --features kvm
-# M1:
 cargo clippy --workspace --all-targets --features vm-kvm/kvm -- -D warnings
 ```

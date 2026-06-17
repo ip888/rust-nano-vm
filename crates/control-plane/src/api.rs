@@ -560,6 +560,37 @@ pub fn openapi_spec() -> Value {
                     }
                 }
             },
+            "/v1/snapshots/{id}/fork": {
+                "post": {
+                    "summary": "Fork a child VM from a snapshot (metered)",
+                    "description": "MAP_PRIVATE CoW fork of the snapshot. Subject to per-token token-bucket quota; throttled callers get 429 with Retry-After.",
+                    "parameters": [{ "$ref": "#/components/parameters/SnapshotIdPath" }],
+                    "responses": {
+                        "201": {
+                            "description": "Forked child VM plus per-fork latency and caller usage totals",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/ForkResponse" } }
+                            }
+                        },
+                        "429": {
+                            "description": "Rate-limited by per-token fork quota"
+                        }
+                    }
+                }
+            },
+            "/v1/usage": {
+                "get": {
+                    "summary": "Caller's per-token fork-usage counters",
+                    "responses": {
+                        "200": {
+                            "description": "Token fingerprint plus running fork totals",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/UsageResponse" } }
+                            }
+                        }
+                    }
+                }
+            },
             "/v1/vms/{id}/exec": {
                 "post": {
                     "summary": "Execute a command in the guest",
@@ -713,6 +744,25 @@ pub fn openapi_spec() -> Value {
                         "id": { "type": "integer" },
                         "display": { "type": "string" },
                         "dir": { "type": "string" }
+                    }
+                },
+                "ForkResponse": {
+                    "type": "object",
+                    "required": ["vm", "fork_ms", "fork_count", "fork_total_ms"],
+                    "properties": {
+                        "vm": { "$ref": "#/components/schemas/VmHandleDto" },
+                        "fork_ms": { "type": "integer", "minimum": 0 },
+                        "fork_count": { "type": "integer", "minimum": 0 },
+                        "fork_total_ms": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "UsageResponse": {
+                    "type": "object",
+                    "required": ["token", "fork_count", "fork_total_ms"],
+                    "properties": {
+                        "token": { "type": "string" },
+                        "fork_count": { "type": "integer", "minimum": 0 },
+                        "fork_total_ms": { "type": "integer", "minimum": 0 }
                     }
                 },
                 "SnapshotListEntry": {
