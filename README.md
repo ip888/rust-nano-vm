@@ -106,9 +106,10 @@ metrics   : nanovm_forks_total{token="tok-demo-10"} 5
 ### Driving the REST API by hand
 
 If you'd rather see the wire calls, run the binary and `curl` it. This
-path needs `jq` (`brew install jq` on macOS, `apt install jq` on
-Debian/Ubuntu) and a POSIX shell (`bash` or `zsh` with
-`setopt interactivecomments`):
+path is Linux/macOS only (uses POSIX job control and `until`) and needs
+`jq` installed (`brew install jq` on macOS, `apt install jq` on
+Debian/Ubuntu). Windows users: use the `cargo run --example demo` above
+or run this in WSL.
 
 ```sh
 cargo build --release -p control-plane
@@ -131,6 +132,10 @@ done
 
 curl -s localhost:8080/v1/usage -H "$TOKEN" | jq
 curl -s localhost:8080/metrics | head -20
+
+# Stop the backgrounded server when done. If you don't, the next run
+# will fail with "Address already in use".
+kill %1
 ```
 
 ## Quickstart — real KVM, real numbers
