@@ -49,7 +49,7 @@ them via `MAP_PRIVATE` copy-on-write.
 
 ## What's special
 
-1. **Cold start is a `mmap` away.** Fork doesn't re-boot a kernel; it
+1. **Cold start is an `mmap` away.** Fork doesn't re-boot a kernel; it
    maps the snapshot's memory file `MAP_PRIVATE` and lets the kernel
    serve the read-only golden pages to every child. The whole "trick" is
    ~50 lines of `unsafe` in [`crates/vm-kvm/src/vmstate.rs`](crates/vm-kvm/src/vmstate.rs).
