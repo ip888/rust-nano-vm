@@ -153,7 +153,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bench"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -239,7 +239,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "clap",
  "reqwest",
@@ -257,7 +257,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "control-plane"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "axum",
  "http-body-util",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "guest-agent"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "proto",
  "serde_json",
@@ -767,7 +767,7 @@ dependencies = [
 
 [[package]]
 name = "proto"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -945,7 +945,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "snapshot"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1259,28 +1259,28 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "virtio-fs"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "virtio-queue"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "virtio-vsock"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "vm-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -1288,7 +1288,7 @@ dependencies = [
 
 [[package]]
 name = "vm-kvm"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
@@ -1317,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "vm-mock"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "snapshot",
  "vm-core",

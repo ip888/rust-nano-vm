@@ -74,6 +74,42 @@ them via `MAP_PRIVATE` copy-on-write.
    `MockHypervisor` for tests so CI doesn't need `/dev/kvm`. Single
    workspace, `cargo test --workspace` green without root.
 
+## Supported platforms
+
+The mock backend (used by tests, the demo, and the control plane's
+default wiring) is portable Rust and runs on any platform with a Rust
+toolchain. The real `vm-kvm` backend currently targets Linux x86_64;
+Linux aarch64 (Graviton / Ampere / Apple Silicon under Linux VMs) is
+planned.
+
+| Target | Mock backend | `vm-kvm` (real KVM) | Prebuilt binary |
+| --- | --- | --- | --- |
+| `x86_64-unknown-linux-gnu`  | ✅ | ✅ | ✅ |
+| `aarch64-unknown-linux-gnu` | ✅ | planned | ✅ |
+| `aarch64-apple-darwin`      | ✅ | n/a (macOS has no `/dev/kvm`) | ✅ |
+| `x86_64-apple-darwin`       | ✅ | n/a | build from source |
+| `x86_64-pc-windows-msvc`    | ✅ | n/a | build from source |
+
+## Install — prebuilt binaries
+
+From the [latest release](https://github.com/ip888/Rust-nano-vm/releases/latest),
+pick the tarball matching your host. Each one contains
+`nanovm-control-plane` and `nanovm` plus README + LICENSE files.
+
+```sh
+# Linux x86_64
+curl -L https://github.com/ip888/Rust-nano-vm/releases/latest/download/rust-nano-vm-VERSION-x86_64-unknown-linux-gnu.tar.gz | tar xz
+
+# Linux aarch64 (Graviton / Ampere / Oracle A1)
+curl -L https://github.com/ip888/Rust-nano-vm/releases/latest/download/rust-nano-vm-VERSION-aarch64-unknown-linux-gnu.tar.gz | tar xz
+
+# macOS Apple Silicon (M1/M2/M3/M4)
+curl -L https://github.com/ip888/Rust-nano-vm/releases/latest/download/rust-nano-vm-VERSION-aarch64-apple-darwin.tar.gz | tar xz
+```
+
+Replace `VERSION` with the release tag (e.g. `0.0.2`). Each tarball
+ships a sidecar `.sha256` for integrity verification.
+
 ## Quickstart — demo in 30 seconds (mock backend, no KVM)
 
 One command, identical on Linux, macOS, and Windows. Only prerequisite
