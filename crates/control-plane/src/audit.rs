@@ -46,6 +46,7 @@ use axum::{
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
+use crate::request_id::RequestId;
 use crate::routes::token_fingerprint;
 
 /// JSONL audit appender. Cheap to clone — wraps an `Arc<Mutex<File>>`.
@@ -168,15 +169,26 @@ pub async fn require_audit(
     let token_label = bearer
         .map(token_fingerprint)
         .unwrap_or_else(|| "anonymous".to_owned());
+    // request-id is installed by the outermost middleware. If it's missing
+    // (e.g. library consumer composed router differently) we still log,
+    // just without the correlation field.
+    let request_id = req
+        .extensions()
+        .get::<RequestId>()
+        .map(|r| r.as_str().to_owned());
     let response = next.run(req).await;
     let status = response.status().as_u16();
-    audit.append(&json!({
+    let mut record = json!({
         "ts": rfc3339_now(),
         "method": method.as_str(),
         "path": path,
         "status": status,
         "token": token_label,
-    }));
+    });
+    if let Some(rid) = request_id {
+        record["request_id"] = Value::String(rid);
+    }
+    audit.append(&record);
     Ok(response)
 }
 

@@ -50,6 +50,7 @@ use crate::api::{
 use crate::audit;
 use crate::auth;
 use crate::error::ApiError;
+use crate::request_id;
 
 /// Per-token fork usage — the basis for usage-based billing on the fork API.
 #[derive(Debug, Default, Clone, Copy)]
@@ -163,6 +164,10 @@ pub fn router() -> Router<AppState> {
         // at the reverse proxy — same convention as Prometheus exporters.
         .route("/metrics", get(metrics_text))
         .nest("/v1", v1)
+        // OUTERMOST so /healthz, /metrics, /openapi.json, /v1/* all get a
+        // request id. The audit appender reads RequestId out of
+        // extensions; tracing logs inherit the id via the span.
+        .layer(middleware::from_fn(request_id::with_request_id))
         .layer(TraceLayer::new_for_http())
 }
 

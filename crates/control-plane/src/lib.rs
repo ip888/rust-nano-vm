@@ -45,6 +45,7 @@ mod auth;
 mod error;
 pub mod fork_quota;
 pub mod metrics;
+mod request_id;
 mod routes;
 
 pub use api::openapi_spec;
@@ -52,4 +53,5 @@ pub use audit::AuditLog;
 pub use auth::ApiTokens;
 pub use fork_quota::ForkQuota;
 pub use metrics::Metrics;
+pub use request_id::RequestId;
 pub use routes::{router, AppState};

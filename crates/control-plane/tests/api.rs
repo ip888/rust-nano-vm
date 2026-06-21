@@ -1438,3 +1438,105 @@ async fn audit_records_delete_and_status_code() {
     assert_eq!(second["path"], delete_path);
     assert_eq!(second["status"], 204);
 }
+
+// ---- request-id ----------------------------------------------------------
+
+#[tokio::test]
+async fn request_id_is_minted_when_absent() {
+    let app = app();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let header = resp
+        .headers()
+        .get("x-request-id")
+        .expect("response must carry x-request-id")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(header.starts_with("nanovm-"), "got {header}");
+}
+
+#[tokio::test]
+async fn request_id_echoes_valid_inbound_header() {
+    let app = app();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/healthz")
+        .header("x-request-id", "client-supplied.id_1-OK")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let echoed = resp
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(echoed, "client-supplied.id_1-OK");
+}
+
+#[tokio::test]
+async fn request_id_replaces_malicious_inbound_header() {
+    let app = app();
+    // CRLF injection would be a classic response-splitting attempt.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/healthz")
+        .header("x-request-id", "evil; X-Injected: yes")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let echoed = resp
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        echoed.starts_with("nanovm-"),
+        "malicious id must be replaced with a freshly minted one, got: {echoed}"
+    );
+    // The attacker-controlled header value never appears in any other
+    // response header.
+    assert!(resp.headers().get("x-injected").is_none());
+}
+
+#[tokio::test]
+async fn audit_record_includes_request_id() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let audit = control_plane::AuditLog::open(tmp.path()).unwrap();
+    let tokens = ApiTokens::new(["t"]);
+    let app = app_with_audit(tokens, audit);
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/vms")
+        .header("authorization", "Bearer t")
+        .header("content-type", "application/json")
+        .header("x-request-id", "audit-corr-1")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(
+        resp.headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "audit-corr-1"
+    );
+
+    let log = read_audit(tmp.path());
+    let line = log.lines().next().expect("at least one audit line");
+    let parsed: Value = serde_json::from_str(line).expect("audit line parses as JSON");
+    assert_eq!(parsed["request_id"], "audit-corr-1");
+    assert_eq!(parsed["method"], "POST");
+    assert_eq!(parsed["path"], "/v1/vms");
+}
