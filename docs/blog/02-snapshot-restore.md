@@ -194,5 +194,6 @@ cargo test -p vm-kvm --features kvm --test vsock_driver_ok_boot
 ---
 
 Previous post: [How rust-nano-vm cold-starts in ~12 ms](01-mmap-private.md).
+Next post: [Running AI agents in regulated environments](03-regulated-ai-sandboxes.md).
 
 Code: https://github.com/ip888/Rust-nano-vm
