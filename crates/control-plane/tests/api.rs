@@ -1277,3 +1277,164 @@ async fn metrics_records_throttled_attempts() {
     );
     assert!(text.contains("nanovm_forks_total{token=\"tok-alph-5\"} 1"));
 }
+
+// ---- audit log -----------------------------------------------------------
+
+/// Test-app builder that installs an [`AuditLog`] extension. The bearer-
+/// token set is whatever the caller passes; pass `ApiTokens::default()` for
+/// auth-disabled mode.
+fn app_with_audit(tokens: ApiTokens, audit: control_plane::AuditLog) -> Router {
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    router()
+        .layer(Extension(Arc::new(tokens)))
+        .layer(Extension(audit))
+        .with_state(AppState::new(hv))
+}
+
+fn read_audit(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+#[tokio::test]
+async fn audit_logs_authenticated_post_with_full_path() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let audit = control_plane::AuditLog::open(tmp.path()).unwrap();
+    let tokens = ApiTokens::new(["secret-token"]);
+    let app = app_with_audit(tokens, audit);
+
+    let (status, _) = send_with(
+        app,
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        Some("secret-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let log = read_audit(tmp.path());
+    let line = log.lines().next().expect("at least one audit line");
+    let parsed: Value = serde_json::from_str(line).expect("audit line parses as JSON");
+    assert_eq!(parsed["method"], "POST");
+    assert_eq!(parsed["path"], "/v1/vms");
+    assert_eq!(parsed["status"], 201);
+    assert_eq!(parsed["token"], "tok-secr-12");
+    assert!(parsed["ts"].as_str().unwrap().ends_with('Z'));
+}
+
+#[tokio::test]
+async fn audit_skips_get_requests() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let audit = control_plane::AuditLog::open(tmp.path()).unwrap();
+    let tokens = ApiTokens::new(["t"]);
+    let app = app_with_audit(tokens, audit);
+
+    let (status, _) = send_with(app, Method::GET, "/v1/vms", None, Some("t")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let log = read_audit(tmp.path());
+    assert!(log.is_empty(), "GETs must not be recorded; got: {log:?}");
+}
+
+#[tokio::test]
+async fn audit_never_writes_raw_bearer_token() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let audit = control_plane::AuditLog::open(tmp.path()).unwrap();
+    let raw = "very-secret-bearer-value"; // first4 = "very", len = 24
+    let tokens = ApiTokens::new([raw]);
+    let app = app_with_audit(tokens, audit);
+
+    for _ in 0..3 {
+        let _ = send_with(
+            app.clone(),
+            Method::POST,
+            "/v1/vms",
+            Some(json!({})),
+            Some(raw),
+        )
+        .await;
+    }
+
+    let log = read_audit(tmp.path());
+    assert!(
+        !log.contains(raw),
+        "raw bearer must never appear in audit log:\n{log}"
+    );
+    let expected_fp = format!("\"tok-very-{}\"", raw.len());
+    assert_eq!(
+        log.matches(&expected_fp).count(),
+        3,
+        "expected 3 fingerprinted lines (looking for {expected_fp}):\n{log}"
+    );
+}
+
+#[tokio::test]
+async fn audit_passes_through_when_extension_missing() {
+    // No AuditLog extension installed; default `app()` helper.
+    let (status, body) = send(app(), Method::POST, "/v1/vms", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body["id"].is_u64());
+}
+
+#[tokio::test]
+async fn audit_logs_unauthorized_attempt_is_rejected_before_audit() {
+    // Auth on, audit on, wrong token. Auth rejects FIRST (outer layer), so
+    // the audit file stays empty — that's the design.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let audit = control_plane::AuditLog::open(tmp.path()).unwrap();
+    let tokens = ApiTokens::new(["good-token"]);
+    let app = app_with_audit(tokens, audit);
+
+    let (status, _) = send_with(
+        app,
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        Some("bad-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let log = read_audit(tmp.path());
+    assert!(
+        log.is_empty(),
+        "auth-rejected requests must not appear in the audit log:\n{log:?}"
+    );
+}
+
+#[tokio::test]
+async fn audit_records_delete_and_status_code() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let audit = control_plane::AuditLog::open(tmp.path()).unwrap();
+    let tokens = ApiTokens::new(["t"]);
+    let app = app_with_audit(tokens, audit);
+
+    // VmId::next() is a process-global counter, so the actual id of the
+    // VM we create depends on what other parallel tests have done. Extract
+    // it from the response rather than hard-coding 1.
+    let (create_status, create_body) = send_with(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        Some("t"),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::CREATED);
+    let vm_id = create_body["id"].as_u64().expect("create returned id");
+    let delete_path = format!("/v1/vms/{vm_id}");
+
+    let (status, _) = send_with(app, Method::DELETE, &delete_path, None, Some("t")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let log = read_audit(tmp.path());
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 2, "expected 2 audit lines, got: {log}");
+    let first: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(first["method"], "POST");
+    assert_eq!(first["status"], 201);
+    let second: Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(second["method"], "DELETE");
+    assert_eq!(second["path"], delete_path);
+    assert_eq!(second["status"], 204);
+}

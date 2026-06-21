@@ -143,6 +143,20 @@ A misconfiguration (empty token list) emits a loud `WARN` on
 startup, not a silent fallback. Catches "we forgot to set the env
 var in production" before it ships.
 
+When `NANOVM_AUDIT_LOG=/var/log/nanovm/audit.jsonl` is set, every
+mutating `/v1/*` call (POST / PUT / PATCH / DELETE) appends one JSON
+line:
+
+```jsonl
+{"ts":"2026-06-22T00:00:00.123Z","method":"POST","path":"/v1/vms","status":201,"token":"tok-abcd-12"}
+```
+
+The raw bearer never appears — only the fingerprint. Rotate the file
+with `logrotate` + `copytruncate` so the binary's append handle stays
+on the same inode. Write failures log an `ERROR` and the request
+still completes (losing one line is preferable to dropping the
+request).
+
 ### 3. No outbound telemetry
 
 There is no phone-home. There is no analytics endpoint. There is no
@@ -273,10 +287,11 @@ NANOVM_API_TOKENS=evaluation ./nanovm-control-plane
 ## What's interesting if you take this seriously
 
 If `rust-nano-vm` is a candidate for your regulated AI-agent deployment
-and you have ideas about the gaps above (audit log format, token
-rotation primitives, FIPS-aligned crypto, vsock policy, hardware-rooted
-attestation), file an issue. Pre-1.0 means there's room for the
-contract to reflect what real auditors actually ask.
+and you have ideas about the gaps above (token rotation primitives,
+FIPS-aligned crypto, vsock policy, hardware-rooted attestation), file
+an issue. Pre-1.0 means there's room for the contract to reflect what
+real auditors actually ask. The JSONL audit log is shipped; deeper
+fields (request-id, source IP, payload checksums) are open to design.
 
 The repo lives at https://github.com/ip888/Rust-nano-vm.
 

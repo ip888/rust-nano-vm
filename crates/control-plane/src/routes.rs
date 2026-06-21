@@ -47,6 +47,7 @@ use crate::api::{
     SnapshotListResponse, SnapshotRequest, UsageResponseDto, VmHandleDto, VmListEntry,
     VmListResponse, VmStateResponse,
 };
+use crate::audit;
 use crate::auth;
 use crate::error::ApiError;
 
@@ -148,6 +149,10 @@ pub fn router() -> Router<AppState> {
         // accounting so we can bill on fork count + latency.
         .route("/snapshots/:id/fork", post(fork_snapshot))
         .route("/usage", get(usage))
+        // route_layer is bottom-up: the LAST `.route_layer` runs FIRST.
+        // require_audit must see *authenticated* calls only, so register
+        // it INNER (here) and require_token OUTER (after this).
+        .route_layer(middleware::from_fn(audit::require_audit))
         .route_layer(middleware::from_fn(auth::require_token));
 
     Router::new()
@@ -396,7 +401,7 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
 /// Non-cryptographic fingerprint of a token: `tok-<first4>-<len>`. Lets
 /// operators correlate audit/usage entries without ever logging the raw
 /// secret. Same shape the audit log uses.
-fn token_fingerprint(token: &str) -> String {
+pub(crate) fn token_fingerprint(token: &str) -> String {
     let head: String = token.chars().take(4).collect();
     format!("tok-{head}-{}", token.len())
 }
