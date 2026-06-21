@@ -97,32 +97,39 @@ Three things flow from that for a compliance-aware deployment:
 
 ## Where rust-nano-vm fits
 
-[`rust-nano-vm`](https://github.com/ip888/rust-nano-vm) is a
-single-binary Rust microVM aimed at AI-agent code execution. The
-control plane, the VMM, the guest agent, and the snapshot/fork logic
-all ship in one binary built `#[forbid(unsafe_code)]` everywhere
-except a ~50-line block in `vm-kvm` that does the
-[`MAP_PRIVATE` CoW fork trick](01-mmap-private.md).
+[`rust-nano-vm`](https://github.com/ip888/Rust-nano-vm) is a
+single-binary host-side Rust microVM aimed at AI-agent code
+execution. The Rust source is `#[forbid(unsafe_code)]` everywhere
+except the `vm-kvm` crate, which concentrates the project's only
+`unsafe` in two small areas: the
+[`MAP_PRIVATE` CoW fork primitive](01-mmap-private.md) and the KVM
+vCPU state save/restore. Five `unsafe` blocks across the entire
+workspace.
 
 For a regulated deployment, four properties matter more than any
 single benchmark number:
 
-### 1. Single binary, no external services
+### 1. One host binary, no external services
 
-You deploy one binary. Not a control plane + jailer + agent +
-orchestrator. Not a managed cloud account. Not a Docker daemon. The
-attack surface of *what runs on your host* is whatever syscalls that
-one binary makes, plus whatever the guest kernel exposes via KVM.
+The host-side surface — control plane, VMM, snapshot/fork logic —
+ships as one binary (`nanovm-control-plane`). There's no jailer
+process, no orchestrator daemon, no managed cloud account, no Docker
+daemon. The guest VM does run a small static-musl `nanovm-agent`
+inside its own kernel (baked into an initramfs you build and pin),
+but that runs in the guest, not on the host — its attack surface
+faces *into* the sandbox, not out of it.
 
-That makes the binary itself attestable. You can produce its SHA256,
-sign it with cosign/sigstore, pin its hash in your inventory, and
-have your security team review the build provenance one time.
+That makes the host binary itself attestable. You can produce its
+SHA256, sign it with cosign/sigstore, pin its hash in your
+inventory, and have your security team review the build provenance
+one time.
 
 The release workflow builds prebuilt
-[`aarch64-unknown-linux-gnu`](https://github.com/ip888/rust-nano-vm/releases/latest)
-and `x86_64-unknown-linux-gnu` binaries on GitHub Actions with
-`--locked` against a checked-in `Cargo.lock`. Each release carries
-a sidecar SHA256 you can verify before deployment.
+[`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, and `aarch64-apple-darwin`](https://github.com/ip888/Rust-nano-vm/releases/latest)
+binaries on GitHub Actions with `--locked` against a checked-in
+`Cargo.lock`. Each release carries a sidecar SHA256 you can verify
+before deployment. (The real KVM backend is Linux-only; the macOS
+build runs the mock backend for development on Apple Silicon.)
 
 ### 2. Bearer-token auth on every mutating route
 
@@ -231,12 +238,16 @@ Concretely:
 
 ## Try it
 
-Quickstart is one command — no KVM needed for evaluation, no Rust
-toolchain needed on the host past the build:
+Two evaluation paths, depending on whether you want to build from
+source or audit a prebuilt binary.
+
+**From source** (needs a Rust toolchain — `rustup` from
+https://rustup.rs). No KVM required; the demo runs against the mock
+backend:
 
 ```sh
-git clone https://github.com/ip888/rust-nano-vm
-cd rust-nano-vm
+git clone https://github.com/ip888/Rust-nano-vm
+cd Rust-nano-vm
 cargo run -p control-plane --example demo --release
 ```
 
@@ -247,9 +258,17 @@ cargo run -p bench --features kvm --release --bin nanovm-fork-bench -- \
     --count 100 --alive 50 --settle-secs 2
 ```
 
-Prebuilt binaries (x86_64 + aarch64 Linux, Apple Silicon) are on the
-[releases page](https://github.com/ip888/rust-nano-vm/releases/latest)
-with SHA256 sidecars.
+**Prebuilt binary** (no Rust toolchain on the host). Released for
+`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, and
+`aarch64-apple-darwin` from the
+[releases page](https://github.com/ip888/Rust-nano-vm/releases/latest),
+each with a sidecar SHA256. Example for Linux x86_64:
+
+```sh
+curl -L https://github.com/ip888/Rust-nano-vm/releases/latest/download/rust-nano-vm-VERSION-x86_64-unknown-linux-gnu.tar.gz | tar xz
+cd rust-nano-vm-VERSION-x86_64-unknown-linux-gnu
+NANOVM_API_TOKENS=evaluation ./nanovm-control-plane
+```
 
 ## What's interesting if you take this seriously
 
@@ -259,7 +278,7 @@ rotation primitives, FIPS-aligned crypto, vsock policy, hardware-rooted
 attestation), file an issue. Pre-1.0 means there's room for the
 contract to reflect what real auditors actually ask.
 
-The repo lives at https://github.com/ip888/rust-nano-vm.
+The repo lives at https://github.com/ip888/Rust-nano-vm.
 
 ---
 
