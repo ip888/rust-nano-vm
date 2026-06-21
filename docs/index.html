@@ -75,15 +75,16 @@
   <h1>rust-<span class="accent">nano</span>-vm</h1>
   <p class="tagline">A single-binary Rust microVM for AI-agent code execution.</p>
   <p class="sub">
-    <span class="badge">Rust</span>
-    <span class="badge">KVM</span>
+    <span class="badge">Rust 1.94+</span>
+    <span class="badge">Linux + macOS</span>
+    <span class="badge">x86_64 + aarch64</span>
     <span class="badge">Apache-2.0 / MIT</span>
-    <span class="badge">Linux</span>
   </p>
   <div class="cta">
     <a class="btn primary" href="https://github.com/ip888/Rust-nano-vm">Star on GitHub</a>
-    <a class="btn" href="https://github.com/ip888/Rust-nano-vm#quickstart--demo-in-30-seconds-mock-backend-no-kvm">30-second demo</a>
+    <a class="btn" href="#install">Install</a>
     <a class="btn" href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/blog/01-mmap-private.md">Read the trick</a>
+    <a class="btn" href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/blog/03-regulated-ai-sandboxes.md">Regulated deployments</a>
   </div>
 </header>
 
@@ -155,21 +156,39 @@ all of them via <code>MAP_PRIVATE</code> copy-on-write.
   ~330 lines of axum, no magic.</li>
 </ol>
 
-<h2>30-second demo</h2>
+<h2 id="install">Install &amp; try</h2>
+
+<h3>One-command demo (any platform with Rust)</h3>
 <p style="color: var(--muted); font-size: 0.95rem;">
-One command — works identically on Linux, macOS, and Windows. Only
-prerequisite is a Rust toolchain (<a href="https://rustup.rs">rustup</a>).
-Boots an in-process control plane backed by the mock hypervisor and
-drives the full create → snapshot → fork lifecycle.
+Boots an in-process control plane on a free port, drives the full
+create → snapshot → fork lifecycle, prints a report. Works
+identically on Linux, macOS, and Windows. Only prerequisite is a
+Rust toolchain (<a href="https://rustup.rs">rustup</a>).
 </p>
 <pre><code>git clone https://github.com/ip888/Rust-nano-vm.git
 cd Rust-nano-vm
 cargo run -p control-plane --example demo --release</code></pre>
 <p style="color: var(--muted); font-size: 0.95rem;">
-Prints a per-step report. To see the wire calls instead, see the
+To see the wire calls instead, see the
 <a href="https://github.com/ip888/Rust-nano-vm#driving-the-rest-api-by-hand">"Driving the REST API by hand"</a>
 section of the README.
 </p>
+
+<h3>Prebuilt binaries (no Rust toolchain needed on the host)</h3>
+<p style="color: var(--muted); font-size: 0.95rem;">
+Every tagged release ships native-built binaries for three targets,
+each with a sidecar SHA256 you can verify before deployment. Browse
+all assets on the
+<a href="https://github.com/ip888/Rust-nano-vm/releases/latest">latest release page</a>.
+</p>
+<table>
+  <thead><tr><th>Target</th><th>Use it on</th><th>Real KVM backend</th></tr></thead>
+  <tbody>
+    <tr><td><code>x86_64-unknown-linux-gnu</code></td><td>Generic Linux servers, AWS x86 instances, dev laptops</td><td class="good">✅</td></tr>
+    <tr><td><code>aarch64-unknown-linux-gnu</code></td><td>AWS Graviton, Ampere Altra, Oracle A1, Linux on RPi-class</td><td>planned</td></tr>
+    <tr><td><code>aarch64-apple-darwin</code></td><td>Apple Silicon Macs (M1/M2/M3/M4) for dev</td><td>n/a (macOS has no <code>/dev/kvm</code>)</td></tr>
+  </tbody>
+</table>
 
 <h2>Use cases this is built for</h2>
 <ul>
@@ -177,7 +196,9 @@ section of the README.
   image to run a benchmark in parallel; throw them away in milliseconds.</li>
   <li><strong>Self-hosted code interpreters.</strong> Drop-in OSS alternative to
   E2B for teams that need on-prem (healthcare, finance, defense, EU
-  data residency).</li>
+  data residency). See
+  <a href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/blog/03-regulated-ai-sandboxes.md">Running AI agents in regulated environments →</a>
+  for the audit-narrative angle.</li>
   <li><strong>CI for untrusted PRs.</strong> Stronger isolation than a container,
   faster than a fresh VM, with a REST API your runner can drive.</li>
   <li><strong>Per-user sandboxes for AI products.</strong> One snapshot per
