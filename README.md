@@ -262,7 +262,9 @@ Pre-1.0. Full roadmap in [`docs/PLAN.md`](docs/PLAN.md).
 ## Use cases this is built for
 
 - **AI agent eval pipelines.** Fan out 1000 variants of a base image to
-  run a benchmark in parallel; throw them away in milliseconds.
+  run a benchmark in parallel; throw them away in milliseconds. See
+  [`docs/blog/04-12ms-eval-fanout.md`](docs/blog/04-12ms-eval-fanout.md)
+  for the worked numbers vs containers.
 - **Self-hosted code interpreters.** Drop-in OSS alternative to E2B for
   teams that need on-prem (healthcare, finance, defense, EU data
   residency). See
