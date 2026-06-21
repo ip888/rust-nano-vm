@@ -40,6 +40,7 @@
 #![warn(missing_docs)]
 
 mod api;
+mod audit;
 mod auth;
 mod error;
 pub mod fork_quota;
@@ -47,6 +48,7 @@ pub mod metrics;
 mod routes;
 
 pub use api::openapi_spec;
+pub use audit::AuditLog;
 pub use auth::ApiTokens;
 pub use fork_quota::ForkQuota;
 pub use metrics::Metrics;

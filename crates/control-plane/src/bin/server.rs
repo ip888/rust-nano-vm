@@ -7,13 +7,15 @@
 //! - `NANOVM_CONTROL_PLANE_ADDR` — bind address (default `127.0.0.1:8080`).
 //! - `NANOVM_API_TOKENS` — comma-separated bearer tokens. **Empty disables
 //!   auth** and emits a `WARN` log line on startup.
+//! - `NANOVM_AUDIT_LOG` — when set to a filesystem path, mutating `/v1/*`
+//!   calls are appended as JSON lines for compliance / forensics.
 
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
 
 use axum::Extension;
-use control_plane::{router, ApiTokens, AppState};
+use control_plane::{router, ApiTokens, AppState, AuditLog};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{info, warn};
@@ -41,9 +43,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!(count = tokens.len(), "bearer-token auth enabled");
     }
 
+    let audit = AuditLog::from_env();
+    if let Some(path) = audit.path() {
+        info!(path = %path.display(), "audit log appender enabled");
+    }
+    if !audit.is_disabled() && tokens.is_empty() {
+        warn!(
+            "NANOVM_AUDIT_LOG is set but NANOVM_API_TOKENS is empty; \
+             audit lines will use the literal token \"anonymous\". \
+             Configure tokens before relying on the audit log."
+        );
+    }
+
     let hypervisor: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
     let app = router()
         .layer(Extension(tokens))
+        .layer(Extension(audit))
         .with_state(AppState::new(hypervisor));
 
     let listener = TcpListener::bind(&addr).await?;
