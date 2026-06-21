@@ -265,7 +265,9 @@ Pre-1.0. Full roadmap in [`docs/PLAN.md`](docs/PLAN.md).
   run a benchmark in parallel; throw them away in milliseconds.
 - **Self-hosted code interpreters.** Drop-in OSS alternative to E2B for
   teams that need on-prem (healthcare, finance, defense, EU data
-  residency).
+  residency). See
+  [`docs/blog/03-regulated-ai-sandboxes.md`](docs/blog/03-regulated-ai-sandboxes.md)
+  for the audit-narrative angle.
 - **CI for untrusted PRs.** Stronger isolation than a container, faster
   than a fresh VM, with a REST API your runner can drive.
 - **Per-user sandboxes for AI products.** One snapshot per language
