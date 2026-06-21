@@ -286,3 +286,4 @@ Companion posts:
 
 - [How rust-nano-vm cold-starts in ~12 ms: `mmap(MAP_PRIVATE)` is the whole trick](01-mmap-private.md)
 - [Faithful KVM snapshot/restore in <1000 lines of Rust](02-snapshot-restore.md)
+- [12 ms fan-out for AI-agent eval pipelines](04-12ms-eval-fanout.md)
