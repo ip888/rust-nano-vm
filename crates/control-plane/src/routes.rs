@@ -43,7 +43,7 @@ use vm_core::{Hypervisor, SnapshotId, VmId};
 
 use crate::api::{
     openapi_spec, CreateVmRequest, ExecRequest, ExecResponse, FilePathQuery, FileReadResponse,
-    FileWriteRequest, FileWrittenResponse, ForkResponseDto, ListQuery, SnapshotDto,
+    FileWriteRequest, FileWrittenResponse, ForkResponseDto, HealthResponse, ListQuery, SnapshotDto,
     SnapshotListEntry, SnapshotListResponse, SnapshotRequest, UsageResponseDto, VmHandleDto,
     VmListEntry, VmListResponse, VmStateResponse,
 };
@@ -51,6 +51,7 @@ use crate::audit;
 use crate::auth;
 use crate::error::ApiError;
 use crate::request_id;
+use crate::time::rfc3339_now;
 
 /// Per-token fork usage — the basis for usage-based billing on the fork API.
 #[derive(Debug, Default, Clone, Copy)]
@@ -72,6 +73,17 @@ pub struct AppState {
     fork_quota: Arc<crate::ForkQuota>,
     /// Prometheus counters exposed at `/metrics`.
     metrics: Arc<crate::Metrics>,
+    /// Process start time (monotonic clock) — used to compute uptime
+    /// reported on `GET /v1/health`. Set once when the first `AppState`
+    /// is constructed and shared across clones.
+    start_instant: Instant,
+    /// Wall-clock boot time as a RFC 3339 string — surfaced on
+    /// `GET /v1/health`. Frozen at AppState construction so subsequent
+    /// system clock changes don't drift the reported boot time.
+    started_at: String,
+    /// Human-readable backend label surfaced on `GET /v1/health`
+    /// (e.g. `"mock"`, `"kvm"`). Defaults to `"mock"` in `new()`.
+    backend_label: &'static str,
 }
 
 impl std::fmt::Debug for AppState {
@@ -88,6 +100,8 @@ impl AppState {
     /// fork quota defaults to the values from
     /// [`ForkQuota::from_env`](crate::ForkQuota::from_env); use
     /// [`with_fork_quota`](Self::with_fork_quota) for an explicit override.
+    /// Backend label defaults to `"mock"`; real backends should call
+    /// [`with_backend_label`](Self::with_backend_label).
     pub fn new(hypervisor: Arc<dyn Hypervisor>) -> Self {
         Self::with_fork_quota(hypervisor, Arc::new(crate::ForkQuota::from_env()))
     }
@@ -103,7 +117,19 @@ impl AppState {
             fork_usage: Arc::new(Mutex::new(HashMap::new())),
             fork_quota,
             metrics: Arc::new(crate::Metrics::new()),
+            start_instant: Instant::now(),
+            started_at: rfc3339_now(),
+            backend_label: "mock",
         }
+    }
+
+    /// Override the backend label surfaced on `GET /v1/health`. Real
+    /// backends (e.g. the KVM binary) call this with `"kvm"` so
+    /// monitoring can tell at a glance which backend a process is
+    /// running.
+    pub fn with_backend_label(mut self, label: &'static str) -> Self {
+        self.backend_label = label;
+        self
     }
 
     /// Borrow the metrics collector. Test-only API for asserting on
@@ -150,6 +176,7 @@ pub fn router() -> Router<AppState> {
         // accounting so we can bill on fork count + latency.
         .route("/snapshots/:id/fork", post(fork_snapshot))
         .route("/usage", get(usage))
+        .route("/health", get(health))
         // route_layer is bottom-up: the LAST `.route_layer` runs FIRST.
         // require_audit must see *authenticated* calls only, so register
         // it INNER (here) and require_token OUTER (after this).
@@ -406,6 +433,21 @@ async fn usage(
         fork_count: entry.count,
         fork_total_ms: entry.total_ms,
     }))
+}
+
+/// `GET /v1/health` — structured health endpoint with backend label,
+/// crate version, uptime, and the wall-clock boot time. Auth-gated
+/// (lives under `/v1/*`) so the version disclosure isn't a free
+/// fingerprinting surface; lightweight liveness probes should keep using
+/// `/healthz`.
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    Json(HealthResponse {
+        ok: true,
+        backend: state.backend_label,
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_secs: state.start_instant.elapsed().as_secs(),
+        started_at: state.started_at.clone(),
+    })
 }
 
 /// Pull the bearer token out of the `Authorization: Bearer …` header, if

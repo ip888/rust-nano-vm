@@ -1742,3 +1742,49 @@ async fn list_snapshots_supports_pagination() {
         "every returned snapshot id must be > {after}, got {returned:?}"
     );
 }
+
+// ---- /v1/health ----------------------------------------------------------
+
+#[tokio::test]
+async fn v1_health_returns_structured_detail() {
+    let (status, body) = send(app(), Method::GET, "/v1/health", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["backend"], "mock", "default backend label is mock");
+    assert_eq!(
+        body["version"].as_str().unwrap(),
+        env!("CARGO_PKG_VERSION"),
+        "version field must match the crate version"
+    );
+    assert!(body["uptime_secs"].is_u64());
+    let started = body["started_at"].as_str().expect("started_at is a string");
+    assert!(
+        started.ends_with('Z') && started.len() == 24,
+        "started_at must be a 24-char RFC 3339 stamp, got {started:?}"
+    );
+}
+
+#[tokio::test]
+async fn v1_health_requires_auth_when_tokens_configured() {
+    let app = app_with_tokens(ApiTokens::new(["good"]));
+    let (status, body) = send(app, Method::GET, "/v1/health", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["code"], "unauthorized");
+}
+
+#[tokio::test]
+async fn v1_health_passes_with_valid_token() {
+    let app = app_with_tokens(ApiTokens::new(["good"]));
+    let (status, body) = send_with(app, Method::GET, "/v1/health", None, Some("good")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+}
+
+#[tokio::test]
+async fn legacy_healthz_unchanged() {
+    // /healthz must keep returning plain-text "ok" with no auth — it's the
+    // load-balancer liveness probe surface.
+    let (status, body) = send(app(), Method::GET, "/healthz", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!("ok"));
+}
