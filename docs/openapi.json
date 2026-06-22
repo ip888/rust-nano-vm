@@ -1,6 +1,28 @@
 {
   "components": {
     "parameters": {
+      "ListAfter": {
+        "description": "Return only entries with id strictly greater than this. Use the `next` field from the previous response to advance.",
+        "in": "query",
+        "name": "after",
+        "required": false,
+        "schema": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "ListLimit": {
+        "description": "Page size. Default 100, max 1000. 0 is rejected.",
+        "in": "query",
+        "name": "limit",
+        "required": false,
+        "schema": {
+          "default": 100,
+          "maximum": 1000,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
       "SnapshotIdPath": {
         "in": "path",
         "name": "id",
@@ -243,6 +265,11 @@
       },
       "SnapshotListResponse": {
         "properties": {
+          "next": {
+            "description": "Cursor for the next page. Pass as `?after=<this>`. Absent when the response holds the tail of the result set.",
+            "minimum": 0,
+            "type": "integer"
+          },
           "snapshots": {
             "items": {
               "$ref": "#/components/schemas/SnapshotListEntry"
@@ -336,6 +363,11 @@
       },
       "VmListResponse": {
         "properties": {
+          "next": {
+            "description": "Cursor for the next page. Pass as `?after=<this>`. Absent when the response holds the tail of the result set.",
+            "minimum": 0,
+            "type": "integer"
+          },
           "vms": {
             "items": {
               "$ref": "#/components/schemas/VmListEntry"
@@ -385,7 +417,7 @@
   },
   "info": {
     "title": "rust-nano-vm control-plane API",
-    "version": "0.0.1"
+    "version": "0.0.2"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -428,6 +460,14 @@
     },
     "/v1/snapshots": {
       "get": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ListLimit"
+          },
+          {
+            "$ref": "#/components/parameters/ListAfter"
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -438,6 +478,9 @@
               }
             },
             "description": "Snapshot list"
+          },
+          "400": {
+            "description": "limit out of range (0 or > 1000)"
           }
         },
         "summary": "List snapshots"
@@ -525,6 +568,14 @@
     },
     "/v1/vms": {
       "get": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ListLimit"
+          },
+          {
+            "$ref": "#/components/parameters/ListAfter"
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -535,6 +586,9 @@
               }
             },
             "description": "VM list"
+          },
+          "400": {
+            "description": "limit out of range (0 or > 1000)"
           }
         },
         "summary": "List VMs"

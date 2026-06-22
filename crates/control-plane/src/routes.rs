@@ -43,9 +43,9 @@ use vm_core::{Hypervisor, SnapshotId, VmId};
 
 use crate::api::{
     openapi_spec, CreateVmRequest, ExecRequest, ExecResponse, FilePathQuery, FileReadResponse,
-    FileWriteRequest, FileWrittenResponse, ForkResponseDto, SnapshotDto, SnapshotListEntry,
-    SnapshotListResponse, SnapshotRequest, UsageResponseDto, VmHandleDto, VmListEntry,
-    VmListResponse, VmStateResponse,
+    FileWriteRequest, FileWrittenResponse, ForkResponseDto, ListQuery, SnapshotDto,
+    SnapshotListEntry, SnapshotListResponse, SnapshotRequest, UsageResponseDto, VmHandleDto,
+    VmListEntry, VmListResponse, VmStateResponse,
 };
 use crate::audit;
 use crate::auth;
@@ -204,10 +204,25 @@ async fn create_vm(
     Ok((StatusCode::CREATED, Json(handle.into())))
 }
 
-async fn list_vms(State(state): State<AppState>) -> Result<Json<VmListResponse>, ApiError> {
-    let handles = state.hypervisor.list_vms()?;
-    let mut vms = Vec::with_capacity(handles.len());
-    for handle in handles {
+async fn list_vms(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<VmListResponse>, ApiError> {
+    let limit = query.validated_limit()?;
+    let after = query.after.unwrap_or(0);
+
+    // Fetch all ids first, sort by id, drop everything <= after, then
+    // enrich only the rows we keep. Enriching the dropped rows would
+    // turn a 100-row page over a 100k-VM hypervisor into 100k vm_meta
+    // calls — which would defeat the point of pagination.
+    let mut handles = state.hypervisor.list_vms()?;
+    handles.sort_by_key(|h| h.id.0);
+    let mut filtered: Vec<_> = handles.into_iter().filter(|h| h.id.0 > after).collect();
+    let has_more = filtered.len() > limit as usize;
+    filtered.truncate(limit as usize);
+
+    let mut vms = Vec::with_capacity(filtered.len());
+    for handle in filtered {
         // Best-effort metadata enrichment — same degrade-gracefully
         // pattern as list_snapshots: Unsupported (backend can't
         // surface geometry) or UnknownVm (raced with destroy) → id-
@@ -221,7 +236,9 @@ async fn list_vms(State(state): State<AppState>) -> Result<Json<VmListResponse>,
         };
         vms.push(entry);
     }
-    Ok(Json(VmListResponse { vms }))
+
+    let next = has_more.then(|| vms.last().map(|e| e.id)).flatten();
+    Ok(Json(VmListResponse { vms, next }))
 }
 
 async fn get_vm(
@@ -413,10 +430,22 @@ pub(crate) fn token_fingerprint(token: &str) -> String {
 
 async fn list_snapshots(
     State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<SnapshotListResponse>, ApiError> {
-    let ids = state.hypervisor.list_snapshots()?;
-    let mut snapshots = Vec::with_capacity(ids.len());
-    for id in ids {
+    let limit = query.validated_limit()?;
+    let after = query.after.unwrap_or(0);
+
+    // Same filter-then-enrich shape as `list_vms`: snapshot_meta() can
+    // be expensive (file-system reads for the KVM backend), so only
+    // call it for rows we actually return.
+    let mut ids = state.hypervisor.list_snapshots()?;
+    ids.sort_by_key(|s| s.0);
+    let mut filtered: Vec<_> = ids.into_iter().filter(|s| s.0 > after).collect();
+    let has_more = filtered.len() > limit as usize;
+    filtered.truncate(limit as usize);
+
+    let mut snapshots = Vec::with_capacity(filtered.len());
+    for id in filtered {
         // Best-effort metadata enrichment. Two failure modes are
         // expected and we degrade gracefully:
         // - Unsupported: the backend can't surface geometry. Keep the
@@ -436,7 +465,9 @@ async fn list_snapshots(
         };
         snapshots.push(entry);
     }
-    Ok(Json(SnapshotListResponse { snapshots }))
+
+    let next = has_more.then(|| snapshots.last().map(|e| e.id)).flatten();
+    Ok(Json(SnapshotListResponse { snapshots, next }))
 }
 
 async fn delete_snapshot(

@@ -131,9 +131,14 @@ pub(crate) struct UsageResponseDto {
 /// Response body for `GET /v1/vms`. Wraps a list rather than returning a
 /// bare JSON array so we can add pagination / filter metadata at the
 /// envelope level later without breaking clients.
+///
+/// `next` carries the id to use as `?after=` for the next page. `None`
+/// when this response holds the tail of the result set.
 #[derive(Debug, Serialize)]
 pub(crate) struct VmListResponse {
     pub vms: Vec<VmListEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<u64>,
 }
 
 /// Per-VM row in `GET /v1/vms`. Carries the same id + display + state
@@ -212,6 +217,45 @@ impl VmStateResponse {
     }
 }
 
+/// Default page size for `GET /v1/vms` and `GET /v1/snapshots` when
+/// `?limit=` is not specified.
+pub(crate) const DEFAULT_LIST_LIMIT: u32 = 100;
+
+/// Hard upper bound on the page size a single list call can request.
+/// Capped so a worst-case client can't pull "give me ten million VMs"
+/// and OOM the host.
+pub(crate) const MAX_LIST_LIMIT: u32 = 1000;
+
+/// Query parameters for `GET /v1/vms` and `GET /v1/snapshots`. Forward
+/// pagination by stable u64 id:
+///
+/// - `limit` — page size. Defaults to [`DEFAULT_LIST_LIMIT`]; capped at
+///   [`MAX_LIST_LIMIT`]. `limit=0` is rejected.
+/// - `after` — return only entries with id strictly greater than this.
+///   Pass the previous response's `next` field to advance.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ListQuery {
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub after: Option<u64>,
+}
+
+impl ListQuery {
+    /// Resolve `limit` to a concrete page size or return a structured
+    /// 400 with a stable `code` clients can match on.
+    pub fn validated_limit(&self) -> Result<u32, crate::error::ApiError> {
+        match self.limit {
+            None => Ok(DEFAULT_LIST_LIMIT),
+            Some(0) => Err(crate::error::ApiError::Bad("limit must be >= 1".into())),
+            Some(n) if n > MAX_LIST_LIMIT => Err(crate::error::ApiError::Bad(format!(
+                "limit must be <= {MAX_LIST_LIMIT}"
+            ))),
+            Some(n) => Ok(n),
+        }
+    }
+}
+
 /// Optional body for `POST /v1/vms/{id}/snapshot`. The endpoint also
 /// accepts an empty body (the legacy in-memory-only behaviour).
 #[derive(Debug, Default, Deserialize)]
@@ -248,9 +292,14 @@ impl From<SnapshotId> for SnapshotDto {
 /// Response body for `GET /v1/snapshots`. Wraps the list in an envelope
 /// for the same forward-compat reason as [`VmListResponse`] — leaves
 /// room for pagination / filter metadata later.
+///
+/// `next` carries the id to use as `?after=` for the next page. `None`
+/// when this response holds the tail of the result set.
 #[derive(Debug, Serialize)]
 pub(crate) struct SnapshotListResponse {
     pub snapshots: Vec<SnapshotListEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<u64>,
 }
 
 /// Per-snapshot row in `GET /v1/snapshots`. Carries the same id +
@@ -446,12 +495,19 @@ pub fn openapi_spec() -> Value {
             "/v1/vms": {
                 "get": {
                     "summary": "List VMs",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/ListLimit" },
+                        { "$ref": "#/components/parameters/ListAfter" }
+                    ],
                     "responses": {
                         "200": {
                             "description": "VM list",
                             "content": {
                                 "application/json": { "schema": { "$ref": "#/components/schemas/VmListResponse" } }
                             }
+                        },
+                        "400": {
+                            "description": "limit out of range (0 or > 1000)"
                         }
                     }
                 },
@@ -529,12 +585,19 @@ pub fn openapi_spec() -> Value {
             "/v1/snapshots": {
                 "get": {
                     "summary": "List snapshots",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/ListLimit" },
+                        { "$ref": "#/components/parameters/ListAfter" }
+                    ],
                     "responses": {
                         "200": {
                             "description": "Snapshot list",
                             "content": {
                                 "application/json": { "schema": { "$ref": "#/components/schemas/SnapshotListResponse" } }
                             }
+                        },
+                        "400": {
+                            "description": "limit out of range (0 or > 1000)"
                         }
                     }
                 }
@@ -671,6 +734,20 @@ pub fn openapi_spec() -> Value {
                     "in": "path",
                     "required": true,
                     "schema": { "type": "integer", "minimum": 0 }
+                },
+                "ListLimit": {
+                    "name": "limit",
+                    "in": "query",
+                    "required": false,
+                    "description": "Page size. Default 100, max 1000. 0 is rejected.",
+                    "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 }
+                },
+                "ListAfter": {
+                    "name": "after",
+                    "in": "query",
+                    "required": false,
+                    "description": "Return only entries with id strictly greater than this. Use the `next` field from the previous response to advance.",
+                    "schema": { "type": "integer", "minimum": 0 }
                 }
             },
             "schemas": {
@@ -719,6 +796,11 @@ pub fn openapi_spec() -> Value {
                         "vms": {
                             "type": "array",
                             "items": { "$ref": "#/components/schemas/VmListEntry" }
+                        },
+                        "next": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Cursor for the next page. Pass as `?after=<this>`. Absent when the response holds the tail of the result set."
                         }
                     }
                 },
@@ -784,6 +866,11 @@ pub fn openapi_spec() -> Value {
                         "snapshots": {
                             "type": "array",
                             "items": { "$ref": "#/components/schemas/SnapshotListEntry" }
+                        },
+                        "next": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Cursor for the next page. Pass as `?after=<this>`. Absent when the response holds the tail of the result set."
                         }
                     }
                 },
