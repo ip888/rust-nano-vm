@@ -1540,3 +1540,205 @@ async fn audit_record_includes_request_id() {
     assert_eq!(parsed["method"], "POST");
     assert_eq!(parsed["path"], "/v1/vms");
 }
+
+// ---- pagination ----------------------------------------------------------
+
+/// Create `n` VMs and return them in id order. Helper so the pagination
+/// tests don't repeat the boilerplate.
+async fn seed_vms(app: Router, n: usize) -> Vec<u64> {
+    let mut ids = Vec::with_capacity(n);
+    for _ in 0..n {
+        let (_, body) = send(app.clone(), Method::POST, "/v1/vms", Some(json!({}))).await;
+        ids.push(body["id"].as_u64().unwrap());
+    }
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn list_vms_default_limit_caps_response() {
+    let app = app();
+    // Default limit is 100; seed 105 so we know the cap kicks in.
+    let ids = seed_vms(app.clone(), 105).await;
+    let (status, body) = send(app, Method::GET, "/v1/vms", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let vms = body["vms"].as_array().unwrap();
+    assert_eq!(vms.len(), 100, "default limit must be 100");
+    let next = body["next"]
+        .as_u64()
+        .expect("next must be set when more remain");
+    // `next` should be the id of the last returned VM, which is the 100th
+    // newly-created VM (in id-sorted order over THIS test's seeds — global
+    // counter shared with other tests may include older VMs too).
+    assert!(ids.contains(&next), "next must be one of the seeded ids");
+}
+
+#[tokio::test]
+async fn list_vms_explicit_limit_is_honored() {
+    let app = app();
+    seed_vms(app.clone(), 7).await;
+    let (status, body) = send(app, Method::GET, "/v1/vms?limit=3", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["vms"].as_array().unwrap().len(), 3);
+    assert!(body["next"].is_u64(), "next must be set when more remain");
+}
+
+#[tokio::test]
+async fn list_vms_after_cursor_skips_lower_ids() {
+    let app = app();
+    let ids = seed_vms(app.clone(), 4).await;
+    // After the 2nd id, we should see only the 3rd and 4th (relative to
+    // this test's seeds; older VMs from other tests are filtered out too).
+    let after = ids[1];
+    let (status, body) = send(
+        app,
+        Method::GET,
+        &format!("/v1/vms?after={after}&limit=2"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let returned: Vec<u64> = body["vms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_u64().unwrap())
+        .collect();
+    assert!(
+        returned.iter().all(|id| *id > after),
+        "every returned id must be > {after}, got {returned:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_vms_zero_limit_is_bad_request() {
+    let (status, body) = send(app(), Method::GET, "/v1/vms?limit=0", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn list_vms_overlarge_limit_is_bad_request() {
+    let (status, body) = send(app(), Method::GET, "/v1/vms?limit=10000", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn list_vms_cursor_roundtrip_walks_the_set() {
+    let app = app();
+    // Seed enough that we paginate at least 3 times with limit=2.
+    let seeded = seed_vms(app.clone(), 5).await;
+    let lowest = seeded[0];
+
+    let mut after = lowest.saturating_sub(1); // start from before our first id
+    let mut collected = Vec::<u64>::new();
+    for _ in 0..10 {
+        // safety bound — 10 iterations is more than enough for 5 items
+        let (_, body) = send(
+            app.clone(),
+            Method::GET,
+            &format!("/v1/vms?after={after}&limit=2"),
+            None,
+        )
+        .await;
+        let page: Vec<u64> = body["vms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_u64().unwrap())
+            .collect();
+        // Only keep ids we seeded (other tests may have created VMs too).
+        for id in &page {
+            if seeded.contains(id) {
+                collected.push(*id);
+            }
+        }
+        match body["next"].as_u64() {
+            Some(n) => after = n,
+            None => break,
+        }
+    }
+    // Should have collected every seeded id exactly once, in order.
+    let mut expected = seeded.clone();
+    expected.sort();
+    assert_eq!(
+        collected, expected,
+        "cursor walk must visit each seeded id exactly once in order"
+    );
+}
+
+#[tokio::test]
+async fn list_vms_no_next_field_when_page_holds_the_tail() {
+    // Use a unique-by-construction "after" id so we know the page holds
+    // the tail of our slice: take the largest seeded id minus a small
+    // window to capture just the tail, and use a large enough limit that
+    // there's nothing beyond.
+    let app = app();
+    let ids = seed_vms(app.clone(), 3).await;
+    let after = ids[1]; // skip past first two
+    let (_, body) = send(
+        app,
+        Method::GET,
+        &format!("/v1/vms?after={after}&limit=100"),
+        None,
+    )
+    .await;
+    assert!(
+        body["next"].is_null(),
+        "next must be omitted when the page is the tail; got {body}"
+    );
+}
+
+#[tokio::test]
+async fn list_snapshots_supports_pagination() {
+    let app = app();
+    // Create a VM and capture several snapshots from it.
+    let (_, vm) = send(app.clone(), Method::POST, "/v1/vms", Some(json!({}))).await;
+    let vm_id = vm["id"].as_u64().unwrap();
+    let _ = send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm_id}/start"),
+        None,
+    )
+    .await;
+    let mut snap_ids = Vec::new();
+    for _ in 0..4 {
+        let (_, body) = send(
+            app.clone(),
+            Method::POST,
+            &format!("/v1/vms/{vm_id}/snapshot"),
+            None,
+        )
+        .await;
+        snap_ids.push(body["id"].as_u64().unwrap());
+    }
+    snap_ids.sort();
+
+    // limit=2 → 2 entries + next cursor present.
+    let (status, body) = send(app.clone(), Method::GET, "/v1/snapshots?limit=2", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["snapshots"].as_array().unwrap().len(), 2);
+    assert!(body["next"].is_u64());
+
+    // Pagination by `after`.
+    let after = snap_ids[1];
+    let (_, body) = send(
+        app,
+        Method::GET,
+        &format!("/v1/snapshots?after={after}&limit=10"),
+        None,
+    )
+    .await;
+    let returned: Vec<u64> = body["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_u64().unwrap())
+        .collect();
+    assert!(
+        returned.iter().all(|id| *id > after),
+        "every returned snapshot id must be > {after}, got {returned:?}"
+    );
+}
