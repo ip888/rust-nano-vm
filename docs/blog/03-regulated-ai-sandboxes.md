@@ -290,8 +290,10 @@ If `rust-nano-vm` is a candidate for your regulated AI-agent deployment
 and you have ideas about the gaps above (token rotation primitives,
 FIPS-aligned crypto, vsock policy, hardware-rooted attestation), file
 an issue. Pre-1.0 means there's room for the contract to reflect what
-real auditors actually ask. The JSONL audit log is shipped; deeper
-fields (request-id, source IP, payload checksums) are open to design.
+real auditors actually ask. The JSONL audit log and `X-Request-Id`
+correlation are shipped (each audit line carries `request_id` so HTTP
+trace and audit trail line up); deeper fields (source IP, payload
+checksums, signed entries) are open to design.
 
 The repo lives at https://github.com/ip888/Rust-nano-vm.
 
