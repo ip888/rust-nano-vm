@@ -1,0 +1,3 @@
+# Build outputs and staged binaries — never commit.
+cache/
+agent-musl
