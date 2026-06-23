@@ -5,7 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Split virtqueue primitives (descriptor table + flag constants) for rust-nano-vm."
+description = "Split-virtqueue parsers (descriptor table, avail/used rings) shared across rust-nano-vm's virtio device implementations."
+keywords = ["virtio", "virtqueue", "microvm", "ring", "kvm"]
+categories = ["virtualization", "parser-implementations"]
 
 [dependencies]
 thiserror.workspace = true

@@ -5,7 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "`nanovm` — command-line interface for rust-nano-vm."
+description = "`nanovm` — command-line client for the rust-nano-vm control plane: run, exec, snapshot, fork."
+keywords = ["nanovm", "microvm", "kvm", "sandbox", "cli"]
+categories = ["command-line-utilities", "virtualization"]
 
 [[bin]]
 name = "nanovm"
