@@ -1,9 +1,14 @@
 name: docker
 
-# Publish a multi-arch container image of `nanovm-control-plane` to
-# GitHub Container Registry on every tag push. The release workflow
-# (release.yml) ships the prebuilt tarballs in parallel; this workflow
-# ships the Docker image at `ghcr.io/ip888/nanovm-control-plane:<tag>`.
+# Publish a container image of `nanovm-control-plane` to GitHub
+# Container Registry on every semver tag push (linux/amd64 only — the
+# job runs on `ubuntu-latest` with no QEMU/buildx-platforms config, so
+# this is a single-arch build). Multi-arch is a follow-up that adds
+# `platforms: linux/amd64,linux/arm64` + a QEMU setup step.
+#
+# The release workflow (release.yml) ships the prebuilt tarballs in
+# parallel; this workflow ships the Docker image at
+# `ghcr.io/ip888/nanovm-control-plane:<tag>`.
 #
 # Triggers on the same `v*.*.*` tag pattern as `release.yml` so a
 # single tag push produces both artifacts.

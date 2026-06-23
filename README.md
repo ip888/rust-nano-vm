@@ -113,9 +113,9 @@ ships a sidecar `.sha256` for integrity verification.
 ## Install — Docker (no toolchain needed)
 
 A container image of `nanovm-control-plane` is published to GHCR on
-every tag. Built from the same source as the prebuilt tarballs;
-distroless runtime (~22 MiB image, no shell, runs as the `nonroot`
-user).
+every `v*.*.*` release tag. Built from the same source as the prebuilt
+tarballs; distroless runtime (~22 MiB image, no shell, runs as the
+`nonroot` user).
 
 ```sh
 docker run -d --rm \
