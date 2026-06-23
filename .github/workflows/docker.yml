@@ -1,0 +1,69 @@
+name: docker
+
+# Publish a container image of `nanovm-control-plane` to GitHub
+# Container Registry on every semver tag push (linux/amd64 only — the
+# job runs on `ubuntu-latest` with no QEMU/buildx-platforms config, so
+# this is a single-arch build). Multi-arch is a follow-up that adds
+# `platforms: linux/amd64,linux/arm64` + a QEMU setup step.
+#
+# The release workflow (release.yml) ships the prebuilt tarballs in
+# parallel; this workflow ships the Docker image at
+# `ghcr.io/ip888/nanovm-control-plane:<tag>`.
+#
+# Triggers on the same `v*.*.*` tag pattern as `release.yml` so a
+# single tag push produces both artifacts.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+  packages: write   # required to push to GHCR
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/nanovm-control-plane
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Derives both the canonical `0.0.2` semver tag and a `latest`
+      # tag from the pushed git tag (e.g. `v0.0.2`). Stable
+      # `major.minor` aliases (e.g. `0.0`) are tagged too so callers
+      # can pin loosely.
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GHA-backed registry cache so repeated tag pushes don't
+          # rebuild the entire workspace from scratch.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

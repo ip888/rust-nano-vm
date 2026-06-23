@@ -110,6 +110,28 @@ curl -L https://github.com/ip888/Rust-nano-vm/releases/latest/download/rust-nano
 Replace `VERSION` with the release tag (e.g. `0.0.2`). Each tarball
 ships a sidecar `.sha256` for integrity verification.
 
+## Install — Docker (no toolchain needed)
+
+A container image of `nanovm-control-plane` is published to GHCR on
+every `v*.*.*` release tag. Built from the same source as the prebuilt
+tarballs; distroless runtime (~22 MiB image, no shell, runs as the
+`nonroot` user).
+
+```sh
+docker run -d --rm \
+    -p 8080:8080 \
+    -e NANOVM_API_TOKENS=dev-token \
+    ghcr.io/ip888/nanovm-control-plane:latest
+
+# Drive the lifecycle exactly like the source-build Quickstart below:
+curl -s -X POST localhost:8080/v1/vms -H 'Authorization: Bearer dev-token' \
+    -H 'content-type: application/json' -d '{}'
+```
+
+The image runs the **mock-backend** by default — same as the source
+binary. A `--device /dev/kvm`-aware image with the real KVM backend
+compiled in lands as a follow-up.
+
 ## Quickstart — demo in 30 seconds (mock backend, no KVM)
 
 One command, identical on Linux, macOS, and Windows. Only prerequisite

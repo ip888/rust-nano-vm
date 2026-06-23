@@ -1,0 +1,35 @@
+# Keep the Docker build context as small as possible: only the source
+# the builder stage actually compiles.
+
+# Build outputs — `cargo build` inside the container regenerates these.
+target/
+
+# VCS metadata.
+.git/
+.gitignore
+.github/
+
+# Editor / OS junk.
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Docs and bench / dev tooling — not needed for the control plane build.
+docs/
+tools/
+
+# Repo policy + docs files. (cargo doesn't need README.md or LICENSE
+# to compile the workspace; they ride the source tarball instead.)
+README.md
+CHANGELOG.md
+LICENSE-APACHE
+LICENSE-MIT
+deny.toml
+clippy.toml
+rustfmt.toml
+
+# Don't copy the Dockerfile or .dockerignore into the build context;
+# they're not consumed by `cargo build` and only inflate the layer.
+Dockerfile
+.dockerignore
