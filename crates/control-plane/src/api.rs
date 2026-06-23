@@ -128,6 +128,32 @@ pub(crate) struct UsageResponseDto {
     pub fork_total_ms: u64,
 }
 
+/// Response body for `GET /v1/health`. Carries the structured detail
+/// that `/healthz` (plain text `ok` for legacy liveness probes) can't
+/// express.
+///
+/// All fields are best-effort introspection — `ok` is `true` while the
+/// process is serving requests, and the other fields are useful for
+/// dashboards and operator triage rather than as inputs to a load
+/// balancer's decision-making.
+#[derive(Debug, Serialize)]
+pub(crate) struct HealthResponse {
+    /// Always `true` for a response that successfully reached this
+    /// handler — kept as an explicit field so a JSON consumer doesn't
+    /// have to know to inspect the HTTP status code.
+    pub ok: bool,
+    /// Hypervisor backend label, e.g. `"mock"` or `"kvm"`.
+    pub backend: &'static str,
+    /// Crate version (`Cargo.toml [package].version`).
+    pub version: &'static str,
+    /// Seconds since the process bound its listener.
+    pub uptime_secs: u64,
+    /// RFC 3339 wall-clock timestamp captured once at process start.
+    /// Frozen at startup so subsequent system-clock skew doesn't drift
+    /// what we report.
+    pub started_at: String,
+}
+
 /// Response body for `GET /v1/vms`. Wraps a list rather than returning a
 /// bare JSON array so we can add pagination / filter metadata at the
 /// envelope level later without breaking clients.
@@ -654,6 +680,20 @@ pub fn openapi_spec() -> Value {
                     }
                 }
             },
+            "/v1/health": {
+                "get": {
+                    "summary": "Structured health detail (backend, version, uptime)",
+                    "description": "Auth-gated counterpart to /healthz. /healthz stays plain-text for legacy liveness probes; /v1/health returns parseable JSON for monitoring scrapers.",
+                    "responses": {
+                        "200": {
+                            "description": "Process health detail",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/HealthResponse" } }
+                            }
+                        }
+                    }
+                }
+            },
             "/v1/vms/{id}/exec": {
                 "post": {
                     "summary": "Execute a command in the guest",
@@ -845,6 +885,21 @@ pub fn openapi_spec() -> Value {
                         "token": { "type": "string" },
                         "fork_count": { "type": "integer", "minimum": 0 },
                         "fork_total_ms": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "HealthResponse": {
+                    "type": "object",
+                    "required": ["ok", "backend", "version", "uptime_secs", "started_at"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "backend": { "type": "string", "example": "mock" },
+                        "version": { "type": "string", "example": "0.0.2" },
+                        "uptime_secs": { "type": "integer", "minimum": 0 },
+                        "started_at": {
+                            "type": "string",
+                            "description": "RFC 3339 timestamp captured at process start",
+                            "example": "2026-06-22T00:00:00.000Z"
+                        }
                     }
                 },
                 "SnapshotListEntry": {

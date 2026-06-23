@@ -47,6 +47,7 @@ pub mod fork_quota;
 pub mod metrics;
 mod request_id;
 mod routes;
+mod time;
 
 pub use api::openapi_spec;
 pub use audit::AuditLog;

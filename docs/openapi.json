@@ -218,6 +218,38 @@
         ],
         "type": "object"
       },
+      "HealthResponse": {
+        "properties": {
+          "backend": {
+            "example": "mock",
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "started_at": {
+            "description": "RFC 3339 timestamp captured at process start",
+            "example": "2026-06-22T00:00:00.000Z",
+            "type": "string"
+          },
+          "uptime_secs": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version": {
+            "example": "0.0.2",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "backend",
+          "version",
+          "uptime_secs",
+          "started_at"
+        ],
+        "type": "object"
+      },
       "SnapshotDto": {
         "properties": {
           "dir": {
@@ -456,6 +488,24 @@
         },
         "security": [],
         "summary": "OpenAPI contract"
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "description": "Auth-gated counterpart to /healthz. /healthz stays plain-text for legacy liveness probes; /v1/health returns parseable JSON for monitoring scrapers.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "Process health detail"
+          }
+        },
+        "summary": "Structured health detail (backend, version, uptime)"
       }
     },
     "/v1/snapshots": {
