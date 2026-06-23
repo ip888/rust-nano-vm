@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanovm"
+version = "0.1.0"
+description = "Python client for rust-nano-vm — a single-binary Rust microVM with ~12 ms cold start for AI-agent code execution."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0 OR MIT" }
+authors = [
+    { name = "Rust-nano-vm contributors" },
+]
+keywords = ["microvm", "sandbox", "kvm", "rust-nano-vm", "ai-agent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: System :: Emulators",
+]
+dependencies = [
+    "requests>=2.31",
+]
+
+[project.urls]
+Homepage      = "https://github.com/ip888/Rust-nano-vm"
+Repository    = "https://github.com/ip888/Rust-nano-vm"
+Documentation = "https://github.com/ip888/Rust-nano-vm/tree/main/clients/python#readme"
+Issues        = "https://github.com/ip888/Rust-nano-vm/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
