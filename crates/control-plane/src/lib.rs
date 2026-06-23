@@ -48,6 +48,7 @@ pub mod metrics;
 mod request_id;
 mod routes;
 mod time;
+pub mod warm_pool;
 
 pub use api::openapi_spec;
 pub use audit::AuditLog;
@@ -56,3 +57,4 @@ pub use fork_quota::ForkQuota;
 pub use metrics::Metrics;
 pub use request_id::RequestId;
 pub use routes::{router, AppState};
+pub use warm_pool::WarmPool;
