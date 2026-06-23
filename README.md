@@ -132,6 +132,33 @@ The image runs the **mock-backend** by default — same as the source
 binary. A `--device /dev/kvm`-aware image with the real KVM backend
 compiled in lands as a follow-up.
 
+## Python client
+
+A synchronous Python SDK for the control plane lives at
+[`clients/python/`](clients/python/). Drives the same REST surface
+the curl examples above hit, with dataclasses + typed exceptions:
+
+```python
+import nanovm
+
+with nanovm.Client("http://localhost:8080", token="dev-token") as c:
+    vm = c.create_vm()
+    vm.start()
+    result = vm.exec(program="python3", args=["-c", "print(1+1)"])
+    print(result.stdout)      # "2\n" on a real KVM backend with a Python rootfs
+    vm.destroy()
+```
+
+Install (PyPI publish pending):
+
+```sh
+pip install ./clients/python
+```
+
+See [`clients/python/README.md`](clients/python/README.md) for the
+full surface — snapshot/fork, cursor pagination, error handling,
+and the `iter_vms()` helper that walks the whole result set.
+
 ## Quickstart — demo in 30 seconds (mock backend, no KVM)
 
 One command, identical on Linux, macOS, and Windows. Only prerequisite
