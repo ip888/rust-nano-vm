@@ -5,7 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "virtio-fs host<->guest filesystem integration: FUSE protocol framing for rust-nano-vm."
+description = "Host-side virtio-fs (FUSE-over-virtio) framing + dispatch for rust-nano-vm."
+keywords = ["virtio", "virtio-fs", "fuse", "microvm", "filesystem"]
+categories = ["virtualization", "filesystem"]
 
 [dependencies]
 thiserror.workspace = true

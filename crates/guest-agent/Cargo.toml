@@ -5,7 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Static musl binary that runs inside every sandbox. Placeholder; implementation lands in M2."
+description = "`nanovm-agent` — static musl `/init` that runs inside every rust-nano-vm sandbox; speaks the proto crate's framed RPC over virtio-vsock."
+keywords = ["microvm", "musl", "vsock", "guest-agent", "sandbox"]
+categories = ["virtualization"]
 
 [[bin]]
 name = "nanovm-agent"

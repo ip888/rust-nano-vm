@@ -5,7 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "REST control plane for rust-nano-vm. Exposes the Hypervisor trait over HTTP."
+description = "REST control plane for rust-nano-vm: bearer-token auth, per-token fork quota, JSONL audit log, Prometheus metrics."
+keywords = ["microvm", "rest", "axum", "control-plane", "kvm"]
+categories = ["web-programming::http-server", "virtualization"]
 
 [[bin]]
 name = "nanovm-control-plane"

@@ -5,7 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "In-memory Hypervisor implementation for tests and CI."
+description = "In-memory `Hypervisor` implementation for rust-nano-vm — keeps tests and CI green without `/dev/kvm`."
+keywords = ["microvm", "mock", "testing", "hypervisor", "ci"]
+categories = ["virtualization", "development-tools::testing"]
 
 [dependencies]
 vm-core.workspace = true

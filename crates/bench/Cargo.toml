@@ -5,7 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "nanovm-fork-bench: measures fork latency (P50/P95/P99) and host RSS for the snapshot/fork data plane."
+description = "Latency + density benchmark harness for the rust-nano-vm snapshot/fork data plane. Reports cold-start p50/p95/p99 and per-fork Pss."
+keywords = ["microvm", "benchmark", "snapshot", "kvm", "performance"]
+categories = ["virtualization", "development-tools::profiling"]
 
 [[bin]]
 name = "nanovm-fork-bench"

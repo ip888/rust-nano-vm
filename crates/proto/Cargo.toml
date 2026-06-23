@@ -5,7 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared types for the agent-sandbox-proto (host <-> guest-agent RPC)."
+description = "Wire-format types for rust-nano-vm's host↔guest-agent RPC over virtio-vsock."
+keywords = ["microvm", "rpc", "vsock", "wire-format", "sandbox"]
+categories = ["virtualization", "encoding"]
 
 [dependencies]
 serde.workspace = true

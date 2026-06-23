@@ -5,7 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Hypervisor trait and core types for rust-nano-vm."
+description = "`Hypervisor` trait, VM and snapshot id types, and the error envelope shared by every backend in rust-nano-vm."
+keywords = ["microvm", "hypervisor", "trait", "snapshot", "virtualization"]
+categories = ["virtualization", "api-bindings"]
 
 [dependencies]
 thiserror.workspace = true
