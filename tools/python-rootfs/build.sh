@@ -88,4 +88,4 @@ echo "python-rootfs: DONE"
 echo "python-rootfs:   archive ${OUT} (${bytes} bytes)"
 echo
 echo "Run on a Linux + KVM host:"
-echo "  cargo test -p vm-kvm --features kvm exec_python_boot -- --nocapture"
+echo "  cargo test -p vm-kvm --features kvm --test exec_python_boot -- --nocapture"

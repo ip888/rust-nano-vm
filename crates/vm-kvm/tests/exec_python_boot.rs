@@ -37,6 +37,11 @@
 //! ```sh
 //! cargo test -p vm-kvm --features kvm --test exec_python_boot -- --nocapture
 //! ```
+//!
+//! (Note the `--test exec_python_boot` flag: without it, cargo treats
+//! `exec_python_boot` as a name-substring filter against the test
+//! function `python_print_one_plus_one_runs_inside_guest` — which
+//! doesn't match, and you'll see `1 filtered out` instead of a run.)
 
 #![cfg(feature = "kvm")]
 

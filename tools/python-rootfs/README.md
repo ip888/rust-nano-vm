@@ -51,7 +51,7 @@ On a Linux + KVM host (your i5 dev box, an Oracle A1 instance, etc.):
 ```sh
 tools/kernel/build-tiny-kernel.sh         # one-time
 tools/python-rootfs/build.sh
-cargo test -p vm-kvm --features kvm exec_python_boot -- --nocapture
+cargo test -p vm-kvm --features kvm --test exec_python_boot -- --nocapture
 ```
 
 The test boots the kernel with this initramfs, waits for the agent
