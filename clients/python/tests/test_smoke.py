@@ -123,7 +123,13 @@ def test_snapshot_then_fork_yields_new_vm(client: nanovm.Client) -> None:
         child = snap.fork()
         try:
             assert child.id != base.id
-            assert child.state == "created"
+            # A fork inherits the snapshotted VM's lifecycle state. Since
+            # we snapshot a running VM (snapshot of a stopped VM is also
+            # legal, just not what eval pipelines do), the child comes
+            # back already running. Asserting "running" rather than
+            # "created" is the right shape — it'd be a regression if a
+            # fork came back needing an explicit `.start()`.
+            assert child.state == "running"
         finally:
             child.destroy()
     finally:
