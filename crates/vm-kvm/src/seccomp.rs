@@ -15,7 +15,7 @@
 //! "default" profile and the same crate (`seccompiler`) does the
 //! BPF compilation.
 //!
-//! Denied syscalls (per [`DENIED_SYSCALLS`]):
+//! Denied syscalls (see [`denied_syscalls`]):
 //!
 //! - `execve`, `execveat` — process spawning is a textbook escape
 //!   pivot. The VMM has no reason to exec anything.
@@ -29,9 +29,11 @@
 //! - `chroot`, `pivot_root` — root-fs manipulation.
 //!
 //! Match action is [`SeccompAction::KillProcess`]: the kernel
-//! delivers `SIGSYS` and reaps the entire process group. Crash-loud
-//! is correct here — we want operators to notice that the VMM
-//! attempted something forbidden.
+//! delivers `SIGSYS` and reaps the entire **thread group** — i.e.
+//! the offending VMM process and all its threads. (Other processes
+//! in the same POSIX process group are NOT killed; `KillProcess`
+//! ≠ `kill(-pid)`.) Crash-loud is the right call: we want operators
+//! to notice that the VMM attempted something forbidden.
 //!
 //! Opt-in: [`install_default_filter`] is called by
 //! `KvmHypervisor::new` when `NANOVM_SECCOMP=1` is set in the
@@ -157,10 +159,14 @@ mod tests {
     fn denied_syscalls_list_is_nonempty_and_unique() {
         let list = denied_syscalls();
         assert!(!list.is_empty());
+        // Dereference so the HashSet keys on the syscall number
+        // *value*; keying on `&libc::c_long` would always be unique
+        // (each array slot has a distinct address) and the test
+        // would silently pass for an accidental duplicate value.
         let mut seen = std::collections::HashSet::new();
         for sysno in list {
             assert!(
-                seen.insert(sysno),
+                seen.insert(*sysno),
                 "duplicate syscall in deny list: {sysno}"
             );
         }

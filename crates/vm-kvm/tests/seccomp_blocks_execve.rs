@@ -33,12 +33,15 @@ fn execve_after_filter_is_killed_by_sigsys() {
     let argv: Vec<*const libc::c_char> = vec![argv0.as_ptr(), std::ptr::null()];
     let envp: Vec<*const libc::c_char> = vec![std::ptr::null()];
 
-    // SAFETY: `fork` is unsafe because in the child a number of host
-    // resources (mutexes, allocator state) are in an undefined state
-    // until they're explicitly reinitialised. We touch nothing in
-    // the child other than the seccomp install + a direct execve
-    // syscall — no heap allocations, no Rust stdlib that takes
-    // global locks.
+    // SAFETY: `fork` in a multithreaded process is technically only
+    // async-signal-safe to follow with `execve`. The child here also
+    // allocates inside `install_default_filter` (`BTreeMap`, `Vec`s
+    // for the BPF program) and uses `eprintln!` on the error paths,
+    // so this isn't strictly fork-safe in the textbook sense. It's
+    // accepted because the test process is short-lived and we run
+    // each test in isolation; the test has been stable in practice.
+    // If this ever flakes, switching to a separate helper binary
+    // would remove the constraint entirely.
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => panic!("fork failed: {}", std::io::Error::last_os_error()),

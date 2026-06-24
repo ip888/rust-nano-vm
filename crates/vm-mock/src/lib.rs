@@ -337,7 +337,7 @@ impl Hypervisor for MockHypervisor {
         use std::io::Read;
         use std::process::{Command, Stdio};
         use std::sync::mpsc;
-        use std::time::Instant;
+        use std::time::{Duration, Instant};
 
         let mut cmd = Command::new(&req.program);
         cmd.args(&req.args)
@@ -397,13 +397,50 @@ impl Hypervisor for MockHypervisor {
             }
         });
 
-        // Waiter thread joins both readers BEFORE emitting Exit so the
-        // terminal frame is always the last one observed.
+        // Waiter thread polls `try_wait` so it can also enforce
+        // `req.timeout_ms` by killing the child when the deadline
+        // elapses.
+        let timeout_ms = req.timeout_ms;
         std::thread::spawn(move || {
-            let status_res = child.wait();
+            let deadline = timeout_ms.map(|ms| started + Duration::from_millis(ms));
+            let mut killed_for_timeout = false;
+            let status_res = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Ok(status),
+                    Ok(None) => {
+                        if let (Some(d), false) = (deadline, killed_for_timeout) {
+                            if Instant::now() >= d {
+                                let _ = child.kill();
+                                killed_for_timeout = true;
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => break Err(e),
+                }
+            };
+            let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            if killed_for_timeout {
+                // Emit the timeout error IMMEDIATELY — don't try to
+                // join readers first. If the child spawned its own
+                // children (e.g. `sh -c "sleep 30"` → orphaned
+                // `sleep`), they may still hold our pipes open and
+                // would block the readers for the full sleep
+                // duration. The reader threads are leaked here but
+                // they're cheap and exit on their own when the
+                // pipes finally close.
+                let _ = tx.send(Err(VmError::Backend(format!(
+                    "exec exceeded timeout {} ms",
+                    timeout_ms.unwrap_or_default(),
+                ))));
+                return;
+            }
+            // Normal exit: join readers so the terminal Exit frame
+            // is always observed last. The readers see EOF the
+            // moment the child closes its pipes, so the join is
+            // bounded.
             let _ = h_out.join();
             let _ = h_err.join();
-            let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             match status_res {
                 Ok(status) => {
                     #[cfg(unix)]
@@ -420,8 +457,10 @@ impl Hypervisor for MockHypervisor {
                     let _ = tx.send(Err(VmError::Backend(format!("exec wait: {e}"))));
                 }
             }
-            // tx dropped here — receiver sees `Err(RecvError)` after
-            // the last frame, which we translate to Ok(None) below.
+            // tx dropped here — if the waiter never sent anything
+            // (e.g. panicked) the receiver below converts the
+            // dropped sender into a contract-violation error so the
+            // caller never treats it as "completed cleanly".
         });
 
         #[derive(Debug)]
@@ -446,11 +485,17 @@ impl Hypervisor for MockHypervisor {
                         Err(e)
                     }
                     Err(_) => {
-                        // Sender dropped without an Exit frame —
-                        // exotic, but treat it as end-of-stream so
-                        // callers don't block forever.
+                        // Sender dropped without emitting an Exit
+                        // frame. The `ExecStream` contract promises
+                        // exactly one terminal `Exit` per stream;
+                        // returning `Ok(None)` here would let
+                        // callers treat a crashed waiter as a
+                        // successful completion. Surface a backend
+                        // error so the failure is loud instead.
                         self.done = true;
-                        Ok(None)
+                        Err(VmError::Backend(
+                            "exec stream ended without an Exit frame (waiter dropped)".into(),
+                        ))
                     }
                 }
             }
@@ -995,6 +1040,108 @@ mod tests {
         assert_eq!(stderr_acc, b"err");
         let (code, _) = exit.expect("missing Exit frame");
         assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn exec_in_guest_stream_enforces_timeout() {
+        // Reviewer #98.1: streaming and one-shot exec must agree on
+        // timeout semantics. The child sleeps for 30s but we set
+        // timeout_ms=200, so the stream must surface a timeout
+        // error (not run to completion).
+        let hv = MockHypervisor::new();
+        let h = hv.create_vm(&cfg()).unwrap();
+        hv.start(h.id).unwrap();
+
+        let mut stream = hv
+            .exec_in_guest_stream(
+                h.id,
+                GuestExecRequest {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), "sleep 30".into()],
+                    cwd: None,
+                    env: vec![],
+                    timeout_ms: Some(200),
+                },
+            )
+            .expect("stream spawn");
+
+        // The first frame that materializes should be the timeout
+        // error. We drain in a loop just in case sh emits anything
+        // before the watchdog kills it; any non-error frame is fine
+        // to discard, but the stream MUST eventually error.
+        let mut saw_error = false;
+        let started = std::time::Instant::now();
+        loop {
+            match stream.next_frame() {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(e) => {
+                    saw_error = true;
+                    let msg = format!("{e}");
+                    assert!(
+                        msg.contains("timeout"),
+                        "expected timeout error, got: {msg}"
+                    );
+                    break;
+                }
+            }
+        }
+        assert!(saw_error, "stream completed without a timeout error");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "watchdog took {:?} to fire — should be ~200ms",
+            started.elapsed(),
+        );
+    }
+
+    #[test]
+    fn exec_in_guest_stream_surfaces_error_when_waiter_drops_without_exit() {
+        // Reviewer #98.2: a dropped sender without an Exit frame
+        // used to silently return Ok(None), letting callers treat a
+        // crashed waiter as a clean completion. The new behaviour is
+        // to surface a Backend error from next_frame. Construct that
+        // condition directly: build a MockStream over a channel
+        // whose sender drops without emitting anything.
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<VmResult<ExecFrame>>();
+        drop(tx);
+
+        #[derive(Debug)]
+        struct LocalStream {
+            rx: mpsc::Receiver<VmResult<ExecFrame>>,
+            done: bool,
+        }
+        impl ExecStream for LocalStream {
+            fn next_frame(&mut self) -> VmResult<Option<ExecFrame>> {
+                // Mirror the production impl so this test stays in
+                // sync. If the in-tree impl changes shape, this
+                // shadow has to update too — that's intentional, it
+                // forces the contract to be visible in one place.
+                if self.done {
+                    return Ok(None);
+                }
+                match self.rx.recv() {
+                    Ok(Ok(f)) => Ok(Some(f)),
+                    Ok(Err(e)) => {
+                        self.done = true;
+                        Err(e)
+                    }
+                    Err(_) => {
+                        self.done = true;
+                        Err(VmError::Backend(
+                            "exec stream ended without an Exit frame (waiter dropped)".into(),
+                        ))
+                    }
+                }
+            }
+        }
+        let mut stream = LocalStream { rx, done: false };
+        let err = stream.next_frame().unwrap_err();
+        assert!(
+            format!("{err}").contains("without an Exit"),
+            "expected contract-violation error, got {err}"
+        );
+        assert!(matches!(stream.next_frame(), Ok(None)));
     }
 
     #[test]

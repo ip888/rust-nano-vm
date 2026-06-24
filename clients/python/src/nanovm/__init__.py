@@ -190,17 +190,33 @@ def _iter_sse(resp: "requests.Response") -> Iterator[ExecStreamEvent]:
             # SSE concatenates multiple `data:` lines with newlines.
             data = "\n".join(parts)
             if name == "stdout" or name == "stderr":
+                # Invalid base64 means the server's wire format is
+                # broken (or something is rewriting bytes on the
+                # path). Silently dropping the chunk would hide
+                # protocol bugs; raise so callers see the problem.
                 try:
                     raw = base64.b64decode(data, validate=True)
-                except (ValueError, Exception):  # noqa: BLE001
-                    raw = b""
+                except (ValueError, base64.binascii.Error) as e:
+                    raise NanovmError(
+                        f"malformed base64 in {name!r} SSE event: {e}",
+                        code="bad_stream_payload",
+                        status=0,
+                    ) from e
                 return ExecChunk(kind=name, data=raw)
             if name == "exit":
+                # Malformed exit payload means we don't know what the
+                # process did. Same logic: silently filling defaults
+                # would let callers treat a corrupt frame as a clean
+                # `exit_code=None` completion. Raise instead.
+                import json as _json
                 try:
-                    import json as _json
                     payload = _json.loads(data) if data else {}
-                except ValueError:
-                    payload = {}
+                except ValueError as e:
+                    raise NanovmError(
+                        f"malformed JSON in 'exit' SSE event: {e}",
+                        code="bad_stream_payload",
+                        status=0,
+                    ) from e
                 return ExecExit(
                     exit_code=payload.get("exit_code"),
                     signal=payload.get("signal"),

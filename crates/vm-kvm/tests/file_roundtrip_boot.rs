@@ -92,9 +92,10 @@ fn write_then_read_file_round_trips_over_vsock() {
     // in the minimal initramfs (it's a tmpfs mount, not the read-only
     // initramfs cpio).
     let path = "/tmp/nanovm-roundtrip.bin".to_owned();
-    // Use a payload with non-printable bytes so we'd catch any
-    // string-only round-trip bug — base64 of "hello" + raw NUL +
-    // FF byte.
+    // Use the full byte alphabet (0x00..=0xFF) so any string-only
+    // encoder somewhere on the wire path (UTF-8 lossy replacement,
+    // C-string truncation at NUL, base64 vs. raw confusion) breaks
+    // this assertion loudly.
     let payload: Vec<u8> = (0u8..=255u8).collect();
 
     let write_result = hv.write_file(handle.id, path.clone(), payload.clone(), 0o644);

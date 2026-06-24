@@ -162,6 +162,54 @@ struct VsockBackend {
     guest_mem: GuestMemoryMmap,
     vm_fd: Arc<VmFd>,
     irq: u32,
+    /// Held across every RPC's request → matching-response exchange.
+    /// The vsock wire format reuses `RequestId(1)` for every call,
+    /// and `drain_inbound` returns whatever bytes have accumulated
+    /// since the last drain — so two concurrent callers
+    /// (`exec_in_guest` + `write_file`, say) would deadlock or
+    /// cross-decode each other's frames without this gate. Streaming
+    /// exec holds the gate for the lifetime of the stream by design;
+    /// proper request-id demuxing is the longer-term fix.
+    ///
+    /// Implemented as an `AtomicBool` rather than `Mutex<()>` because
+    /// streaming exec needs an *owned* guard outliving the borrow
+    /// of `&backend` — see [`RpcGuard`].
+    rpc_in_flight: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Owned guard for the per-vsock RPC gate. Spin-polls
+/// [`VsockBackend::rpc_in_flight`] to claim exclusive access; releases
+/// on `Drop`. The spin uses `std::thread::sleep` (5 ms) rather than a
+/// real condvar because RPCs are short-lived in practice and we'd
+/// already be polling `drain_inbound` on a similar cadence.
+#[cfg(feature = "kvm")]
+#[derive(Debug)]
+struct RpcGuard {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "kvm")]
+impl RpcGuard {
+    fn acquire(backend: &VsockBackend) -> Self {
+        use std::sync::atomic::Ordering;
+        while backend
+            .rpc_in_flight
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Self {
+            flag: Arc::clone(&backend.rpc_in_flight),
+        }
+    }
+}
+
+#[cfg(feature = "kvm")]
+impl Drop for RpcGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[cfg(feature = "kvm")]
@@ -275,11 +323,16 @@ impl VsockBackend {
 /// `ExecResult`.
 ///
 /// Runs on the caller's thread (not the vCPU thread). The vCPU thread
-/// fills the inbound queue as the guest agent replies; we poll it. All
-/// device access is serialized by the device mutex inside `backend`.
+/// fills the inbound queue as the guest agent replies; we poll it.
+/// `VsockBackend::rpc_lock` is held across the whole exchange so
+/// concurrent RPC calls don't cross-decode each other's frames (the
+/// wire format still uses `RequestId(1)` for everything — see the
+/// field docs).
 #[cfg(feature = "kvm")]
 fn exec_over_vsock(backend: &VsockBackend, req: GuestExecRequest) -> VmResult<GuestExecResult> {
     use std::time::{Duration, Instant};
+
+    let _rpc_guard = RpcGuard::acquire(backend);
 
     // 1. Wait for the guest agent to connect out to our listener.
     let connect_deadline = Instant::now() + Duration::from_secs(15);
@@ -377,8 +430,10 @@ fn response_to_exec_result(resp: proto::Response) -> VmResult<GuestExecResult> {
 /// ReadFile) where the timeout is the call's wall-clock budget rather
 /// than a guest-side process deadline.
 ///
-/// The device mutex inside `backend` serializes calls — successive
-/// requests can reuse `RequestId(1)` because they never overlap.
+/// `VsockBackend::rpc_lock` serializes the request → matching-response
+/// window so concurrent RPC callers don't interleave on the shared
+/// inbound buffer (the wire format reuses `RequestId(1)` for every
+/// call — see the field docs).
 #[cfg(feature = "kvm")]
 fn rpc_oneshot(
     backend: &VsockBackend,
@@ -386,6 +441,8 @@ fn rpc_oneshot(
     timeout: std::time::Duration,
 ) -> VmResult<proto::ResponseBody> {
     use std::time::{Duration, Instant};
+
+    let _rpc_guard = RpcGuard::acquire(backend);
 
     let connect_deadline = Instant::now() + Duration::from_secs(15);
     let conn = loop {
@@ -434,8 +491,13 @@ fn rpc_oneshot(
 }
 
 /// Lift a [`proto::Response`] into its body, surfacing any guest-side
-/// `RpcError` as a `VmError::Backend` carrying the stable error code
-/// so callers can match on it (instead of grepping the message).
+/// `RpcError` as a `VmError::Backend` whose `String` payload contains
+/// both the `proto::ErrorCode` debug-print and the human message
+/// (`[Io]: write …: ENOSPC`-style). The error code is **not** carried
+/// as a structured field — `VmError::Backend` is just a `String`
+/// today — so callers that need to branch on it have to inspect the
+/// formatted text. A structured error variant can land later if a
+/// caller actually needs reliable matching.
 #[cfg(feature = "kvm")]
 fn rpc_response_body(resp: proto::Response) -> VmResult<proto::ResponseBody> {
     match resp.result {
@@ -468,6 +530,10 @@ struct KvmExecStream {
     /// further `next_frame` calls return `Ok(None)` instead of
     /// blocking on a guest that's already done talking.
     done: bool,
+    /// Held for the lifetime of the stream so no other RPC can
+    /// interleave with the ExecOutput/ExecExited frames the agent
+    /// is sending us. Released when the stream is dropped.
+    _rpc_guard: RpcGuard,
 }
 
 #[cfg(feature = "kvm")]
@@ -567,6 +633,8 @@ fn exec_stream_over_vsock(
 ) -> VmResult<Box<dyn vm_core::ExecStream>> {
     use std::time::{Duration, Instant};
 
+    let rpc_guard = RpcGuard::acquire(backend);
+
     let connect_deadline = Instant::now() + Duration::from_secs(15);
     let conn = loop {
         if let Some(c) = backend.established_connection() {
@@ -604,6 +672,7 @@ fn exec_stream_over_vsock(
         backend: backend.clone(),
         buf: Vec::new(),
         done: false,
+        _rpc_guard: rpc_guard,
     }))
 }
 
@@ -673,12 +742,13 @@ struct PauseSlot {
 impl KvmHypervisor {
     /// Construct a new KVM hypervisor handle.
     ///
-    /// When `NANOVM_SECCOMP=1` is set, also installs a default
-    /// seccomp-BPF filter ([`seccomp::install_default_filter`])
-    /// before opening `/dev/kvm`. Filter install happens *first* so
-    /// any subsequent KVM ioctl crossing the sandbox is the first
-    /// real check that the allow-list is wide enough — failing fast
-    /// at startup beats failing under load.
+    /// When `NANOVM_SECCOMP=1` is set, also installs the default
+    /// deny-list seccomp-BPF filter
+    /// ([`seccomp::install_default_filter`]) before opening
+    /// `/dev/kvm`. Install happens *first* so any KVM ioctl that
+    /// would somehow land on a denied syscall trips the sandbox at
+    /// startup instead of under load. (The filter is a deny-list,
+    /// not an allow-list — see the module docs.)
     #[cfg(feature = "kvm")]
     pub fn new() -> VmResult<Self> {
         if seccomp::env_opts_in() {
@@ -951,6 +1021,7 @@ impl KvmHypervisor {
                 guest_mem: boot_plan.guest_mem.clone(),
                 vm_fd: Arc::clone(&vm_fd),
                 irq: VSOCK_MMIO_IRQ,
+                rpc_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         });
 
@@ -1597,6 +1668,17 @@ impl Hypervisor for KvmHypervisor {
         let backend = {
             let inner = self.lock_inner()?;
             let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+            if vm.state != VmState::Running {
+                // The trait documents that this RPC requires a
+                // Running VM; without this preflight an idle vsock
+                // would block for 15s and surface as a generic
+                // backend timeout, hiding the real cause.
+                return Err(VmError::InvalidTransition {
+                    id,
+                    from: vm.state,
+                    to: VmState::Running,
+                });
+            }
             vm.runtime.vsock.clone().ok_or(VmError::Unsupported(
                 "vm-kvm: write_file requires a vsock device (set VmConfig.vsock_cid)",
             ))?
@@ -1626,6 +1708,13 @@ impl Hypervisor for KvmHypervisor {
         let backend = {
             let inner = self.lock_inner()?;
             let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+            if vm.state != VmState::Running {
+                return Err(VmError::InvalidTransition {
+                    id,
+                    from: vm.state,
+                    to: VmState::Running,
+                });
+            }
             vm.runtime.vsock.clone().ok_or(VmError::Unsupported(
                 "vm-kvm: read_file requires a vsock device (set VmConfig.vsock_cid)",
             ))?

@@ -100,7 +100,7 @@ them via `MAP_PRIVATE` copy-on-write.
    refuses a deny-list of escape-pivot syscalls (`execve`,
    `ptrace`, `mount`, `kexec_load`, `init_module`, `setns`,
    `unshare`, `chroot`, `pivot_root`, …) — a KVM escape that
-   landed in our address space is now `SIGKILL`'d at the kernel
+   landed in our address space is now killed via `SIGSYS` at the kernel
    instead of free to spawn shells. Same `seccompiler` crate
    Firecracker uses. See
    [`crates/vm-kvm/src/seccomp.rs`](crates/vm-kvm/src/seccomp.rs).
