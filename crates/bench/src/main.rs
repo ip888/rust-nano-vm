@@ -278,7 +278,7 @@ fn run_warm_pool_phase(
 
     let pool = WarmPool::new(Arc::clone(&hv), pool_depth);
 
-    let warm_latencies: Vec<Duration> = rt.block_on(async move {
+    let phase_result: (Vec<Duration>, usize) = rt.block_on(async move {
         // Trigger an initial take to kick the first refill. The first
         // take is necessarily a miss (queue empty); we discard the
         // None and wait for depth to reach the configured target.
@@ -300,36 +300,48 @@ fn run_warm_pool_phase(
         );
 
         let mut warm_latencies: Vec<Duration> = Vec::with_capacity(forks);
+        let mut misses: usize = 0;
         for i in 0..forks {
-            // If the take misses we've outrun the refill — record the
-            // miss latency (still likely a sub-ms None return), then
-            // fall back to a cold restore so the sample loop doesn't
-            // skip an iteration. The reported p50/p99 below is over
-            // takes that actually hit; we log the miss count.
             let t = Instant::now();
             let taken = pool.take(snap);
-            let lat = t.elapsed();
-            warm_latencies.push(lat);
-            let vm = match taken {
-                Some(v) => v,
-                None => hv
-                    .restore(snap)
-                    .with_context(|| format!("warm-fork #{i} fallback restore"))?,
-            };
-            finalize(&*hv, vm.id);
+            match taken {
+                Some(vm) => {
+                    // Only hits go into the warm percentile sample.
+                    // Recording the sub-ms `None` of a miss alongside
+                    // hits would make the warm column look faster
+                    // than it actually is — the cold restore that
+                    // follows still happens in the iteration, just
+                    // not in the timed window.
+                    warm_latencies.push(t.elapsed());
+                    finalize(&*hv, vm.id);
+                }
+                None => {
+                    misses += 1;
+                    let vm = hv
+                        .restore(snap)
+                        .with_context(|| format!("warm-fork #{i} fallback restore"))?;
+                    finalize(&*hv, vm.id);
+                }
+            }
         }
-        Ok::<_, anyhow::Error>(warm_latencies)
+        Ok::<_, anyhow::Error>((warm_latencies, misses))
     })?;
 
-    print_warm_pool_results(&warm_latencies, cold);
+    let (warm_latencies, misses) = phase_result;
+    print_warm_pool_results(&warm_latencies, cold, forks, misses);
     Ok(())
 }
 
 /// Print warm-pool vs cold-phase percentiles side by side. The
 /// headline number is `cold.p50 / warm.p50` — the speedup the warm
 /// pool buys for a single customer fork.
+///
+/// `total` is the number of `take()` attempts the run made; `misses`
+/// counts how many of those returned `None` and fell back to a cold
+/// restore. The reported percentiles are over the HIT samples only —
+/// see the note printed at the bottom.
 #[cfg(feature = "kvm")]
-fn print_warm_pool_results(warm: &[Duration], cold: &LatencySummary) {
+fn print_warm_pool_results(warm: &[Duration], cold: &LatencySummary, total: usize, misses: usize) {
     let n = warm.len();
     let mut sorted = warm.to_vec();
     sorted.sort();
@@ -352,18 +364,21 @@ fn print_warm_pool_results(warm: &[Duration], cold: &LatencySummary) {
     };
 
     println!();
-    println!("samples: {n}");
+    println!(
+        "samples: {n} hits / {total} attempts ({misses} miss{} → cold fallback)",
+        if misses == 1 { "" } else { "es" },
+    );
     row("p50", warm_p50, cold.p50);
     row("p95", warm_p95, cold.p95);
     row("p99", warm_p99, cold.p99);
     row("mean", warm_mean, cold.mean);
     println!();
     println!(
-        "note: warm-pool `take()` is the customer-visible fork latency \
-         when the pool is steady-state full. The bench keeps the pool \
-         topped up between takes, so this measures the hot path; \
-         empty-pool misses fall back to a cold restore and would skew \
-         these numbers if the refill couldn't keep up."
+        "note: percentiles are over HIT samples only — `take()` returning a \
+         pre-restored VM. Misses (refill couldn't keep up) fall back to a \
+         cold restore but are excluded from the warm column so they don't \
+         make warm look artificially fast. A high miss rate means the pool \
+         depth is undersized for the request rate; raise `--warm-pool N`."
     );
 }
 

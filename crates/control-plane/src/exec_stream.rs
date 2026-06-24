@@ -40,8 +40,18 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::Serialize;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use vm_core::{ExecFrame, VmId};
+
+/// Bound on the in-flight SSE event buffer per client. A bounded
+/// channel (vs the previous `unbounded_channel`) is what gives us
+/// backpressure: when a slow client can't read events as fast as the
+/// backend produces them, the spawn_blocking producer parks on
+/// `blocking_send` instead of growing an unbounded queue and OOM'ing
+/// the host. 64 holds about a megabyte of base64'd stdout in the
+/// worst case (each event ≤ a few KiB), which is plenty for typical
+/// bursts without blocking the producer on every chunk.
+const SSE_BUFFER: usize = 64;
 
 use crate::api::ExecRequest;
 use crate::error::ApiError;
@@ -65,7 +75,7 @@ pub(crate) async fn exec_vm_stream(
     State(state): State<AppState>,
     id: Result<Path<u64>, PathRejection>,
     body: Result<Json<ExecRequest>, JsonRejection>,
-) -> Result<Sse<UnboundedReceiverStream<Result<Event, Infallible>>>, ApiError> {
+) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
     let Path(id) = id?;
     let Json(req) = body?;
 
@@ -78,7 +88,10 @@ pub(crate) async fn exec_vm_stream(
         .hypervisor()
         .exec_in_guest_stream(VmId(id), req.into())?;
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
+    // Bounded channel + `blocking_send` is the backpressure path:
+    // the producer parks when the SSE consumer can't keep up,
+    // capping in-flight memory at `SSE_BUFFER` events.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(SSE_BUFFER);
 
     // Pull frames on the blocking pool — `ExecStream::next_frame` is
     // synchronous and can block on guest IO for arbitrary durations.
@@ -86,13 +99,13 @@ pub(crate) async fn exec_vm_stream(
         match stream.next_frame() {
             Ok(Some(ExecFrame::Stdout(bytes))) => {
                 let event = Event::default().event("stdout").data(B64.encode(&bytes));
-                if tx.send(Ok(event)).is_err() {
+                if tx.blocking_send(Ok(event)).is_err() {
                     return;
                 }
             }
             Ok(Some(ExecFrame::Stderr(bytes))) => {
                 let event = Event::default().event("stderr").data(B64.encode(&bytes));
-                if tx.send(Ok(event)).is_err() {
+                if tx.blocking_send(Ok(event)).is_err() {
                     return;
                 }
             }
@@ -108,20 +121,35 @@ pub(crate) async fn exec_vm_stream(
                 })
                 .unwrap_or_else(|_| "{}".into());
                 let event = Event::default().event("exit").data(payload);
-                let _ = tx.send(Ok(event));
+                let _ = tx.blocking_send(Ok(event));
                 return;
             }
-            Ok(None) => return,
+            Ok(None) => {
+                // The backend stream ended without emitting a
+                // terminal `Exit` — that's a contract violation.
+                // Surface it as an `error` event so the client
+                // doesn't treat the closed connection as a clean
+                // successful completion (the SSE wire docs say
+                // "exit is always last"). Without this, a Python
+                // SDK consumer would exit its `for event in
+                // exec_stream(...)` loop without ever observing an
+                // `ExecExit`.
+                let event = Event::default()
+                    .event("error")
+                    .data("backend ended exec stream without an exit frame");
+                let _ = tx.blocking_send(Ok(event));
+                return;
+            }
             Err(e) => {
                 // Surface backend errors as an `error` event so the
                 // client gets *something* rather than a silent close.
                 let event = Event::default().event("error").data(format!("{e}"));
-                let _ = tx.send(Ok(event));
+                let _ = tx.blocking_send(Ok(event));
                 return;
             }
         }
     });
 
-    Ok(Sse::new(UnboundedReceiverStream::new(rx))
+    Ok(Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
