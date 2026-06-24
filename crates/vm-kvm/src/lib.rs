@@ -362,6 +362,82 @@ fn response_to_exec_result(resp: proto::Response) -> VmResult<GuestExecResult> {
     }
 }
 
+/// Send one [`proto::Request`] over vsock and wait for the matching
+/// single [`proto::Response`] frame. Mirrors the connect-send-receive
+/// dance in [`exec_over_vsock`] but for fixed-shape RPCs (WriteFile /
+/// ReadFile) where the timeout is the call's wall-clock budget rather
+/// than a guest-side process deadline.
+///
+/// The device mutex inside `backend` serializes calls — successive
+/// requests can reuse `RequestId(1)` because they never overlap.
+#[cfg(feature = "kvm")]
+fn rpc_oneshot(
+    backend: &VsockBackend,
+    body: proto::RequestBody,
+    timeout: std::time::Duration,
+) -> VmResult<proto::ResponseBody> {
+    use std::time::{Duration, Instant};
+
+    let connect_deadline = Instant::now() + Duration::from_secs(15);
+    let conn = loop {
+        if let Some(c) = backend.established_connection() {
+            break c;
+        }
+        if Instant::now() >= connect_deadline {
+            return Err(VmError::Backend(
+                "vm-kvm: guest agent did not connect over vsock within 15s".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let request = proto::Request {
+        version: proto::PROTOCOL_VERSION,
+        id: proto::RequestId(1),
+        body,
+    };
+    let mut frame = Vec::new();
+    proto::frame::encode_request(&request, &mut frame)
+        .map_err(|e| VmError::Backend(format!("vm-kvm: encode rpc request: {e}")))?;
+    backend.host_send(conn, &frame)?;
+
+    let reply_deadline = Instant::now() + timeout;
+    let mut buf = Vec::new();
+    loop {
+        backend.drain_inbound(&mut buf);
+        match proto::frame::decode_response(&buf) {
+            Ok((resp, _consumed)) => return rpc_response_body(resp),
+            Err(e) if e.is_incomplete() => {
+                if Instant::now() >= reply_deadline {
+                    return Err(VmError::Backend(
+                        "vm-kvm: timed out waiting for the agent's rpc response".into(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => {
+                return Err(VmError::Backend(format!(
+                    "vm-kvm: decode rpc response: {e}"
+                )))
+            }
+        }
+    }
+}
+
+/// Lift a [`proto::Response`] into its body, surfacing any guest-side
+/// `RpcError` as a `VmError::Backend` carrying the stable error code
+/// so callers can match on it (instead of grepping the message).
+#[cfg(feature = "kvm")]
+fn rpc_response_body(resp: proto::Response) -> VmResult<proto::ResponseBody> {
+    match resp.result {
+        Ok(body) => Ok(body),
+        Err(rpc) => Err(VmError::Backend(format!(
+            "vm-kvm: agent rpc error [{:?}]: {}",
+            rpc.code, rpc.message
+        ))),
+    }
+}
+
 /// Adapts `vm-memory`'s guest RAM to the virtqueue layer's [`GuestRam`]
 /// trait. A newtype is required because both the trait and
 /// `GuestMemoryMmap` are foreign to this crate (orphan rule).
@@ -1323,16 +1399,55 @@ impl Hypervisor for KvmHypervisor {
         exec_over_vsock(&backend, req)
     }
 
-    fn write_file(&self, _id: VmId, _path: String, _content: Vec<u8>, _mode: u32) -> VmResult<u64> {
-        Err(VmError::Unsupported(
-            "vm-kvm: guest file I/O requires the M2/M3 device path",
-        ))
+    fn write_file(&self, id: VmId, path: String, content: Vec<u8>, mode: u32) -> VmResult<u64> {
+        let backend = {
+            let inner = self.lock_inner()?;
+            let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+            vm.runtime.vsock.clone().ok_or(VmError::Unsupported(
+                "vm-kvm: write_file requires a vsock device (set VmConfig.vsock_cid)",
+            ))?
+        };
+        // Body size is capped by the proto framing (MAX_FRAME_BYTES);
+        // surface that to the caller as Backend rather than silently
+        // truncating downstream.
+        let path_for_msg = path.clone();
+        let resp = rpc_oneshot(
+            &backend,
+            proto::RequestBody::WriteFile {
+                path,
+                content,
+                mode,
+            },
+            std::time::Duration::from_secs(30),
+        )?;
+        match resp {
+            proto::ResponseBody::Written { bytes } => Ok(bytes),
+            other => Err(VmError::Backend(format!(
+                "vm-kvm: unexpected write_file response for {path_for_msg:?}: {other:?}"
+            ))),
+        }
     }
 
-    fn read_file(&self, _id: VmId, _path: String) -> VmResult<Vec<u8>> {
-        Err(VmError::Unsupported(
-            "vm-kvm: guest file I/O requires the M2/M3 device path",
-        ))
+    fn read_file(&self, id: VmId, path: String) -> VmResult<Vec<u8>> {
+        let backend = {
+            let inner = self.lock_inner()?;
+            let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+            vm.runtime.vsock.clone().ok_or(VmError::Unsupported(
+                "vm-kvm: read_file requires a vsock device (set VmConfig.vsock_cid)",
+            ))?
+        };
+        let path_for_msg = path.clone();
+        let resp = rpc_oneshot(
+            &backend,
+            proto::RequestBody::ReadFile { path },
+            std::time::Duration::from_secs(30),
+        )?;
+        match resp {
+            proto::ResponseBody::FileContent { content } => Ok(content),
+            other => Err(VmError::Backend(format!(
+                "vm-kvm: unexpected read_file response for {path_for_msg:?}: {other:?}"
+            ))),
+        }
     }
 }
 
