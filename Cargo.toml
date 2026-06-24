@@ -33,6 +33,7 @@ virtio-fs = { path = "crates/virtio-fs", version = "0.0.3" }
 virtio-queue = { path = "crates/virtio-queue", version = "0.0.3" }
 virtio-vsock = { path = "crates/virtio-vsock", version = "0.0.3" }
 snapshot = { path = "crates/snapshot", version = "0.0.3" }
+control-plane = { path = "crates/control-plane", version = "0.0.3" }
 
 # External
 thiserror = "1.0"

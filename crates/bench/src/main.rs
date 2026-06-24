@@ -29,6 +29,8 @@ fn main() {
 #[cfg(feature = "kvm")]
 use std::path::PathBuf;
 #[cfg(feature = "kvm")]
+use std::sync::Arc;
+#[cfg(feature = "kvm")]
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "kvm")]
@@ -36,7 +38,9 @@ use anyhow::{anyhow, Context, Result};
 #[cfg(feature = "kvm")]
 use clap::Parser;
 #[cfg(feature = "kvm")]
-use vm_core::{Hypervisor, VmConfig, VmId};
+use control_plane::WarmPool;
+#[cfg(feature = "kvm")]
+use vm_core::{Hypervisor, SnapshotId, VmConfig, VmId};
 #[cfg(feature = "kvm")]
 use vm_kvm::KvmHypervisor;
 
@@ -82,6 +86,18 @@ struct Args {
     /// the page cache + guest working set stabilise.
     #[arg(long, default_value_t = 5)]
     settle_secs: u64,
+
+    /// Target depth of the warm pool to bench. If > 0, after the cold
+    /// phase the bench primes a [`WarmPool`] with this many
+    /// pre-restored children per snapshot, then runs another
+    /// `--forks`-sized loop pulling from the pool. Prints a
+    /// side-by-side cold-vs-warm comparison.
+    ///
+    /// `0` disables the warm-pool phase. The warm phase shares the
+    /// same golden snapshot as the cold phase, so the comparison is
+    /// apples-to-apples.
+    #[arg(long, default_value_t = 0)]
+    warm_pool: usize,
 }
 
 #[cfg(feature = "kvm")]
@@ -107,7 +123,11 @@ fn main() -> Result<()> {
         args.forks, args.memory_mib,
     );
 
-    let hv = KvmHypervisor::new().context("open /dev/kvm")?;
+    // Concrete `Arc<KvmHypervisor>` so we can still reach
+    // `serial_output` (a KVM-specific helper not on the trait). For
+    // the warm-pool phase we hand the same Arc out as
+    // `Arc<dyn Hypervisor>` via unsizing.
+    let hv = Arc::new(KvmHypervisor::new().context("open /dev/kvm")?);
 
     // 1) Boot the golden VM and wait for it to reach the tick loop.
     let cfg = VmConfig {
@@ -167,7 +187,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("fork #{i} restore"))?;
         let lat = t.elapsed();
         latencies.push(lat);
-        finalize(&hv, fork.id);
+        finalize(&*hv, fork.id);
         if args.progress_every > 0 && (i + 1) % args.progress_every == 0 {
             eprintln!("  ... forked {}/{} (last: {:?})", i + 1, args.forks, lat);
         }
@@ -180,14 +200,171 @@ fn main() -> Result<()> {
 
     // 5) Density phase: spin up `--alive N` forks, keep them alive, sample.
     if args.alive > 0 {
-        run_density_phase(&hv, snap, args.alive, args.settle_secs)?;
+        run_density_phase(&*hv, snap, args.alive, args.settle_secs)?;
     }
 
-    // 6) Cleanup.
-    finalize(&hv, golden.id);
+    // 6) Warm-pool phase: prime a WarmPool and measure side-by-side.
+    if args.warm_pool > 0 {
+        run_warm_pool_phase(
+            Arc::clone(&hv) as Arc<dyn Hypervisor>,
+            snap,
+            args.warm_pool,
+            args.forks,
+            &sorted_summary(&latencies),
+        )?;
+    }
+
+    // 7) Cleanup.
+    finalize(&*hv, golden.id);
     let _ = hv.delete_snapshot(snap);
 
     Ok(())
+}
+
+/// Pre-computed cold-phase percentiles, kept around so the warm-pool
+/// phase can print the headline cold-vs-warm comparison without
+/// re-running the cold loop.
+#[cfg(feature = "kvm")]
+#[derive(Clone, Copy)]
+struct LatencySummary {
+    p50: Duration,
+    p95: Duration,
+    p99: Duration,
+    mean: Duration,
+}
+
+#[cfg(feature = "kvm")]
+fn sorted_summary(latencies: &[Duration]) -> LatencySummary {
+    let mut s = latencies.to_vec();
+    s.sort();
+    let mean = if s.is_empty() {
+        Duration::ZERO
+    } else {
+        s.iter().sum::<Duration>() / (s.len() as u32)
+    };
+    LatencySummary {
+        p50: percentile(&s, 0.50),
+        p95: percentile(&s, 0.95),
+        p99: percentile(&s, 0.99),
+        mean,
+    }
+}
+
+/// Prime a [`WarmPool`] of `pool_depth` pre-restored children from
+/// `snap`, then time `forks` sequential `take()` calls — the
+/// customer-visible warm-fork latency. Reports a side-by-side
+/// comparison against the cold-phase numbers in `cold`.
+///
+/// The warm-pool refill machinery is async (tokio tasks), so we run
+/// this phase on a dedicated runtime. The bench itself is sync; the
+/// runtime exists only so the pool's background fillers have a
+/// reactor to live on.
+#[cfg(feature = "kvm")]
+fn run_warm_pool_phase(
+    hv: Arc<dyn Hypervisor>,
+    snap: SnapshotId,
+    pool_depth: usize,
+    forks: usize,
+    cold: &LatencySummary,
+) -> Result<()> {
+    println!();
+    println!("=== warm-pool phase ===");
+    println!("pool depth: {pool_depth}, samples: {forks}");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build warm-pool tokio runtime")?;
+
+    let pool = WarmPool::new(Arc::clone(&hv), pool_depth);
+
+    let warm_latencies: Vec<Duration> = rt.block_on(async move {
+        // Trigger an initial take to kick the first refill. The first
+        // take is necessarily a miss (queue empty); we discard the
+        // None and wait for depth to reach the configured target.
+        let _ = pool.take(snap);
+        let prime_deadline = Instant::now() + Duration::from_secs(60);
+        while pool.depth(snap) < pool_depth {
+            if Instant::now() >= prime_deadline {
+                return Err(anyhow!(
+                    "warm pool failed to reach depth {pool_depth} within 60s \
+                     (current depth: {})",
+                    pool.depth(snap),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        eprintln!(
+            "  warm-pool primed to depth {pool_depth} \
+             (kept refilling in the background)"
+        );
+
+        let mut warm_latencies: Vec<Duration> = Vec::with_capacity(forks);
+        for i in 0..forks {
+            // If the take misses we've outrun the refill — record the
+            // miss latency (still likely a sub-ms None return), then
+            // fall back to a cold restore so the sample loop doesn't
+            // skip an iteration. The reported p50/p99 below is over
+            // takes that actually hit; we log the miss count.
+            let t = Instant::now();
+            let taken = pool.take(snap);
+            let lat = t.elapsed();
+            warm_latencies.push(lat);
+            let vm = match taken {
+                Some(v) => v,
+                None => hv
+                    .restore(snap)
+                    .with_context(|| format!("warm-fork #{i} fallback restore"))?,
+            };
+            finalize(&*hv, vm.id);
+        }
+        Ok::<_, anyhow::Error>(warm_latencies)
+    })?;
+
+    print_warm_pool_results(&warm_latencies, cold);
+    Ok(())
+}
+
+/// Print warm-pool vs cold-phase percentiles side by side. The
+/// headline number is `cold.p50 / warm.p50` — the speedup the warm
+/// pool buys for a single customer fork.
+#[cfg(feature = "kvm")]
+fn print_warm_pool_results(warm: &[Duration], cold: &LatencySummary) {
+    let n = warm.len();
+    let mut sorted = warm.to_vec();
+    sorted.sort();
+    let warm_p50 = percentile(&sorted, 0.50);
+    let warm_p95 = percentile(&sorted, 0.95);
+    let warm_p99 = percentile(&sorted, 0.99);
+    let warm_mean = if n == 0 {
+        Duration::ZERO
+    } else {
+        sorted.iter().sum::<Duration>() / (n as u32)
+    };
+
+    let row = |label: &str, w: Duration, c: Duration| {
+        let speedup = if w.as_nanos() > 0 {
+            c.as_secs_f64() / w.as_secs_f64()
+        } else {
+            f64::INFINITY
+        };
+        println!("  {label:<6} cold {c:>10?}   warm {w:>10?}   speedup ×{speedup:.1}");
+    };
+
+    println!();
+    println!("samples: {n}");
+    row("p50", warm_p50, cold.p50);
+    row("p95", warm_p95, cold.p95);
+    row("p99", warm_p99, cold.p99);
+    row("mean", warm_mean, cold.mean);
+    println!();
+    println!(
+        "note: warm-pool `take()` is the customer-visible fork latency \
+         when the pool is steady-state full. The bench keeps the pool \
+         topped up between takes, so this measures the hot path; \
+         empty-pool misses fall back to a cold restore and would skew \
+         these numbers if the refill couldn't keep up."
+    );
 }
 
 /// Spin up `n` forks, keep them alive for `settle_secs`, sample the host's
@@ -196,7 +373,7 @@ fn main() -> Result<()> {
 /// — the headline density number.
 #[cfg(feature = "kvm")]
 fn run_density_phase(
-    hv: &KvmHypervisor,
+    hv: &dyn Hypervisor,
     snap: vm_core::SnapshotId,
     n: usize,
     settle_secs: u64,
@@ -306,7 +483,7 @@ fn pss_kib() -> Option<u64> {
 }
 
 #[cfg(feature = "kvm")]
-fn finalize(hv: &KvmHypervisor, id: VmId) {
+fn finalize(hv: &dyn Hypervisor, id: VmId) {
     let _ = hv.stop(id);
     let _ = hv.destroy(id);
 }
