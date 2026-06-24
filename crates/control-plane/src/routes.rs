@@ -168,6 +168,12 @@ impl AppState {
     pub fn warm_pool(&self) -> &Arc<WarmPool> {
         &self.warm_pool
     }
+
+    /// Borrow the hypervisor handle. Used by sibling modules
+    /// (`exec_stream`) that need to call the backend directly.
+    pub(crate) fn hypervisor(&self) -> &Arc<dyn Hypervisor> {
+        &self.hypervisor
+    }
 }
 
 /// Build the REST router. The returned [`Router`] is parameterised over
@@ -197,6 +203,10 @@ pub fn router() -> Router<AppState> {
         .route("/vms/:id/stop", post(stop_vm))
         .route("/vms/:id/snapshot", post(snapshot_vm))
         .route("/vms/:id/exec", post(exec_vm))
+        .route(
+            "/vms/:id/exec/stream",
+            post(crate::exec_stream::exec_vm_stream),
+        )
         .route("/vms/:id/files", get(read_file).post(write_file))
         .route("/snapshots", get(list_snapshots))
         .route("/snapshots/:id", axum::routing::delete(delete_snapshot))

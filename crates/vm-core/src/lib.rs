@@ -263,6 +263,29 @@ pub trait Hypervisor: Send + Sync {
         ))
     }
 
+    /// Execute a command in the guest and stream stdout/stderr/exit
+    /// frames back as they're produced. Pulls one frame at a time via
+    /// [`ExecStream::next_frame`].
+    ///
+    /// The VM must be in the `Running` state; callers that pass a
+    /// non-running VM id receive [`VmError::InvalidTransition`].
+    ///
+    /// The default implementation returns [`VmError::Unsupported`].
+    /// Backends that already implement the one-shot [`exec_in_guest`]
+    /// can override this with a streaming variant — typically by
+    /// pushing chunks into a channel from a worker thread.
+    ///
+    /// [`exec_in_guest`]: Hypervisor::exec_in_guest
+    fn exec_in_guest_stream(
+        &self,
+        _id: VmId,
+        _req: GuestExecRequest,
+    ) -> VmResult<Box<dyn ExecStream>> {
+        Err(VmError::Unsupported(
+            "exec_in_guest_stream: not implemented on this backend",
+        ))
+    }
+
     /// Write a file into the guest filesystem. The VM must be `Running`.
     ///
     /// `path` is the absolute path inside the guest.  `mode` is the
@@ -357,6 +380,48 @@ pub struct GuestExecResult {
     pub stderr: Vec<u8>,
     /// Wall-clock runtime in milliseconds.
     pub duration_ms: u64,
+}
+
+/// One unit of output from a streaming guest exec, produced by
+/// [`Hypervisor::exec_in_guest_stream`].
+///
+/// A well-formed stream emits zero or more [`ExecFrame::Stdout`] /
+/// [`ExecFrame::Stderr`] frames in arrival order, then exactly one
+/// terminal [`ExecFrame::Exit`] frame, after which
+/// [`ExecStream::next_frame`] returns `Ok(None)`. Backends are free to
+/// coalesce or split chunk boundaries however the underlying transport
+/// surfaces them — callers must not assume one frame per line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecFrame {
+    /// Bytes from the guest process's stdout.
+    Stdout(Vec<u8>),
+    /// Bytes from the guest process's stderr.
+    Stderr(Vec<u8>),
+    /// Terminal frame — process finished. At most one per stream.
+    Exit {
+        /// Process exit code. `None` if killed by a signal.
+        exit_code: Option<i32>,
+        /// Signal that terminated the process, if any (POSIX only).
+        signal: Option<i32>,
+        /// Wall-clock runtime in milliseconds.
+        duration_ms: u64,
+    },
+}
+
+/// Pull-iterator over [`ExecFrame`]s produced by a streaming guest
+/// exec. Each call to [`next_frame`](ExecStream::next_frame) blocks
+/// until the next frame is available (or the stream ends). Returning
+/// `Ok(None)` signals end-of-stream; callers should drop the stream
+/// at that point.
+///
+/// The trait is `Send` so the control plane can move the stream onto
+/// a `spawn_blocking` worker that pushes frames into an async channel.
+/// The `Debug` bound keeps `Result::unwrap_err`-style assertions
+/// usable in tests without callers having to match by hand.
+pub trait ExecStream: Send + std::fmt::Debug {
+    /// Block until the next frame is available, or `Ok(None)` if the
+    /// stream has ended.
+    fn next_frame(&mut self) -> VmResult<Option<ExecFrame>>;
 }
 
 #[cfg(test)]

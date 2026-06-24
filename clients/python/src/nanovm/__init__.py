@@ -30,8 +30,9 @@ is **not** thread-safe — wrap in a lock or build one client per thread.
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Union
 from urllib.parse import urlencode
 
 import requests
@@ -43,6 +44,9 @@ __all__ = [
     "Vm",
     "Snapshot",
     "ExecResult",
+    "ExecChunk",
+    "ExecExit",
+    "ExecStreamEvent",
     "Usage",
     "Health",
     "NanovmError",
@@ -120,6 +124,36 @@ class ExecResult:
 
 
 @dataclass
+class ExecChunk:
+    """One chunk of stdout/stderr from ``Vm.exec_stream``.
+
+    ``kind`` is ``"stdout"`` or ``"stderr"``. ``data`` is raw bytes —
+    chunk boundaries follow the underlying SSE frames and may not
+    align to lines or UTF-8 character boundaries.
+    """
+
+    kind: str
+    data: bytes
+
+
+@dataclass
+class ExecExit:
+    """Terminal event from ``Vm.exec_stream`` — process finished.
+
+    Yielded exactly once, as the last item. After this, the iterator
+    is exhausted.
+    """
+
+    exit_code: Optional[int]
+    signal: Optional[int]
+    duration_ms: int
+
+
+# Type alias for the union of events ``exec_stream`` can yield.
+ExecStreamEvent = Union[ExecChunk, ExecExit]
+
+
+@dataclass
 class Usage:
     """Caller's per-token fork-usage counters."""
 
@@ -137,6 +171,79 @@ class Health:
     version: str
     uptime_secs: int
     started_at: str
+
+
+def _iter_sse(resp: "requests.Response") -> Iterator[ExecStreamEvent]:
+    """Parse the SSE body of `resp` into ExecChunk / ExecExit events.
+
+    Generator: yields events as they arrive. Handles ``keep-alive``
+    comment lines (lines starting with ``:``) by ignoring them. After
+    yielding ``ExecExit``, closes the underlying response.
+    """
+    try:
+        event_name: Optional[str] = None
+        data_parts: List[str] = []
+
+        def _emit(name: Optional[str], parts: List[str]) -> Optional[ExecStreamEvent]:
+            if not name:
+                return None
+            # SSE concatenates multiple `data:` lines with newlines.
+            data = "\n".join(parts)
+            if name == "stdout" or name == "stderr":
+                try:
+                    raw = base64.b64decode(data, validate=True)
+                except (ValueError, Exception):  # noqa: BLE001
+                    raw = b""
+                return ExecChunk(kind=name, data=raw)
+            if name == "exit":
+                try:
+                    import json as _json
+                    payload = _json.loads(data) if data else {}
+                except ValueError:
+                    payload = {}
+                return ExecExit(
+                    exit_code=payload.get("exit_code"),
+                    signal=payload.get("signal"),
+                    duration_ms=int(payload.get("duration_ms", 0)),
+                )
+            if name == "error":
+                raise NanovmError(f"stream error: {data}", code="stream_error", status=0)
+            # Unknown event names: tolerate quietly so future server
+            # additions don't break old clients.
+            return None
+
+        for raw_line in resp.iter_lines(decode_unicode=False):
+            # `iter_lines` yields ``None`` only for trailing bytes
+            # without a terminator. SSE record boundary is a blank
+            # line — represented as ``b""``.
+            if raw_line is None:
+                continue
+            if raw_line == b"":
+                ev = _emit(event_name, data_parts)
+                event_name, data_parts = None, []
+                if ev is not None:
+                    yield ev
+                    if isinstance(ev, ExecExit):
+                        return
+                continue
+            line = raw_line.decode("utf-8", errors="replace")
+            if line.startswith(":"):
+                # Comment / keep-alive ping; ignore.
+                continue
+            if line.startswith("event:"):
+                event_name = line[len("event:"):].strip()
+            elif line.startswith("data:"):
+                # SSE spec: data field strips a single leading space.
+                rest = line[len("data:"):]
+                if rest.startswith(" "):
+                    rest = rest[1:]
+                data_parts.append(rest)
+        # Flush any trailing record without a terminating blank line.
+        ev = _emit(event_name, data_parts)
+        if ev is not None:
+            yield ev
+    finally:
+        resp.close()
 
 
 @dataclass
@@ -198,6 +305,44 @@ class Vm:
             signal=resp.get("signal"),
             duration_ms=int(resp.get("duration_ms", 0)),
         )
+
+    def exec_stream(
+        self,
+        program: str,
+        args: Optional[List[str]] = None,
+        env: Optional[List[List[str]]] = None,
+        cwd: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+    ) -> Iterator[ExecStreamEvent]:
+        """Stream guest exec output via Server-Sent Events.
+
+        Yields ``ExecChunk`` for each stdout/stderr fragment as it
+        arrives, then exactly one terminal ``ExecExit``. The iterator
+        ends after ``ExecExit``.
+
+        Errors raised before the stream is established (``UnknownVm``,
+        ``InvalidTransition``, auth) surface as the usual typed
+        exceptions. Backend errors mid-stream surface as
+        ``NanovmError`` raised from the iterator.
+
+        Example::
+
+            for event in vm.exec_stream("sh", ["-c", "echo hi"]):
+                if isinstance(event, ExecChunk):
+                    print(event.kind, event.data)
+                else:
+                    print("exit", event.exit_code)
+        """
+        body: Dict[str, Any] = {"program": program}
+        if args is not None:
+            body["args"] = list(args)
+        if env is not None:
+            body["env"] = [list(pair) for pair in env]
+        if cwd is not None:
+            body["cwd"] = cwd
+        if timeout_ms is not None:
+            body["timeout_ms"] = int(timeout_ms)
+        return self._client._sse_post(f"/v1/vms/{self.id}/exec/stream", body=body)
 
 
 @dataclass
@@ -299,9 +444,20 @@ class Client:
                 return resp.json()
             except ValueError:
                 return resp.text
-        # Error path — parse the structured envelope, fall back to raw text.
-        code: str = "unknown"
-        message: str = resp.text or f"HTTP {resp.status_code}"
+        # Error path — let the shared error mapper raise.
+        self._raise_for_error(resp)
+        # Unreachable — _raise_for_error always raises.
+        return None  # pragma: no cover
+
+    def _raise_for_error(self, resp: "requests.Response") -> None:
+        """Map a non-2xx response to the right typed exception.
+
+        Reused by both ``_request`` (one-shot JSON path) and
+        ``_sse_post`` (streaming path — must surface errors that
+        happen BEFORE the SSE stream opens, like ``404 unknown_vm``).
+        """
+        code = "unknown"
+        message = resp.text or f"HTTP {resp.status_code}"
         try:
             envelope = resp.json()
             err = envelope.get("error", {})
@@ -323,6 +479,37 @@ class Client:
             code=code,
             status=resp.status_code,
         )
+
+    def _sse_post(
+        self, path: str, body: Optional[Dict[str, Any]] = None
+    ) -> Iterator[ExecStreamEvent]:
+        """POST a JSON body and stream the text/event-stream response.
+
+        Returns a generator that yields ``ExecChunk`` / ``ExecExit``.
+        Errors before the stream opens (4xx/5xx with a JSON envelope)
+        raise the appropriate typed exception synchronously; errors
+        once streaming has begun surface as ``NanovmError`` raised
+        from inside the iterator.
+        """
+        url = f"{self.base_url}{path}"
+        try:
+            resp = self._session.post(
+                url,
+                json=body,
+                stream=True,
+                timeout=self.timeout,
+                headers={"accept": "text/event-stream"},
+            )
+        except requests.RequestException as e:
+            raise NanovmError(
+                f"transport error talking to {self.base_url}: {e}"
+            ) from e
+        if resp.status_code >= 300:
+            try:
+                self._raise_for_error(resp)
+            finally:
+                resp.close()
+        return _iter_sse(resp)
 
     # -- high-level API -----------------------------------------------------
 

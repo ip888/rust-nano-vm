@@ -14,8 +14,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use vm_core::{
-    GuestExecRequest, GuestExecResult, Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError,
-    VmHandle, VmId, VmMeta, VmResult, VmState,
+    ExecFrame, ExecStream, GuestExecRequest, GuestExecResult, Hypervisor, SnapshotId, SnapshotMeta,
+    VmConfig, VmError, VmHandle, VmId, VmMeta, VmResult, VmState,
 };
 
 #[derive(Debug, Clone)]
@@ -313,6 +313,150 @@ impl Hypervisor for MockHypervisor {
             stderr: output.stderr,
             duration_ms,
         })
+    }
+
+    fn exec_in_guest_stream(
+        &self,
+        id: VmId,
+        req: GuestExecRequest,
+    ) -> VmResult<Box<dyn ExecStream>> {
+        // Same lifecycle preconditions as `exec_in_guest`: the VM must
+        // exist and be `Running` before we spawn anything.
+        {
+            let inner = self.inner.lock().expect("mock hypervisor poisoned");
+            let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+            if vm.state != VmState::Running {
+                return Err(VmError::InvalidTransition {
+                    id,
+                    from: vm.state,
+                    to: VmState::Running,
+                });
+            }
+        }
+
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        let mut cmd = Command::new(&req.program);
+        cmd.args(&req.args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null());
+        if let Some(ref dir) = req.cwd {
+            cmd.current_dir(dir);
+        }
+        for (k, v) in &req.env {
+            cmd.env(k, v);
+        }
+        let started = Instant::now();
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| VmError::Backend(format!("exec spawn {}: {e}", req.program)))?;
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+
+        let (tx, rx) = mpsc::channel::<VmResult<ExecFrame>>();
+
+        // Reader threads pump stdout/stderr into the channel. Each
+        // chunk is whatever `read()` happens to return — callers must
+        // not assume one frame per line.
+        let tx_out = tx.clone();
+        let h_out = std::thread::spawn(move || -> std::io::Result<()> {
+            let mut buf = vec![0u8; 4096];
+            let mut reader = stdout;
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                if tx_out
+                    .send(Ok(ExecFrame::Stdout(buf[..n].to_vec())))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+        });
+        let tx_err = tx.clone();
+        let h_err = std::thread::spawn(move || -> std::io::Result<()> {
+            let mut buf = vec![0u8; 4096];
+            let mut reader = stderr;
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                if tx_err
+                    .send(Ok(ExecFrame::Stderr(buf[..n].to_vec())))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+        });
+
+        // Waiter thread joins both readers BEFORE emitting Exit so the
+        // terminal frame is always the last one observed.
+        std::thread::spawn(move || {
+            let status_res = child.wait();
+            let _ = h_out.join();
+            let _ = h_err.join();
+            let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            match status_res {
+                Ok(status) => {
+                    #[cfg(unix)]
+                    let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+                    #[cfg(not(unix))]
+                    let signal: Option<i32> = None;
+                    let _ = tx.send(Ok(ExecFrame::Exit {
+                        exit_code: status.code(),
+                        signal,
+                        duration_ms,
+                    }));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(VmError::Backend(format!("exec wait: {e}"))));
+                }
+            }
+            // tx dropped here — receiver sees `Err(RecvError)` after
+            // the last frame, which we translate to Ok(None) below.
+        });
+
+        #[derive(Debug)]
+        struct MockStream {
+            rx: mpsc::Receiver<VmResult<ExecFrame>>,
+            done: bool,
+        }
+        impl ExecStream for MockStream {
+            fn next_frame(&mut self) -> VmResult<Option<ExecFrame>> {
+                if self.done {
+                    return Ok(None);
+                }
+                match self.rx.recv() {
+                    Ok(Ok(frame)) => {
+                        if matches!(frame, ExecFrame::Exit { .. }) {
+                            self.done = true;
+                        }
+                        Ok(Some(frame))
+                    }
+                    Ok(Err(e)) => {
+                        self.done = true;
+                        Err(e)
+                    }
+                    Err(_) => {
+                        // Sender dropped without an Exit frame —
+                        // exotic, but treat it as end-of-stream so
+                        // callers don't block forever.
+                        self.done = true;
+                        Ok(None)
+                    }
+                }
+            }
+        }
+
+        Ok(Box::new(MockStream { rx, done: false }))
     }
 
     fn write_file(&self, id: VmId, path: String, content: Vec<u8>, mode: u32) -> VmResult<u64> {
@@ -799,6 +943,88 @@ mod tests {
                 VmId(0xbad),
                 GuestExecRequest {
                     program: "echo".into(),
+                    args: vec![],
+                    cwd: None,
+                    env: vec![],
+                    timeout_ms: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, VmError::UnknownVm(_)));
+    }
+
+    #[test]
+    fn exec_in_guest_stream_emits_stdout_then_exit() {
+        let hv = MockHypervisor::new();
+        let h = hv.create_vm(&cfg()).unwrap();
+        hv.start(h.id).unwrap();
+
+        let mut stream = hv
+            .exec_in_guest_stream(
+                h.id,
+                GuestExecRequest {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), "printf hello; printf err 1>&2".into()],
+                    cwd: None,
+                    env: vec![],
+                    timeout_ms: None,
+                },
+            )
+            .expect("stream spawn");
+
+        let mut stdout_acc: Vec<u8> = Vec::new();
+        let mut stderr_acc: Vec<u8> = Vec::new();
+        let mut exit: Option<(Option<i32>, u64)> = None;
+
+        loop {
+            match stream.next_frame().expect("frame") {
+                Some(ExecFrame::Stdout(bytes)) => stdout_acc.extend_from_slice(&bytes),
+                Some(ExecFrame::Stderr(bytes)) => stderr_acc.extend_from_slice(&bytes),
+                Some(ExecFrame::Exit {
+                    exit_code,
+                    duration_ms,
+                    ..
+                }) => {
+                    exit = Some((exit_code, duration_ms));
+                }
+                None => break,
+            }
+        }
+
+        assert_eq!(stdout_acc, b"hello");
+        assert_eq!(stderr_acc, b"err");
+        let (code, _) = exit.expect("missing Exit frame");
+        assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn exec_in_guest_stream_requires_running_state() {
+        let hv = MockHypervisor::new();
+        let h = hv.create_vm(&cfg()).unwrap();
+        // Don't start — VM is in `Created`.
+        let err = hv
+            .exec_in_guest_stream(
+                h.id,
+                GuestExecRequest {
+                    program: "/bin/true".into(),
+                    args: vec![],
+                    cwd: None,
+                    env: vec![],
+                    timeout_ms: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, VmError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn exec_in_guest_stream_on_unknown_vm_returns_unknown_vm() {
+        let hv = MockHypervisor::new();
+        let err = hv
+            .exec_in_guest_stream(
+                VmId(0xbad),
+                GuestExecRequest {
+                    program: "/bin/true".into(),
                     args: vec![],
                     cwd: None,
                     env: vec![],
