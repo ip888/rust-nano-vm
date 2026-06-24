@@ -26,6 +26,17 @@ Per-fork Pss *decreases* as fan-out grows — the marginal cost of fork #50
 is lower than fork #10 because the kernel keeps reusing the same
 read-only pages.
 
+**Warm pool (opt-in).** Set `NANOVM_WARM_POOL_PER_SNAPSHOT=N` to keep
+`N` pre-restored children per snapshot in a background queue. The
+customer-visible `/v1/snapshots/:id/fork` call then pops a warmed VM
+instead of paying the full KVM restore, collapsing fork latency to a
+queue pop plus the HTTP round-trip. Off by default. End-to-end design
++ tests live in
+[`crates/control-plane/src/warm_pool.rs`](crates/control-plane/src/warm_pool.rs);
+the real-KVM p99 number isn't in the table yet because it hasn't been
+benched on the i5 — verify locally with
+`NANOVM_WARM_POOL_PER_SNAPSHOT=8 cargo run -p bench --features kvm --release --bin nanovm-fork-bench`.
+
 ## Why this exists
 
 Every AI coding agent — Claude Code, Cursor, Devin, OpenHands, aider,
@@ -69,7 +80,13 @@ them via `MAP_PRIVATE` copy-on-write.
    token-bucket quota on the expensive `/fork` route, per-caller usage
    metering, Prometheus `/metrics` endpoint. ~330 lines of axum, no magic.
 
-5. **No detours.** Custom `virtio-vsock` (~1200 lines), hand-rolled
+5. **Warm pool for steady-state fan-out.** When the eval loop will
+   fork the same snapshot thousands of times, opt in to a pre-restored
+   pool so each customer fork is a queue pop, not a fresh KVM restore.
+   Lazy-warming, bounded refill, drains on snapshot delete. See
+   [`crates/control-plane/src/warm_pool.rs`](crates/control-plane/src/warm_pool.rs).
+
+6. **No detours.** Custom `virtio-vsock` (~1200 lines), hand-rolled
    Prometheus exposition (no `prometheus` crate dependency),
    `MockHypervisor` for tests so CI doesn't need `/dev/kvm`. Single
    workspace, `cargo test --workspace` green without root.
@@ -304,6 +321,10 @@ crates/
 | virtio-vsock + musl guest agent, `nanovm exec` round-trip | ✅ |
 | Snapshot + fork; ~12 ms p50 cold start, measured | ✅ |
 | Control plane REST: auth, quota, metering, Prometheus | ✅ |
+| Warm pool: pre-restored forks for sub-ms hand-out (opt-in) | ✅ |
+| Python guest rootfs (Alpine 3.20 + Python 3.12); `python3 -c "print(1+1)"` round-trip on real KVM | ✅ |
+| Python SDK (`pip install ./clients/python`) — synchronous, typed exceptions | ✅ |
+| Docker image on GHCR (`ghcr.io/ip888/nanovm-control-plane`) | ✅ |
 | virtio-fs host↔guest file push/pull | in progress |
 
 Pre-1.0. Full roadmap in [`docs/PLAN.md`](docs/PLAN.md).
@@ -311,7 +332,9 @@ Pre-1.0. Full roadmap in [`docs/PLAN.md`](docs/PLAN.md).
 ## Use cases this is built for
 
 - **AI agent eval pipelines.** Fan out 1000 variants of a base image to
-  run a benchmark in parallel; throw them away in milliseconds. See
+  run a benchmark in parallel; throw them away in milliseconds. Set
+  `NANOVM_WARM_POOL_PER_SNAPSHOT=N` to hide the cold-restore cost
+  behind a background queue. See
   [`docs/blog/04-12ms-eval-fanout.md`](docs/blog/04-12ms-eval-fanout.md)
   for the worked numbers vs containers.
 - **Self-hosted code interpreters.** Drop-in OSS alternative to E2B for
