@@ -349,6 +349,7 @@ crates/
 | Warm pool: pre-restored forks for sub-ms hand-out (opt-in) | ✅ |
 | Streaming exec via Server-Sent Events (`POST /v1/vms/:id/exec/stream`) on both mock and real KVM | ✅ |
 | Python guest rootfs (Alpine 3.20 + Python 3.12); `python3 -c "print(1+1)"` round-trip on real KVM | ✅ |
+| Node.js guest rootfs (Alpine 3.20 + Node 20); `node -e "console.log(1+1)"` round-trip on real KVM | ✅ |
 | Host↔guest file push/pull via `/v1/vms/:id/files` (vsock RPC, real KVM end-to-end) | ✅ |
 | Seccomp-BPF sandbox on the VMM process (opt-in via `NANOVM_SECCOMP=1`) | ✅ |
 | Python SDK (`pip install ./clients/python`) — synchronous, typed exceptions | ✅ |
