@@ -52,6 +52,7 @@ use crate::auth;
 use crate::error::ApiError;
 use crate::request_id;
 use crate::time::rfc3339_now;
+use crate::warm_pool::WarmPool;
 
 /// Per-token fork usage — the basis for usage-based billing on the fork API.
 #[derive(Debug, Default, Clone, Copy)]
@@ -73,6 +74,10 @@ pub struct AppState {
     fork_quota: Arc<crate::ForkQuota>,
     /// Prometheus counters exposed at `/metrics`.
     metrics: Arc<crate::Metrics>,
+    /// Pre-warmed fork pool. Default is a disabled pool (every fork
+    /// takes the cold path); callers opt in via
+    /// [`with_warm_pool_size`](Self::with_warm_pool_size).
+    warm_pool: Arc<WarmPool>,
     /// Process start time (monotonic clock) — used to compute uptime
     /// reported on `GET /v1/health`. Set once when the first `AppState`
     /// is constructed and shared across clones.
@@ -112,11 +117,13 @@ impl AppState {
         hypervisor: Arc<dyn Hypervisor>,
         fork_quota: Arc<crate::ForkQuota>,
     ) -> Self {
+        let warm_pool = WarmPool::disabled(Arc::clone(&hypervisor));
         Self {
             hypervisor,
             fork_usage: Arc::new(Mutex::new(HashMap::new())),
             fork_quota,
             metrics: Arc::new(crate::Metrics::new()),
+            warm_pool,
             start_instant: Instant::now(),
             started_at: rfc3339_now(),
             backend_label: "mock",
@@ -132,11 +139,34 @@ impl AppState {
         self
     }
 
+    /// Enable the warm-fork pool with `per_snapshot` pre-restored VMs
+    /// per source snapshot. `0` is a no-op (keeps the default disabled
+    /// pool). The pool shares this state's hypervisor `Arc`.
+    pub fn with_warm_pool_size(mut self, per_snapshot: usize) -> Self {
+        if per_snapshot > 0 {
+            self.warm_pool = WarmPool::new(Arc::clone(&self.hypervisor), per_snapshot);
+        }
+        self
+    }
+
+    /// Install a pre-built [`WarmPool`]. Lets the server binary
+    /// construct the pool once from env and hand it in.
+    pub fn with_warm_pool(mut self, pool: Arc<WarmPool>) -> Self {
+        self.warm_pool = pool;
+        self
+    }
+
     /// Borrow the metrics collector. Test-only API for asserting on
     /// recorded counters without going through `/metrics`.
     #[doc(hidden)]
     pub fn metrics(&self) -> &Arc<crate::Metrics> {
         &self.metrics
+    }
+
+    /// Borrow the warm pool. Test/observability helper.
+    #[doc(hidden)]
+    pub fn warm_pool(&self) -> &Arc<WarmPool> {
+        &self.warm_pool
     }
 }
 
@@ -379,7 +409,16 @@ async fn fork_snapshot(
         });
     }
     let started = Instant::now();
-    let handle = state.hypervisor.restore(SnapshotId(id))?;
+    // Try the warm pool first — sub-millisecond pop when populated.
+    // Disabled / empty pool falls straight through to the cold path,
+    // which preserves prior behaviour for callers that never opted in.
+    let handle = if let Some(h) = state.warm_pool.take(SnapshotId(id)) {
+        state.metrics.record_warm_hit();
+        h
+    } else {
+        state.metrics.record_warm_miss();
+        state.hypervisor.restore(SnapshotId(id))?
+    };
     let fork_ms = started.elapsed().as_millis() as u64;
 
     let mut fork_count = 1u64;
@@ -517,6 +556,10 @@ async fn delete_snapshot(
     id: Result<Path<u64>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
     let Path(id) = id?;
+    // Drain warm children FIRST so their parent doesn't disappear out
+    // from under them. Drain is idempotent — safe even if the snapshot
+    // turns out to be unknown to the hypervisor.
+    state.warm_pool.drain(SnapshotId(id));
     state.hypervisor.delete_snapshot(SnapshotId(id))?;
     Ok(StatusCode::NO_CONTENT)
 }

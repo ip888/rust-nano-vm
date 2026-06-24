@@ -1788,3 +1788,131 @@ async fn legacy_healthz_unchanged() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, json!("ok"));
 }
+
+// ---- warm pool ----------------------------------------------------------
+
+/// Router with auth disabled and the warm pool enabled at `per_snapshot`.
+fn app_with_warm_pool(per_snapshot: usize) -> Router {
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    router()
+        .layer(Extension(Arc::new(ApiTokens::default())))
+        .with_state(AppState::new(hv).with_warm_pool_size(per_snapshot))
+}
+
+async fn fetch_metrics_text(app: Router) -> String {
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn warm_pool_second_fork_hits_warm_path() {
+    let app = app_with_warm_pool(2);
+    let snap = snapshot_a_fresh_vm(&app, None).await;
+
+    // First fork: pool is cold, must miss and kick a refill.
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/snapshots/{snap}/fork"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // MockHypervisor.restore is sub-millisecond; 100 ms is generous
+    // headroom for the refill task to land a child on the queue.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Second fork: must hit the warm path.
+    let (status, _) = send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/snapshots/{snap}/fork"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let text = fetch_metrics_text(app.clone()).await;
+    assert!(
+        text.contains("nanovm_warm_pool_hits_total 1"),
+        "expected one warm hit, got:\n{text}"
+    );
+    assert!(
+        text.contains("nanovm_warm_pool_misses_total 1"),
+        "expected one warm miss, got:\n{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn warm_pool_disabled_by_default_always_misses() {
+    let app = app(); // default AppState: pool disabled
+    let snap = snapshot_a_fresh_vm(&app, None).await;
+
+    for _ in 0..3 {
+        let (status, _) = send(
+            app.clone(),
+            Method::POST,
+            &format!("/v1/snapshots/{snap}/fork"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let text = fetch_metrics_text(app).await;
+    assert!(
+        text.contains("nanovm_warm_pool_hits_total 0"),
+        "disabled pool should record zero hits, got:\n{text}"
+    );
+    assert!(
+        text.contains("nanovm_warm_pool_misses_total 3"),
+        "every fork should record a miss when the pool is disabled, got:\n{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn warm_pool_drains_on_snapshot_delete() {
+    let app = app_with_warm_pool(3);
+    let snap = snapshot_a_fresh_vm(&app, None).await;
+
+    // One fork warms the pool. Wait for refill to settle.
+    let _ = send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/snapshots/{snap}/fork"),
+        None,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    // Delete the snapshot — drain must run before delete_snapshot,
+    // and the request must succeed.
+    let (status, _) = send(
+        app.clone(),
+        Method::DELETE,
+        &format!("/v1/snapshots/{snap}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Subsequent fork against the gone snapshot must surface
+    // UnknownSnapshot — proving the snapshot really was deleted and
+    // didn't get held alive by leftover warm children.
+    let (status, body) = send(
+        app,
+        Method::POST,
+        &format!("/v1/snapshots/{snap}/fork"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "got {body:?}");
+}

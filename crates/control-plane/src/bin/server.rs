@@ -9,13 +9,15 @@
 //!   auth** and emits a `WARN` log line on startup.
 //! - `NANOVM_AUDIT_LOG` — when set to a filesystem path, mutating `/v1/*`
 //!   calls are appended as JSON lines for compliance / forensics.
+//! - `NANOVM_WARM_POOL_PER_SNAPSHOT` — target number of pre-restored VMs
+//!   to keep ready per source snapshot. Default `0` (disabled).
 
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
 
 use axum::Extension;
-use control_plane::{router, ApiTokens, AppState, AuditLog};
+use control_plane::{router, ApiTokens, AppState, AuditLog, WarmPool};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{info, warn};
@@ -56,10 +58,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let hypervisor: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    let warm_pool = WarmPool::from_env(Arc::clone(&hypervisor));
+    if warm_pool.is_disabled() {
+        info!("warm pool disabled (set NANOVM_WARM_POOL_PER_SNAPSHOT=N to enable)");
+    } else {
+        info!(per_snapshot = warm_pool.per_snapshot(), "warm pool enabled");
+    }
     let app = router()
         .layer(Extension(tokens))
         .layer(Extension(audit))
-        .with_state(AppState::new(hypervisor));
+        .with_state(AppState::new(hypervisor).with_warm_pool(warm_pool));
 
     let listener = TcpListener::bind(&addr).await?;
     info!(%addr, "nanovm-control-plane listening");

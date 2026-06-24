@@ -15,6 +15,11 @@
 //! - `nanovm_fork_latency_ms_sum` / `nanovm_fork_latency_ms_count` —
 //!   sum + count of fork wall-time in milliseconds (rate gives mean
 //!   latency: `rate(sum) / rate(count)`).
+//! - `nanovm_warm_pool_hits_total` / `nanovm_warm_pool_misses_total` —
+//!   `/fork` calls served from the pre-warmed pool vs. ones that fell
+//!   through to a cold restore. Hit-rate is the warm-pool's headline
+//!   number; misses are normal during cold-start or right after a
+//!   burst that drains the queue.
 //! - `nanovm_up 1` — heartbeat gauge so a stale process is detectable.
 //!
 //! Labels are deliberately limited to the token fingerprint. Per-route
@@ -38,6 +43,10 @@ pub struct Metrics {
     fork_latency_ms_sum: AtomicU64,
     /// Number of latency observations recorded.
     fork_latency_ms_count: AtomicU64,
+    /// `/fork` calls served from the warm pool.
+    warm_pool_hits: AtomicU64,
+    /// `/fork` calls that fell through to a cold restore.
+    warm_pool_misses: AtomicU64,
 }
 
 impl Metrics {
@@ -62,6 +71,16 @@ impl Metrics {
         if let Ok(mut map) = self.throttled_total.lock() {
             *map.entry(token_fp.to_owned()).or_insert(0) += 1;
         }
+    }
+
+    /// Record a fork served from the warm pool.
+    pub fn record_warm_hit(&self) {
+        self.warm_pool_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a fork that fell through to a cold restore.
+    pub fn record_warm_miss(&self) {
+        self.warm_pool_misses.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Render the Prometheus text exposition for these metrics.
@@ -106,6 +125,23 @@ impl Metrics {
             out,
             "nanovm_fork_latency_ms_count {}",
             self.fork_latency_ms_count.load(Ordering::Relaxed)
+        );
+
+        out.push_str("# HELP nanovm_warm_pool_hits_total Forks served from the warm pool.\n");
+        out.push_str("# TYPE nanovm_warm_pool_hits_total counter\n");
+        let _ = writeln!(
+            out,
+            "nanovm_warm_pool_hits_total {}",
+            self.warm_pool_hits.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP nanovm_warm_pool_misses_total Forks that fell through to a cold restore.\n",
+        );
+        out.push_str("# TYPE nanovm_warm_pool_misses_total counter\n");
+        let _ = writeln!(
+            out,
+            "nanovm_warm_pool_misses_total {}",
+            self.warm_pool_misses.load(Ordering::Relaxed)
         );
 
         out
