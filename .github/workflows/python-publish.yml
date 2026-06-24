@@ -1,0 +1,87 @@
+name: python-publish
+
+# Build and publish the `nanovm` Python SDK to PyPI on every `v*.*.*`
+# tag push — the same trigger that already cuts a GitHub Release and a
+# GHCR Docker image, so all three artifacts stay version-locked.
+#
+# Authentication uses PyPI Trusted Publishers (OIDC), so no API token
+# secret is stored in this repo. One-time setup on PyPI:
+#
+#   1. https://pypi.org/manage/account/publishing/
+#   2. Add a "pending publisher" for project `nanovm` with:
+#        - Owner:           ip888
+#        - Repository name: Rust-nano-vm
+#        - Workflow name:   python-publish.yml
+#        - Environment:     pypi
+#   3. Once a tag like `v0.1.0` is pushed, this workflow runs as the
+#      Trusted Publisher and PyPI promotes the pending project to a
+#      real one bound to this workflow file.
+#
+# Until that PyPI-side setup is done, this workflow will FAIL at the
+# `pypa/gh-action-pypi-publish` step with "Trusted publisher not
+# configured". That's the intended fence — the job runs, but no
+# package gets published until the human registers the project.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  # Manual trigger so we can dry-run the build (sdist + wheel + twine
+  # check) against a feature branch without actually publishing.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade build twine
+
+      - name: Build sdist + wheel
+        working-directory: clients/python
+        run: python -m build
+
+      - name: Twine check
+        working-directory: clients/python
+        run: python -m twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: clients/python/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish to PyPI
+    # Only publish on tag pushes; skip on manual dry-run dispatches.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    # Bound the OIDC blast radius to a named environment so PyPI's
+    # Trusted Publisher binding stays specific.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/nanovm
+    permissions:
+      # Trusted Publisher: GitHub mints a short-lived OIDC token that
+      # PyPI verifies — no long-lived secret in repo settings.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
