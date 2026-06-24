@@ -8,9 +8,19 @@ not like a generated stub of the OpenAPI.
 ## Install
 
 ```sh
-pip install ./clients/python
-# (PyPI publish: TODO — for now install straight from the repo path.)
+pip install nanovm
 ```
+
+Or, from a working checkout (development install):
+
+```sh
+pip install ./clients/python
+```
+
+PyPI releases are cut by [`.github/workflows/python-publish.yml`](../../.github/workflows/python-publish.yml)
+on every `v*.*.*` tag push, using PyPI Trusted Publishers (no API
+token stored in the repo). Until a tag has shipped through the
+workflow, the path install is the only one that works.
 
 ## 30-second smoke test
 

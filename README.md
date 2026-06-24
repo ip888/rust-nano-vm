@@ -166,11 +166,17 @@ with nanovm.Client("http://localhost:8080", token="dev-token") as c:
     vm.destroy()
 ```
 
-Install (PyPI publish pending):
+Install:
 
 ```sh
+pip install nanovm
+# or, for development:
 pip install ./clients/python
 ```
+
+PyPI releases ship via a Trusted-Publisher GitHub Actions workflow on
+every `v*.*.*` tag — see
+[`.github/workflows/python-publish.yml`](.github/workflows/python-publish.yml).
 
 See [`clients/python/README.md`](clients/python/README.md) for the
 full surface — snapshot/fork, cursor pagination, error handling,
