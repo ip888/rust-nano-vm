@@ -43,6 +43,7 @@ mod api;
 mod audit;
 mod auth;
 mod error;
+mod exec_stream;
 pub mod fork_quota;
 pub mod metrics;
 mod request_id;

@@ -1789,6 +1789,128 @@ async fn legacy_healthz_unchanged() {
     assert_eq!(body, json!("ok"));
 }
 
+// ---- exec stream (SSE) --------------------------------------------------
+
+/// Drive an SSE endpoint to completion and return the full text body.
+/// MockHypervisor's stream is bounded — child exits, the producer
+/// emits an `exit` event, the channel closes, the body ends.
+async fn drain_sse(app: Router, uri: &str, body: Value) -> (StatusCode, String) {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn decode_b64(s: &str) -> Vec<u8> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    B64.decode(s.trim()).expect("valid base64")
+}
+
+#[tokio::test]
+async fn exec_stream_emits_stdout_then_exit_events() {
+    let app = app();
+    let id = create_running_vm(app.clone()).await;
+
+    let (status, body) = drain_sse(
+        app,
+        &format!("/v1/vms/{id}/exec/stream"),
+        json!({
+            "program": "sh",
+            "args": ["-c", "printf hello-stream; exit 0"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // SSE blocks parse as: blank-line-separated records, each with one
+    // or more "event:" / "data:" fields.
+    let mut events: Vec<(String, String)> = Vec::new();
+    for block in body.split("\n\n") {
+        if block.trim().is_empty() {
+            continue;
+        }
+        let mut name = String::new();
+        let mut payload = String::new();
+        for line in block.lines() {
+            if let Some(rest) = line.strip_prefix("event:") {
+                name = rest.trim().to_string();
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                if !payload.is_empty() {
+                    payload.push('\n');
+                }
+                payload.push_str(rest.trim_start_matches(' '));
+            }
+        }
+        events.push((name, payload));
+    }
+
+    // Filter keep-alives (event: "" with empty data).
+    let events: Vec<_> = events.into_iter().filter(|(n, _)| !n.is_empty()).collect();
+
+    let mut stdout_acc = Vec::new();
+    let mut saw_exit = false;
+    let mut exit_code: Option<i64> = None;
+    for (name, data) in &events {
+        match name.as_str() {
+            "stdout" => stdout_acc.extend_from_slice(&decode_b64(data)),
+            "exit" => {
+                saw_exit = true;
+                let v: Value = serde_json::from_str(data).expect("exit json");
+                exit_code = v["exit_code"].as_i64();
+                // Exit must be the LAST event.
+            }
+            other => panic!("unexpected event {other:?} body={body:?}"),
+        }
+    }
+    assert_eq!(stdout_acc, b"hello-stream");
+    assert!(saw_exit, "missing exit event in:\n{body}");
+    assert_eq!(exit_code, Some(0));
+    assert_eq!(
+        events.last().map(|(n, _)| n.as_str()),
+        Some("exit"),
+        "exit must be terminal"
+    );
+}
+
+#[tokio::test]
+async fn exec_stream_on_created_vm_returns_conflict_before_streaming() {
+    let app = app();
+    let (_, h) = send(app.clone(), Method::POST, "/v1/vms", Some(json!({}))).await;
+    let id = h["id"].as_u64().unwrap();
+    // VM is in Created — preflight should reject with 409 before any
+    // SSE response is opened.
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        &format!("/v1/vms/{id}/exec/stream"),
+        Some(json!({ "program": "true" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "got body {body:?}");
+    assert_eq!(body["error"]["code"], "invalid_transition");
+}
+
+#[tokio::test]
+async fn exec_stream_on_unknown_vm_returns_not_found_before_streaming() {
+    let app = app();
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/v1/vms/4242424242/exec/stream",
+        Some(json!({ "program": "true" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "got body {body:?}");
+    assert_eq!(body["error"]["code"], "unknown_vm");
+}
+
 // ---- warm pool ----------------------------------------------------------
 
 /// Router with auth disabled and the warm pool enabled at `per_snapshot`.

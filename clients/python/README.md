@@ -81,6 +81,38 @@ with nanovm.Client("http://localhost:8080", token="dev-token") as client:
         vm.destroy()
 ```
 
+## Streaming exec
+
+For long-running guest programs where you want output as it arrives —
+log tailing, an LLM agent loop, a build with progress — use
+`Vm.exec_stream` instead of `Vm.exec`. It's a generator over
+`ExecChunk` (stdout/stderr bytes) and a terminal `ExecExit`:
+
+```python
+import nanovm
+
+with nanovm.Client("http://localhost:8080", token="dev-token") as client:
+    vm = client.create_vm()
+    vm.start()
+
+    for event in vm.exec_stream(
+        program="python3",
+        args=["-c", "for i in range(5): print(i, flush=True)"],
+    ):
+        if isinstance(event, nanovm.ExecChunk):
+            print(event.kind, event.data)            # b"0\n", b"1\n", …
+        else:                                         # ExecExit, terminal
+            print("done", event.exit_code, event.duration_ms)
+
+    vm.destroy()
+```
+
+The wire format is Server-Sent Events; the SDK parses + base64-decodes
+chunks for you. Chunk boundaries follow the underlying transport — do
+not assume one chunk per line. Errors raised before the stream opens
+(`NotFoundError`, `ConflictError`, `AuthError`) surface synchronously;
+errors mid-stream surface as `NanovmError` raised from the iterator.
+
 ## Errors
 
 Every failure raises a typed exception derived from `NanovmError`:
@@ -143,9 +175,6 @@ u = client.usage()
   if there's demand.
 - A retry layer. Network errors raise `NanovmError`; pin your retry
   policy at your call site (tenacity is the idiomatic choice).
-- A streaming-exec client. The current SDK only exposes the
-  one-shot `Exec` op; `ExecStart`/`ExecOutput`/`ExecExited`
-  streaming arrives when the underlying API does.
 
 ## Versioning
 

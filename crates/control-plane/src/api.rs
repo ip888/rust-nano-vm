@@ -714,6 +714,27 @@ pub fn openapi_spec() -> Value {
                     }
                 }
             },
+            "/v1/vms/{id}/exec/stream": {
+                "post": {
+                    "summary": "Stream guest exec output via Server-Sent Events",
+                    "description": "Identical request body to /v1/vms/{id}/exec. Response is text/event-stream with `stdout`/`stderr` events carrying base64-encoded byte chunks, terminated by a single `exit` event whose data is a JSON object with `exit_code`, `signal`, and `duration_ms`.",
+                    "parameters": [{ "$ref": "#/components/parameters/VmIdPath" }],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": { "schema": { "$ref": "#/components/schemas/ExecRequest" } }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Streaming exec output",
+                            "content": {
+                                "text/event-stream": { "schema": { "type": "string" } }
+                            }
+                        }
+                    }
+                }
+            },
             "/v1/vms/{id}/files": {
                 "get": {
                     "summary": "Read a file from the guest filesystem",

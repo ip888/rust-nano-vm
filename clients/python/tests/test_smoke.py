@@ -181,3 +181,50 @@ def test_list_vms_zero_limit_is_bad_request(client: nanovm.Client) -> None:
         client.list_vms(limit=0)
     assert excinfo.value.status == 400
     assert excinfo.value.code == "bad_request"
+
+
+# --- streaming exec ----------------------------------------------------------
+
+
+def test_exec_stream_yields_stdout_chunks_then_exit(client: nanovm.Client) -> None:
+    """``Vm.exec_stream`` yields raw byte chunks then a terminal exit.
+
+    Against the mock backend the host runs ``printf`` directly, so we
+    can assert on exact bytes — the wire shape is identical against a
+    real-KVM backend.
+    """
+    vm = client.create_vm()
+    try:
+        vm.start()
+        stdout_bytes = b""
+        exit_event = None
+        for event in vm.exec_stream(
+            program="sh",
+            args=["-c", "printf 'streamed-line\\n'; exit 0"],
+        ):
+            if isinstance(event, nanovm.ExecChunk):
+                assert event.kind in {"stdout", "stderr"}
+                if event.kind == "stdout":
+                    stdout_bytes += event.data
+            else:
+                assert isinstance(event, nanovm.ExecExit)
+                exit_event = event
+
+        assert stdout_bytes == b"streamed-line\n"
+        assert exit_event is not None, "exec_stream never yielded ExecExit"
+        assert exit_event.exit_code == 0
+
+
+    finally:
+        vm.destroy()
+
+
+def test_exec_stream_on_created_vm_raises_conflict(client: nanovm.Client) -> None:
+    vm = client.create_vm()
+    try:
+        with pytest.raises(nanovm.ConflictError) as excinfo:
+            list(vm.exec_stream(program="true"))
+        assert excinfo.value.status == 409
+        assert excinfo.value.code == "invalid_transition"
+    finally:
+        vm.destroy()
