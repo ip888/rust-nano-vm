@@ -16,8 +16,10 @@ path = "src/main.rs"
 [dependencies]
 vm-core.workspace = true
 vm-kvm = { workspace = true }
+control-plane.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+tokio.workspace = true
 
 # The bench is a KVM-only tool, but enabling `vm-kvm/kvm` *unconditionally*
 # turns the feature on for every other workspace member that depends on

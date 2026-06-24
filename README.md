@@ -11,7 +11,7 @@
 
 Measured on a stock i5 laptop, 8 GiB RAM, KVM, vanilla Linux. Reproduce
 with `cargo run -p bench --features kvm --release --bin nanovm-fork-bench
--- --count 100 --alive 50`.
+-- --forks 100 --alive 50`.
 
 | Metric | Value | How |
 | --- | --- | --- |
@@ -32,10 +32,19 @@ customer-visible `/v1/snapshots/:id/fork` call then pops a warmed VM
 instead of paying the full KVM restore, collapsing fork latency to a
 queue pop plus the HTTP round-trip. Off by default. End-to-end design
 + tests live in
-[`crates/control-plane/src/warm_pool.rs`](crates/control-plane/src/warm_pool.rs);
-the real-KVM p99 number isn't in the table yet because it hasn't been
-benched on the i5 — verify locally with
-`NANOVM_WARM_POOL_PER_SNAPSHOT=8 cargo run -p bench --features kvm --release --bin nanovm-fork-bench`.
+[`crates/control-plane/src/warm_pool.rs`](crates/control-plane/src/warm_pool.rs).
+The real-KVM warm vs cold numbers aren't pinned in the table yet
+because they're machine-dependent — run the bench yourself:
+
+```sh
+# Cold-only (default): the headline ~12 ms p50.
+cargo run -p bench --features kvm --release --bin nanovm-fork-bench -- \
+    --forks 100
+
+# Cold + warm-pool side-by-side: bench prints both phases and the speedup.
+cargo run -p bench --features kvm --release --bin nanovm-fork-bench -- \
+    --forks 100 --warm-pool 8
+```
 
 ## Why this exists
 
@@ -257,7 +266,7 @@ tools/initramfs/build-initramfs.sh
 
 # Boot one guest, snapshot it, fork 100 children, measure:
 cargo run -p bench --features kvm --release --bin nanovm-fork-bench -- \
-  --count 100 --alive 50 --settle-secs 2
+  --forks 100 --alive 50 --settle-secs 2
 ```
 
 Expected output on a modest laptop:
