@@ -329,9 +329,10 @@ crates/
 | Control plane REST: auth, quota, metering, Prometheus | ✅ |
 | Warm pool: pre-restored forks for sub-ms hand-out (opt-in) | ✅ |
 | Python guest rootfs (Alpine 3.20 + Python 3.12); `python3 -c "print(1+1)"` round-trip on real KVM | ✅ |
+| Host↔guest file push/pull via `/v1/vms/:id/files` (vsock RPC, real KVM end-to-end) | ✅ |
 | Python SDK (`pip install ./clients/python`) — synchronous, typed exceptions | ✅ |
 | Docker image on GHCR (`ghcr.io/ip888/nanovm-control-plane`) | ✅ |
-| virtio-fs host↔guest file push/pull | in progress |
+| virtio-fs `mount` from inside the guest (FUSE wire types + dispatch are done; KVM device wiring is the gap) | in progress |
 
 Pre-1.0. Full roadmap in [`docs/PLAN.md`](docs/PLAN.md).
 
