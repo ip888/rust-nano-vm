@@ -438,6 +438,166 @@ fn rpc_response_body(resp: proto::Response) -> VmResult<proto::ResponseBody> {
     }
 }
 
+/// Streaming exec over vsock: drives a guest `ExecStart` and yields
+/// [`vm_core::ExecFrame`]s as the agent's response frames arrive.
+///
+/// One [`KvmExecStream`] is one logical exec. The stream is fed by
+/// polling the shared [`VsockBackend`]: each `next_frame` call drains
+/// any newly-buffered vsock bytes, tries to decode a response, and
+/// either yields an `ExecFrame` or sleeps and retries.
+///
+/// Cancellation note: dropping the stream stops further polling but
+/// does NOT kill the guest-side child. That requires sending a
+/// `RequestBody::Signal` over the same vsock (out of scope for v1 —
+/// the SSE handler in the control plane doesn't surface client
+/// disconnect to the stream yet).
+#[cfg(feature = "kvm")]
+struct KvmExecStream {
+    backend: VsockBackend,
+    buf: Vec<u8>,
+    /// Set once we've yielded the terminal `ExecExited` frame so
+    /// further `next_frame` calls return `Ok(None)` instead of
+    /// blocking on a guest that's already done talking.
+    done: bool,
+}
+
+#[cfg(feature = "kvm")]
+impl std::fmt::Debug for KvmExecStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KvmExecStream")
+            .field("buf_len", &self.buf.len())
+            .field("done", &self.done)
+            .finish()
+    }
+}
+
+#[cfg(feature = "kvm")]
+impl vm_core::ExecStream for KvmExecStream {
+    fn next_frame(&mut self) -> VmResult<Option<vm_core::ExecFrame>> {
+        use std::time::Duration;
+        if self.done {
+            return Ok(None);
+        }
+        loop {
+            // Try to peel off one complete frame from whatever bytes
+            // we already buffered.
+            match proto::frame::decode_response(&self.buf) {
+                Ok((resp, consumed)) => {
+                    self.buf.drain(..consumed);
+                    match resp.result {
+                        Ok(proto::ResponseBody::ExecStarted { .. }) => {
+                            // First frame of a stream — confirms the
+                            // child spawned. We don't surface a pid to
+                            // the trait, so keep going.
+                            continue;
+                        }
+                        Ok(proto::ResponseBody::ExecOutput { stream, data, .. }) => {
+                            let frame = match stream {
+                                proto::StdStream::Stdout => vm_core::ExecFrame::Stdout(data),
+                                proto::StdStream::Stderr => vm_core::ExecFrame::Stderr(data),
+                            };
+                            return Ok(Some(frame));
+                        }
+                        Ok(proto::ResponseBody::ExecExited {
+                            exit_code,
+                            signal,
+                            duration_ms,
+                            ..
+                        }) => {
+                            self.done = true;
+                            return Ok(Some(vm_core::ExecFrame::Exit {
+                                exit_code,
+                                signal,
+                                duration_ms,
+                            }));
+                        }
+                        Ok(other) => {
+                            // Anything else (Pong, Written, …) means
+                            // we got crossed wires with another RPC.
+                            // Mark done so we don't keep spinning.
+                            self.done = true;
+                            return Err(VmError::Backend(format!(
+                                "vm-kvm: unexpected response on exec stream: {other:?}"
+                            )));
+                        }
+                        Err(rpc) => {
+                            self.done = true;
+                            return Err(VmError::Backend(format!(
+                                "vm-kvm: agent exec_stream error [{:?}]: {}",
+                                rpc.code, rpc.message
+                            )));
+                        }
+                    }
+                }
+                Err(e) if e.is_incomplete() => {
+                    // Need more bytes — drain whatever the vCPU
+                    // thread has pushed, then sleep briefly so we
+                    // don't spin the CPU.
+                    self.backend.drain_inbound(&mut self.buf);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => {
+                    self.done = true;
+                    return Err(VmError::Backend(format!(
+                        "vm-kvm: decode exec stream frame: {e}"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// Send a streaming `ExecStart` over vsock and return a
+/// [`KvmExecStream`] that yields frames as they arrive. Mirrors the
+/// connect-encode-send opening of [`exec_over_vsock`]; the streaming
+/// reply loop lives in `KvmExecStream::next_frame`.
+#[cfg(feature = "kvm")]
+fn exec_stream_over_vsock(
+    backend: &VsockBackend,
+    req: GuestExecRequest,
+) -> VmResult<Box<dyn vm_core::ExecStream>> {
+    use std::time::{Duration, Instant};
+
+    let connect_deadline = Instant::now() + Duration::from_secs(15);
+    let conn = loop {
+        if let Some(c) = backend.established_connection() {
+            break c;
+        }
+        if Instant::now() >= connect_deadline {
+            return Err(VmError::Backend(
+                "vm-kvm: guest agent did not connect over vsock within 15s".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // `ExecStart` doesn't carry timeout_ms — the agent treats the
+    // child as long-running by design. If a caller-supplied
+    // `timeout_ms` becomes important later we'd add a host-side
+    // deadline in `KvmExecStream::next_frame`.
+    let _ = req.timeout_ms;
+    let request = proto::Request {
+        version: proto::PROTOCOL_VERSION,
+        id: proto::RequestId(1),
+        body: proto::RequestBody::ExecStart {
+            program: req.program,
+            args: req.args,
+            cwd: req.cwd,
+            env: req.env,
+        },
+    };
+    let mut frame = Vec::new();
+    proto::frame::encode_request(&request, &mut frame)
+        .map_err(|e| VmError::Backend(format!("vm-kvm: encode exec_start: {e}")))?;
+    backend.host_send(conn, &frame)?;
+
+    Ok(Box::new(KvmExecStream {
+        backend: backend.clone(),
+        buf: Vec::new(),
+        done: false,
+    }))
+}
+
 /// Adapts `vm-memory`'s guest RAM to the virtqueue layer's [`GuestRam`]
 /// trait. A newtype is required because both the trait and
 /// `GuestMemoryMmap` are foreign to this crate (orphan rule).
@@ -1397,6 +1557,21 @@ impl Hypervisor for KvmHypervisor {
             ))?
         };
         exec_over_vsock(&backend, req)
+    }
+
+    fn exec_in_guest_stream(
+        &self,
+        id: VmId,
+        req: GuestExecRequest,
+    ) -> VmResult<Box<dyn vm_core::ExecStream>> {
+        let backend = {
+            let inner = self.lock_inner()?;
+            let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+            vm.runtime.vsock.clone().ok_or(VmError::Unsupported(
+                "vm-kvm: exec_in_guest_stream requires a vsock device (set VmConfig.vsock_cid)",
+            ))?
+        };
+        exec_stream_over_vsock(&backend, req)
     }
 
     fn write_file(&self, id: VmId, path: String, content: Vec<u8>, mode: u32) -> VmResult<u64> {
