@@ -31,6 +31,10 @@ snapshot = { workspace = true, optional = true }
 # kvm-bindings `serde` feature derives (de)serialize on the KVM structs.
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+# Seccomp-BPF filter installer. Pure Rust (no libseccomp), same crate
+# Firecracker uses. Linux-only and only useful with the real KVM path,
+# so gate it behind `kvm`.
+seccompiler = { workspace = true, optional = true }
 
 # Real KVM deps (kvm-ioctls, vm-memory, linux-loader) arrive with the `kvm`
 # feature in M1. Keeping them out of the default build keeps
@@ -40,7 +44,7 @@ serde_json = { workspace = true, optional = true }
 [features]
 default = []
 # Enable the real KVM backend. Requires Linux + /dev/kvm at runtime.
-kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:vm-memory", "dep:linux-loader", "dep:libc", "dep:vmm-sys-util", "dep:virtio-vsock", "dep:proto", "dep:snapshot", "dep:serde", "dep:serde_json"]
+kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:vm-memory", "dep:linux-loader", "dep:libc", "dep:vmm-sys-util", "dep:virtio-vsock", "dep:proto", "dep:snapshot", "dep:serde", "dep:serde_json", "dep:seccompiler"]
 
 [lints]
 workspace = true

@@ -15,7 +15,16 @@
 #![warn(missing_docs)]
 
 #[cfg(feature = "kvm")]
+mod seccomp;
+#[cfg(feature = "kvm")]
 mod vmstate;
+
+// Public re-export so integration tests (and downstream callers that
+// want to install the sandbox before opening /dev/kvm themselves)
+// can reach `install_default_filter` without going through the
+// `KvmHypervisor::new` env-var bootstrap.
+#[cfg(feature = "kvm")]
+pub use seccomp::install_default_filter;
 
 use vm_core::{
     GuestExecRequest, GuestExecResult, Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError,
@@ -663,8 +672,18 @@ struct PauseSlot {
 
 impl KvmHypervisor {
     /// Construct a new KVM hypervisor handle.
+    ///
+    /// When `NANOVM_SECCOMP=1` is set, also installs a default
+    /// seccomp-BPF filter ([`seccomp::install_default_filter`])
+    /// before opening `/dev/kvm`. Filter install happens *first* so
+    /// any subsequent KVM ioctl crossing the sandbox is the first
+    /// real check that the allow-list is wide enough — failing fast
+    /// at startup beats failing under load.
     #[cfg(feature = "kvm")]
     pub fn new() -> VmResult<Self> {
+        if seccomp::env_opts_in() {
+            seccomp::install_default_filter()?;
+        }
         let kvm = KvmBootPlan::open_kvm()?;
         let msr_indices = Arc::new(vmstate::snapshotable_msr_indices(&kvm)?);
         Ok(Self {
