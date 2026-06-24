@@ -52,6 +52,7 @@ http-body-util = "0.1"
 reqwest = { version = "0.12", features = ["json", "blocking"], default-features = false }
 vsock = "0.5"
 base64 = "0.22"
+seccompiler = "0.5"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

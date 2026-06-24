@@ -95,7 +95,17 @@ them via `MAP_PRIVATE` copy-on-write.
    Lazy-warming, bounded refill, drains on snapshot delete. See
    [`crates/control-plane/src/warm_pool.rs`](crates/control-plane/src/warm_pool.rs).
 
-6. **No detours.** Custom `virtio-vsock` (~1200 lines), hand-rolled
+6. **Seccomp-BPF sandbox on the VMM process (opt-in).** Set
+   `NANOVM_SECCOMP=1` and the host-side VMM that owns `/dev/kvm`
+   refuses a deny-list of escape-pivot syscalls (`execve`,
+   `ptrace`, `mount`, `kexec_load`, `init_module`, `setns`,
+   `unshare`, `chroot`, `pivot_root`, …) — a KVM escape that
+   landed in our address space is now `SIGKILL`'d at the kernel
+   instead of free to spawn shells. Same `seccompiler` crate
+   Firecracker uses. See
+   [`crates/vm-kvm/src/seccomp.rs`](crates/vm-kvm/src/seccomp.rs).
+
+7. **No detours.** Custom `virtio-vsock` (~1200 lines), hand-rolled
    Prometheus exposition (no `prometheus` crate dependency),
    `MockHypervisor` for tests so CI doesn't need `/dev/kvm`. Single
    workspace, `cargo test --workspace` green without root.
@@ -337,8 +347,10 @@ crates/
 | Snapshot + fork; ~12 ms p50 cold start, measured | ✅ |
 | Control plane REST: auth, quota, metering, Prometheus | ✅ |
 | Warm pool: pre-restored forks for sub-ms hand-out (opt-in) | ✅ |
+| Streaming exec via Server-Sent Events (`POST /v1/vms/:id/exec/stream`) on both mock and real KVM | ✅ |
 | Python guest rootfs (Alpine 3.20 + Python 3.12); `python3 -c "print(1+1)"` round-trip on real KVM | ✅ |
 | Host↔guest file push/pull via `/v1/vms/:id/files` (vsock RPC, real KVM end-to-end) | ✅ |
+| Seccomp-BPF sandbox on the VMM process (opt-in via `NANOVM_SECCOMP=1`) | ✅ |
 | Python SDK (`pip install ./clients/python`) — synchronous, typed exceptions | ✅ |
 | Docker image on GHCR (`ghcr.io/ip888/nanovm-control-plane`) | ✅ |
 | virtio-fs `mount` from inside the guest (FUSE wire types + dispatch are done; KVM device wiring is the gap) | in progress |
