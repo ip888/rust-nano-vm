@@ -38,6 +38,10 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// `serde_json::json!{...}` builds the whole OpenAPI document in a
+// single literal — it needs more than the default 128 recursion
+// budget once the schema has a couple-dozen entries.
+#![recursion_limit = "256"]
 
 mod api;
 mod audit;

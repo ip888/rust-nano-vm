@@ -1035,24 +1035,72 @@ pub fn openapi_spec() -> Value {
                     }
                 },
                 "SandboxInvokeRequest": {
+                    "description": "Tagged-union request body keyed by `action`. Each variant requires its own set of fields; the shared `snapshot` field is optional on every variant.",
+                    "oneOf": [
+                        { "$ref": "#/components/schemas/SandboxAction_ExecutePython" },
+                        { "$ref": "#/components/schemas/SandboxAction_ExecuteShell" },
+                        { "$ref": "#/components/schemas/SandboxAction_ReadFile"     },
+                        { "$ref": "#/components/schemas/SandboxAction_WriteFile"    },
+                        { "$ref": "#/components/schemas/SandboxAction_ListFiles"    }
+                    ],
+                    "discriminator": {
+                        "propertyName": "action",
+                        "mapping": {
+                            "execute_python": "#/components/schemas/SandboxAction_ExecutePython",
+                            "execute_shell":  "#/components/schemas/SandboxAction_ExecuteShell",
+                            "read_file":      "#/components/schemas/SandboxAction_ReadFile",
+                            "write_file":     "#/components/schemas/SandboxAction_WriteFile",
+                            "list_files":     "#/components/schemas/SandboxAction_ListFiles"
+                        }
+                    }
+                },
+                "SandboxAction_ExecutePython": {
                     "type": "object",
-                    "required": ["action"],
+                    "required": ["action", "code"],
                     "properties": {
-                        "snapshot": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "description": "Snapshot to fork from. Falls back to NANOVM_SANDBOX_SNAPSHOT_ID when omitted."
-                        },
-                        "action": {
-                            "type": "string",
-                            "enum": ["execute_python", "execute_shell", "read_file", "write_file", "list_files"]
-                        },
-                        "code":       { "type": "string", "description": "execute_python: program body." },
-                        "command":    { "type": "string", "description": "execute_shell: shell command (passed to `sh -c`)." },
-                        "path":       { "type": "string", "description": "read_file / write_file / list_files: absolute path inside the guest." },
-                        "content":    { "type": "string", "description": "write_file: file body (UTF-8)." },
-                        "mode":       { "type": "integer", "minimum": 0, "description": "write_file: POSIX permission bits (defaults to 0o644)." },
-                        "timeout_ms": { "type": "integer", "minimum": 0, "description": "execute_python / execute_shell: wall-clock timeout in milliseconds." }
+                        "snapshot":   { "type": "integer", "minimum": 0, "description": "Snapshot to fork from. Falls back to NANOVM_SANDBOX_SNAPSHOT_ID when omitted." },
+                        "action":     { "type": "string", "enum": ["execute_python"] },
+                        "code":       { "type": "string", "description": "Program body passed to `python3 -c`." },
+                        "timeout_ms": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "SandboxAction_ExecuteShell": {
+                    "type": "object",
+                    "required": ["action", "command"],
+                    "properties": {
+                        "snapshot":   { "type": "integer", "minimum": 0 },
+                        "action":     { "type": "string", "enum": ["execute_shell"] },
+                        "command":    { "type": "string", "description": "Shell command passed to `sh -c`." },
+                        "timeout_ms": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "SandboxAction_ReadFile": {
+                    "type": "object",
+                    "required": ["action", "path"],
+                    "properties": {
+                        "snapshot": { "type": "integer", "minimum": 0 },
+                        "action":   { "type": "string", "enum": ["read_file"] },
+                        "path":     { "type": "string", "description": "Absolute path inside the guest." }
+                    }
+                },
+                "SandboxAction_WriteFile": {
+                    "type": "object",
+                    "required": ["action", "path", "content"],
+                    "properties": {
+                        "snapshot": { "type": "integer", "minimum": 0 },
+                        "action":   { "type": "string", "enum": ["write_file"] },
+                        "path":     { "type": "string", "description": "Absolute path inside the guest." },
+                        "content":  { "type": "string", "description": "File body (UTF-8)." },
+                        "mode":     { "type": "integer", "minimum": 0, "description": "POSIX permission bits (defaults to 0o644)." }
+                    }
+                },
+                "SandboxAction_ListFiles": {
+                    "type": "object",
+                    "required": ["action", "path"],
+                    "properties": {
+                        "snapshot": { "type": "integer", "minimum": 0 },
+                        "action":   { "type": "string", "enum": ["list_files"] },
+                        "path":     { "type": "string", "description": "Absolute path inside the guest." }
                     }
                 },
                 "SandboxResult": {

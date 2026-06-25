@@ -181,9 +181,12 @@ fn dispatch(
             })
         }
         SandboxAction::ListFiles { path } => {
+            // `--` terminates option parsing, so a caller-supplied
+            // `path` starting with `-` is treated as the directory
+            // operand instead of an `ls` flag.
             let req = GuestExecRequest {
                 program: "ls".to_owned(),
-                args: vec!["-1".to_owned(), path],
+                args: vec!["-1".to_owned(), "--".to_owned(), path],
                 cwd: None,
                 env: Vec::new(),
                 timeout_ms: None,
@@ -240,11 +243,13 @@ pub(crate) async fn sandbox_invoke(
     let outcome = dispatch(state.hypervisor(), vm_id, req.action);
 
     // Ephemeral semantics: VM is always destroyed, even on error.
-    // Best-effort — backend failures here would already be hidden
-    // behind the action error, and there's nothing useful to report
-    // to the caller about a destroy that raced with the panic
-    // unwinder.
-    let _ = state.hypervisor().destroy(vm_id);
+    // The action result still goes back to the caller; a destroy
+    // failure is an operator concern (potential VM leak / cgroup
+    // leftover), so we surface it via `tracing` instead of bubbling
+    // a 5xx that would mask the action outcome.
+    if let Err(err) = state.hypervisor().destroy(vm_id) {
+        tracing::warn!(vm_id = vm_id.0, ?err, "sandbox: VM destroy failed");
+    }
 
     let outcome = outcome?;
     Ok(Json(SandboxResult {
