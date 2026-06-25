@@ -11,6 +11,12 @@
 //!   calls are appended as JSON lines for compliance / forensics.
 //! - `NANOVM_WARM_POOL_PER_SNAPSHOT` — target number of pre-restored VMs
 //!   to keep ready per source snapshot. Default `0` (disabled).
+//! - `NANOVM_SNAPSHOT_STORE` — durable snapshot store URI. Supported
+//!   schemes: `file:///abs/path` (always available) and `s3://bucket[/prefix]`
+//!   (requires `--features s3`). Unset → `/v1/snapshots/:id/export` and
+//!   `/v1/snapshots/import` return 501.
+//! - `NANOVM_S3_ENDPOINT` — custom S3 endpoint for MinIO / R2 / Wasabi.
+//!   Read by the S3 backend when constructed.
 
 #![forbid(unsafe_code)]
 
@@ -64,10 +70,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         info!(per_snapshot = warm_pool.per_snapshot(), "warm pool enabled");
     }
+
+    // Durable snapshot store (S3 / MinIO / R2 / local filesystem).
+    // Failing at startup beats failing on the first export — a typo
+    // in NANOVM_SNAPSHOT_STORE shouldn't surface as a customer 5xx.
+    let snapshot_store = control_plane::snapshot_store::from_env()
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    match &snapshot_store {
+        Some(s) => info!(uri = %s.display(), "durable snapshot store enabled"),
+        None => info!("durable snapshot store disabled (set NANOVM_SNAPSHOT_STORE to enable)"),
+    }
+
     let app = router()
         .layer(Extension(tokens))
         .layer(Extension(audit))
-        .with_state(AppState::new(hypervisor).with_warm_pool(warm_pool));
+        .with_state(
+            AppState::new(hypervisor)
+                .with_warm_pool(warm_pool)
+                .with_snapshot_store(snapshot_store),
+        );
 
     let listener = TcpListener::bind(&addr).await?;
     info!(%addr, "nanovm-control-plane listening");
