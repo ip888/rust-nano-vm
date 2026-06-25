@@ -201,7 +201,7 @@ pub fn install_default_limits() -> VmResult<()> {
         .ok_or_else(|| VmError::Backend("cgroups: child path has no parent (impossible)".into()))?;
     check_controllers_delegated(parent)?;
 
-    fs::create_dir_all(&child)
+    fs::create_dir(&child)
         .map_err(|e| VmError::Backend(format!("cgroups: create {}: {e}", child.display())))?;
 
     if let Some(mib) = limits.memory_mib {
