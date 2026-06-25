@@ -2038,3 +2038,117 @@ async fn warm_pool_drains_on_snapshot_delete() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "got {body:?}");
 }
+
+// ---- durable snapshot export/import ----------------------------------
+
+fn app_with_fs_store(root: &std::path::Path) -> Router {
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    let store: Arc<dyn snapshot::SnapshotStore> = Arc::new(snapshot::FsSnapshotStore::new(root));
+    router()
+        .layer(Extension(Arc::new(ApiTokens::default())))
+        .with_state(AppState::new(hv).with_snapshot_store(Some(store)))
+}
+
+#[tokio::test]
+async fn export_then_import_round_trips_via_fs_store() {
+    let root = std::env::temp_dir().join(format!(
+        "rust-nano-vm-store-rt-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+
+    let app = app_with_fs_store(&root);
+
+    let snap = snapshot_a_fresh_vm(&app, None).await;
+
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/snapshots/{snap}/export"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got body {body:?}");
+    assert_eq!(body["snapshot_id"], snap);
+    assert!(
+        body["uri"].as_str().unwrap().starts_with("file://"),
+        "uri = {:?}",
+        body["uri"]
+    );
+    // Files must actually be on disk under the store root.
+    assert!(root
+        .join(format!("snap-{snap}"))
+        .join("manifest.json")
+        .exists());
+
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/v1/snapshots/import",
+        Some(json!({ "snapshot_id": snap })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "got body {body:?}");
+    let imported_id = body["snapshot_id"].as_u64().unwrap();
+    assert_ne!(imported_id, snap, "import must assign a fresh local id");
+    assert!(body["source_uri"].as_str().unwrap().starts_with("file://"));
+
+    // The imported snapshot is usable for fork/restore.
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/snapshots/{imported_id}/restore"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "got body {body:?}");
+    assert!(body["id"].is_u64());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn export_without_store_returns_501() {
+    let app = app(); // no SnapshotStore configured
+    let snap = snapshot_a_fresh_vm(&app, None).await;
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        &format!("/v1/snapshots/{snap}/export"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "got body {body:?}");
+    assert_eq!(body["error"]["code"], "storage_unsupported");
+}
+
+#[tokio::test]
+async fn import_missing_snapshot_returns_404() {
+    let root = std::env::temp_dir().join(format!(
+        "rust-nano-vm-store-miss-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let app = app_with_fs_store(&root);
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/v1/snapshots/import",
+        Some(json!({ "snapshot_id": 999_999 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "got body {body:?}");
+    assert_eq!(body["error"]["code"], "snapshot_not_in_store");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

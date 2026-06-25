@@ -105,7 +105,20 @@ them via `MAP_PRIVATE` copy-on-write.
    Firecracker uses. See
    [`crates/vm-kvm/src/seccomp.rs`](crates/vm-kvm/src/seccomp.rs).
 
-7. **No detours.** Custom `virtio-vsock` (~1200 lines), hand-rolled
+7. **Durable snapshots on S3 / MinIO / R2.** Snapshots aren't
+   pinned to one host: `POST /v1/snapshots/:id/export` uploads
+   a snapshot directory to whatever store you point
+   `NANOVM_SNAPSHOT_STORE` at (`s3://bucket/prefix`,
+   `file:///var/lib/nanovm/snapshots`), and `POST /v1/snapshots/import`
+   pulls it back into any other control-plane process — same
+   on-disk layout, portable. Built on the official AWS Rust SDK
+   so production IAM roles, instance profiles, and web-identity
+   tokens (IRSA) work out of the box; the `--features s3` build
+   picks up the dependency only when an operator wants it.
+   See [`crates/snapshot/src/store.rs`](crates/snapshot/src/store.rs)
+   and [`crates/snapshot/src/s3.rs`](crates/snapshot/src/s3.rs).
+
+8. **No detours.** Custom `virtio-vsock` (~1200 lines), hand-rolled
    Prometheus exposition (no `prometheus` crate dependency),
    `MockHypervisor` for tests so CI doesn't need `/dev/kvm`. Single
    workspace, `cargo test --workspace` green without root.
@@ -351,6 +364,7 @@ crates/
 | Python guest rootfs (Alpine 3.20 + Python 3.12); `python3 -c "print(1+1)"` round-trip on real KVM | ✅ |
 | Host↔guest file push/pull via `/v1/vms/:id/files` (vsock RPC, real KVM end-to-end) | ✅ |
 | Seccomp-BPF sandbox on the VMM process (opt-in via `NANOVM_SECCOMP=1`) | ✅ |
+| Durable snapshot storage on S3 / MinIO / R2 (`NANOVM_SNAPSHOT_STORE=s3://...`, opt-in via `--features s3`) | ✅ |
 | Python SDK (`pip install ./clients/python`) — synchronous, typed exceptions | ✅ |
 | Docker image on GHCR (`ghcr.io/ip888/nanovm-control-plane`) | ✅ |
 | virtio-fs `mount` from inside the guest (FUSE wire types + dispatch are done; KVM device wiring is the gap) | in progress |
