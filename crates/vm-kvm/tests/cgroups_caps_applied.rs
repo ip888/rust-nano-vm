@@ -79,6 +79,8 @@ fn install_default_limits_writes_expected_values() {
     // have to allocate after fork.
     let mem_mib: u64 = 256;
     let cpu_pct: u32 = 75;
+    let mem_mib_s = mem_mib.to_string();
+    let cpu_pct_s = cpu_pct.to_string();
 
     // SAFETY: same caveat as `seccomp_blocks_execve` — fork + post-
     // fork allocation isn't strictly async-signal-safe but the test
@@ -93,8 +95,8 @@ fn install_default_limits_writes_expected_values() {
             // we don't print on success (the parent reads the
             // cgroupfs to verify).
             unsafe {
-                std::env::set_var("NANOVM_VMM_MEMORY_LIMIT_MIB", mem_mib.to_string());
-                std::env::set_var("NANOVM_VMM_CPU_QUOTA_PCT", cpu_pct.to_string());
+                std::env::set_var("NANOVM_VMM_MEMORY_LIMIT_MIB", &mem_mib_s);
+                std::env::set_var("NANOVM_VMM_CPU_QUOTA_PCT", &cpu_pct_s);
             }
             match vm_kvm::install_default_limits() {
                 Ok(()) => std::process::exit(0),
