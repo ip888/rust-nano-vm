@@ -78,6 +78,11 @@ pub struct AppState {
     /// takes the cold path); callers opt in via
     /// [`with_warm_pool_size`](Self::with_warm_pool_size).
     warm_pool: Arc<WarmPool>,
+    /// Durable snapshot store (S3 / filesystem). `None` means no
+    /// `/v1/snapshots/:id/export` or `/v1/snapshots/import` endpoint
+    /// is reachable; default to `None` so existing deployments
+    /// don't change behaviour.
+    snapshot_store: Option<Arc<dyn snapshot::SnapshotStore>>,
     /// Process start time (monotonic clock) — used to compute uptime
     /// reported on `GET /v1/health`. Set once when the first `AppState`
     /// is constructed and shared across clones.
@@ -124,10 +129,25 @@ impl AppState {
             fork_quota,
             metrics: Arc::new(crate::Metrics::new()),
             warm_pool,
+            snapshot_store: None,
             start_instant: Instant::now(),
             started_at: rfc3339_now(),
             backend_label: "mock",
         }
+    }
+
+    /// Install a durable snapshot store. Enables the
+    /// `/v1/snapshots/:id/export` and `/v1/snapshots/import`
+    /// endpoints. Passing `None` leaves them disabled (503).
+    pub fn with_snapshot_store(mut self, store: Option<Arc<dyn snapshot::SnapshotStore>>) -> Self {
+        self.snapshot_store = store;
+        self
+    }
+
+    /// Borrow the durable snapshot store. Used by sibling modules
+    /// implementing the export/import endpoints.
+    pub(crate) fn snapshot_store(&self) -> Option<&Arc<dyn snapshot::SnapshotStore>> {
+        self.snapshot_store.as_ref()
     }
 
     /// Override the backend label surfaced on `GET /v1/health`. Real
@@ -219,6 +239,16 @@ pub fn router() -> Router<AppState> {
         // under the hood (CoW fork from the snapshot), plus per-token usage
         // accounting so we can bill on fork count + latency.
         .route("/snapshots/:id/fork", post(fork_snapshot))
+        // Durable storage round-trip. Both endpoints 501 when no
+        // SnapshotStore is configured at startup.
+        .route(
+            "/snapshots/:id/export",
+            post(crate::snapshot_export::export_snapshot),
+        )
+        .route(
+            "/snapshots/import",
+            post(crate::snapshot_export::import_snapshot),
+        )
         .route("/usage", get(usage))
         .route("/health", get(health))
         // route_layer is bottom-up: the LAST `.route_layer` runs FIRST.

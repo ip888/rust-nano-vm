@@ -20,6 +20,10 @@ path = "src/bin/openapi.rs"
 [dependencies]
 vm-core.workspace = true
 vm-mock.workspace = true
+# `s3` is propagated from the control-plane's own `s3` feature; the
+# bin opts in via `cargo build --features s3` to ship a binary with
+# durable S3 snapshot storage. The default build still works without
+# it (filesystem store only).
 snapshot.workspace = true
 axum.workspace = true
 base64.workspace = true
@@ -31,6 +35,13 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[features]
+default = []
+# Adds the S3 snapshot store backend to the control plane. Forwards
+# to the `snapshot/s3` feature so `aws-sdk-s3` only ships when the
+# operator actually wants it.
+s3 = ["snapshot/s3"]
 
 [dev-dependencies]
 base64.workspace = true

@@ -53,6 +53,8 @@ pub mod metrics;
 mod request_id;
 mod routes;
 mod sandbox;
+mod snapshot_export;
+pub mod snapshot_store;
 mod time;
 pub mod warm_pool;
 

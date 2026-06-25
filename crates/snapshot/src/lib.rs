@@ -41,9 +41,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod runtime;
+#[cfg(feature = "s3")]
+mod s3;
+mod store;
 pub use runtime::{
     CowFaultAction, CowPager, RuntimeError, UffdPagefaultEvent, UFFDIO_REGISTER_MODE_MISSING,
     UFFD_API, UFFD_PAGEFAULT_FLAG_WRITE,
+};
+#[cfg(feature = "s3")]
+pub use s3::{S3SnapshotStore, ENV_ENDPOINT as S3_ENV_ENDPOINT};
+pub use store::{
+    parse_store_uri, FsSnapshotStore, SnapshotIdNum, SnapshotStore, StoreError, StoreLocation,
 };
 
 /// Current snapshot format version. Bump on any backwards-incompatible
