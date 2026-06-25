@@ -102,7 +102,8 @@ fn parse_env_u32(key: &str) -> Option<u32> {
 /// by `KvmHypervisor::new` to decide whether to call into this
 /// module at all.
 pub fn env_opts_in() -> bool {
-    LimitsFromEnv::from_env().any_set()
+    std::env::var_os("NANOVM_VMM_MEMORY_LIMIT_MIB").is_some()
+        || std::env::var_os("NANOVM_VMM_CPU_QUOTA_PCT").is_some()
 }
 
 /// Read `/proc/self/cgroup` and return the v2 path
