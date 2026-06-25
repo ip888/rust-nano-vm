@@ -48,6 +48,7 @@ pub mod fork_quota;
 pub mod metrics;
 mod request_id;
 mod routes;
+mod sandbox;
 mod time;
 pub mod warm_pool;
 

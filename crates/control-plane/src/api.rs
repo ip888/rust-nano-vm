@@ -774,6 +774,28 @@ pub fn openapi_spec() -> Value {
                         }
                     }
                 }
+            },
+            "/v1/sandbox/invoke": {
+                "post": {
+                    "summary": "Ephemeral sandbox: fork from a snapshot, run an action, destroy",
+                    "description": "Single-endpoint action dispatch for tool-use agents. The server forks a fresh VM from the requested snapshot (or NANOVM_SANDBOX_SNAPSHOT_ID if `snapshot` is omitted), runs the action, destroys the VM, and returns a flat result envelope. `cold_start` is `false` when the VM was popped off the warm pool, `true` when it was cold-restored from the snapshot.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": { "schema": { "$ref": "#/components/schemas/SandboxInvokeRequest" } }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Action result",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/SandboxResult" } }
+                            }
+                        },
+                        "400": { "description": "Missing snapshot id (no body field and NANOVM_SANDBOX_SNAPSHOT_ID unset)" },
+                        "404": { "description": "Snapshot not found" }
+                    }
+                }
             }
         },
         "components": {
@@ -1010,6 +1032,38 @@ pub fn openapi_spec() -> Value {
                             "type": "array",
                             "items": { "type": "integer", "minimum": 0, "maximum": 255 }
                         }
+                    }
+                },
+                "SandboxInvokeRequest": {
+                    "type": "object",
+                    "required": ["action"],
+                    "properties": {
+                        "snapshot": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Snapshot to fork from. Falls back to NANOVM_SANDBOX_SNAPSHOT_ID when omitted."
+                        },
+                        "action": {
+                            "type": "string",
+                            "enum": ["execute_python", "execute_shell", "read_file", "write_file", "list_files"]
+                        },
+                        "code":       { "type": "string", "description": "execute_python: program body." },
+                        "command":    { "type": "string", "description": "execute_shell: shell command (passed to `sh -c`)." },
+                        "path":       { "type": "string", "description": "read_file / write_file / list_files: absolute path inside the guest." },
+                        "content":    { "type": "string", "description": "write_file: file body (UTF-8)." },
+                        "mode":       { "type": "integer", "minimum": 0, "description": "write_file: POSIX permission bits (defaults to 0o644)." },
+                        "timeout_ms": { "type": "integer", "minimum": 0, "description": "execute_python / execute_shell: wall-clock timeout in milliseconds." }
+                    }
+                },
+                "SandboxResult": {
+                    "type": "object",
+                    "required": ["stdout", "stderr", "exit_code", "duration_ms", "cold_start"],
+                    "properties": {
+                        "stdout":      { "type": "string" },
+                        "stderr":      { "type": "string" },
+                        "exit_code":   { "type": "integer", "description": "POSIX-shell convention: signal-killed processes report 128 + signal. File ops report 0 on success." },
+                        "duration_ms": { "type": "integer", "minimum": 0 },
+                        "cold_start":  { "type": "boolean", "description": "true iff the VM was cold-restored from the snapshot (false on a warm-pool hit)." }
                     }
                 }
             }

@@ -208,6 +208,10 @@ pub fn router() -> Router<AppState> {
             post(crate::exec_stream::exec_vm_stream),
         )
         .route("/vms/:id/files", get(read_file).post(write_file))
+        .route(
+            "/sandbox/invoke",
+            post(crate::sandbox::sandbox_invoke),
+        )
         .route("/snapshots", get(list_snapshots))
         .route("/snapshots/:id", axum::routing::delete(delete_snapshot))
         .route("/snapshots/:id/restore", post(restore_snapshot))

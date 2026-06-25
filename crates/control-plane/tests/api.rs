@@ -2038,3 +2038,172 @@ async fn warm_pool_drains_on_snapshot_delete() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "got {body:?}");
 }
+
+// ===================== POST /v1/sandbox/invoke ========================
+//
+// Single-endpoint action dispatch. Each test snapshots a running mock
+// VM, then exercises the sandbox endpoint with `snapshot` in the body
+// (the env-var fallback is covered by unit tests in the sandbox
+// module — pulling NANOVM_SANDBOX_SNAPSHOT_ID into integration tests
+// would race with the harness's other env tests).
+
+async fn create_snapshot(app: Router) -> u64 {
+    let id = create_running_vm(app.clone()).await;
+    let (_, snap) = send(app, Method::POST, &format!("/v1/vms/{id}/snapshot"), None).await;
+    snap["id"].as_u64().unwrap()
+}
+
+#[tokio::test]
+async fn sandbox_invoke_execute_shell_returns_envelope() {
+    let app = app();
+    let snap = create_snapshot(app.clone()).await;
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/v1/sandbox/invoke",
+        Some(json!({
+            "snapshot": snap,
+            "action": "execute_shell",
+            "command": "echo hello-sandbox"
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "got body {body:?}");
+    assert_eq!(body["exit_code"], 0);
+    assert!(
+        body["stdout"].as_str().unwrap().contains("hello-sandbox"),
+        "stdout was {:?}",
+        body["stdout"]
+    );
+    // cold_start must be present and (for an unwarmed pool) true.
+    assert_eq!(body["cold_start"], true);
+    assert!(body["duration_ms"].is_u64());
+}
+
+#[tokio::test]
+async fn sandbox_invoke_execute_shell_non_zero_exit_propagates() {
+    let app = app();
+    let snap = create_snapshot(app.clone()).await;
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/v1/sandbox/invoke",
+        Some(json!({
+            "snapshot": snap,
+            "action": "execute_shell",
+            "command": "exit 7"
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "got body {body:?}");
+    assert_eq!(body["exit_code"], 7);
+}
+
+#[tokio::test]
+async fn sandbox_invoke_write_file_succeeds() {
+    let app = app();
+    let snap = create_snapshot(app.clone()).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp
+        .path()
+        .join("sandbox.txt")
+        .to_string_lossy()
+        .into_owned();
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/v1/sandbox/invoke",
+        Some(json!({
+            "snapshot": snap,
+            "action": "write_file",
+            "path": path,
+            "content": "hello"
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "got body {body:?}");
+    assert_eq!(body["exit_code"], 0);
+    assert!(
+        body["stdout"]
+            .as_str()
+            .unwrap()
+            .starts_with("bytes_written="),
+        "stdout was {:?}",
+        body["stdout"]
+    );
+}
+
+#[tokio::test]
+async fn sandbox_invoke_rejects_when_snapshot_unset() {
+    let app = app();
+
+    // No `snapshot` in body, no env var set in this process.
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/v1/sandbox/invoke",
+        Some(json!({
+            "action": "execute_shell",
+            "command": "true"
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got body {body:?}");
+    assert_eq!(body["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn sandbox_invoke_unknown_snapshot_is_404() {
+    let app = app();
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/v1/sandbox/invoke",
+        Some(json!({
+            "snapshot": 999999_u64,
+            "action": "execute_shell",
+            "command": "true"
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "got body {body:?}");
+    assert_eq!(body["error"]["code"], "unknown_snapshot");
+}
+
+#[tokio::test]
+async fn sandbox_invoke_rejects_malformed_action() {
+    let app = app();
+    let snap = create_snapshot(app.clone()).await;
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/v1/sandbox/invoke",
+        Some(json!({
+            "snapshot": snap,
+            "action": "rm_rf",
+            "path": "/"
+        })),
+    )
+    .await;
+
+    // Tagged-union mismatch → axum's JsonRejection → 422 with a
+    // structured error envelope (same shape as any other malformed
+    // body in the API).
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "got body {body:?}"
+    );
+    assert_eq!(body["error"]["code"], "bad_request");
+}
