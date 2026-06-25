@@ -774,6 +774,28 @@ pub fn openapi_spec() -> Value {
                         }
                     }
                 }
+            },
+            "/v1/sandbox/invoke": {
+                "post": {
+                    "summary": "Ephemeral sandbox: fork from a snapshot, run an action, destroy",
+                    "description": "Single-endpoint action dispatch for tool-use agents. The server forks a fresh VM from the requested snapshot (or NANOVM_SANDBOX_SNAPSHOT_ID if `snapshot` is omitted), runs the action, destroys the VM, and returns a flat result envelope. `cold_start` is `false` when the VM was popped off the warm pool, `true` when it was cold-restored from the snapshot.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": { "schema": { "$ref": "#/components/schemas/SandboxInvokeRequest" } }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Action result",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/SandboxResult" } }
+                            }
+                        },
+                        "400": { "description": "Missing snapshot id (no body field and NANOVM_SANDBOX_SNAPSHOT_ID unset)" },
+                        "404": { "description": "Snapshot not found" }
+                    }
+                }
             }
         },
         "components": {
@@ -1010,6 +1032,86 @@ pub fn openapi_spec() -> Value {
                             "type": "array",
                             "items": { "type": "integer", "minimum": 0, "maximum": 255 }
                         }
+                    }
+                },
+                "SandboxInvokeRequest": {
+                    "description": "Tagged-union request body keyed by `action`. Each variant requires its own set of fields; the shared `snapshot` field is optional on every variant.",
+                    "oneOf": [
+                        { "$ref": "#/components/schemas/SandboxAction_ExecutePython" },
+                        { "$ref": "#/components/schemas/SandboxAction_ExecuteShell" },
+                        { "$ref": "#/components/schemas/SandboxAction_ReadFile"     },
+                        { "$ref": "#/components/schemas/SandboxAction_WriteFile"    },
+                        { "$ref": "#/components/schemas/SandboxAction_ListFiles"    }
+                    ],
+                    "discriminator": {
+                        "propertyName": "action",
+                        "mapping": {
+                            "execute_python": "#/components/schemas/SandboxAction_ExecutePython",
+                            "execute_shell":  "#/components/schemas/SandboxAction_ExecuteShell",
+                            "read_file":      "#/components/schemas/SandboxAction_ReadFile",
+                            "write_file":     "#/components/schemas/SandboxAction_WriteFile",
+                            "list_files":     "#/components/schemas/SandboxAction_ListFiles"
+                        }
+                    }
+                },
+                "SandboxAction_ExecutePython": {
+                    "type": "object",
+                    "required": ["action", "code"],
+                    "properties": {
+                        "snapshot":   { "type": "integer", "minimum": 0, "description": "Snapshot to fork from. Falls back to NANOVM_SANDBOX_SNAPSHOT_ID when omitted." },
+                        "action":     { "type": "string", "enum": ["execute_python"] },
+                        "code":       { "type": "string", "description": "Program body passed to `python3 -c`." },
+                        "timeout_ms": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "SandboxAction_ExecuteShell": {
+                    "type": "object",
+                    "required": ["action", "command"],
+                    "properties": {
+                        "snapshot":   { "type": "integer", "minimum": 0 },
+                        "action":     { "type": "string", "enum": ["execute_shell"] },
+                        "command":    { "type": "string", "description": "Shell command passed to `sh -c`." },
+                        "timeout_ms": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "SandboxAction_ReadFile": {
+                    "type": "object",
+                    "required": ["action", "path"],
+                    "properties": {
+                        "snapshot": { "type": "integer", "minimum": 0 },
+                        "action":   { "type": "string", "enum": ["read_file"] },
+                        "path":     { "type": "string", "description": "Absolute path inside the guest." }
+                    }
+                },
+                "SandboxAction_WriteFile": {
+                    "type": "object",
+                    "required": ["action", "path", "content"],
+                    "properties": {
+                        "snapshot": { "type": "integer", "minimum": 0 },
+                        "action":   { "type": "string", "enum": ["write_file"] },
+                        "path":     { "type": "string", "description": "Absolute path inside the guest." },
+                        "content":  { "type": "string", "description": "File body (UTF-8)." },
+                        "mode":     { "type": "integer", "minimum": 0, "description": "POSIX permission bits (defaults to 0o644)." }
+                    }
+                },
+                "SandboxAction_ListFiles": {
+                    "type": "object",
+                    "required": ["action", "path"],
+                    "properties": {
+                        "snapshot": { "type": "integer", "minimum": 0 },
+                        "action":   { "type": "string", "enum": ["list_files"] },
+                        "path":     { "type": "string", "description": "Absolute path inside the guest." }
+                    }
+                },
+                "SandboxResult": {
+                    "type": "object",
+                    "required": ["stdout", "stderr", "exit_code", "duration_ms", "cold_start"],
+                    "properties": {
+                        "stdout":      { "type": "string" },
+                        "stderr":      { "type": "string" },
+                        "exit_code":   { "type": "integer", "description": "POSIX-shell convention: signal-killed processes report 128 + signal. File ops report 0 on success." },
+                        "duration_ms": { "type": "integer", "minimum": 0 },
+                        "cold_start":  { "type": "boolean", "description": "true iff the VM was cold-restored from the snapshot (false on a warm-pool hit)." }
                     }
                 }
             }

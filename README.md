@@ -291,6 +291,34 @@ curl -s localhost:8080/metrics | head -20
 kill %1
 ```
 
+### Sandbox-action API (one-shot fork-exec-destroy)
+
+For AI-agent tool use, the VM-lifecycle API is unwieldy — agents
+just want "run this in a sandbox and give me back the output."
+`POST /v1/sandbox/invoke` does exactly that: forks a fresh VM from
+a snapshot, runs an action, destroys the VM, returns a flat
+envelope. Five actions: `execute_python`, `execute_shell`,
+`read_file`, `write_file`, `list_files`.
+
+```sh
+SNAP=...   # snapshot id captured above
+
+curl -s -X POST localhost:8080/v1/sandbox/invoke \
+  -H "$TOKEN" -H 'content-type: application/json' \
+  -d '{
+    "snapshot": '"$SNAP"',
+    "action": "execute_shell",
+    "command": "echo hello from sandbox"
+  }' | jq
+# { "stdout": "hello from sandbox\n", "stderr": "", "exit_code": 0,
+#   "duration_ms": 14, "cold_start": true }
+```
+
+`cold_start: false` indicates the VM came off the warm pool
+(sub-millisecond fork); `cold_start: true` means a fresh restore.
+Set `NANOVM_SANDBOX_SNAPSHOT_ID=<id>` on the server to make the
+`snapshot` body field optional.
+
 ## Quickstart — real KVM, real numbers
 
 Linux host with `/dev/kvm`:
