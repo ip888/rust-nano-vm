@@ -15,6 +15,8 @@
 #![warn(missing_docs)]
 
 #[cfg(feature = "kvm")]
+mod cgroups;
+#[cfg(feature = "kvm")]
 mod seccomp;
 #[cfg(feature = "kvm")]
 mod vmstate;
@@ -25,6 +27,12 @@ mod vmstate;
 // `KvmHypervisor::new` env-var bootstrap.
 #[cfg(feature = "kvm")]
 pub use seccomp::install_default_filter;
+
+// Same shape as the seccomp re-export above: lets integration tests
+// and out-of-tree callers apply the v1 cgroup caps without going
+// through `KvmHypervisor::new`.
+#[cfg(feature = "kvm")]
+pub use cgroups::install_default_limits;
 
 use vm_core::{
     GuestExecRequest, GuestExecResult, Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError,
@@ -749,10 +757,20 @@ impl KvmHypervisor {
     /// would somehow land on a denied syscall trips the sandbox at
     /// startup instead of under load. (The filter is a deny-list,
     /// not an allow-list — see the module docs.)
+    ///
+    /// When `NANOVM_VMM_MEMORY_LIMIT_MIB` or
+    /// `NANOVM_VMM_CPU_QUOTA_PCT` is set, the VMM process is moved
+    /// into a fresh cgroup v2 child with the requested cap applied
+    /// (see [`cgroups::install_default_limits`]). The cgroup attach
+    /// happens *after* seccomp so a syscall-deny violation during
+    /// attach kills the VMM rather than partially-applying a cap.
     #[cfg(feature = "kvm")]
     pub fn new() -> VmResult<Self> {
         if seccomp::env_opts_in() {
             seccomp::install_default_filter()?;
+        }
+        if cgroups::env_opts_in() {
+            cgroups::install_default_limits()?;
         }
         let kvm = KvmBootPlan::open_kvm()?;
         let msr_indices = Arc::new(vmstate::snapshotable_msr_indices(&kvm)?);

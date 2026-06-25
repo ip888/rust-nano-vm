@@ -105,7 +105,20 @@ them via `MAP_PRIVATE` copy-on-write.
    Firecracker uses. See
    [`crates/vm-kvm/src/seccomp.rs`](crates/vm-kvm/src/seccomp.rs).
 
-7. **No detours.** Custom `virtio-vsock` (~1200 lines), hand-rolled
+7. **Cgroups v2 resource caps on the VMM process (opt-in).** Set
+   `NANOVM_VMM_MEMORY_LIMIT_MIB=512` and/or `NANOVM_VMM_CPU_QUOTA_PCT=75`
+   and the VMM moves itself into a fresh cgroup v2 child with the
+   requested `memory.max` / `cpu.max` applied. A runaway guest (fork
+   bomb, OOM allocator loop, busy-spin vCPU) trips the kernel's cap
+   instead of taking the host with it. **v1 scope: process-wide,
+   not per-VM** — every VM hosted by the VMM shares the budget. Per-VM
+   caps need the multi-process rearchitecture and land in a later
+   milestone; for the monolithic VMM this still bounds blast radius
+   on the host. Requires cgroup v2 with `memory` + `cpu` delegated
+   to the VMM's parent (under systemd: `Delegate=memory cpu`). See
+   [`crates/vm-kvm/src/cgroups.rs`](crates/vm-kvm/src/cgroups.rs).
+
+8. **No detours.** Custom `virtio-vsock` (~1200 lines), hand-rolled
    Prometheus exposition (no `prometheus` crate dependency),
    `MockHypervisor` for tests so CI doesn't need `/dev/kvm`. Single
    workspace, `cargo test --workspace` green without root.
@@ -351,6 +364,7 @@ crates/
 | Python guest rootfs (Alpine 3.20 + Python 3.12); `python3 -c "print(1+1)"` round-trip on real KVM | ✅ |
 | Host↔guest file push/pull via `/v1/vms/:id/files` (vsock RPC, real KVM end-to-end) | ✅ |
 | Seccomp-BPF sandbox on the VMM process (opt-in via `NANOVM_SECCOMP=1`) | ✅ |
+| Cgroups v2 process-wide memory + CPU caps on the VMM (opt-in via `NANOVM_VMM_MEMORY_LIMIT_MIB` / `NANOVM_VMM_CPU_QUOTA_PCT`) | ✅ |
 | Python SDK (`pip install ./clients/python`) — synchronous, typed exceptions | ✅ |
 | Docker image on GHCR (`ghcr.io/ip888/nanovm-control-plane`) | ✅ |
 | virtio-fs `mount` from inside the guest (FUSE wire types + dispatch are done; KVM device wiring is the gap) | in progress |
