@@ -131,7 +131,7 @@ fn own_cgroup_path() -> VmResult<String> {
 /// will actually accept the limits we write. Returns an actionable
 /// diagnostic if not — the most common cause is running outside a
 /// systemd `Delegate=yes` service.
-fn check_controllers_delegated(parent: &Path) -> VmResult<()> {
+fn check_controllers_delegated(parent: &Path, needed: &[&str]) -> VmResult<()> {
     let path = parent.join("cgroup.subtree_control");
     let enabled = fs::read_to_string(&path).map_err(|e| {
         VmError::Backend(format!(
@@ -141,9 +141,9 @@ fn check_controllers_delegated(parent: &Path) -> VmResult<()> {
     })?;
     let tokens: Vec<&str> = enabled.split_ascii_whitespace().collect();
     let mut missing: Vec<&str> = Vec::new();
-    for needed in ["memory", "cpu"] {
-        if !tokens.contains(&needed) {
-            missing.push(needed);
+    for &ctl in needed {
+        if !tokens.contains(&ctl) {
+            missing.push(ctl);
         }
     }
     if !missing.is_empty() {
