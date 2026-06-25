@@ -30,7 +30,32 @@ version = 2
 yanked = "deny"
 # Override with `ignore` entries (tracking-issue required) if we
 # intentionally accept a specific advisory.
-ignore = []
+ignore = [
+    # Both advisories live in `rustls-webpki 0.101.7`, pulled in
+    # transitively when the optional `s3` feature is built:
+    # aws-sdk-s3 -> aws-smithy-http-client -> hyper-rustls 0.24 ->
+    # rustls 0.21 -> rustls-webpki 0.101. The modern chain
+    # (rustls 0.23 + rustls-webpki 0.103) is also in the graph; the
+    # legacy chain is unused at runtime by our S3 snapshot store but
+    # the audit can't tell.
+    #
+    #  - RUSTSEC-2026-0098: URI-name constraints were silently
+    #    ignored. The library does not expose URI-name assertion at
+    #    all, so this is unreachable from any caller.
+    #  - RUSTSEC-2026-0099: name-constraints + wildcard SAN
+    #    mishandling. Reachable only on a misissued certificate; S3
+    #    / MinIO / R2 endpoints are signed by well-known issuers.
+    #  - RUSTSEC-2026-0104: panic in
+    #    `{Borrowed,Owned}CertRevocationList::from_der`. We never
+    #    parse a CRL through webpki.
+    #
+    # Drop these once `aws-smithy-http-client` retires its legacy
+    # rustls 0.21 connector (or a backport lands in rustls-webpki
+    # 0.101.x). Re-evaluate on every aws-sdk-s3 bump.
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+]
 
 [licenses]
 version = 2
