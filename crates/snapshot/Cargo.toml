@@ -18,8 +18,25 @@ serde_json.workspace = true
 # couple dozen transitive crates. Keeping it off by default means
 # `cargo build --workspace` stays portable and fast for anyone not
 # using the S3 backend.
-aws-config = { version = "1", optional = true, features = ["behavior-version-latest"] }
-aws-sdk-s3 = { version = "1", optional = true }
+# `default-features = false` + explicit feature list drops the legacy
+# `rustls` feature, which transitively pulls in the unmaintained
+# rustls 0.21 / hyper-rustls 0.24 / sct stack (flagged by cargo-deny).
+# `default-https-client` keeps a working TLS client backed by the
+# modern rustls 0.23 + aws-lc-rs path.
+aws-config = { version = "1", optional = true, default-features = false, features = [
+    "behavior-version-latest",
+    "rt-tokio",
+    "credentials-process",
+    "sso",
+    "default-https-client",
+] }
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = [
+    "behavior-version-latest",
+    "rt-tokio",
+    "http-1x",
+    "sigv4a",
+    "default-https-client",
+] }
 tokio = { workspace = true, optional = true }
 
 [features]
