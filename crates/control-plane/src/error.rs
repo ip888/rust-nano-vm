@@ -54,6 +54,29 @@ pub(crate) enum ApiError {
         /// Seconds the client should wait before retrying.
         retry_after_secs: u64,
     },
+    /// Endpoint or feature isn't supported on this deployment (no
+    /// snapshot store configured, backend doesn't know how to do X,
+    /// etc.). Renders as 501 with a caller-supplied stable code.
+    Unsupported {
+        /// Stable machine-readable code (e.g. `"storage_unsupported"`).
+        code: &'static str,
+        /// Human-readable detail surfaced to the client.
+        message: String,
+    },
+    /// Resource not found, with a caller-supplied stable code so
+    /// callers can distinguish (e.g. `"snapshot_not_in_store"` vs.
+    /// `"unknown_snapshot"`). Renders as 404.
+    NotFound {
+        /// Stable machine-readable code.
+        code: &'static str,
+        /// Human-readable detail surfaced to the client.
+        message: String,
+    },
+    /// Internal failure with a dynamic message (failed background
+    /// task, IO error during durable-store interaction, …). Renders
+    /// as 500 with code `"internal"`. The static-message variant
+    /// [`ApiError::Internal`] stays for operator-facing constants.
+    InternalDyn(String),
 }
 
 impl From<VmError> for ApiError {
@@ -125,7 +148,10 @@ impl IntoResponse for ApiError {
             ApiError::BadPath(rej) => (rej.status(), "bad_request", rej.body_text()),
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "unauthorized", msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", msg.into()),
+            ApiError::InternalDyn(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", msg),
             ApiError::Bad(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg),
+            ApiError::Unsupported { code, message } => (StatusCode::NOT_IMPLEMENTED, code, message),
+            ApiError::NotFound { code, message } => (StatusCode::NOT_FOUND, code, message),
             ApiError::TooManyRequests { .. } => {
                 unreachable!("TooManyRequests handled above with Retry-After header")
             }

@@ -1622,6 +1622,88 @@ impl Hypervisor for KvmHypervisor {
             .ok_or(VmError::UnknownSnapshot(snap))
     }
 
+    fn snapshot_export_dir(&self, snap: SnapshotId) -> VmResult<Option<std::path::PathBuf>> {
+        let inner = self.lock_inner()?;
+        let entry = inner
+            .snapshots
+            .get(&snap)
+            .ok_or(VmError::UnknownSnapshot(snap))?;
+        Ok(Some(entry.dir.clone()))
+    }
+
+    fn snapshot_adopt(&self, dir: &std::path::Path) -> VmResult<SnapshotId> {
+        // Validate the source dir parses as a real snapshot before
+        // taking any locks or copying files. A malformed import
+        // should fail loud at the API boundary.
+        let manifest = Manifest::read_from_dir(dir).map_err(|e| {
+            VmError::Backend(format!(
+                "vm-kvm: adopt: read manifest from {}: {e}",
+                dir.display()
+            ))
+        })?;
+        let new_id = SnapshotId::next();
+        let target = self.snapshot_dir(new_id);
+
+        // Copy the whole directory tree into our managed snapshot
+        // location. We don't symlink because the caller's temp dir
+        // is expected to be deleted right after this returns.
+        std::fs::create_dir_all(&target).map_err(|e| {
+            VmError::Backend(format!("vm-kvm: adopt: mkdir {}: {e}", target.display()))
+        })?;
+        for entry in std::fs::read_dir(dir).map_err(|e| {
+            VmError::Backend(format!("vm-kvm: adopt: read_dir {}: {e}", dir.display()))
+        })? {
+            let entry =
+                entry.map_err(|e| VmError::Backend(format!("vm-kvm: adopt: entry: {e}")))?;
+            let src = entry.path();
+            let dst = target.join(entry.file_name());
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                // Snapshot dirs are flat today (manifest +
+                // memory.cow + vcpu state + machine state). If a
+                // nested dir appears, refuse rather than implement
+                // recursive copy for something we don't expect.
+                return Err(VmError::Backend(format!(
+                    "vm-kvm: adopt: unexpected nested directory {}",
+                    src.display()
+                )));
+            }
+            std::fs::copy(&src, &dst).map_err(|e| {
+                VmError::Backend(format!(
+                    "vm-kvm: adopt: copy {} → {}: {e}",
+                    src.display(),
+                    dst.display()
+                ))
+            })?;
+        }
+
+        // The on-disk manifest was written by whatever produced the
+        // export, so we trust its geometry rather than re-deriving
+        // it. Rewrite the snapshot_id field to the freshly-assigned
+        // value (otherwise the manifest's id stays the producer's
+        // value, which is confusing).
+        let mut adopted_manifest = manifest.clone();
+        adopted_manifest.snapshot_id = new_id.0;
+        adopted_manifest.write_to_dir(&target).map_err(|e| {
+            VmError::Backend(format!(
+                "vm-kvm: adopt: rewrite manifest at {}: {e}",
+                target.display()
+            ))
+        })?;
+
+        let meta = SnapshotMeta {
+            id: new_id,
+            vcpu_count: manifest.vcpu_count,
+            memory_bytes: manifest.memory_bytes,
+            page_size: manifest.page_size,
+            kernel_cmdline: manifest.kernel_cmdline.clone(),
+        };
+        let mut inner = self.lock_inner()?;
+        inner
+            .snapshots
+            .insert(new_id, SnapshotEntry { dir: target, meta });
+        Ok(new_id)
+    }
+
     fn vm_meta(&self, id: VmId) -> VmResult<VmMeta> {
         let mut inner = self.lock_inner()?;
         Self::reap_finished_vcpus(&mut inner)?;

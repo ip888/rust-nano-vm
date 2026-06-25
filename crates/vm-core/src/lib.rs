@@ -241,6 +241,43 @@ pub trait Hypervisor: Send + Sync {
     /// return [`VmError::Unsupported`].
     fn snapshot_meta(&self, snap: SnapshotId) -> VmResult<SnapshotMeta>;
 
+    /// Path on the local filesystem where this snapshot's files
+    /// live (`manifest.json`, `memory.cow`, vCPU state, …) — or
+    /// `Ok(None)` if the backend doesn't materialize snapshots on
+    /// disk (mock backend in tests).
+    ///
+    /// Used by the control plane's durable-storage path: it points
+    /// a `snapshot::SnapshotStore` at this directory to upload to
+    /// S3 / MinIO / etc.
+    ///
+    /// The default implementation returns `Ok(None)`. Backends that
+    /// keep snapshots on disk should override to return `Some(path)`
+    /// for ids they recognize, or [`VmError::UnknownSnapshot`] for
+    /// ones they don't.
+    fn snapshot_export_dir(&self, _snap: SnapshotId) -> VmResult<Option<std::path::PathBuf>> {
+        Ok(None)
+    }
+
+    /// Register an externally-sourced snapshot directory as a known
+    /// snapshot under a freshly-assigned [`SnapshotId`]. Used by the
+    /// control plane to import a snapshot pulled from durable
+    /// storage so that subsequent `restore` / `fork` requests find
+    /// it.
+    ///
+    /// Implementations should:
+    ///
+    /// 1. Allocate a new `SnapshotId`.
+    /// 2. Validate / copy the directory under their internal
+    ///    storage (so the caller's temp dir is safe to delete).
+    /// 3. Register the snapshot in any in-process bookkeeping.
+    ///
+    /// The default implementation returns [`VmError::Unsupported`].
+    fn snapshot_adopt(&self, _dir: &std::path::Path) -> VmResult<SnapshotId> {
+        Err(VmError::Unsupported(
+            "snapshot_adopt: not implemented on this backend",
+        ))
+    }
+
     /// Read metadata describing a VM's geometry — what it was created
     /// with, plus its current observed state. The control plane uses
     /// this to enrich `GET /v1/vms` so operators see vcpu / memory

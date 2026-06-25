@@ -250,6 +250,67 @@ impl Hypervisor for MockHypervisor {
         })
     }
 
+    fn snapshot_export_dir(&self, snap: SnapshotId) -> VmResult<Option<std::path::PathBuf>> {
+        // Mock snapshots are in-memory by design. Materialize on
+        // demand so the durable-storage path can ship them out: we
+        // write `manifest.json` (no memory.cow) into a per-snapshot
+        // dir under temp and return that path. The dir persists for
+        // the process lifetime, which is fine for tests and short
+        // demo runs — the consumer is expected to upload + delete.
+        let meta = self.snapshot_meta(snap)?;
+        let dir = std::env::temp_dir()
+            .join("nanovm-mock-snapshots")
+            .join(snap.0.to_string());
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| VmError::Backend(format!("mock: snapshot_export_dir mkdir: {e}")))?;
+        let manifest = snapshot::Manifest::new(
+            meta.id.0,
+            meta.memory_bytes,
+            meta.page_size,
+            meta.vcpu_count,
+        );
+        let mut manifest = manifest;
+        manifest.kernel_cmdline = meta.kernel_cmdline;
+        manifest
+            .write_to_dir(&dir)
+            .map_err(|e| VmError::Backend(format!("mock: write manifest: {e}")))?;
+        Ok(Some(dir))
+    }
+
+    fn snapshot_adopt(&self, dir: &std::path::Path) -> VmResult<SnapshotId> {
+        let manifest = snapshot::Manifest::read_from_dir(dir).map_err(|e| {
+            VmError::Backend(format!(
+                "mock: adopt: read manifest from {}: {e}",
+                dir.display()
+            ))
+        })?;
+        // Cook a plausible VmConfig out of the manifest so the
+        // adopted snapshot supports `restore` like a native one.
+        // Memory: round up to MiB (mock stores MiB internally; the
+        // real backend stores bytes).
+        let memory_mib = manifest.memory_bytes.div_ceil(1024 * 1024).max(1);
+        let cfg = VmConfig {
+            vcpus: manifest.vcpu_count,
+            memory_mib,
+            cmdline: manifest.kernel_cmdline.clone(),
+            ..VmConfig::default()
+        };
+        let snap_id = SnapshotId::next();
+        let mut inner = self.inner.lock().expect("mock hypervisor poisoned");
+        inner.snapshots.insert(
+            snap_id,
+            MockSnapshot {
+                config: cfg,
+                // Adopted snapshots come from external sources;
+                // their captured state is "Running" by
+                // convention so that subsequent restores → fork
+                // semantics match what producers expect.
+                state: VmState::Running,
+            },
+        );
+        Ok(snap_id)
+    }
+
     // ---- Guest operations (M2 offline-testable subset) -------------------
 
     fn exec_in_guest(&self, id: VmId, req: GuestExecRequest) -> VmResult<GuestExecResult> {
