@@ -14,6 +14,7 @@ members = [
     "crates/cli",
     "crates/bench",
     "crates/nanovm-mcp",
+    "crates/vmm-ipc",
 ]
 
 [workspace.package]
@@ -35,6 +36,7 @@ virtio-queue = { path = "crates/virtio-queue", version = "0.0.3" }
 virtio-vsock = { path = "crates/virtio-vsock", version = "0.0.3" }
 snapshot = { path = "crates/snapshot", version = "0.0.3" }
 control-plane = { path = "crates/control-plane", version = "0.0.3" }
+vmm-ipc = { path = "crates/vmm-ipc", version = "0.0.3" }
 
 # External
 thiserror = "1.0"

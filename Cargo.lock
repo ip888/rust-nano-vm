@@ -2950,6 +2950,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmm-ipc"
+version = "0.0.3"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "vm-core",
+]
+
+[[package]]
 name = "vmm-sys-util"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

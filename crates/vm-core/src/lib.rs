@@ -138,7 +138,8 @@ pub enum VmState {
 /// lifecycle state as observed at the moment the handle was issued or last
 /// returned from an operation. Callers should not treat [`VmHandle::state`]
 /// as authoritative over time — query the hypervisor for a fresh read.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VmHandle {
     /// Unique id assigned by the hypervisor.
     pub id: VmId,
@@ -354,6 +355,7 @@ pub trait Hypervisor: Send + Sync {
 /// read assembled — same caveat as [`VmHandle::state`]: a concurrent
 /// transition can stale it before the caller looks.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VmMeta {
     /// VM identifier.
     pub id: VmId,
@@ -374,6 +376,7 @@ pub struct VmMeta {
 /// [`Hypervisor::snapshot_meta`]; mirrors the relevant fields of the
 /// `snapshot::Manifest` produced when a snapshot is persisted to disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SnapshotMeta {
     /// Snapshot identifier.
     pub id: SnapshotId,
@@ -389,7 +392,8 @@ pub struct SnapshotMeta {
 }
 
 /// Request parameters for [`Hypervisor::exec_in_guest`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GuestExecRequest {
     /// Program to execute (absolute path or found on `$PATH`).
     pub program: String,
@@ -405,7 +409,8 @@ pub struct GuestExecRequest {
 }
 
 /// Outcome of [`Hypervisor::exec_in_guest`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GuestExecResult {
     /// Process exit code. `None` if the process was killed by a signal.
     pub exit_code: Option<i32>,
