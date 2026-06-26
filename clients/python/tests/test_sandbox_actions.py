@@ -27,7 +27,7 @@ class FakeResponse:
     def __init__(
         self,
         status_code: int = 200,
-        json_body: Dict[str, Any] | None = None,
+        json_body: Optional[Dict[str, Any]] = None,
     ):
         self.status_code = status_code
         self._json = json_body if json_body is not None else {}
