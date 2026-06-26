@@ -1,0 +1,36 @@
+[package]
+name = "nanovm-vmm-child"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Single-VM VMM worker binary for rust-nano-vm. Listens on a Unix socket, accepts vmm-ipc requests from the control-plane orchestrator, dispatches to an in-process hypervisor. PR-2 of the per-VM cgroup isolation arc."
+keywords = ["microvm", "vmm", "worker", "rust-nano-vm"]
+categories = ["virtualization", "command-line-utilities"]
+
+[[bin]]
+name = "nanovm-vmm-child"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "signal", "macros"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+vm-core = { workspace = true, features = ["serde"] }
+vm-mock.workspace = true
+vmm-ipc.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "net", "process", "macros", "rt-multi-thread", "time"] }
+tempfile = "3"
+serde_json.workspace = true
+
+[lints]
+workspace = true
