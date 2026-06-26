@@ -30,14 +30,15 @@
 //!
 //! - Linux with cgroup v2 (unified hierarchy) mounted at
 //!   `/sys/fs/cgroup`.
-//! - The VMM's parent cgroup must have `memory` and `cpu` listed in
-//!   `cgroup.controllers` and enabled in `cgroup.subtree_control`.
-//!   On systemd this typically means running under a service with
-//!   `Delegate=memory cpu` (or `Delegate=yes`); under a user session
-//!   this works out of the box. If the controllers aren't delegated,
-//!   [`install_default_limits`] returns [`VmError::Backend`] with a
-//!   diagnostic — we fail loudly rather than silently dropping the
-//!   cap.
+//! - The VMM's parent cgroup must delegate the controllers you
+//!   actually request (`memory` for `NANOVM_VMM_MEMORY_LIMIT_MIB`,
+//!   `cpu` for `NANOVM_VMM_CPU_QUOTA_PCT`). A memory-only config
+//!   does not require `cpu` delegation, and vice versa. Under
+//!   systemd this means `Delegate=memory`, `Delegate=cpu`, or
+//!   `Delegate=memory cpu`. If a requested controller isn't
+//!   delegated, [`install_default_limits`] returns
+//!   [`VmError::Backend`] with a diagnostic — we fail loudly rather
+//!   than silently dropping the cap.
 //!
 //! ## What the function does
 //!
@@ -78,11 +79,18 @@ struct LimitsFromEnv {
 }
 
 impl LimitsFromEnv {
-    fn from_env() -> Self {
-        Self {
-            memory_mib: parse_env_u64("NANOVM_VMM_MEMORY_LIMIT_MIB"),
-            cpu_quota_pct: parse_env_u32("NANOVM_VMM_CPU_QUOTA_PCT"),
-        }
+    /// Read both env vars and fail loudly on garbage. A *missing* var
+    /// is fine — it just means that knob isn't requested. An *empty
+    /// or unparsable* var means the operator typed something they
+    /// expected to apply, and we'd be silently dropping the cap if
+    /// we returned `None`. That's a security footgun: the host would
+    /// look protected from a config audit but actually run without
+    /// the limit.
+    fn from_env() -> VmResult<Self> {
+        Ok(Self {
+            memory_mib: parse_env_u64("NANOVM_VMM_MEMORY_LIMIT_MIB")?,
+            cpu_quota_pct: parse_env_u32("NANOVM_VMM_CPU_QUOTA_PCT")?,
+        })
     }
 
     fn any_set(&self) -> bool {
@@ -90,17 +98,39 @@ impl LimitsFromEnv {
     }
 }
 
-fn parse_env_u64(key: &str) -> Option<u64> {
-    std::env::var(key).ok()?.trim().parse().ok()
+/// `Ok(None)` when the env var is unset, `Ok(Some(n))` when present
+/// and parsable, `Err(Backend)` when present-but-unparsable. The
+/// failure path is deliberately loud — see `LimitsFromEnv::from_env`.
+fn parse_env_u64(key: &str) -> VmResult<Option<u64>> {
+    match std::env::var(key) {
+        Err(_) => Ok(None),
+        Ok(raw) => raw.trim().parse::<u64>().map(Some).map_err(|e| {
+            VmError::Backend(format!(
+                "cgroups: {key}={raw:?} is not a non-negative integer ({e}); \
+                 unset or fix the value, don't leave a garbage cap request"
+            ))
+        }),
+    }
 }
 
-fn parse_env_u32(key: &str) -> Option<u32> {
-    std::env::var(key).ok()?.trim().parse().ok()
+fn parse_env_u32(key: &str) -> VmResult<Option<u32>> {
+    match std::env::var(key) {
+        Err(_) => Ok(None),
+        Ok(raw) => raw.trim().parse::<u32>().map(Some).map_err(|e| {
+            VmError::Backend(format!(
+                "cgroups: {key}={raw:?} is not a non-negative integer ({e}); \
+                 unset or fix the value, don't leave a garbage cap request"
+            ))
+        }),
+    }
 }
 
-/// True when at least one of the cgroup limit env vars is set. Used
-/// by `KvmHypervisor::new` to decide whether to call into this
-/// module at all.
+/// True when at least one of the cgroup limit env vars is set,
+/// regardless of whether its value parses. Used by `KvmHypervisor::new`
+/// to decide whether to call into this module at all — a present-
+/// but-garbage value still gates entry, so the parse failure in
+/// `install_default_limits` surfaces to the operator instead of being
+/// silently skipped.
 pub fn env_opts_in() -> bool {
     std::env::var_os("NANOVM_VMM_MEMORY_LIMIT_MIB").is_some()
         || std::env::var_os("NANOVM_VMM_CPU_QUOTA_PCT").is_some()
@@ -188,21 +218,43 @@ fn child_cgroup_path() -> VmResult<PathBuf> {
 /// a 512 MiB limit and we couldn't apply it, they need to know
 /// before the VMM is exposed to traffic.
 pub fn install_default_limits() -> VmResult<()> {
-    let limits = LimitsFromEnv::from_env();
+    let limits = LimitsFromEnv::from_env()?;
     if !limits.any_set() {
         return Ok(());
     }
     let child = child_cgroup_path()?;
     // The parent is whatever cgroup we're currently in. We need
-    // memory + cpu enabled in its subtree_control or any write to
-    // memory.max / cpu.max will fail with ENOTSUP.
+    // only the controllers actually requested to be delegated —
+    // memory-only configs shouldn't fail just because cpu isn't
+    // available, and vice versa.
     let parent = child
         .parent()
         .ok_or_else(|| VmError::Backend("cgroups: child path has no parent (impossible)".into()))?;
-    check_controllers_delegated(parent)?;
+    let mut needed: Vec<&str> = Vec::with_capacity(2);
+    if limits.memory_mib.is_some() {
+        needed.push("memory");
+    }
+    if limits.cpu_quota_pct.is_some() {
+        needed.push("cpu");
+    }
+    check_controllers_delegated(parent, &needed)?;
 
-    fs::create_dir(&child)
-        .map_err(|e| VmError::Backend(format!("cgroups: create {}: {e}", child.display())))?;
+    // `create_dir` (NOT `create_dir_all`) errors loudly when the
+    // target already exists, which catches the edge case where a
+    // previous VMM with our same PID was killed without cleaning up
+    // its cgroup. Reusing that directory would silently inherit
+    // whatever caps the prior process wrote — the operator's intent
+    // here is "fresh child," so we surface the conflict with an
+    // actionable diagnostic instead of clobbering.
+    fs::create_dir(&child).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => VmError::Backend(format!(
+            "cgroups: child {} already exists — a previous VMM with the \
+             same PID likely crashed; rmdir the leftover directory and \
+             retry",
+            child.display()
+        )),
+        _ => VmError::Backend(format!("cgroups: create {}: {e}", child.display())),
+    })?;
 
     if let Some(mib) = limits.memory_mib {
         let bytes = mib.saturating_mul(1024 * 1024);
@@ -236,34 +288,54 @@ pub fn install_default_limits() -> VmResult<()> {
 mod tests {
     use super::*;
 
+    // `from_env()` reads process-global state, so the three env
+    // tests below share a mutex to stay deterministic when the
+    // suite runs threaded.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn env_parser_handles_unset_and_garbage() {
-        // SAFETY: tests run single-threaded by default with
-        // `cargo test -- --test-threads=1` only if asked; the env
-        // vars used here have a nanovm-specific prefix so cross-test
-        // contamination is unlikely in practice. Each test
-        // remove_var before reading.
+    fn env_parser_handles_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("NANOVM_VMM_MEMORY_LIMIT_MIB");
             std::env::remove_var("NANOVM_VMM_CPU_QUOTA_PCT");
         }
-        assert_eq!(LimitsFromEnv::from_env(), LimitsFromEnv::default());
+        assert_eq!(LimitsFromEnv::from_env().unwrap(), LimitsFromEnv::default());
+    }
 
+    #[test]
+    fn env_parser_fails_loudly_on_garbage() {
+        let _g = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("NANOVM_VMM_MEMORY_LIMIT_MIB", "garbage");
+            std::env::remove_var("NANOVM_VMM_CPU_QUOTA_PCT");
         }
-        assert_eq!(LimitsFromEnv::from_env().memory_mib, None);
+        // Unparsable env values are a config-audit footgun: an
+        // operator who set the var expects the cap to apply.
+        // Returning Ok(None) here would silently drop the cap and
+        // leave the host unprotected.
+        let err = LimitsFromEnv::from_env().expect_err("garbage must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("NANOVM_VMM_MEMORY_LIMIT_MIB"),
+            "diagnostic should name the env var; got: {msg}"
+        );
+        unsafe {
+            std::env::remove_var("NANOVM_VMM_MEMORY_LIMIT_MIB");
+        }
+    }
 
+    #[test]
+    fn env_parser_accepts_valid_values() {
+        let _g = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("NANOVM_VMM_MEMORY_LIMIT_MIB", "512");
             std::env::set_var("NANOVM_VMM_CPU_QUOTA_PCT", "150");
         }
-        let parsed = LimitsFromEnv::from_env();
+        let parsed = LimitsFromEnv::from_env().unwrap();
         assert_eq!(parsed.memory_mib, Some(512));
         assert_eq!(parsed.cpu_quota_pct, Some(150));
         assert!(parsed.any_set());
-
-        // Cleanup so other tests in the suite see a clean slate.
         unsafe {
             std::env::remove_var("NANOVM_VMM_MEMORY_LIMIT_MIB");
             std::env::remove_var("NANOVM_VMM_CPU_QUOTA_PCT");
@@ -271,12 +343,20 @@ mod tests {
     }
 
     #[test]
-    fn env_opts_in_reflects_any_set() {
+    fn env_opts_in_reflects_any_set_even_when_unparsable() {
+        let _g = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("NANOVM_VMM_MEMORY_LIMIT_MIB");
             std::env::remove_var("NANOVM_VMM_CPU_QUOTA_PCT");
         }
         assert!(!env_opts_in());
+        // Even a garbage value gates entry — that way the parse
+        // failure is surfaced loudly inside install_default_limits
+        // instead of being silently skipped at the caller.
+        unsafe {
+            std::env::set_var("NANOVM_VMM_CPU_QUOTA_PCT", "not-a-number");
+        }
+        assert!(env_opts_in(), "garbage value must still gate entry");
         unsafe {
             std::env::set_var("NANOVM_VMM_CPU_QUOTA_PCT", "50");
         }

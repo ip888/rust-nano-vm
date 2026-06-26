@@ -114,8 +114,11 @@ them via `MAP_PRIVATE` copy-on-write.
    not per-VM** — every VM hosted by the VMM shares the budget. Per-VM
    caps need the multi-process rearchitecture and land in a later
    milestone; for the monolithic VMM this still bounds blast radius
-   on the host. Requires cgroup v2 with `memory` + `cpu` delegated
-   to the VMM's parent (under systemd: `Delegate=memory cpu`). See
+   on the host. Requires cgroup v2; only the controller(s) you actually
+   request need to be delegated to the VMM's parent (memory-only configs
+   don't need cpu, and vice versa). Under systemd: `Delegate=memory`,
+   `Delegate=cpu`, or `Delegate=memory cpu` depending on which knobs
+   you set. See
    [`crates/vm-kvm/src/cgroups.rs`](crates/vm-kvm/src/cgroups.rs).
 
 8. **Durable snapshots on S3 / MinIO / R2.** Snapshots aren't
