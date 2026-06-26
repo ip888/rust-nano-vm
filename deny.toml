@@ -51,6 +51,12 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "0BSD",
+    # Pulled in by `webpki-roots` when reqwest is built with the
+    # `rustls-tls` feature. CDLA-Permissive-2.0 is the data-license
+    # analogue of Apache-2.0: any redistribution, derivative, or
+    # commercial use is allowed with attribution and no patent
+    # surprises. Same shape as the rest of this allow-list.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 exceptions = []
