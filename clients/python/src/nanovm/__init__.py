@@ -691,8 +691,8 @@ class Client:
         convenience methods for the expected field names.
 
         ``snapshot`` overrides the server's
-        ``NANOVM_SANDBOX_SNAPSHOT_ID`` default. Passing both works:
-        body wins.
+        ``NANOVM_SANDBOX_SNAPSHOT_ID`` default. When ``snapshot`` is
+        ``None``, the client omits the field so the server can fall back.
 
         Raises ``NotFoundError`` when the snapshot is unknown,
         ``NanovmError`` (400) when no snapshot id is resolvable.
