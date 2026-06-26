@@ -1,0 +1,111 @@
+name: smoke
+
+# Live-server smoke tests for the Python SDK.
+#
+# `clients/python/tests/test_smoke.py` was authored with a real
+# control plane in mind — every test goes through one bound to
+# `http://localhost:8080`. Without a server up it skips silently,
+# which kept the suite green in `ci.yml` but also meant the SDK's
+# request shapes and error paths were never end-to-end exercised in
+# CI. This job builds a control plane image from the workspace's
+# `Dockerfile`, runs it as a backgrounded sidecar bound to
+# `127.0.0.1:8080`, and drives the smoke tests against it — same
+# command an operator would run locally per the SDK README.
+#
+# Runs on every PR + push to main. Separate workflow file so the
+# matrix can be tightened (e.g. add Python 3.9 once the SDK's
+# `requires-python = ">=3.9"` claim is worth verifying live) without
+# touching the Rust-side ci.yml.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-sdk-smoke:
+    name: python-sdk-smoke (mock backend)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build the local Dockerfile (workspace-pinned) and load it
+      # into the runner's docker daemon. GHA cache keeps repeat
+      # builds cheap; cold builds take ~3-4 min for the Rust stage.
+      - name: Build control-plane image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: nanovm-control-plane:ci
+          cache-from: type=gha,scope=smoke
+          cache-to: type=gha,mode=max,scope=smoke
+
+      # `services:` would have been cleaner but it requires a
+      # registry-hosted image — we use the locally-built one, so
+      # background it with `docker run -d`. Bind to 127.0.0.1 so the
+      # runner's firewall doesn't expose it.
+      - name: Start control-plane sidecar
+        run: |
+          docker run -d --rm --name nanovm \
+            -p 127.0.0.1:8080:8080 \
+            -e NANOVM_API_TOKENS=dev-token \
+            -e RUST_LOG=info \
+            nanovm-control-plane:ci
+
+      - name: Wait for /healthz
+        run: |
+          # The control plane starts in <1s, but distroless cold start
+          # plus port-binding can briefly miss the first probe. 30
+          # attempts × 1s gives a generous margin without masking a
+          # genuinely failing image.
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null; then
+              echo "control plane up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "control plane did not come up; dumping container logs:"
+          docker logs nanovm
+          exit 1
+
+      - name: Install Python SDK
+        working-directory: clients/python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run smoke tests
+        env:
+          NANOVM_BASE_URL: http://127.0.0.1:8080
+          NANOVM_API_TOKEN: dev-token
+        run: |
+          # `-q` keeps the output focused; `-vv` would dump per-test
+          # lines and make a real failure harder to spot in the GH
+          # Actions UI. Failure surfaces with a stderr dump anyway.
+          pytest clients/python/tests/ -q
+
+      # On failure, surface the control-plane stderr so the cause
+      # isn't buried in a docker-internal log file.
+      - name: Dump control-plane logs on failure
+        if: failure()
+        run: docker logs nanovm || true
+
+      - name: Stop sidecar
+        if: always()
+        run: docker stop nanovm || true
