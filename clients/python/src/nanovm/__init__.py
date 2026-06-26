@@ -682,13 +682,18 @@ class Client:
         snapshot: Optional[int] = None,
         **action_args: Any,
     ) -> SandboxResult:
-        """Invoke an action against an ephemeral sandbox VM.
+        """Low-level escape hatch for the ``POST /v1/sandbox/invoke``
+        endpoint. Prefer the typed convenience methods
+        (``execute_python``, ``execute_shell``, ``read_file``,
+        ``write_file``, ``list_files``) when one matches; reach for
+        this when you need to drive an action the SDK hasn't yet
+        wrapped — including future actions the server adds before
+        this client ships an update.
 
-        ``action`` is an action discriminator string (currently one of
-        ``"execute_python"``, ``"execute_shell"``, ``"read_file"``,
-        ``"write_file"``, ``"list_files"``). The remaining keyword
-        arguments are flattened into the request body alongside the
-        discriminator — see the action-specific convenience methods for the expected field names.
+        ``action`` is the discriminator string sent verbatim to the
+        server. ``**action_args`` is flattened into the request body
+        alongside the discriminator; the server validates the
+        per-action fields and 422s anything unrecognized.
 
         ``snapshot`` overrides the server's
         ``NANOVM_SANDBOX_SNAPSHOT_ID`` default. When ``snapshot`` is
