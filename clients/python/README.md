@@ -85,9 +85,10 @@ with nanovm.Client("http://localhost:8080", token="dev-token") as client:
 
 For AI-agent tool use, you usually don't want to manage VM lifecycles
 — you just want "run this in a sandbox and give me back the output."
-`Client.execute_python`, `Client.execute_shell`, `Client.read_file`, `Client.write_file`,
-and `Client.list_files` each do that as a single call: the server forks a
-a flat `SandboxResult`.
+`Client.execute_python`, `Client.execute_shell`, `Client.read_file`,
+`Client.write_file`, and `Client.list_files` each do that as a single
+call: the server forks a fresh VM from a snapshot, runs the action,
+destroys the VM, and returns a flat `SandboxResult`.
 
 ```python
 import nanovm
