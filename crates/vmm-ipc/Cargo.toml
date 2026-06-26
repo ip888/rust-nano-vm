@@ -1,0 +1,26 @@
+[package]
+name = "vmm-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wire contract between the rust-nano-vm control plane and the per-VM `nanovm-vmm-child` worker processes. Defines the request/response envelopes, the framing protocol, and the serde shape used over the Unix-socket transport."
+keywords = ["microvm", "ipc", "nanovm", "wire-protocol"]
+categories = ["virtualization", "encoding"]
+readme = "README.md"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+# Wire types share the vm-core shape one-for-one so the host
+# orchestrator and the child worker speak the same domain language.
+vm-core = { workspace = true, features = ["serde"] }
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+
+[lints]
+workspace = true
