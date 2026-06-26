@@ -47,6 +47,7 @@ __all__ = [
     "ExecChunk",
     "ExecExit",
     "ExecStreamEvent",
+    "SandboxResult",
     "Usage",
     "Health",
     "NanovmError",
@@ -171,6 +172,30 @@ class Health:
     version: str
     uptime_secs: int
     started_at: str
+
+
+@dataclass
+class SandboxResult:
+    """Outcome of ``Client.sandbox_invoke`` and the action-specific
+    convenience wrappers (``execute_python``, ``execute_shell``,
+    ``read_file``, ``write_file``, ``list_files``).
+
+    The fields mirror the server's flat envelope from
+    ``POST /v1/sandbox/invoke``:
+
+    - ``stdout`` / ``stderr`` — captured streams (UTF-8 lossy)
+    - ``exit_code`` — POSIX-shell convention: signal-killed processes
+      report ``128 + signal``. File-op actions report ``0`` on success.
+    - ``duration_ms`` — wall-clock from snapshot-fork through destroy
+    - ``cold_start`` — ``True`` iff the VM was cold-restored from the
+      snapshot (``False`` on a warm-pool hit)
+    """
+
+    stdout: str
+    stderr: str
+    exit_code: int
+    duration_ms: int
+    cold_start: bool
 
 
 def _iter_sse(resp: "requests.Response") -> Iterator[ExecStreamEvent]:
@@ -638,6 +663,120 @@ class Client:
             fork_count=int(resp["fork_count"]),
             fork_total_ms=int(resp["fork_total_ms"]),
         )
+
+    # -- sandbox-action API ------------------------------------------------
+    #
+    # The control-plane's `POST /v1/sandbox/invoke` is a single endpoint
+    # that does "fork from snapshot → run one action → destroy the VM →
+    # return a flat envelope". It's the path AI-agent tool runners and
+    # MCP servers should use — they don't want to manage the VM
+    # lifecycle, they just want a sandboxed result.
+    #
+    # `sandbox_invoke` is the low-level escape hatch (passes the action
+    # name as a string), and the five `execute_*` / `*_file` methods
+    # below are typed convenience wrappers around it.
+
+    def sandbox_invoke(
+        self,
+        action: str,
+        snapshot: Optional[int] = None,
+        **action_args: Any,
+    ) -> SandboxResult:
+        """Invoke an action against an ephemeral sandbox VM.
+
+        ``action`` is one of ``"execute_python"``, ``"execute_shell"``,
+        ``"read_file"``, ``"write_file"``, ``"list_files"``. The
+        remaining keyword arguments are flattened into the request
+        body alongside the discriminator — see the action-specific
+        convenience methods for the expected field names.
+
+        ``snapshot`` overrides the server's
+        ``NANOVM_SANDBOX_SNAPSHOT_ID`` default. Passing both works:
+        body wins.
+
+        Raises ``NotFoundError`` when the snapshot is unknown,
+        ``NanovmError`` (400) when no snapshot id is resolvable.
+        """
+        body: Dict[str, Any] = {"action": action}
+        if snapshot is not None:
+            body["snapshot"] = int(snapshot)
+        body.update(action_args)
+        resp = self._request("POST", "/v1/sandbox/invoke", body=body)
+        return SandboxResult(
+            stdout=resp.get("stdout", ""),
+            stderr=resp.get("stderr", ""),
+            exit_code=int(resp.get("exit_code", 0)),
+            duration_ms=int(resp.get("duration_ms", 0)),
+            cold_start=bool(resp.get("cold_start", False)),
+        )
+
+    def execute_python(
+        self,
+        code: str,
+        snapshot: Optional[int] = None,
+        timeout_ms: Optional[int] = None,
+    ) -> SandboxResult:
+        """Run a Python program (``python3 -c <code>``) in a fresh
+        sandbox VM. Returns the captured stdout / stderr / exit code.
+        """
+        kwargs: Dict[str, Any] = {"code": code}
+        if timeout_ms is not None:
+            kwargs["timeout_ms"] = int(timeout_ms)
+        return self.sandbox_invoke("execute_python", snapshot=snapshot, **kwargs)
+
+    def execute_shell(
+        self,
+        command: str,
+        snapshot: Optional[int] = None,
+        timeout_ms: Optional[int] = None,
+    ) -> SandboxResult:
+        """Run a shell command (``sh -c <command>``) in a fresh
+        sandbox VM.
+        """
+        kwargs: Dict[str, Any] = {"command": command}
+        if timeout_ms is not None:
+            kwargs["timeout_ms"] = int(timeout_ms)
+        return self.sandbox_invoke("execute_shell", snapshot=snapshot, **kwargs)
+
+    def read_file(
+        self,
+        path: str,
+        snapshot: Optional[int] = None,
+    ) -> SandboxResult:
+        """Read a file from the guest filesystem.
+
+        File content (UTF-8 lossy) lands in ``result.stdout``;
+        ``exit_code`` is ``0`` on success. Missing-file / IO errors
+        from the guest agent surface as ``NanovmError`` (5xx).
+        """
+        return self.sandbox_invoke("read_file", snapshot=snapshot, path=path)
+
+    def write_file(
+        self,
+        path: str,
+        content: str,
+        mode: Optional[int] = None,
+        snapshot: Optional[int] = None,
+    ) -> SandboxResult:
+        """Write a file to the guest filesystem.
+
+        ``mode`` defaults to ``0o644`` server-side.
+        ``result.stdout`` carries ``"bytes_written=N"`` on success.
+        """
+        kwargs: Dict[str, Any] = {"path": path, "content": content}
+        if mode is not None:
+            kwargs["mode"] = int(mode)
+        return self.sandbox_invoke("write_file", snapshot=snapshot, **kwargs)
+
+    def list_files(
+        self,
+        path: str,
+        snapshot: Optional[int] = None,
+    ) -> SandboxResult:
+        """List directory entries (``ls -1 -- <path>``) in a fresh
+        sandbox VM. One entry per line in ``result.stdout``.
+        """
+        return self.sandbox_invoke("list_files", snapshot=snapshot, path=path)
 
     def close(self) -> None:
         """Release the underlying connection pool."""

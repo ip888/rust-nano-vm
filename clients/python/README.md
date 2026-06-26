@@ -81,6 +81,36 @@ with nanovm.Client("http://localhost:8080", token="dev-token") as client:
         vm.destroy()
 ```
 
+## Sandbox-action API (one-shot fork-exec-destroy)
+
+For AI-agent tool use, you usually don't want to manage VM lifecycles
+— you just want "run this in a sandbox and give me back the output."
+`Client.execute_python`, `execute_shell`, `read_file`, `write_file`,
+and `list_files` each do that as a single call: the server forks a
+fresh VM from a snapshot, runs the action, destroys the VM, returns
+a flat `SandboxResult`.
+
+```python
+import nanovm
+
+with nanovm.Client("http://localhost:8080", token="dev-token") as client:
+    # The server's NANOVM_SANDBOX_SNAPSHOT_ID env var picks the
+    # default; pass `snapshot=` to override per-call.
+    r = client.execute_python("print(1+1)", snapshot=42)
+    print(r.stdout)        # "2\n"
+    print(r.cold_start)    # True (cold-restored) or False (warm pool)
+
+    r = client.execute_shell("uname -a", snapshot=42)
+    r = client.read_file("/etc/hostname", snapshot=42)
+    r = client.write_file("/tmp/x", "hello", mode=0o644, snapshot=42)
+    r = client.list_files("/tmp", snapshot=42)
+```
+
+`SandboxResult.exit_code` follows POSIX-shell convention
+(signal-killed processes are reported as `128 + signal`). For
+direct access to the underlying endpoint with an arbitrary action
+name, use `Client.sandbox_invoke(action, snapshot=..., **kwargs)`.
+
 ## Streaming exec
 
 For long-running guest programs where you want output as it arrives —
