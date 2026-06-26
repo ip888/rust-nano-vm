@@ -684,11 +684,11 @@ class Client:
     ) -> SandboxResult:
         """Invoke an action against an ephemeral sandbox VM.
 
-        ``action`` is one of ``"execute_python"``, ``"execute_shell"``,
-        ``"read_file"``, ``"write_file"``, ``"list_files"``. The
-        remaining keyword arguments are flattened into the request
-        body alongside the discriminator — see the action-specific
-        convenience methods for the expected field names.
+        ``action`` is an action discriminator string (currently one of
+        ``"execute_python"``, ``"execute_shell"``, ``"read_file"``,
+        ``"write_file"``, ``"list_files"``). The remaining keyword
+        arguments are flattened into the request body alongside the
+        discriminator — see the action-specific convenience methods for the expected field names.
 
         ``snapshot`` overrides the server's
         ``NANOVM_SANDBOX_SNAPSHOT_ID`` default. When ``snapshot`` is
