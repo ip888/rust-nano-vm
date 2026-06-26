@@ -186,6 +186,34 @@ def test_list_vms_zero_limit_is_bad_request(client: nanovm.Client) -> None:
 # --- streaming exec ----------------------------------------------------------
 
 
+def _server_can_spawn_sh(client: nanovm.Client) -> bool:
+    """Probe whether the control plane's host can spawn `/bin/sh`.
+
+    The published Docker image ships on `distroless/cc:nonroot` which
+    contains glibc but no shell — perfectly fine for the production
+    deployment, but the mock backend `exec_in_guest` literally spawns
+    the named program as a host subprocess, so any exec-shaped smoke
+    test depending on `sh` would 500. We skip those tests when the
+    probe says no, and let them run on dev boxes that have a real
+    shell on PATH.
+    """
+    vm = client.create_vm()
+    try:
+        vm.start()
+        try:
+            vm.exec(program="sh", args=["-c", "exit 0"])
+        except nanovm.NanovmError as e:
+            if "No such file" in str(e):
+                return False
+            raise
+        return True
+    finally:
+        try:
+            vm.destroy()
+        except nanovm.NanovmError:
+            pass
+
+
 def test_exec_stream_yields_stdout_chunks_then_exit(client: nanovm.Client) -> None:
     """``Vm.exec_stream`` yields raw byte chunks then a terminal exit.
 
@@ -193,6 +221,12 @@ def test_exec_stream_yields_stdout_chunks_then_exit(client: nanovm.Client) -> No
     can assert on exact bytes — the wire shape is identical against a
     real-KVM backend.
     """
+    if not _server_can_spawn_sh(client):
+        pytest.skip(
+            "control plane's host has no /bin/sh (e.g. distroless image); "
+            "the exec_stream wire shape is covered by the Rust-side "
+            "mock + KVM integration tests"
+        )
     vm = client.create_vm()
     try:
         vm.start()
