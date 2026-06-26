@@ -13,6 +13,7 @@ members = [
     "crates/proto",
     "crates/cli",
     "crates/bench",
+    "crates/nanovm-mcp",
 ]
 
 [workspace.package]
