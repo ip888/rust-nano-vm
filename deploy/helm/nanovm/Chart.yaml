@@ -1,0 +1,23 @@
+apiVersion: v2
+name: nanovm
+description: |
+  rust-nano-vm control plane — single-binary Rust microVM for AI-agent code
+  execution. ~12 ms cold start, ~0.5 MiB Pss per fork, multi-tenant ready.
+
+  This chart deploys `nanovm-control-plane` with the real-KVM backend on
+  nodes that expose `/dev/kvm` (AWS *.metal, Fly.io performance machines,
+  bare-metal Linux with KVM). For mock-backend dev deployments use the
+  default `Dockerfile` image instead.
+type: application
+version: 0.1.0
+appVersion: "0.0.3"
+keywords:
+  - microvm
+  - sandbox
+  - kvm
+  - ai-agent
+  - rust-nano-vm
+sources:
+  - https://github.com/ip888/rust-nano-vm
+maintainers:
+  - name: Rust-nano-vm contributors

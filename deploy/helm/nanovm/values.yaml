@@ -1,0 +1,122 @@
+# Default values for the nanovm-control-plane chart. Override via
+# `helm install ... --set` or your own values.yaml.
+
+image:
+  # Default to the KVM-enabled production image. Operators that want
+  # mock-backend dev deployments should override to the plain
+  # `ghcr.io/ip888/nanovm-control-plane` repository instead.
+  repository: ghcr.io/ip888/nanovm-control-plane-kvm
+  tag: ""              # falls back to .Chart.AppVersion when empty
+  pullPolicy: IfNotPresent
+
+# Number of replicas. Per-replica VM/snapshot state is in-memory
+# (control plane), so multi-replica is HA-blast-radius only — pin
+# clients to one replica via a session-affinity Service if you need
+# stable VM ids across reconnect.
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    # Memory is the hard limit; vCPUs are spec'd by `requests` so the
+    # kernel scheduler hands the control plane time when the host is
+    # busy with other tenants' guests.
+    memory: 4Gi
+
+# ---- KVM device wiring -----------------------------------------------
+# The control plane needs /dev/kvm on the node. Two shapes work:
+#
+#   1. nodes with the device file mounted into the container via a
+#      `hostPath` volume (this chart's default — set `kvm.enabled=true`).
+#   2. nodes running a kvm-device-plugin that exposes `devices.kvm.com/kvm`
+#      as a resource (set `kvm.devicePluginRequest=1` and disable hostPath).
+#
+# Option 1 needs `securityContext.privileged: true` or the right
+# device-cgroup-rule; option 2 keeps the pod un-privileged but requires
+# the plugin to be installed on the cluster.
+kvm:
+  # Mount /dev/kvm from the host. Requires that the chosen nodes have
+  # the kvm kernel module loaded.
+  enabled: true
+  # Request the KVM device via a device plugin instead. Mutually
+  # exclusive with `enabled`.
+  devicePluginRequest: 0
+
+# Pod-security context. When `kvm.enabled` is true, the container needs
+# write access to /dev/kvm — adjust `runAsGroup` to match your node's
+# `kvm` group GID (typically 36 on Debian-derived hosts, 78 on RHEL).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 36
+  fsGroup: 36
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  readOnlyRootFilesystem: true
+  seccompProfile:
+    type: RuntimeDefault
+
+# Node selector: pin to nodes that expose /dev/kvm. The recommended
+# pattern is to label your KVM-capable nodes with `nanovm.io/kvm=true`
+# during the AWS *.metal / Fly.io setup.
+nodeSelector:
+  nanovm.io/kvm: "true"
+
+tolerations: []
+affinity: {}
+
+# ---- Configuration ---------------------------------------------------
+config:
+  # `acme:tok1,acme:tok2,globex:tok3` form is recommended for any
+  # multi-tenant deployment (see auth.rs for the env shape).
+  # Provided here as a literal for first-boot testing only — production
+  # deployments should pull this from a SealedSecret / external secret
+  # operator. Empty value disables auth (NEVER in production).
+  apiTokens: "dev-token"
+  # Wall-clock fork quota in tokens-per-second per bearer.
+  forkQuotaPerSec: 10
+  # JSONL audit destination. Defaults to /var/log/nanovm/audit.jsonl,
+  # mapped to a fresh `emptyDir` so a crash doesn't lose the in-flight
+  # log — production wires this to a PVC.
+  auditPath: "/var/log/nanovm/audit.jsonl"
+  # Optional default snapshot id for the sandbox-action API
+  # (NANOVM_SANDBOX_SNAPSHOT_ID).
+  sandboxSnapshotId: ""
+  # Optional warm-pool size per snapshot.
+  warmPoolPerSnapshot: ""
+  # Optional S3-compatible snapshot store URL.
+  snapshotStore: ""
+  # Extra RUST_LOG directives (defaults to "info").
+  rustLog: "info"
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# Optional Prometheus metrics scrape. The control plane exposes
+# `/metrics` (Prometheus text format) on the same port as the REST API
+# without auth — the Helm chart relies on Kubernetes RBAC + the
+# service-monitor selector to keep it private.
+serviceMonitor:
+  enabled: false
+  interval: 15s
+  scrapeTimeout: 10s
+  labels: {}
+
+# Optional Ingress. When `enabled`, exposes the REST API. Operators
+# that front nanovm with their own gateway should leave this off.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: nanovm.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
