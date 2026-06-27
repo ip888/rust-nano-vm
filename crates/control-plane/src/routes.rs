@@ -31,7 +31,7 @@ use axum::{
     body::Bytes,
     extract::{
         rejection::{JsonRejection, PathRejection},
-        Path, Query, State,
+        Extension, Path, Query, State,
     },
     http::{HeaderMap, StatusCode},
     middleware,
@@ -49,7 +49,9 @@ use crate::api::{
 };
 use crate::audit;
 use crate::auth;
+use crate::auth::OrgId;
 use crate::error::ApiError;
+use crate::ownership::OwnershipMap;
 use crate::request_id;
 use crate::time::rfc3339_now;
 use crate::warm_pool::WarmPool;
@@ -83,6 +85,11 @@ pub struct AppState {
     /// is reachable; default to `None` so existing deployments
     /// don't change behaviour.
     snapshot_store: Option<Arc<dyn snapshot::SnapshotStore>>,
+    /// Per-org ownership of VMs and snapshots. Populated as
+    /// resources are created; consulted on every `/v1/vms/:id/*` and
+    /// `/v1/snapshots/:id/*` access. Single-tenant deployments
+    /// (default-org only) keep working without touching this map.
+    ownership: Arc<OwnershipMap>,
     /// Process start time (monotonic clock) — used to compute uptime
     /// reported on `GET /v1/health`. Set once when the first `AppState`
     /// is constructed and shared across clones.
@@ -130,10 +137,19 @@ impl AppState {
             metrics: Arc::new(crate::Metrics::new()),
             warm_pool,
             snapshot_store: None,
+            ownership: Arc::new(OwnershipMap::default()),
             start_instant: Instant::now(),
             started_at: rfc3339_now(),
             backend_label: "mock",
         }
+    }
+
+    /// Borrow the per-org ownership map. Used by sibling modules
+    /// (`sandbox`, `snapshot_export`) that need to record/check
+    /// resource ownership outside the main handlers in this file.
+    #[allow(dead_code)]
+    pub(crate) fn ownership(&self) -> &Arc<OwnershipMap> {
+        &self.ownership
     }
 
     /// Install a durable snapshot store. Enables the
@@ -298,15 +314,18 @@ async fn metrics_text(
 
 async fn create_vm(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     body: Result<Json<CreateVmRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<VmHandleDto>), ApiError> {
     let Json(req) = body?;
     let handle = state.hypervisor.create_vm(&req.into())?;
+    state.ownership.record_vm(handle.id, org);
     Ok((StatusCode::CREATED, Json(handle.into())))
 }
 
 async fn list_vms(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<VmListResponse>, ApiError> {
     let limit = query.validated_limit()?;
@@ -316,7 +335,17 @@ async fn list_vms(
     // enrich only the rows we keep. Enriching the dropped rows would
     // turn a 100-row page over a 100k-VM hypervisor into 100k vm_meta
     // calls — which would defeat the point of pagination.
+    //
+    // Org filter: hide VMs the caller's org doesn't own. The default
+    // org sees every VM that has no recorded owner (the legacy
+    // single-tenant fall-through). Multi-tenant deployments where the
+    // operator wants strict isolation should run with explicit per-org
+    // token wiring so no resource lives in the default-org bucket.
     let mut handles = state.hypervisor.list_vms()?;
+    handles.retain(|h| {
+        let owner = state.ownership.vm_owner(h.id);
+        owner == org
+    });
     handles.sort_by_key(|h| h.id.0);
     let mut filtered: Vec<_> = handles.into_iter().filter(|h| h.id.0 > after).collect();
     let has_more = filtered.len() > limit as usize;
@@ -344,47 +373,62 @@ async fn list_vms(
 
 async fn get_vm(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     id: Result<Path<u64>, PathRejection>,
 ) -> Result<Json<VmStateResponse>, ApiError> {
     let Path(id) = id?;
     let vm_id = VmId(id);
+    state.ownership.require_vm_access(vm_id, &org)?;
     let vm_state = state.hypervisor.state(vm_id)?;
     Ok(Json(VmStateResponse::new(vm_id, vm_state)))
 }
 
 async fn start_vm(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     id: Result<Path<u64>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
     let Path(id) = id?;
-    state.hypervisor.start(VmId(id))?;
+    let vm_id = VmId(id);
+    state.ownership.require_vm_access(vm_id, &org)?;
+    state.hypervisor.start(vm_id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn stop_vm(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     id: Result<Path<u64>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
     let Path(id) = id?;
-    state.hypervisor.stop(VmId(id))?;
+    let vm_id = VmId(id);
+    state.ownership.require_vm_access(vm_id, &org)?;
+    state.hypervisor.stop(vm_id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn destroy_vm(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     id: Result<Path<u64>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
     let Path(id) = id?;
-    state.hypervisor.destroy(VmId(id))?;
+    let vm_id = VmId(id);
+    state.ownership.require_vm_access(vm_id, &org)?;
+    state.hypervisor.destroy(vm_id)?;
+    state.ownership.forget_vm(vm_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn snapshot_vm(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     id: Result<Path<u64>, PathRejection>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<SnapshotDto>), ApiError> {
     let Path(id) = id?;
+    let vm_id = VmId(id);
+    state.ownership.require_vm_access(vm_id, &org)?;
     // Body is optional. Empty (legacy callers) → default request.
     // Otherwise must parse as SnapshotRequest JSON, mirroring the
     // BadJson envelope shape used by the rest of the API.
@@ -394,7 +438,8 @@ async fn snapshot_vm(
         serde_json::from_slice::<SnapshotRequest>(&body)
             .map_err(|e| ApiError::Bad(format!("snapshot body: {e}")))?
     };
-    let snap = state.hypervisor.snapshot(VmId(id))?;
+    let snap = state.hypervisor.snapshot(vm_id)?;
+    state.ownership.record_snapshot(snap, org);
     let mut dto: SnapshotDto = snap.into();
     if let Some(dir) = req.to_dir {
         // Pull the captured geometry from the backend, render it as a
@@ -419,10 +464,14 @@ async fn snapshot_vm(
 
 async fn restore_snapshot(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     id: Result<Path<u64>, PathRejection>,
 ) -> Result<(StatusCode, Json<VmHandleDto>), ApiError> {
     let Path(id) = id?;
-    let handle = state.hypervisor.restore(SnapshotId(id))?;
+    let snap_id = SnapshotId(id);
+    state.ownership.require_snapshot_access(snap_id, &org)?;
+    let handle = state.hypervisor.restore(snap_id)?;
+    state.ownership.record_vm(handle.id, org);
     Ok((StatusCode::CREATED, Json(handle.into())))
 }
 
@@ -433,10 +482,13 @@ async fn restore_snapshot(
 /// fork; only the usage counter is skipped.
 async fn fork_snapshot(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     id: Result<Path<u64>, PathRejection>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<ForkResponseDto>), ApiError> {
     let Path(id) = id?;
+    let snap_id = SnapshotId(id);
+    state.ownership.require_snapshot_access(snap_id, &org)?;
     let bearer = extract_bearer(&headers);
     // Gate before doing any work — quota exhaustion is the common bad-day
     // signal, so it should be cheap to surface.
@@ -456,13 +508,14 @@ async fn fork_snapshot(
     // Try the warm pool first — sub-millisecond pop when populated.
     // Disabled / empty pool falls straight through to the cold path,
     // which preserves prior behaviour for callers that never opted in.
-    let handle = if let Some(h) = state.warm_pool.take(SnapshotId(id)) {
+    let handle = if let Some(h) = state.warm_pool.take(snap_id) {
         state.metrics.record_warm_hit();
         h
     } else {
         state.metrics.record_warm_miss();
-        state.hypervisor.restore(SnapshotId(id))?
+        state.hypervisor.restore(snap_id)?
     };
+    state.ownership.record_vm(handle.id, org);
     let fork_ms = started.elapsed().as_millis() as u64;
 
     let mut fork_count = 1u64;
@@ -555,6 +608,7 @@ pub(crate) fn token_fingerprint(token: &str) -> String {
 
 async fn list_snapshots(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<SnapshotListResponse>, ApiError> {
     let limit = query.validated_limit()?;
@@ -562,8 +616,10 @@ async fn list_snapshots(
 
     // Same filter-then-enrich shape as `list_vms`: snapshot_meta() can
     // be expensive (file-system reads for the KVM backend), so only
-    // call it for rows we actually return.
+    // call it for rows we actually return. Org filter applies upstream
+    // so we never enrich a row we'd then drop.
     let mut ids = state.hypervisor.list_snapshots()?;
+    ids.retain(|s| state.ownership.snapshot_owner(*s) == org);
     ids.sort_by_key(|s| s.0);
     let mut filtered: Vec<_> = ids.into_iter().filter(|s| s.0 > after).collect();
     let has_more = filtered.len() > limit as usize;
@@ -597,48 +653,61 @@ async fn list_snapshots(
 
 async fn delete_snapshot(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     id: Result<Path<u64>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
     let Path(id) = id?;
+    let snap_id = SnapshotId(id);
+    state.ownership.require_snapshot_access(snap_id, &org)?;
     // Drain warm children FIRST so their parent doesn't disappear out
     // from under them. Drain is idempotent — safe even if the snapshot
     // turns out to be unknown to the hypervisor.
-    state.warm_pool.drain(SnapshotId(id));
-    state.hypervisor.delete_snapshot(SnapshotId(id))?;
+    state.warm_pool.drain(snap_id);
+    state.hypervisor.delete_snapshot(snap_id)?;
+    state.ownership.forget_snapshot(snap_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn exec_vm(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     id: Result<Path<u64>, PathRejection>,
     body: Result<Json<ExecRequest>, JsonRejection>,
 ) -> Result<Json<ExecResponse>, ApiError> {
     let Path(id) = id?;
+    let vm_id = VmId(id);
+    state.ownership.require_vm_access(vm_id, &org)?;
     let Json(req) = body?;
-    let result = state.hypervisor.exec_in_guest(VmId(id), req.into())?;
+    let result = state.hypervisor.exec_in_guest(vm_id, req.into())?;
     Ok(Json(result.into()))
 }
 
 async fn write_file(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     id: Result<Path<u64>, PathRejection>,
     body: Result<Json<FileWriteRequest>, JsonRejection>,
 ) -> Result<Json<FileWrittenResponse>, ApiError> {
     let Path(id) = id?;
+    let vm_id = VmId(id);
+    state.ownership.require_vm_access(vm_id, &org)?;
     let Json(req) = body?;
     let bytes = state
         .hypervisor
-        .write_file(VmId(id), req.path, req.content, req.mode)?;
+        .write_file(vm_id, req.path, req.content, req.mode)?;
     Ok(Json(FileWrittenResponse { bytes }))
 }
 
 async fn read_file(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     id: Result<Path<u64>, PathRejection>,
     query: Result<Query<FilePathQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<FileReadResponse>, ApiError> {
     let Path(id) = id?;
+    let vm_id = VmId(id);
+    state.ownership.require_vm_access(vm_id, &org)?;
     let Query(q) = query.map_err(|e| ApiError::Bad(e.to_string()))?;
-    let content = state.hypervisor.read_file(VmId(id), q.path)?;
+    let content = state.hypervisor.read_file(vm_id, q.path)?;
     Ok(Json(FileReadResponse { content }))
 }

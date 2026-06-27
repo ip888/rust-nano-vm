@@ -34,6 +34,16 @@ pub(crate) enum ApiError {
     /// The request lacked a valid bearer token. The `String` is the reason
     /// (surfaced to the client in `message`).
     Unauthorized(String),
+    /// The caller authenticated successfully but is forbidden from
+    /// touching the addressed resource. Used for cross-org access on
+    /// VMs / snapshots / etc. Renders as 403 with a caller-supplied
+    /// stable code.
+    Forbidden {
+        /// Stable machine-readable code (e.g. `"cross_org"`).
+        code: &'static str,
+        /// Human-readable detail surfaced to the client.
+        message: String,
+    },
     /// The server is misconfigured in a way the client can't fix (e.g. a
     /// required `axum::Extension` was not installed at startup). Surfaced as
     /// 500 with code "internal" — the message is intended for the operator
@@ -147,6 +157,7 @@ impl IntoResponse for ApiError {
             ApiError::BadJson(rej) => (rej.status(), "bad_request", rej.body_text()),
             ApiError::BadPath(rej) => (rej.status(), "bad_request", rej.body_text()),
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "unauthorized", msg),
+            ApiError::Forbidden { code, message } => (StatusCode::FORBIDDEN, code, message),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", msg.into()),
             ApiError::InternalDyn(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", msg),
             ApiError::Bad(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg),
