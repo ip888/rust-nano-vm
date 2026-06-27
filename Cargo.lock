@@ -1724,6 +1724,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanovm-jailer"
+version = "0.0.3"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vmm-ipc",
+]
+
+[[package]]
 name = "nanovm-mcp"
 version = "0.0.3"
 dependencies = [

@@ -1,0 +1,38 @@
+[package]
+name = "nanovm-jailer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Per-VM jailer for rust-nano-vm. Creates a fresh cgroup v2 child with per-VM memory.max + cpu.max, attaches itself, then execve()s into nanovm-vmm-child. PR-3 of the per-VM cgroup isolation arc."
+keywords = ["microvm", "jailer", "cgroups", "isolation", "rust-nano-vm"]
+categories = ["virtualization", "command-line-utilities"]
+readme = "README.md"
+
+[[bin]]
+name = "nanovm-jailer"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Only Unix has CommandExt::exec; the rest of this crate stays
+# portable for unit-test compilation on other hosts, but the binary
+# is Linux-only in practice.
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["io-util", "net", "process", "macros", "rt-multi-thread", "time"] }
+vmm-ipc.workspace = true
+
+[lints]
+workspace = true
