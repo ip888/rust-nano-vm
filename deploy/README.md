@@ -139,6 +139,8 @@ systemd unit for the same: `deploy/systemd/nanovm.service` (TODO follow-up).
 
 The Helm chart defaults to the KVM image; switch the `image.repository` to the plain repository if you want the mock backend in cluster (useful for staging clusters without `/dev/kvm`).
 
+## Honest non-features
+
 - **No auto-scaling.** The control plane is stateful (VM ids, snapshot ids, ownership map are all in-memory today). A multi-replica deployment is HA-blast-radius only — pin clients to one replica via session affinity if you need stable ids.
 - **No persistence.** Snapshots live on disk until you set `NANOVM_SNAPSHOT_STORE=s3://...` to push to a durable store. Per-org ownership is in-memory — a restart resets the binding (every resource falls back to `OrgId::default_org()`). A SQLite backing for ownership lands in a follow-up PR.
 - **No cross-region replication.** S3 snapshot store enables cross-region restore, but the control plane itself is single-region per deployment.
