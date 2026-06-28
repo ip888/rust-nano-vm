@@ -144,3 +144,54 @@ The Helm chart defaults to the KVM image; switch the `image.repository` to the p
 - **No auto-scaling.** The control plane is stateful (VM ids, snapshot ids, ownership map are all in-memory today). A multi-replica deployment is HA-blast-radius only — pin clients to one replica via session affinity if you need stable ids.
 - **No persistence.** Snapshots live on disk until you set `NANOVM_SNAPSHOT_STORE=s3://...` to push to a durable store. Per-org ownership is in-memory — a restart resets the binding (every resource falls back to `OrgId::default_org()`). A SQLite backing for ownership lands in a follow-up PR.
 - **No cross-region replication.** S3 snapshot store enables cross-region restore, but the control plane itself is single-region per deployment.
+
+## Observability
+
+`/metrics` is exposed unauthenticated by design (matches the
+Prometheus exporter convention). Either keep the listener on a private
+network OR add a reverse-proxy ACL. The chart's optional
+`serviceMonitor.enabled=true` flips on Prometheus Operator scraping.
+
+### Logs
+
+Set `NANOVM_LOG_FORMAT=json` on every reachable deployment. The binary
+then emits newline-delimited JSON tracing events that drop straight
+into Loki / Datadog / CloudWatch / OpenSearch without a regex parser
+in between. Levels are still controlled by `RUST_LOG` (default
+`info`).
+
+### Prometheus + Grafana
+
+Drop-in configs live under `deploy/prometheus/` and `deploy/grafana/`:
+
+| File                                            | Purpose                                       |
+|-------------------------------------------------|-----------------------------------------------|
+| `deploy/prometheus/prometheus-scrape.yaml`      | Static + Kubernetes-SD scrape job for nanovm  |
+| `deploy/prometheus/alerts.yaml`                 | 4 production alerts (down / latency / pool / throttle) |
+| `deploy/grafana/dashboards/nanovm-overview.json`| Operator-facing dashboard with the headline 6 panels |
+
+The Grafana dashboard expects a Prometheus datasource and a `job`
+template variable that defaults to `nanovm`. Import it via Grafana →
+Dashboards → New → Import → upload JSON.
+
+The alerting rules assume a scrape `job_name: nanovm` (matches the
+example scrape config). Rename if yours differs.
+
+### Metrics reference
+
+Series the control plane exposes today:
+
+| Metric                                       | Type    | Labels   | Description                                        |
+|----------------------------------------------|---------|----------|----------------------------------------------------|
+| `nanovm_up`                                  | gauge   | —        | Always `1` while the process is serving.           |
+| `nanovm_forks_total`                         | counter | `token`  | Successful forks. `token` is a non-secret fingerprint. |
+| `nanovm_forks_total_by_org`                  | counter | `org`    | Successful forks bucketed by caller org (PR-A2).   |
+| `nanovm_fork_latency_ms_sum`                 | counter | —        | Sum of per-fork wall-time (ms).                    |
+| `nanovm_fork_latency_ms_count`               | counter | —        | Number of latency observations.                    |
+| `nanovm_fork_latency_ms_sum_by_org`          | counter | `org`    | Per-org fork latency sum (PR-A2).                  |
+| `nanovm_fork_quota_throttled_total`          | counter | `token`  | Forks rejected by per-token quota.                 |
+| `nanovm_fork_quota_throttled_total_by_org`   | counter | `org`    | Per-org throttle counts (PR-A2).                   |
+| `nanovm_warm_pool_hits_total`                | counter | —        | Forks served from the warm pool.                   |
+| `nanovm_warm_pool_misses_total`              | counter | —        | Forks that fell through to a cold restore.         |
+
+Avg fork latency = `rate(sum) / rate(count)`. Hit rate = `hits / (hits + misses)`.

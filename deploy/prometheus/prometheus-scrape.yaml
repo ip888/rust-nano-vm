@@ -1,0 +1,44 @@
+# Example Prometheus scrape config for nanovm-control-plane.
+#
+# Drop this into your existing prometheus.yml under `scrape_configs:`.
+# Adjust the `targets` list (or swap in service discovery — see the
+# Kubernetes section below) for your topology.
+#
+# /metrics is exposed UNAUTHENTICATED so scrapers don't carry secrets.
+# Keep it on a private network or block public ingress at your reverse
+# proxy. Anyone who can reach :8080/metrics can see all label values,
+# including token fingerprints — they're not secret but they ARE PII-ish
+# (they identify which org made which call).
+
+scrape_configs:
+  # ---- Static targets (single host / docker-compose / bare metal) ------
+  - job_name: nanovm
+    metrics_path: /metrics
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - "nanovm.internal:8080"
+
+  # ---- Kubernetes pod discovery (no Operator required) -----------------
+  # If you've installed the Helm chart with `serviceMonitor.enabled=true`
+  # AND you run prometheus-operator, you don't need this block — the
+  # Operator auto-generates a scrape from the ServiceMonitor.
+  #
+  # This config is for "I have plain Prometheus, no Operator." It
+  # discovers pods labeled `app.kubernetes.io/name=nanovm` and scrapes
+  # them on the `http` port.
+  - job_name: nanovm-k8s
+    metrics_path: /metrics
+    scrape_interval: 15s
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+        regex: nanovm
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        regex: http
+        action: keep
+      - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_pod_name]
+        target_label: instance
+        separator: "/"

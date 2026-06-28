@@ -1,0 +1,92 @@
+# Prometheus alerting rules for nanovm-control-plane.
+#
+# Drop this file into `/etc/prometheus/rules.d/` (or load it via your
+# operator-managed `PrometheusRule`). The rules are scoped to a job
+# label of `nanovm` to match the example scrape config; rename if
+# yours differs.
+#
+# Severity convention:
+#   - critical → page on-call. Customer impact in flight.
+#   - warning  → notify slack/ops. Triage during business hours.
+#   - info     → dashboard-only awareness, no notification.
+
+groups:
+  - name: nanovm-control-plane
+    rules:
+      # ---- Process liveness ---------------------------------------------
+      - alert: NanovmControlPlaneDown
+        expr: max(nanovm_up{job="nanovm"}) == 0 or absent(nanovm_up{job="nanovm"})
+        for: 1m
+        labels:
+          severity: critical
+          service: nanovm
+        annotations:
+          summary: "nanovm-control-plane is down"
+          description: |
+            The control plane has not exposed a successful scrape for
+            at least 1 minute. Customers are unable to create or fork
+            VMs. Check pod status, recent deploys, and resource limits.
+          runbook: "https://github.com/ip888/rust-nano-vm/blob/main/deploy/README.md"
+
+      # ---- Latency drift ------------------------------------------------
+      - alert: NanovmForkLatencyHigh
+        # Avg fork latency over the last 5m is sustained > 100 ms.
+        # Warm-pool floor is sub-millisecond; cold-restore floor is
+        # ~50 ms on KVM. 100 ms sustained means the pool is empty AND
+        # cold restores are getting slow — usually IO contention or a
+        # rootfs blob that's grown.
+        expr: |
+          rate(nanovm_fork_latency_ms_sum{job="nanovm"}[5m])
+          / clamp_min(rate(nanovm_fork_latency_ms_count{job="nanovm"}[5m]), 1)
+          > 100
+        for: 10m
+        labels:
+          severity: warning
+          service: nanovm
+        annotations:
+          summary: "fork latency sustained > 100ms"
+          description: |
+            Avg fork latency over the last 5m is above 100 ms for the
+            last 10 minutes. Usually means the warm pool is empty.
+            Check NANOVM_WARM_POOL_PER_SNAPSHOT and disk IO.
+
+      # ---- Warm pool starvation -----------------------------------------
+      - alert: NanovmWarmPoolStarved
+        # Hit rate below 50% over 10m — pool can't keep up with demand.
+        expr: |
+          (
+            rate(nanovm_warm_pool_hits_total{job="nanovm"}[10m])
+            /
+            clamp_min(
+              rate(nanovm_warm_pool_hits_total{job="nanovm"}[10m])
+              + rate(nanovm_warm_pool_misses_total{job="nanovm"}[10m]),
+              1
+            )
+          ) < 0.5
+        for: 10m
+        labels:
+          severity: warning
+          service: nanovm
+        annotations:
+          summary: "warm-pool hit rate below 50%"
+          description: |
+            More than half of forks are taking the cold path for the
+            last 10m. Either bump NANOVM_WARM_POOL_PER_SNAPSHOT or
+            investigate why refill isn't keeping up.
+
+      # ---- Quota throttling ---------------------------------------------
+      - alert: NanovmThrottleSustained
+        # Any non-zero throttle rate for > 15m suggests a real user is
+        # banging on the quota — re-tune NANOVM_FORK_QUOTA_* or upsell.
+        expr: sum(rate(nanovm_fork_quota_throttled_total{job="nanovm"}[5m])) > 0
+        for: 15m
+        labels:
+          severity: info
+          service: nanovm
+        annotations:
+          summary: "fork-quota throttling sustained for 15m"
+          description: |
+            Quota throttling has been non-zero for 15+ minutes.
+            Check which token is being throttled (label `token` on
+            nanovm_fork_quota_throttled_total) and decide whether to
+            raise their plan limits or talk to the customer.
