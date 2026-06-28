@@ -1,0 +1,26 @@
+apiVersion: v2
+name: nanovm
+description: |
+  Helm chart for nanovm-control-plane — the REST API in front of the
+  rust-nano-vm KVM hypervisor backend. Deploys the `kvm`-feature
+  container, wires `/dev/kvm` into the pod, pins to KVM-capable nodes
+  via nodeSelector, and surfaces the `/metrics` endpoint to Prometheus
+  via an optional ServiceMonitor.
+type: application
+# Chart version is decoupled from app version so we can iterate on the
+# chart (e.g. add a new toggle) without bumping the binary's semver.
+version: 0.1.0
+# App version mirrors the `control-plane` crate version published in
+# the workspace. Bump alongside container image tags.
+appVersion: "0.0.3"
+keywords:
+  - microvm
+  - kvm
+  - hypervisor
+  - sandbox
+home: https://github.com/ip888/rust-nano-vm
+sources:
+  - https://github.com/ip888/rust-nano-vm
+maintainers:
+  - name: rust-nano-vm contributors
+    url: https://github.com/ip888/rust-nano-vm

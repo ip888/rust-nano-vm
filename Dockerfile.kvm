@@ -1,0 +1,81 @@
+# syntax=docker/dockerfile:1.6
+#
+# Production-shaped container image for `nanovm-control-plane` built
+# with the `kvm` feature ON — the binary brings up real microVMs through
+# the host's `/dev/kvm` device instead of using the in-memory mock
+# backend.
+#
+# Differences vs. the default `Dockerfile`:
+#
+#   - `cargo build … --features kvm` so the kvm backend is linked in.
+#   - Runtime base is `cc-debian12:debug-nonroot` (still distroless, but
+#     ships busybox-style coreutils for operator triage on a KVM host).
+#   - `NANOVM_BACKEND_LABEL=kvm` so `/v1/health` and Prometheus labels
+#     surface the right backend out of the box.
+#
+# This image NEEDS `/dev/kvm` mounted into the container at runtime;
+# without it the binary still starts but every `create_vm` returns
+# `backend: /dev/kvm not accessible`. The recommended ways to expose it:
+#
+#   - Bare metal / VM with KVM enabled:
+#       docker run --rm -p 8080:8080 \
+#         --device=/dev/kvm \
+#         -e NANOVM_API_TOKENS=dev-token \
+#         ghcr.io/ip888/nanovm-control-plane-kvm:<version>
+#
+#   - Kubernetes: hostPath volume into the pod (see `deploy/helm/nanovm`
+#     for a turnkey chart that does this + nodeSelector pinning).
+#
+#   - AWS Nitro / GCP nested virt: the device shows up as `/dev/kvm`
+#     directly on supported instance families. Same `--device` flag.
+#
+# Build with:
+#   docker build -f Dockerfile.kvm -t nanovm-control-plane-kvm:dev .
+#
+# Published image (set by .github/workflows/docker.yml on tag push):
+#   ghcr.io/ip888/nanovm-control-plane-kvm:<version>
+
+# ---- Stage 1: build with the kvm feature -----------------------------
+FROM rust:1.94.1-bookworm AS builder
+
+WORKDIR /src
+COPY . .
+
+# `--features kvm` pulls in `vm-kvm` and links the KVM backend into the
+# server binary. `--locked` reproduces the workspace's Cargo.lock so
+# tagged builds are bit-identical to the workspace at that point.
+RUN cargo build \
+    --release \
+    --locked \
+    -p control-plane \
+    --features kvm \
+    --bin nanovm-control-plane
+
+# ---- Stage 2: runtime ------------------------------------------------
+# `debug-nonroot` is the same Distroless cc-debian12 base as the mock
+# image but ships busybox-style coreutils (`ls`, `cat`, `ps`, …) for
+# operator triage on a KVM host. Image is ~10 MiB larger than `nonroot`
+# (~32 MiB total) — worth it for the kind of "is this pod actually
+# wired to /dev/kvm" diagnosis that comes up in prod.
+FROM gcr.io/distroless/cc-debian12:debug-nonroot
+
+COPY --from=builder \
+     /src/target/release/nanovm-control-plane \
+     /usr/local/bin/nanovm-control-plane
+
+ENV NANOVM_CONTROL_PLANE_ADDR=0.0.0.0:8080
+# Surface the right backend label on /v1/health + per-metric labels.
+ENV NANOVM_BACKEND_LABEL=kvm
+
+EXPOSE 8080
+
+# Distroless ships uid 65532 (`nonroot`). On Debian-family hosts the
+# `kvm` group is GID 36 — operators must either:
+#   - chmod 0666 /dev/kvm on the host (simple, lower-security)
+#   - run the container with `--group-add=kvm` (matches GID 36) so the
+#     nonroot uid lands in the kvm group, OR
+#   - use the Helm chart which sets `supplementalGroups: [36]` on the
+#     pod's securityContext.
+USER nonroot
+
+ENTRYPOINT ["/usr/local/bin/nanovm-control-plane"]

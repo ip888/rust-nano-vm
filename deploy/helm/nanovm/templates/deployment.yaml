@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "nanovm.fullname" . }}
+  labels:
+    {{- include "nanovm.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "nanovm.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nanovm.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: control-plane
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            {{- range $k, $v := .Values.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            # API tokens are always sourced from a Secret, never inlined.
+            - name: NANOVM_API_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "nanovm.secretName" . }}
+                  key: NANOVM_API_TOKENS
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            # Audit log + any future on-disk state. emptyDir by default;
+            # override to a PVC for durability.
+            - name: state
+              mountPath: /var/lib/nanovm
+            {{- if eq .Values.kvm.mode "hostPath" }}
+            - name: kvm
+              mountPath: {{ .Values.kvm.hostPathTarget }}
+            {{- end }}
+          {{- if eq .Values.kvm.mode "devicePlugin" }}
+          # Device plugin path — the kubelet wires /dev/kvm into the
+          # container automatically when the resource is requested.
+          # No volume mount needed; resources block does the work.
+          {{- /* see resources merge below */ -}}
+          {{- end }}
+      volumes:
+        - name: state
+          emptyDir: {}
+        {{- if eq .Values.kvm.mode "hostPath" }}
+        - name: kvm
+          hostPath:
+            path: {{ .Values.kvm.hostPathSource }}
+            # `CharDevice` so the kubelet validates we're mounting a
+            # character device. Plain File / Directory would silently
+            # accept the wrong path.
+            type: CharDevice
+        {{- end }}

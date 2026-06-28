@@ -1,17 +1,20 @@
 name: docker
 
-# Publish a container image of `nanovm-control-plane` to GitHub
+# Publish container images of `nanovm-control-plane` to GitHub
 # Container Registry on every semver tag push (linux/amd64 only — the
 # job runs on `ubuntu-latest` with no QEMU/buildx-platforms config, so
 # this is a single-arch build). Multi-arch is a follow-up that adds
 # `platforms: linux/amd64,linux/arm64` + a QEMU setup step.
 #
-# The release workflow (release.yml) ships the prebuilt tarballs in
-# parallel; this workflow ships the Docker image at
-# `ghcr.io/ip888/nanovm-control-plane:<tag>`.
+# Ships two images in parallel on every tag:
 #
-# Triggers on the same `v*.*.*` tag pattern as `release.yml` so a
-# single tag push produces both artifacts.
+#   - `ghcr.io/<owner>/nanovm-control-plane`        (mock backend, default Dockerfile)
+#   - `ghcr.io/<owner>/nanovm-control-plane-kvm`    (KVM backend, Dockerfile.kvm)
+#
+# Both are tagged with the same semver (e.g. `0.0.3`, `0.0`, `latest`)
+# so callers picking one or the other only choose the suffix.
+#
+# Triggers on the same `v*.*.*` tag pattern as `release.yml`.
 
 on:
   push:
@@ -23,11 +26,24 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/nanovm-control-plane
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    strategy:
+      # We want both images to publish even if one fails so a hotfix
+      # doesn't drag the whole release down.
+      fail-fast: false
+      matrix:
+        include:
+          # Default mock-backend image.
+          - image: nanovm-control-plane
+            dockerfile: ./Dockerfile
+            cache_scope: mock
+          # KVM-feature image — pulls in vm-kvm + seccomp deny-list.
+          - image: nanovm-control-plane-kvm
+            dockerfile: ./Dockerfile.kvm
+            cache_scope: kvm
     steps:
       - uses: actions/checkout@v4
 
@@ -49,7 +65,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -59,11 +75,12 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # GHA-backed registry cache so repeated tag pushes don't
-          # rebuild the entire workspace from scratch.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Per-image GHA cache scope so the mock and KVM builds don't
+          # invalidate each other on every tag (their builder layers
+          # differ at `cargo build --features kvm`).
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,scope=${{ matrix.cache_scope }},mode=max

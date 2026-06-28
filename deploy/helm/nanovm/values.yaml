@@ -1,0 +1,159 @@
+# Default values for nanovm-control-plane.
+#
+# The chart ships ready to deploy on a Kubernetes cluster whose nodes
+# expose `/dev/kvm` at the host path. The minimum knob you typically
+# need to override is `apiTokens` (or `existingSecret`); everything
+# else has a sensible production default.
+
+# -- Image registry / tag. Override to pin a specific release.
+image:
+  repository: ghcr.io/ip888/nanovm-control-plane-kvm
+  tag: "0.0.3"
+  pullPolicy: IfNotPresent
+
+# -- Optional registry pull secret(s) for private images.
+imagePullSecrets: []
+
+# -- Number of replicas. Runtime-issued API keys (POST /v1/keys) are
+#    currently per-replica in-memory, so >1 replica needs a sticky
+#    load balancer or a shared token store (planned follow-up).
+replicaCount: 1
+
+# -- nanovm-control-plane env vars. Same shape as the binary expects.
+env:
+  # -- Bind addr inside the pod. Don't change unless the readiness
+  #    probe / Service port is changed alongside.
+  NANOVM_CONTROL_PLANE_ADDR: "0.0.0.0:8080"
+  # -- Self-identification on /v1/health and Prometheus labels.
+  NANOVM_BACKEND_LABEL: "kvm"
+  # -- Audit log path inside the container. The chart mounts an
+  #    emptyDir at /var/lib/nanovm; override to a PVC for durability.
+  NANOVM_AUDIT_LOG: "/var/lib/nanovm/audit.jsonl"
+
+# -- Bearer tokens. Format: `org_id:token` (multi-tenant) or bare
+#    `token` (single-tenant, lands in the `default` org). Comma-
+#    separated, same as NANOVM_API_TOKENS for the binary. Leaving
+#    this empty enables auth-off mode — DO NOT do that for any
+#    reachable deployment.
+apiTokens: ""
+
+# -- Name of a pre-existing Secret containing the `NANOVM_API_TOKENS`
+#    key. If set, `apiTokens` above is ignored and the chart's own
+#    Secret is not created. Use this when tokens are managed by an
+#    external tool (sealed-secrets, External Secrets Operator, …).
+existingSecret: ""
+
+# -- How /dev/kvm reaches the pod. Two modes:
+#
+#    `hostPath` — the simplest path. The pod mounts the host's
+#    `/dev/kvm` directly. Requires `privileged: true` OR matching the
+#    host's `kvm` group via supplementalGroups (the default below).
+#
+#    `devicePlugin` — relies on a kubelet device plugin (e.g.
+#    smarter-device-manager, k8s-device-plugin/kvm) that advertises
+#    `devices.kubevirt.io/kvm`. No hostPath, no privileged. Pick this
+#    if your platform already runs one of those plugins.
+kvm:
+  mode: hostPath
+  hostPathSource: /dev/kvm
+  hostPathTarget: /dev/kvm
+  # Resource name when `mode: devicePlugin`. Pinned to the kubevirt
+  # plugin's name by default — override for other plugin variants.
+  resourceName: devices.kubevirt.io/kvm
+
+# -- Pin pods to nodes that actually have KVM. Operators are expected
+#    to label KVM-capable nodes themselves (e.g. via cloud-init or a
+#    DaemonSet); the chart just adds the selector. Empty disables.
+nodeSelector:
+  nanovm.io/kvm: "true"
+
+# -- Toleration list. Useful if KVM-capable nodes are tainted.
+tolerations: []
+
+# -- Pod affinity / anti-affinity rules. Empty = no constraints.
+affinity: {}
+
+# -- Pod-level security context. The chart's defaults run the
+#    container as the `nonroot` uid baked into the distroless image
+#    and joins the host's `kvm` group (GID 36 on Debian-family hosts —
+#    the GID that owns `/dev/kvm` when `hostPath` mode is used).
+#    Privileged is OFF; we only need the supplementalGroup, not the
+#    whole privileged escalation.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  # /dev/kvm on Debian is `crw-rw----  root kvm`; joining GID 36
+  # is enough to talk to it without privileged mode.
+  supplementalGroups:
+    - 36
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container-level security context.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# -- Resource requests / limits. The defaults assume a moderate
+#    fan-out (low hundreds of concurrent VMs). Scale up for higher
+#    concurrency; KVM memory dominates the request.
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: 2
+    memory: 4Gi
+
+# -- Liveness / readiness probes hit the unauthenticated `/healthz`
+#    endpoint so probes don't carry secrets. Tune timing for slow
+#    boots if you wire a large warm pool.
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 2
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 3
+  periodSeconds: 5
+  timeoutSeconds: 2
+
+# -- Service in front of the pods.
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+# -- Optional Ingress. Disabled by default — most operators terminate
+#    TLS at a service mesh or a separate L7 gateway. Enable + tweak
+#    host / className / annotations to expose externally.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: nanovm.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# -- Prometheus Operator ServiceMonitor. Off by default so the chart
+#    works on clusters without the Prometheus CRDs installed. Turn on
+#    to have the operator scrape `/metrics` automatically.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
