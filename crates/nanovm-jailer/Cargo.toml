@@ -24,15 +24,13 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-[target.'cfg(unix)'.dependencies]
-# Only Unix has CommandExt::exec; the rest of this crate stays
-# portable for unit-test compilation on other hosts, but the binary
-# is Linux-only in practice.
+# No `[target.'cfg(unix)'.dependencies]` block — `CommandExt::exec`
+# is in libstd, no extra crate needed. The library half stays
+# portable for unit-test compilation on non-Unix dev hosts via a
+# `cfg(unix)` gate on the exec call site in `src/lib.rs`.
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { workspace = true, features = ["io-util", "net", "process", "macros", "rt-multi-thread", "time"] }
-vmm-ipc.workspace = true
 
 [lints]
 workspace = true

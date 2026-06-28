@@ -146,18 +146,38 @@ fn parse_own_cgroup_line(proc_self_cgroup: &str) -> Result<String, JailerError> 
 }
 
 /// Compute the child cgroup directory we'll create for this VM.
-/// Returns `<CGROUP_ROOT>/<parent>/nanovm-vm-<vm_id>` — joining
-/// the parent under the unified-hierarchy mount point and
-/// suffixing the VM id.
+/// Returns `<absolute parent>/nanovm-vm-<vm_id>`. Accepts either:
+///
+/// - an absolute cgroupfs path (`/sys/fs/cgroup/<own>`) — used verbatim
+/// - a cgroup-relative path (`/user.slice/foo`) — joined under [`CGROUP_ROOT`]
+///
+/// Detecting "already absolute under CGROUP_ROOT" rather than blindly
+/// re-prefixing avoids the `/sys/fs/cgroup/sys/fs/cgroup/...` double-
+/// prefix bug a naive `push(trimmed)` would produce when the caller
+/// has already absolutized the parent (which `apply_isolation_and_exec`
+/// does).
 pub fn child_cgroup_path(parent: &Path, vm_id: u64) -> PathBuf {
-    let mut path = PathBuf::from(CGROUP_ROOT);
+    let base = normalize_parent(parent);
+    base.join(format!("nanovm-vm-{vm_id}"))
+}
+
+/// Treat `parent` as an absolute cgroupfs path if it already lives
+/// under [`CGROUP_ROOT`]; otherwise treat it as a cgroup-relative
+/// path (the shape returned by `/proc/self/cgroup`) and join it
+/// under the unified-hierarchy mount point. Returns the absolute
+/// path either way.
+fn normalize_parent(parent: &Path) -> PathBuf {
+    let cgroup_root = Path::new(CGROUP_ROOT);
+    if parent == cgroup_root || parent.starts_with(cgroup_root) {
+        return parent.to_path_buf();
+    }
     let parent_str = parent.to_string_lossy();
     let trimmed = parent_str.trim_start_matches('/');
-    if !trimmed.is_empty() {
-        path.push(trimmed);
+    if trimmed.is_empty() {
+        cgroup_root.to_path_buf()
+    } else {
+        cgroup_root.join(trimmed)
     }
-    path.push(format!("nanovm-vm-{vm_id}"));
-    path
 }
 
 /// Verify the parent has the listed controllers enabled in its
@@ -219,17 +239,14 @@ pub fn required_controllers(cfg: &JailerConfig) -> Vec<&'static str> {
 /// (the jailer immediately execs), but the canonical Firecracker
 /// order is "cap first, attach last," so we follow it.
 pub fn apply_isolation_and_exec(cfg: JailerConfig) -> Result<Infallible, JailerError> {
+    // Resolve the parent to an absolute cgroupfs path. Two paths:
+    // - `--cgroup-parent /sys/fs/cgroup/foo` → used verbatim.
+    // - `--cgroup-parent /user.slice/foo` (cgroup-relative, the shape
+    //   `/proc/self/cgroup` returns) → joined under CGROUP_ROOT.
+    // - `cgroup_parent` unset → resolve our own cgroup.
     let parent = match &cfg.cgroup_parent {
-        Some(p) => p.clone(),
-        None => {
-            let own = own_cgroup_path()?;
-            let trimmed = own.trim_start_matches('/');
-            let mut p = PathBuf::from(CGROUP_ROOT);
-            if !trimmed.is_empty() {
-                p.push(trimmed);
-            }
-            p
-        }
+        Some(p) => normalize_parent(p),
+        None => normalize_parent(Path::new(&own_cgroup_path()?)),
     };
 
     let needed = required_controllers(&cfg);
@@ -283,8 +300,42 @@ pub fn apply_isolation_and_exec(cfg: JailerConfig) -> Result<Infallible, JailerE
     tracing::debug!("attached self to child cgroup");
 
     // exec into the worker. From here, errors only return on
-    // failure; success replaces the process.
-    exec_into_worker(&cfg)
+    // failure; success replaces the process. If exec fails we'd
+    // otherwise leave the child cgroup (with our PID still
+    // attached) behind, which trips `AlreadyExists` on the next
+    // retry with the same vm_id. Best-effort cleanup: move back
+    // to the parent + rmdir the child. Cleanup failures are logged
+    // but don't shadow the original Exec error.
+    match exec_into_worker(&cfg) {
+        Err(JailerError::Exec { binary, source }) => {
+            cleanup_after_exec_failure(&parent, &child);
+            Err(JailerError::Exec { binary, source })
+        }
+        other => other,
+    }
+}
+
+/// On `exec()` failure, move this process back to `parent`'s
+/// `cgroup.procs` (so we're no longer occupying `child`) and rmdir
+/// the empty child cgroup. Best-effort — every step logs at `warn`
+/// on failure and continues; the original exec error is what the
+/// caller cares about.
+fn cleanup_after_exec_failure(parent: &Path, child: &Path) {
+    let parent_procs = parent.join("cgroup.procs");
+    if let Err(e) = fs::write(&parent_procs, std::process::id().to_string()) {
+        tracing::warn!(
+            path = %parent_procs.display(),
+            error = %e,
+            "exec-cleanup: failed to re-attach self to parent cgroup; child cgroup may not be rmdir-able"
+        );
+    }
+    if let Err(e) = fs::remove_dir(child) {
+        tracing::warn!(
+            path = %child.display(),
+            error = %e,
+            "exec-cleanup: failed to rmdir child cgroup; manual `rmdir` may be needed before retry"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -371,6 +422,23 @@ mod tests {
         // the prefix.
         let p = child_cgroup_path(Path::new("/"), 3);
         assert_eq!(p, PathBuf::from("/sys/fs/cgroup/nanovm-vm-3"));
+    }
+
+    #[test]
+    fn child_cgroup_path_does_not_double_prefix_absolute_cgroupfs_parent() {
+        // Regression: `apply_isolation_and_exec` builds the parent
+        // as `/sys/fs/cgroup/<own>`. If `child_cgroup_path` re-
+        // prefixed CGROUP_ROOT, we'd get
+        // `/sys/fs/cgroup/sys/fs/cgroup/<own>/...` and every cgroup
+        // file write would target a non-existent path.
+        let p = child_cgroup_path(Path::new("/sys/fs/cgroup/user.slice"), 7);
+        assert_eq!(p, PathBuf::from("/sys/fs/cgroup/user.slice/nanovm-vm-7"));
+    }
+
+    #[test]
+    fn child_cgroup_path_handles_cgroup_root_verbatim() {
+        let p = child_cgroup_path(Path::new("/sys/fs/cgroup"), 11);
+        assert_eq!(p, PathBuf::from("/sys/fs/cgroup/nanovm-vm-11"));
     }
 
     #[test]

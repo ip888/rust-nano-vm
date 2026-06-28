@@ -71,6 +71,17 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    // Reject a relative `--vmm-child-binary` up front. The jailer
+    // is intended to run with elevated privileges; accepting a
+    // relative path would let an attacker who controls our cwd
+    // substitute a binary we never intended to run. Same posture
+    // Firecracker's jailer takes.
+    if !args.vmm_child_binary.is_absolute() {
+        anyhow::bail!(
+            "--vmm-child-binary must be an absolute path; got {:?}",
+            args.vmm_child_binary
+        );
+    }
     let cfg = JailerConfig {
         vm_id: args.vm_id,
         memory_limit_mib: args.memory_limit_mib,

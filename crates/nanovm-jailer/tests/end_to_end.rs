@@ -36,21 +36,43 @@ use std::time::Duration;
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// True iff the host has cgroup v2 + memory/cpu delegated + we can
-/// create a child cgroup. Returns the parent path on success.
+/// create a child cgroup. Returns the parent path on success. Every
+/// failing precondition prints exactly one `SKIP:` line so a CI log
+/// reader can see why the test was skipped instead of staring at a
+/// silent green.
 fn host_supports_test() -> Option<PathBuf> {
     if !Path::new(CGROUP_ROOT).is_dir() {
         eprintln!("SKIP: {CGROUP_ROOT} is not a directory");
         return None;
     }
-    let own = fs::read_to_string("/proc/self/cgroup").ok()?;
-    let path = own.lines().find_map(|l| l.strip_prefix("0::"))?.to_owned();
+    let own = match fs::read_to_string("/proc/self/cgroup") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("SKIP: cannot read /proc/self/cgroup: {e}");
+            return None;
+        }
+    };
+    let Some(path) = own
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(|s| s.to_owned())
+    else {
+        eprintln!("SKIP: /proc/self/cgroup has no `0::` line (legacy cgroup v1 host?)");
+        return None;
+    };
     let parent = if path == "/" {
         PathBuf::from(CGROUP_ROOT)
     } else {
         PathBuf::from(CGROUP_ROOT).join(path.trim_start_matches('/'))
     };
     let subtree = parent.join("cgroup.subtree_control");
-    let enabled = fs::read_to_string(&subtree).ok()?;
+    let enabled = match fs::read_to_string(&subtree) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("SKIP: cannot read {}: {e}", subtree.display());
+            return None;
+        }
+    };
     let tokens: Vec<&str> = enabled.split_ascii_whitespace().collect();
     if !tokens.contains(&"memory") || !tokens.contains(&"cpu") {
         eprintln!(
