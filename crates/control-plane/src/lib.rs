@@ -49,6 +49,7 @@ mod auth;
 mod error;
 mod exec_stream;
 pub mod fork_quota;
+mod keys;
 pub mod metrics;
 mod ownership;
 mod request_id;
@@ -61,7 +62,7 @@ pub mod warm_pool;
 
 pub use api::openapi_spec;
 pub use audit::AuditLog;
-pub use auth::{ApiTokens, OrgId};
+pub use auth::{ApiTokens, IssuedToken, OrgId, RuntimeTokenInfo, TokenId};
 pub use fork_quota::ForkQuota;
 pub use metrics::Metrics;
 pub use request_id::RequestId;
