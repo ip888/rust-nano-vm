@@ -74,6 +74,10 @@ spec:
             - name: NANOVM_SNAPSHOT_STORE
               value: {{ .Values.config.snapshotStore | quote }}
             {{- end }}
+            {{- if .Values.config.tokenStorePath }}
+            - name: NANOVM_TOKEN_STORE_PATH
+              value: {{ .Values.config.tokenStorePath | quote }}
+            {{- end }}
           envFrom:
             - secretRef:
                 name: {{ include "nanovm.secretName" . }}

@@ -21,6 +21,11 @@
 //!   `json` for newline-delimited structured logs aimed at log
 //!   aggregators (Loki / Datadog / CloudWatch / OpenSearch). Set to
 //!   `json` on every reachable deployment.
+//! - `NANOVM_TOKEN_STORE_PATH` — path to a JSON file the control plane
+//!   uses to persist runtime-issued API keys (`POST /v1/keys`) across
+//!   restarts. Unset → in-memory only (keys are lost on restart, fine
+//!   for ephemeral dev). Set to a path on persistent storage for any
+//!   production deployment where tenants self-serve their keys.
 
 #![forbid(unsafe_code)]
 
@@ -49,6 +54,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     } else {
         info!(count = tokens.len(), "bearer-token auth enabled");
+    }
+    if let Ok(path) = std::env::var("NANOVM_TOKEN_STORE_PATH") {
+        if !path.is_empty() {
+            info!(path = %path, "runtime token persistence enabled");
+        }
+    } else {
+        info!(
+            "runtime token persistence disabled \
+             (set NANOVM_TOKEN_STORE_PATH=/var/lib/nanovm/tokens.json to enable)"
+        );
     }
 
     let audit = AuditLog::from_env();
