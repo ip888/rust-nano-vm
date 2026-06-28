@@ -203,14 +203,19 @@ if let Ok(map) = self.fork_latency_ms_sum_by_org.lock() {
             "# HELP nanovm_fork_quota_throttled_total_by_org Quota-rejected forks, per org.\n",
         );
         out.push_str("# TYPE nanovm_fork_quota_throttled_total_by_org counter\n");
-        if let Ok(map) = self.throttled_total_by_org.lock() {
-            for (org, n) in sorted_pairs(&map) {
-                let _ = writeln!(
-                    out,
-                    "nanovm_fork_quota_throttled_total_by_org{{org=\"{org}\"}} {n}"
-                );
-            }
-        }
+if let Ok(map) = self.throttled_total_by_org.lock() {
+    for (org, n) in sorted_pairs(&map) {
+        let org = org
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r");
+        let _ = writeln!(
+            out,
+            "nanovm_fork_quota_throttled_total_by_org{{org=\"{org}\"}} {n}"
+        );
+    }
+}
 
         out.push_str("# HELP nanovm_fork_latency_ms_sum Sum of fork wall-time (ms).\n");
         out.push_str("# TYPE nanovm_fork_latency_ms_sum counter\n");
