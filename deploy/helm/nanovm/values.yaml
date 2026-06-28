@@ -112,6 +112,12 @@ config:
   snapshotStore: ""
   # Extra RUST_LOG directives (defaults to "info").
   rustLog: "info"
+  # Where to persist runtime-issued API keys (POST /v1/keys). Empty
+  # → in-memory only (keys lost on restart). Set to a path under a
+  # PVC for production. The chart wires this to the same /var/lib/nanovm
+  # emptyDir as the audit log by default — promote to a PVC if you
+  # want survival across pod recreation.
+  tokenStorePath: "/var/lib/nanovm/tokens.json"
 
 service:
   type: ClusterIP

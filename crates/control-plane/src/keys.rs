@@ -9,9 +9,12 @@
 //! | DELETE | `/v1/keys/:id`    | Revoke a runtime token by its public id.                        |
 //!
 //! Env-loaded tokens are not addressable here — they're operator-managed
-//! out of band via `NANOVM_API_TOKENS`. Runtime tokens live in-memory
-//! only; persistence is a deliberate follow-up so we ship the API
-//! surface first and harden durability separately.
+//! out of band via `NANOVM_API_TOKENS`. Runtime tokens are kept in
+//! memory and (when `NANOVM_TOKEN_STORE_PATH` is set) atomically
+//! snapshotted to a JSON file after every `issue` / `revoke`, so they
+//! survive process restarts. Multi-replica deployments still need a
+//! shared store (the JSON file is per-pod); the persistence shim is
+//! enough for the single-replica case the Helm chart defaults to.
 
 use std::sync::Arc;
 

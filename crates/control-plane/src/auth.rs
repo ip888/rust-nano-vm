@@ -46,7 +46,8 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use axum::{
@@ -146,9 +147,34 @@ struct Store {
 /// Internally guarded by an `RwLock`: the hot path (every authenticated
 /// request) takes a read lock; the cold path (issue / revoke) takes a
 /// write lock.
+///
+/// Persistence: when [`with_persistence`](Self::with_persistence) is
+/// called, runtime-issued tokens are snapshotted to that path after
+/// every `issue` / `revoke`. On startup, [`load_persisted`](
+/// Self::load_persisted) replays the file so single-replica deployments
+/// keep working across restarts. Env-loaded tokens are NOT persisted —
+/// they're operator-managed via `NANOVM_API_TOKENS` and re-loaded on
+/// every startup anyway.
 #[derive(Debug, Default)]
 pub struct ApiTokens {
     store: RwLock<Store>,
+    /// Path of the JSON file backing runtime token persistence. `None`
+    /// → in-memory only (the default; runtime keys are lost on restart).
+    persist_path: Option<PathBuf>,
+}
+
+/// Wire shape of a persisted runtime token. Stored as a JSON array
+/// `[{token, id, org, created_at}]` at the path configured by
+/// `NANOVM_TOKEN_STORE_PATH`. Plaintext on disk is acceptable because
+/// the file lives under the same threat model as `NANOVM_API_TOKENS`
+/// (Helm Secret / Fly secret / mounted Kubernetes Secret) — anyone who
+/// can read the file can already read the env that owns it.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedToken {
+    token: String,
+    id: String,
+    org: String,
+    created_at: String,
 }
 
 /// Public metadata for one runtime-issued token. Returned from
@@ -205,6 +231,7 @@ impl ApiTokens {
         }
         Self {
             store: RwLock::new(store),
+            persist_path: None,
         }
     }
 
@@ -231,13 +258,134 @@ impl ApiTokens {
         }
         Self {
             store: RwLock::new(store),
+            persist_path: None,
         }
     }
 
     /// Build from `NANOVM_API_TOKENS`. Empty / unset → "auth disabled".
+    /// Also reads `NANOVM_TOKEN_STORE_PATH` and, when set, wires the
+    /// persistence shim + replays any previously-issued runtime tokens
+    /// so they survive process restarts.
     pub fn from_env() -> Self {
         let raw = std::env::var("NANOVM_API_TOKENS").unwrap_or_default();
-        Self::from_csv(&raw)
+        let mut tokens = Self::from_csv(&raw);
+        if let Ok(path) = std::env::var("NANOVM_TOKEN_STORE_PATH") {
+            if !path.is_empty() {
+                tokens = tokens.with_persistence(PathBuf::from(path));
+            }
+        }
+        tokens
+    }
+
+    /// Enable disk persistence of runtime-issued tokens at `path`.
+    /// Replays the existing file (if any) into the accept set before
+    /// returning. A missing file is fine (first-run); a malformed file
+    /// is logged at `WARN` and skipped — the deployment stays usable.
+    pub fn with_persistence(mut self, path: PathBuf) -> Self {
+        self.persist_path = Some(path.clone());
+        if let Err(err) = self.load_persisted(&path) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to load persisted runtime tokens; continuing with env tokens only"
+            );
+        }
+        self
+    }
+
+    /// Replay the persistence file into the accept set. Treats a
+    /// missing file as "no tokens yet" — only IO / JSON errors bubble
+    /// up. Idempotent: re-loading the same file is a no-op.
+    fn load_persisted(&self, path: &Path) -> std::io::Result<()> {
+        let mut file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let mut buf = String::new();
+        file.read_to_string(&mut buf)?;
+        if buf.trim().is_empty() {
+            return Ok(());
+        }
+        let entries: Vec<PersistedToken> = serde_json::from_str(&buf).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("token store JSON: {e}"),
+            )
+        })?;
+        let mut store = self.store.write().expect("api tokens lock");
+        let mut loaded = 0usize;
+        for p in entries {
+            if p.token.is_empty() || p.id.is_empty() {
+                continue;
+            }
+            let id = TokenId(p.id);
+            store.by_token.insert(
+                p.token.clone(),
+                TokenEntry {
+                    org: OrgId(p.org),
+                    source: TokenSource::Runtime {
+                        id: id.clone(),
+                        created_at: p.created_at,
+                    },
+                },
+            );
+            store.id_to_token.insert(id, p.token);
+            loaded += 1;
+        }
+        if loaded > 0 {
+            tracing::info!(
+                count = loaded,
+                path = %path.display(),
+                "replayed runtime tokens from persistence file"
+            );
+        }
+        Ok(())
+    }
+
+    /// Snapshot the runtime token set to the persistence file. Writes
+    /// to a sibling `*.tmp` first and `rename`s into place so a crash
+    /// mid-write doesn't corrupt the file an operator can read.
+    /// Best-effort: errors are logged at `WARN` (the in-memory state
+    /// is still authoritative for the running process).
+    fn persist(&self, store: &Store) {
+        let Some(path) = self.persist_path.as_ref() else {
+            return;
+        };
+        let entries: Vec<PersistedToken> = store
+            .by_token
+            .iter()
+            .filter_map(|(token, entry)| match &entry.source {
+                TokenSource::Runtime { id, created_at } => Some(PersistedToken {
+                    token: token.clone(),
+                    id: id.0.clone(),
+                    org: entry.org.0.clone(),
+                    created_at: created_at.clone(),
+                }),
+                TokenSource::Env => None,
+            })
+            .collect();
+        let payload = match serde_json::to_vec_pretty(&entries) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "serialize runtime tokens");
+                return;
+            }
+        };
+        let tmp = path.with_extension("tmp");
+        let write = (|| -> std::io::Result<()> {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&payload)?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, path)
+        })();
+        if let Err(e) = write {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "persist runtime tokens to disk"
+            );
+        }
     }
 
     /// Parse a comma-separated list of `org_id:token` entries, with a
@@ -281,6 +429,7 @@ impl ApiTokens {
         }
         Self {
             store: RwLock::new(store),
+            persist_path: None,
         }
     }
 
@@ -341,6 +490,7 @@ impl ApiTokens {
             },
         );
         store.id_to_token.insert(id.clone(), token.clone());
+        self.persist(&store);
         IssuedToken {
             token,
             id,
@@ -371,6 +521,7 @@ impl ApiTokens {
         }
         store.by_token.remove(&token);
         store.id_to_token.remove(id);
+        self.persist(&store);
         true
     }
 
@@ -612,5 +763,92 @@ mod tests {
         let fake = TokenId("nvk_imaginary".into());
         assert!(!t.revoke(&fake, &OrgId::new("acme")));
         assert!(t.accepts("env-tok"));
+    }
+
+    #[test]
+    fn persistence_roundtrip_replays_runtime_tokens() {
+        // First ApiTokens instance issues; second loads from disk and
+        // sees the same tokens. Models a process restart with
+        // NANOVM_TOKEN_STORE_PATH set.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+
+        let acme = OrgId::new("acme");
+        let issued = {
+            let t = ApiTokens::from_csv("").with_persistence(path.clone());
+            let a = t.issue(acme.clone());
+            let _ = t.issue(OrgId::new("globex"));
+            a
+        };
+        // File exists and is non-empty.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(&issued.token));
+        assert!(raw.contains(issued.id.as_str()));
+
+        // Fresh instance loads the file.
+        let restored = ApiTokens::from_csv("").with_persistence(path.clone());
+        assert_eq!(restored.org_for(&issued.token), Some(acme.clone()));
+        assert_eq!(restored.list_runtime(&acme).len(), 1);
+        assert_eq!(restored.list_runtime(&OrgId::new("globex")).len(), 1);
+    }
+
+    #[test]
+    fn persistence_revoke_persists_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        let acme = OrgId::new("acme");
+
+        let id = {
+            let t = ApiTokens::from_csv("").with_persistence(path.clone());
+            let a = t.issue(acme.clone());
+            assert!(t.revoke(&a.id, &acme));
+            a.id
+        };
+
+        // After revoke the token no longer exists on disk.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains(id.as_str()));
+
+        // A fresh instance loading the file sees no runtime tokens.
+        let restored = ApiTokens::from_csv("").with_persistence(path);
+        assert!(restored.list_runtime(&acme).is_empty());
+    }
+
+    #[test]
+    fn persistence_missing_file_is_not_an_error() {
+        // First-run case: path doesn't exist yet. with_persistence
+        // should not panic; the accept set stays as whatever was
+        // already there from env.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        let t = ApiTokens::from_csv("acme:env-tok").with_persistence(path);
+        assert!(t.accepts("env-tok"));
+    }
+
+    #[test]
+    fn persistence_malformed_file_logs_warn_and_continues() {
+        // A corrupted JSON file shouldn't take down startup. The env
+        // tokens stay usable; the bad runtime file is simply ignored.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        std::fs::write(&path, "{ not valid json").unwrap();
+        let t = ApiTokens::from_csv("acme:env-tok").with_persistence(path);
+        assert!(t.accepts("env-tok"));
+    }
+
+    #[test]
+    fn persistence_does_not_write_env_tokens() {
+        // Env-loaded tokens must NOT end up in the persistence file —
+        // operator-managed lifecycle.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        let t = ApiTokens::from_csv("acme:env-tok").with_persistence(path.clone());
+        // No runtime tokens yet → no file written either (issue/revoke
+        // are the only writers; env tokens skip persist).
+        // After a runtime issue, the file should contain ONLY the
+        // runtime entry, not env-tok.
+        let _ = t.issue(OrgId::new("acme"));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("env-tok"));
     }
 }
