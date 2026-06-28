@@ -1,3 +1,12 @@
+{{/*
+Guard: kvm.enabled (hostPath /dev/kvm) and kvm.devicePluginRequest
+(kubelet device-plugin resource) are mutually exclusive shapes. Fail
+fast at render time if both are set so the operator doesn't get a
+confused running pod.
+*/}}
+{{- if and .Values.kvm.enabled (gt (int .Values.kvm.devicePluginRequest) 0) -}}
+{{- fail "kvm.enabled and kvm.devicePluginRequest are mutually exclusive — pick exactly one" -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -67,7 +76,7 @@ spec:
             {{- end }}
           envFrom:
             - secretRef:
-                name: {{ include "nanovm.fullname" . }}-tokens
+                name: {{ include "nanovm.secretName" . }}
           {{- $resources := deepCopy .Values.resources }}
           {{- if gt (int .Values.kvm.devicePluginRequest) 0 }}
           {{- $kvmReq := int .Values.kvm.devicePluginRequest }}

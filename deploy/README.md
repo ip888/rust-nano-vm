@@ -49,19 +49,35 @@ podSecurityContext:
 
 ### Install
 
+The chart **requires** either `config.apiTokens` or `tokensSecret.existingSecret` to be set — it won't render an auth-disabled deployment by default. Two shapes:
+
 ```sh
+# Inline tokens (fine for dev / first-boot).
 helm install nanovm ./deploy/helm/nanovm \
   --namespace nanovm --create-namespace \
   --set config.apiTokens="acme:$(openssl rand -hex 24),globex:$(openssl rand -hex 24)"
+
+# Bring-your-own Secret (recommended for prod: managed by sealed-secrets / ExternalSecrets / Vault).
+kubectl -n nanovm create secret generic nanovm-tokens \
+  --from-literal=NANOVM_API_TOKENS="acme:$(openssl rand -hex 24)"
+helm install nanovm ./deploy/helm/nanovm \
+  --namespace nanovm --create-namespace \
+  --set tokensSecret.existingSecret=nanovm-tokens
 ```
+
+To deliberately run auth-off on a throwaway cluster, set `config.apiTokens=NONE` (literal string).
 
 Production overrides worth setting:
 
 ```yaml
 image:
   tag: "0.0.3"  # pin to a released version, never `latest`
+
+# Tokens managed out-of-band — chart doesn't render its own Secret.
+tokensSecret:
+  existingSecret: nanovm-tokens
+
 config:
-  apiTokens: ""           # leave empty; set via SealedSecret / external-secrets
   forkQuotaPerSec: 50
   warmPoolPerSnapshot: 8
   snapshotStore: "s3://acme-nanovm-snapshots/prod"
