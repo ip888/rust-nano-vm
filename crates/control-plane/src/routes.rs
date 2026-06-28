@@ -267,6 +267,8 @@ pub fn router() -> Router<AppState> {
         )
         .route("/usage", get(usage))
         .route("/usage/by-org", get(usage_by_org))
+        .route("/keys", get(crate::keys::list_keys).post(crate::keys::issue_key))
+        .route("/keys/:id", axum::routing::delete(crate::keys::revoke_key))
         .route("/health", get(health))
         // route_layer is bottom-up: the LAST `.route_layer` runs FIRST.
         // require_audit must see *authenticated* calls only, so register

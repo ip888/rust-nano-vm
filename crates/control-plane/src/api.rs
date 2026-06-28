@@ -680,6 +680,48 @@ pub fn openapi_spec() -> Value {
                     }
                 }
             },
+            "/v1/keys": {
+                "get": {
+                    "summary": "List the caller org's runtime API keys",
+                    "description": "Returns metadata for every runtime-issued token owned by the caller's org. Plaintext bearers are never returned; the response only carries the public `id` (used to revoke) and `created_at`. Env-loaded bootstrap tokens are not listed here.",
+                    "responses": {
+                        "200": {
+                            "description": "Keys belonging to the caller's org",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/ListKeysResponse" } }
+                            }
+                        }
+                    }
+                },
+                "post": {
+                    "summary": "Issue a new runtime API key for the caller's org",
+                    "description": "Mints a fresh bearer token bound to the caller's org. The plaintext `token` is returned ONCE on creation and never again — clients MUST persist it. The token authenticates immediately against the same control plane.",
+                    "responses": {
+                        "201": {
+                            "description": "New bearer token plus public id",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/IssueKeyResponse" } }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/keys/{id}": {
+                "delete": {
+                    "summary": "Revoke a runtime API key",
+                    "description": "Revokes a runtime-issued token by its public id. Subsequent requests carrying the revoked token are rejected. Returns 404 if the id is unknown OR belongs to a different org (the API does not distinguish, to avoid leaking other orgs' id space).",
+                    "parameters": [{
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string" }
+                    }],
+                    "responses": {
+                        "204": { "description": "Key revoked" },
+                        "404": { "description": "Key id not found or not owned by caller" }
+                    }
+                }
+            },
             "/v1/health": {
                 "get": {
                     "summary": "Structured health detail (backend, version, uptime)",
@@ -928,6 +970,47 @@ pub fn openapi_spec() -> Value {
                         "token": { "type": "string" },
                         "fork_count": { "type": "integer", "minimum": 0 },
                         "fork_total_ms": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "IssueKeyResponse": {
+                    "type": "object",
+                    "required": ["token", "id", "org", "created_at"],
+                    "properties": {
+                        "token": {
+                            "type": "string",
+                            "description": "Bearer token. Shown ONCE on creation and never again — persist client-side.",
+                            "example": "nv_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                        },
+                        "id": {
+                            "type": "string",
+                            "description": "Public identifier. Safe to log; used to revoke via DELETE /v1/keys/{id}.",
+                            "example": "nvk_AAAAAAAAAAAAAAAAAAAAAA"
+                        },
+                        "org": { "type": "string" },
+                        "created_at": {
+                            "type": "string",
+                            "description": "RFC 3339 issue time",
+                            "example": "2026-06-28T00:00:00.000Z"
+                        }
+                    }
+                },
+                "ListKeysResponse": {
+                    "type": "object",
+                    "required": ["keys"],
+                    "properties": {
+                        "keys": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/KeyEntry" }
+                        }
+                    }
+                },
+                "KeyEntry": {
+                    "type": "object",
+                    "required": ["id", "org", "created_at"],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "org": { "type": "string" },
+                        "created_at": { "type": "string" }
                     }
                 },
                 "HealthResponse": {
