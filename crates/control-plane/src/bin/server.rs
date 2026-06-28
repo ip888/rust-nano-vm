@@ -17,6 +17,10 @@
 //!   `/v1/snapshots/import` return 501.
 //! - `NANOVM_S3_ENDPOINT` — custom S3 endpoint for MinIO / R2 / Wasabi.
 //!   Read by the S3 backend when constructed.
+//! - `NANOVM_LOG_FORMAT` — `text` (default) for human-friendly logs, or
+//!   `json` for newline-delimited structured logs aimed at log
+//!   aggregators (Loki / Datadog / CloudWatch / OpenSearch). Set to
+//!   `json` on every reachable deployment.
 
 #![forbid(unsafe_code)]
 
@@ -31,11 +35,7 @@ use vm_mock::MockHypervisor;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    init_logging();
 
     let addr =
         std::env::var("NANOVM_CONTROL_PLANE_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
@@ -97,6 +97,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Bootstrap tracing. Honours `RUST_LOG` for level filtering (default
+/// `info`) and `NANOVM_LOG_FORMAT` for shape (`text` default, `json` for
+/// aggregator-friendly newline-delimited structured logs). Unknown
+/// format values fall back to text and log a single WARN line so the
+/// operator notices the typo.
+fn init_logging() {
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let format = std::env::var("NANOVM_LOG_FORMAT").unwrap_or_default();
+    match format.as_str() {
+        "json" => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .json()
+                .flatten_event(true)
+                .with_current_span(true)
+                .with_span_list(false)
+                .init();
+        }
+        "" | "text" => {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        }
+        other => {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+            warn!(
+                format = other,
+                "unknown NANOVM_LOG_FORMAT; defaulting to text. \
+                 Valid values: text, json"
+            );
+        }
+    }
 }
 
 async fn shutdown_signal() {
