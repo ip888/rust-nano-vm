@@ -17,6 +17,9 @@ spec:
         # Roll the deployment when the tokens secret changes.
         checksum/tokens-secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
     spec:
+      {{- if and .Values.kvm.enabled (gt (int .Values.kvm.devicePluginRequest) 0) }}
+      {{- fail "Values.kvm.enabled and Values.kvm.devicePluginRequest are mutually exclusive; enable exactly one" }}
+      {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- with .Values.nodeSelector }}
