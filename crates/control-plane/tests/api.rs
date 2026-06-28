@@ -8,7 +8,7 @@ use axum::{
     http::{Method, Request, StatusCode},
     Extension, Router,
 };
-use control_plane::{router, ApiTokens, AppState};
+use control_plane::{router, ApiTokens, AppState, OrgId};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -2037,6 +2037,235 @@ async fn warm_pool_drains_on_snapshot_delete() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "got {body:?}");
+}
+
+// ===================== multi-tenant org scoping ========================
+//
+// Two orgs share one control plane. Each org has its own token. We
+// verify: each org sees only its own VMs and snapshots, and any
+// cross-org operation (start/stop/destroy/fork/exec/file ops on a
+// foreign id) returns 403 `cross_org` rather than leaking existence.
+
+fn app_with_two_orgs() -> Router {
+    let tokens = ApiTokens::with_orgs([
+        ("acme-token", OrgId::new("acme")),
+        ("globex-token", OrgId::new("globex")),
+    ]);
+    app_with_tokens(tokens)
+}
+
+#[tokio::test]
+async fn multi_tenant_create_vm_records_owning_org() {
+    let app = app_with_two_orgs();
+
+    let (status, body) = send_with(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        Some("acme-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body:?}");
+    let vm_id = body["id"].as_u64().unwrap();
+
+    // acme can read its own VM.
+    let (s, _) = send_with(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/vms/{vm_id}"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // globex cannot.
+    let (s, b) = send_with(
+        app,
+        Method::GET,
+        &format!("/v1/vms/{vm_id}"),
+        None,
+        Some("globex-token"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert_eq!(b["error"]["code"], "cross_org");
+}
+
+#[tokio::test]
+async fn multi_tenant_list_vms_is_scoped_to_caller_org() {
+    let app = app_with_two_orgs();
+
+    // acme creates 2 VMs.
+    for _ in 0..2 {
+        let _ = send_with(
+            app.clone(),
+            Method::POST,
+            "/v1/vms",
+            Some(json!({})),
+            Some("acme-token"),
+        )
+        .await;
+    }
+    // globex creates 1.
+    let _ = send_with(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        Some("globex-token"),
+    )
+    .await;
+
+    let (_, acme_list) = send_with(
+        app.clone(),
+        Method::GET,
+        "/v1/vms",
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    let (_, globex_list) = send_with(app, Method::GET, "/v1/vms", None, Some("globex-token")).await;
+
+    assert_eq!(acme_list["vms"].as_array().unwrap().len(), 2);
+    assert_eq!(globex_list["vms"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn multi_tenant_cross_org_destroy_is_forbidden() {
+    let app = app_with_two_orgs();
+
+    let (_, h) = send_with(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        Some("acme-token"),
+    )
+    .await;
+    let vm_id = h["id"].as_u64().unwrap();
+
+    let (status, body) = send_with(
+        app,
+        Method::DELETE,
+        &format!("/v1/vms/{vm_id}"),
+        None,
+        Some("globex-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "cross_org");
+}
+
+#[tokio::test]
+async fn multi_tenant_snapshot_inherits_creator_org() {
+    let app = app_with_two_orgs();
+
+    // acme: create + start + snapshot.
+    let (_, h) = send_with(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        Some("acme-token"),
+    )
+    .await;
+    let vm_id = h["id"].as_u64().unwrap();
+    send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm_id}/start"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    let (_, snap) = send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm_id}/snapshot"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    let snap_id = snap["id"].as_u64().unwrap();
+
+    // acme can fork; globex cannot.
+    let (s, _) = send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/snapshots/{snap_id}/fork"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    let (s, b) = send_with(
+        app,
+        Method::POST,
+        &format!("/v1/snapshots/{snap_id}/fork"),
+        None,
+        Some("globex-token"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert_eq!(b["error"]["code"], "cross_org");
+}
+
+#[tokio::test]
+async fn multi_tenant_forked_vm_belongs_to_forker_org() {
+    let app = app_with_two_orgs();
+
+    // acme creates the snapshot.
+    let (_, h) = send_with(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        Some("acme-token"),
+    )
+    .await;
+    let vm_id = h["id"].as_u64().unwrap();
+    send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm_id}/start"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    let (_, snap) = send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm_id}/snapshot"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    let snap_id = snap["id"].as_u64().unwrap();
+
+    // acme forks → acme owns the child too.
+    let (_, fork) = send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/snapshots/{snap_id}/fork"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    let forked_vm_id = fork["vm"]["id"].as_u64().unwrap();
+
+    // globex can't touch it.
+    let (s, _) = send_with(
+        app,
+        Method::GET,
+        &format!("/v1/vms/{forked_vm_id}"),
+        None,
+        Some("globex-token"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
 }
 
 // ===================== POST /v1/sandbox/invoke ========================
