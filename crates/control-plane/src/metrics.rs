@@ -157,11 +157,16 @@ impl Metrics {
             "# HELP nanovm_forks_total_by_org Successful forks, rolled up per org (billing dimension).\n",
         );
         out.push_str("# TYPE nanovm_forks_total_by_org counter\n");
-        if let Ok(map) = self.forks_total_by_org.lock() {
-            for (org, n) in sorted_pairs(&map) {
-                let _ = writeln!(out, "nanovm_forks_total_by_org{{org=\"{org}\"}} {n}");
-            }
-        }
+if let Ok(map) = self.forks_total_by_org.lock() {
+    for (org, n) in sorted_pairs(&map) {
+        let org = org
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r");
+        let _ = writeln!(out, "nanovm_forks_total_by_org{{org=\"{org}\"}} {n}");
+    }
+}
 
         out.push_str(
             "# HELP nanovm_fork_latency_ms_sum_by_org Cumulative fork wall-time (ms), per org.\n",
