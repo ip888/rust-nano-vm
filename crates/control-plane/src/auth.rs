@@ -242,7 +242,11 @@ impl ApiTokens {
 
     /// Parse a comma-separated list of `org_id:token` entries, with a
     /// bare `token` entry treated as `default:token`. Whitespace around
-    /// each entry is trimmed; empty entries are dropped.
+    /// each entry is trimmed; empty entries are dropped. An entry with
+    /// an empty org id (`:tok`) is treated as the default-org form
+    /// (`default:tok`) rather than the literal empty-string org — an
+    /// `OrgId("")` would land in metric labels and break Grafana
+    /// queries.
     pub fn from_csv(s: &str) -> Self {
         let mut store = Store::default();
         for entry in s.split(',') {
@@ -251,7 +255,15 @@ impl ApiTokens {
                 continue;
             }
             let (org, token) = match trimmed.split_once(':') {
-                Some((o, t)) => (OrgId::new(o.trim()), t.trim().to_owned()),
+                Some((o, t)) => {
+                    let org_str = o.trim();
+                    let org = if org_str.is_empty() {
+                        OrgId::default_org()
+                    } else {
+                        OrgId::new(org_str)
+                    };
+                    (org, t.trim().to_owned())
+                }
                 None => (OrgId::default_org(), trimmed.to_owned()),
             };
             if token.is_empty() {
@@ -493,6 +505,17 @@ mod tests {
         assert!(ApiTokens::from_csv("").is_empty());
         assert!(ApiTokens::from_csv("   ").is_empty());
         assert!(ApiTokens::from_csv(",,, ,").is_empty());
+    }
+
+    #[test]
+    fn from_csv_empty_org_id_falls_back_to_default() {
+        // `:tok` used to land an OrgId("") in extensions, which would
+        // then appear as an empty-string label value in /metrics
+        // (`nanovm_forks_total_by_org{org=""}`). Treat it as the
+        // default-org form instead.
+        let t = ApiTokens::from_csv(":tok1, :tok2");
+        assert_eq!(t.org_for("tok1"), Some(OrgId::default_org()));
+        assert_eq!(t.org_for("tok2"), Some(OrgId::default_org()));
     }
 
     #[test]

@@ -32,6 +32,25 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+/// Escape a string for use as a Prometheus label *value*. Spec requires
+/// escaping `\`, `"`, and `\n`. We also escape `\r` defensively so a
+/// stray carriage return can't corrupt the exposition. Order matters:
+/// escape `\\` first so the new `\` characters introduced by the other
+/// substitutions aren't doubled. Returns `Cow::Borrowed` on the common
+/// path so the hot loop allocates nothing for well-formed inputs.
+fn escape_label(v: &str) -> std::borrow::Cow<'_, str> {
+    if v.bytes().any(|b| matches!(b, b'\\' | b'"' | b'\n' | b'\r')) {
+        std::borrow::Cow::Owned(
+            v.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r"),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(v)
+    }
+}
+
 /// Process-local metrics, shared via `Arc<Metrics>` in `AppState`.
 #[derive(Debug, Default)]
 pub struct Metrics {
@@ -148,6 +167,7 @@ impl Metrics {
         out.push_str("# TYPE nanovm_forks_total counter\n");
         if let Ok(map) = self.forks_total.lock() {
             for (fp, n) in sorted_pairs(&map) {
+                let fp = escape_label(fp.as_str());
                 let _ = writeln!(out, "nanovm_forks_total{{token=\"{fp}\"}} {n}");
             }
         }
@@ -159,11 +179,7 @@ impl Metrics {
         out.push_str("# TYPE nanovm_forks_total_by_org counter\n");
         if let Ok(map) = self.forks_total_by_org.lock() {
             for (org, n) in sorted_pairs(&map) {
-                let org = org
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\n', "\\n")
-                    .replace('\r', "\\r");
+                let org = escape_label(org.as_str());
                 let _ = writeln!(out, "nanovm_forks_total_by_org{{org=\"{org}\"}} {n}");
             }
         }
@@ -174,11 +190,7 @@ impl Metrics {
         out.push_str("# TYPE nanovm_fork_latency_ms_sum_by_org counter\n");
         if let Ok(map) = self.fork_latency_ms_sum_by_org.lock() {
             for (org, n) in sorted_pairs(&map) {
-                let org = org
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\n', "\\n")
-                    .replace('\r', "\\r");
+                let org = escape_label(org.as_str());
                 let _ = writeln!(
                     out,
                     "nanovm_fork_latency_ms_sum_by_org{{org=\"{org}\"}} {n}"
@@ -192,6 +204,7 @@ impl Metrics {
         out.push_str("# TYPE nanovm_fork_quota_throttled_total counter\n");
         if let Ok(map) = self.throttled_total.lock() {
             for (fp, n) in sorted_pairs(&map) {
+                let fp = escape_label(fp.as_str());
                 let _ = writeln!(
                     out,
                     "nanovm_fork_quota_throttled_total{{token=\"{fp}\"}} {n}"
@@ -205,11 +218,7 @@ impl Metrics {
         out.push_str("# TYPE nanovm_fork_quota_throttled_total_by_org counter\n");
         if let Ok(map) = self.throttled_total_by_org.lock() {
             for (org, n) in sorted_pairs(&map) {
-                let org = org
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\n', "\\n")
-                    .replace('\r', "\\r");
+                let org = escape_label(org.as_str());
                 let _ = writeln!(
                     out,
                     "nanovm_fork_quota_throttled_total_by_org{{org=\"{org}\"}} {n}"
@@ -264,6 +273,39 @@ fn sorted_pairs(map: &HashMap<String, u64>) -> Vec<(&String, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_label_passes_through_ascii() {
+        // Cheap path returns Borrowed; no allocation.
+        let out = escape_label("acme");
+        assert!(matches!(out, std::borrow::Cow::Borrowed("acme")));
+    }
+
+    #[test]
+    fn escape_label_handles_quote_backslash_newline() {
+        // The four characters the Prometheus exposition format actually
+        // breaks on. `\r` is escaped defensively.
+        assert_eq!(escape_label("a\"b").as_ref(), "a\\\"b");
+        assert_eq!(escape_label("a\\b").as_ref(), "a\\\\b");
+        assert_eq!(escape_label("a\nb").as_ref(), "a\\nb");
+        assert_eq!(escape_label("a\rb").as_ref(), "a\\rb");
+        // All four in one string, escape order matters.
+        assert_eq!(escape_label("\\\"\n\r").as_ref(), "\\\\\\\"\\n\\r");
+    }
+
+    #[test]
+    fn hostile_org_name_does_not_corrupt_exposition() {
+        // Operator-controlled env value with a `"` and a `\n` should
+        // round-trip into a single well-formed metric line.
+        let m = Metrics::new();
+        m.record_fork("tok-x-12", "ev\"il\nco", 1);
+        let text = m.render_text();
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("nanovm_forks_total_by_org"))
+            .expect("per-org line must exist");
+        assert_eq!(line, "nanovm_forks_total_by_org{org=\"ev\\\"il\\nco\"} 1");
+    }
 
     #[test]
     fn render_with_no_data_lists_only_help_lines_and_up_gauge() {

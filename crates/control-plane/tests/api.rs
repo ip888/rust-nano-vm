@@ -2872,3 +2872,97 @@ async fn keys_endpoints_require_auth() {
     let (status, _) = send(app, Method::DELETE, "/v1/keys/nvk_anything", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+// ----- Cross-org isolation: sibling handlers (sandbox / exec-stream) ----------
+//
+// PR-A2 wired OrgId checks into the main `/v1/vms/:id/*` and
+// `/v1/snapshots/:id/*` handlers, but sandbox-invoke and
+// exec-stream still went straight to the backend without checking
+// the ownership map. These tests cover the follow-up sweep.
+
+#[tokio::test]
+async fn sandbox_invoke_rejects_cross_org_snapshot() {
+    let tokens = Arc::new(ApiTokens::from_csv("acme:acme-tok,globex:globex-tok"));
+    let app = app_with_shared_tokens(tokens);
+
+    // acme creates a snapshot...
+    let (_, vm) = send_with(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        Some("acme-tok"),
+    )
+    .await;
+    let vm_id = vm["id"].as_u64().unwrap();
+    send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm_id}/start"),
+        None,
+        Some("acme-tok"),
+    )
+    .await;
+    let (_, snap) = send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm_id}/snapshot"),
+        None,
+        Some("acme-tok"),
+    )
+    .await;
+    let snap_id = snap["id"].as_u64().unwrap();
+
+    // ...globex tries to sandbox-fork from it.
+    let (status, body) = send_with(
+        app,
+        Method::POST,
+        "/v1/sandbox/invoke",
+        Some(json!({
+            "snapshot": snap_id,
+            "action": "execute_shell",
+            "command": "echo hi"
+        })),
+        Some("globex-tok"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "cross_org");
+}
+
+#[tokio::test]
+async fn exec_stream_rejects_cross_org_vm() {
+    let tokens = Arc::new(ApiTokens::from_csv("acme:acme-tok,globex:globex-tok"));
+    let app = app_with_shared_tokens(tokens);
+
+    // acme owns the VM.
+    let (_, vm) = send_with(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        Some("acme-tok"),
+    )
+    .await;
+    let vm_id = vm["id"].as_u64().unwrap();
+    send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm_id}/start"),
+        None,
+        Some("acme-tok"),
+    )
+    .await;
+
+    // globex tries to attach an SSE exec stream to it.
+    let (status, body) = send_with(
+        app,
+        Method::POST,
+        &format!("/v1/vms/{vm_id}/exec/stream"),
+        Some(json!({"program": "echo", "args": ["hi"]})),
+        Some("globex-tok"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "cross_org");
+}
