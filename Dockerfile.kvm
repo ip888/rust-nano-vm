@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1.6
+#
+# Production image of `nanovm-control-plane` built with `--features kvm`.
+#
+# Differs from the default `Dockerfile` in two ways:
+#
+#   1. Built with `--features kvm`, so the binary actually drives KVM
+#      ioctls instead of the in-process mock backend.
+#   2. Runtime image switches from distroless `cc-debian12:nonroot`
+#      to `cc-debian12:debug-nonroot` so an operator can `exec` into
+#      the container during incident triage. (No package manager;
+#      busybox only.)
+#
+# Both images use the same uid 65532 (`nonroot`). The container needs
+# `/dev/kvm` mapped in at runtime:
+#
+#   docker run --rm -d \
+#     --device=/dev/kvm \
+#     -p 8080:8080 \
+#     -e NANOVM_API_TOKENS=acme:tok1 \
+#     ghcr.io/ip888/nanovm-control-plane-kvm:<version>
+#
+# Hosts that need `/dev/kvm`: AWS `*.metal` instances + every modern
+# Nitro family; Fly.io machines with `--vm-cpu-kind=performance` and
+# `--kernel-version=>=6.1`; any bare-metal Linux box with KVM kernel
+# module loaded.
+#
+# Operators that don't want KVM should keep using the default
+# `Dockerfile` (mock backend); this image is the production shape
+# for the SaaS deployment.
+
+# ---- Stage 1: build the binary with --features kvm -------------------
+FROM rust:1.94.1-bookworm AS builder
+
+WORKDIR /src
+
+# kvm-ioctls + kvm-bindings only need libc; no system deps to install.
+COPY . .
+
+RUN cargo build --release --locked --features kvm \
+    -p control-plane --bin nanovm-control-plane
+
+# ---- Stage 2: runtime ------------------------------------------------
+FROM gcr.io/distroless/cc-debian12:debug-nonroot
+
+COPY --from=builder \
+     /src/target/release/nanovm-control-plane \
+     /usr/local/bin/nanovm-control-plane
+
+# Bind to all interfaces by default — port mapping works out of the box.
+ENV NANOVM_CONTROL_PLANE_ADDR=0.0.0.0:8080
+# Real backends should advertise themselves on /v1/health.
+ENV NANOVM_BACKEND_LABEL=kvm
+
+EXPOSE 8080
+
+# `nonroot` user (uid 65532). Access to /dev/kvm requires either:
+#   - the `kvm` group on the host (we'd `usermod` here in production)
+#   - or a permissive `--device-cgroup-rule` on `docker run`
+# The Helm chart (`deploy/helm/nanovm/`) wires the right pod-security
+# context for both shapes.
+USER nonroot
+
+ENTRYPOINT ["/usr/local/bin/nanovm-control-plane"]

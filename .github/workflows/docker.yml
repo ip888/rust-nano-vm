@@ -55,7 +55,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
 
-      - name: Build and push
+      - name: Build and push (mock backend)
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -65,5 +65,29 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           # GHA-backed registry cache so repeated tag pushes don't
           # rebuild the entire workspace from scratch.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=mock
+          cache-to: type=gha,mode=max,scope=mock
+
+      # KVM-backed production image. Pushed alongside the mock image
+      # on every tag, under `*-kvm` repo so operators can pick the
+      # right shape for their deployment without parsing tag flavors.
+      - name: Extract Docker metadata (KVM image)
+        id: meta-kvm
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-kvm
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push (KVM backend)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.kvm
+          push: true
+          tags: ${{ steps.meta-kvm.outputs.tags }}
+          labels: ${{ steps.meta-kvm.outputs.labels }}
+          cache-from: type=gha,scope=kvm
+          cache-to: type=gha,mode=max,scope=kvm
