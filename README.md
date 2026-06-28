@@ -270,8 +270,14 @@ or run this in WSL.
 ```sh
 cargo build --release -p control-plane
 
+# Single-tenant: every token shares the implicit `default` org.
 NANOVM_API_TOKENS=dev-token \
   ./target/release/nanovm-control-plane &
+
+# Multi-tenant: bind each token to an explicit org. Tokens may not
+# read or touch VMs/snapshots owned by a different org (the server
+# returns 403 `cross_org` and list endpoints filter transparently).
+#   NANOVM_API_TOKENS=acme:acme-tok,acme:acme-tok-2,globex:globex-tok
 
 until curl -sf localhost:8080/healthz >/dev/null; do sleep 0.1; done
 
