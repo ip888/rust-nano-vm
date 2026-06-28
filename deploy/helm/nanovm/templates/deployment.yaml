@@ -65,16 +65,14 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ include "nanovm.fullname" . }}-tokens
-          resources:
-            {{- toYaml .Values.resources | nindent 12 }}
-          {{- if eq (int .Values.kvm.devicePluginRequest) 1 }}
-          # Device-plugin shape: the plugin daemon hands us the device.
-          resources:
-            limits:
-              devices.kvm.com/kvm: 1
-            requests:
-              devices.kvm.com/kvm: 1
+          {{- $resources := deepCopy .Values.resources }}
+          {{- if gt (int .Values.kvm.devicePluginRequest) 0 }}
+          {{- $kvmReq := int .Values.kvm.devicePluginRequest }}
+          {{- $_ := set $resources "limits" (merge (default (dict) (get $resources "limits")) (dict "devices.kvm.com/kvm" $kvmReq)) }}
+          {{- $_ := set $resources "requests" (merge (default (dict) (get $resources "requests")) (dict "devices.kvm.com/kvm" $kvmReq)) }}
           {{- end }}
+          resources:
+            {{- toYaml $resources | nindent 12 }}
           volumeMounts:
             - name: audit-log
               mountPath: /var/log/nanovm
