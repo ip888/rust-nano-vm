@@ -86,7 +86,7 @@ exec "$WORKER" --socket "$SOCKET"
     script
 }
 
-fn make_fleet(dir: &Path) -> Arc<ProcessFleet> {
+fn make_fleet_with_warm(dir: &Path, warm_pool_size: usize) -> Arc<ProcessFleet> {
     let cfg = FleetConfig {
         jailer_binary: make_stub_jailer(dir),
         vmm_child_binary: vmm_child_binary(),
@@ -95,8 +95,13 @@ fn make_fleet(dir: &Path) -> Arc<ProcessFleet> {
         default_cpu_quota_pct: None,
         cgroup_parent: None,
         spawn_timeout: Duration::from_secs(10),
+        warm_pool_size,
     };
     Arc::new(ProcessFleet::new(cfg).expect("construct fleet"))
+}
+
+fn make_fleet(dir: &Path) -> Arc<ProcessFleet> {
+    make_fleet_with_warm(dir, 0)
 }
 
 #[test]
@@ -153,18 +158,39 @@ fn snapshot_captures_id_and_lists() {
 }
 
 #[test]
-fn restore_returns_actionable_unsupported_message() {
-    // PR-4 honestly rejects restore on the fleet backend — the
-    // message must point operators at PR-5 / the in-process
-    // backend so they know what to do.
+fn restore_unknown_snapshot_returns_unknown_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let fleet = make_fleet(dir.path());
-    let err = fleet.restore(vm_core::SnapshotId(1)).unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("not yet supported") || msg.contains("PR-5"),
-        "restore error should explain the limitation: {msg}"
-    );
+    assert!(matches!(
+        fleet.restore(vm_core::SnapshotId(9999)).unwrap_err(),
+        vm_core::VmError::UnknownSnapshot(_)
+    ));
+}
+
+#[test]
+fn restore_roundtrips_via_export_and_adopt_to_a_fresh_worker() {
+    // The fork-from-snapshot story: owner worker exports the
+    // snapshot dir → fleet spawns a fresh worker → that worker
+    // adopts the dir and runs Restore. The result is a new VM
+    // hosted by a NEW process / cgroup, not the owner's worker.
+    let dir = tempfile::tempdir().unwrap();
+    let fleet = make_fleet(dir.path());
+
+    let h = fleet.create_vm(&VmConfig::default()).expect("create_vm");
+    fleet.start(h.id).expect("start");
+    let snap = fleet.snapshot(h.id).expect("snapshot");
+
+    let restored = fleet.restore(snap).expect("restore");
+    assert_ne!(restored.id, h.id, "restore must assign a fresh vm_id");
+    let live = fleet.list_vms().expect("list_vms");
+    assert_eq!(live.len(), 2);
+
+    // Both workers should be addressable independently.
+    assert!(fleet.state(h.id).is_ok());
+    assert!(fleet.state(restored.id).is_ok());
+
+    fleet.destroy(h.id).expect("destroy original");
+    fleet.destroy(restored.id).expect("destroy restored");
 }
 
 #[test]
@@ -175,6 +201,25 @@ fn destroy_unknown_vm_returns_unknown_vm() {
         fleet.destroy(vm_core::VmId(999)).unwrap_err(),
         vm_core::VmError::UnknownVm(_)
     ));
+}
+
+#[test]
+fn warm_pool_pre_spawns_workers_at_construction() {
+    let dir = tempfile::tempdir().unwrap();
+    let fleet = make_fleet_with_warm(dir.path(), 2);
+    // After `new()` the pool should be at target depth.
+    assert_eq!(fleet.warm_pool_len(), 2);
+}
+
+#[test]
+fn create_vm_pops_from_warm_pool_and_refills() {
+    let dir = tempfile::tempdir().unwrap();
+    let fleet = make_fleet_with_warm(dir.path(), 1);
+    assert_eq!(fleet.warm_pool_len(), 1);
+    let h = fleet.create_vm(&VmConfig::default()).expect("create_vm");
+    // After the create the pool should have refilled back to 1.
+    assert_eq!(fleet.warm_pool_len(), 1);
+    fleet.destroy(h.id).expect("destroy");
 }
 
 #[test]
