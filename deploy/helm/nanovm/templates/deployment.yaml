@@ -1,3 +1,12 @@
+{{/*
+Guard: kvm.enabled (hostPath /dev/kvm) and kvm.devicePluginRequest
+(kubelet device-plugin resource) are mutually exclusive shapes. Fail
+fast at render time if both are set so the operator doesn't get a
+confused running pod.
+*/}}
+{{- if and .Values.kvm.enabled (gt (int .Values.kvm.devicePluginRequest) 0) -}}
+{{- fail "kvm.enabled and kvm.devicePluginRequest are mutually exclusive — pick exactly one" -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -64,17 +73,21 @@ spec:
             {{- end }}
           envFrom:
             - secretRef:
-                name: {{ include "nanovm.fullname" . }}-tokens
+                name: {{ include "nanovm.secretName" . }}
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
-          {{- if eq (int .Values.kvm.devicePluginRequest) 1 }}
-          # Device-plugin shape: the plugin daemon hands us the device.
-          resources:
-            limits:
-              devices.kvm.com/kvm: 1
             requests:
-              devices.kvm.com/kvm: 1
-          {{- end }}
+              {{- toYaml .Values.resources.requests | nindent 14 }}
+              {{- if gt (int .Values.kvm.devicePluginRequest) 0 }}
+              # Device-plugin shape: kubelet hands us /dev/kvm via the
+              # plugin daemon. Merged into the same requests block to
+              # keep CPU/memory requests alongside.
+              devices.kvm.com/kvm: {{ .Values.kvm.devicePluginRequest }}
+              {{- end }}
+            limits:
+              {{- toYaml .Values.resources.limits | nindent 14 }}
+              {{- if gt (int .Values.kvm.devicePluginRequest) 0 }}
+              devices.kvm.com/kvm: {{ .Values.kvm.devicePluginRequest }}
+              {{- end }}
           volumeMounts:
             - name: audit-log
               mountPath: /var/log/nanovm
