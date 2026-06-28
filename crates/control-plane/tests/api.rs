@@ -2550,3 +2550,325 @@ async fn import_missing_snapshot_returns_404() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ===================== per-org metering & /v1/usage/by-org ============
+
+#[tokio::test]
+async fn metrics_endpoint_exposes_per_org_fork_series() {
+    let app = app_with_two_orgs();
+
+    let (_, vh) = send_with(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        Some("acme-token"),
+    )
+    .await;
+    let vm = vh["id"].as_u64().unwrap();
+    send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm}/start"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    let (_, sh) = send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm}/snapshot"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    let snap = sh["id"].as_u64().unwrap();
+    for _ in 0..2 {
+        send_with(
+            app.clone(),
+            Method::POST,
+            &format!("/v1/snapshots/{snap}/fork"),
+            None,
+            Some("acme-token"),
+        )
+        .await;
+    }
+
+    let (status, body) = send(app, Method::GET, "/metrics", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = body.as_str().unwrap_or_default();
+    assert!(
+        text.contains("nanovm_forks_total_by_org{org=\"acme\"} 2"),
+        "expected per-org series in /metrics; got:\n{text}"
+    );
+    assert!(text.contains("nanovm_fork_latency_ms_sum_by_org{org=\"acme\"}"));
+}
+
+#[tokio::test]
+async fn usage_by_org_returns_callers_own_org_by_default() {
+    let app = app_with_two_orgs();
+
+    let (_, vh) = send_with(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        Some("acme-token"),
+    )
+    .await;
+    let vm = vh["id"].as_u64().unwrap();
+    send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm}/start"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    let (_, sh) = send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm}/snapshot"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    let snap = sh["id"].as_u64().unwrap();
+    send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/snapshots/{snap}/fork"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+
+    let (status, body) = send_with(
+        app.clone(),
+        Method::GET,
+        "/v1/usage/by-org",
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let orgs = body["orgs"].as_array().unwrap();
+    assert_eq!(orgs.len(), 1);
+    assert_eq!(orgs[0]["org_id"], "acme");
+    assert_eq!(orgs[0]["fork_count"], 1);
+
+    let (_, body) = send_with(
+        app,
+        Method::GET,
+        "/v1/usage/by-org",
+        None,
+        Some("globex-token"),
+    )
+    .await;
+    assert_eq!(body["orgs"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn usage_by_org_all_view_is_operator_scoped() {
+    // Auth-disabled router → caller is the default-org (operator surface).
+    let app = app();
+    let (_, vh) = send(app.clone(), Method::POST, "/v1/vms", Some(json!({}))).await;
+    let vm = vh["id"].as_u64().unwrap();
+    send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm}/start"),
+        None,
+    )
+    .await;
+    let (_, sh) = send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm}/snapshot"),
+        None,
+    )
+    .await;
+    let snap = sh["id"].as_u64().unwrap();
+    send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/snapshots/{snap}/fork"),
+        None,
+    )
+    .await;
+
+    let (status, body) = send(app, Method::GET, "/v1/usage/by-org?all=true", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let orgs = body["orgs"].as_array().unwrap();
+    assert!(!orgs.is_empty());
+    assert_eq!(orgs[0]["org_id"], "default");
+}
+
+// ----- /v1/keys self-serve API key issuance ------------------------------------
+
+/// Helper: build a router whose token set is shared with the test so it
+/// can mint runtime keys against the SAME store the middleware reads.
+/// Returns `(app, tokens)`. Use `tokens.org_for(...)` to peek under the
+/// hood (only used to confirm a freshly issued token authenticates).
+fn app_with_shared_tokens(tokens: Arc<ApiTokens>) -> Router {
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    router()
+        .layer(Extension(tokens))
+        .with_state(AppState::new(hv))
+}
+
+#[tokio::test]
+async fn keys_post_issues_a_usable_bearer_for_callers_org() {
+    // Two bootstrap env tokens, one per org. Both can call /v1/keys.
+    let tokens = Arc::new(ApiTokens::from_csv(
+        "acme:acme-bootstrap,globex:globex-bootstrap",
+    ));
+    let app = app_with_shared_tokens(Arc::clone(&tokens));
+
+    let (status, body) = send_with(
+        app.clone(),
+        Method::POST,
+        "/v1/keys",
+        None,
+        Some("acme-bootstrap"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let new_token = body["token"].as_str().unwrap().to_owned();
+    let new_id = body["id"].as_str().unwrap();
+    assert_eq!(body["org"], "acme");
+    assert!(body["created_at"].as_str().is_some());
+    assert!(new_token.starts_with("nv_"));
+    assert!(new_id.starts_with("nvk_"));
+
+    // The new token authenticates against the same router.
+    let (status, _body) = send_with(app, Method::GET, "/v1/vms", None, Some(&new_token)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn keys_get_lists_only_callers_org_runtime_keys() {
+    let tokens = Arc::new(ApiTokens::from_csv("acme:acme-bs,globex:globex-bs"));
+    let app = app_with_shared_tokens(Arc::clone(&tokens));
+
+    // Issue two keys for acme and one for globex.
+    let (s, _) = send_with(app.clone(), Method::POST, "/v1/keys", None, Some("acme-bs")).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, _) = send_with(app.clone(), Method::POST, "/v1/keys", None, Some("acme-bs")).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, gx_issue) = send_with(
+        app.clone(),
+        Method::POST,
+        "/v1/keys",
+        None,
+        Some("globex-bs"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let gx_id = gx_issue["id"].as_str().unwrap().to_owned();
+
+    // acme sees exactly its 2 runtime keys, never globex's, never the
+    // env bootstrap token.
+    let (status, body) =
+        send_with(app.clone(), Method::GET, "/v1/keys", None, Some("acme-bs")).await;
+    assert_eq!(status, StatusCode::OK);
+    let acme_keys = body["keys"].as_array().unwrap();
+    assert_eq!(acme_keys.len(), 2);
+    for k in acme_keys {
+        assert_eq!(k["org"], "acme");
+        assert!(k["id"].as_str().unwrap().starts_with("nvk_"));
+        // Plaintext token MUST NOT appear in the list payload.
+        assert!(k.get("token").is_none());
+    }
+
+    // globex sees only its single key.
+    let (_, body) = send_with(app, Method::GET, "/v1/keys", None, Some("globex-bs")).await;
+    let gx_keys = body["keys"].as_array().unwrap();
+    assert_eq!(gx_keys.len(), 1);
+    assert_eq!(gx_keys[0]["id"], gx_id);
+}
+
+#[tokio::test]
+async fn keys_delete_revokes_runtime_token_and_subsequent_use_401s() {
+    let tokens = Arc::new(ApiTokens::from_csv("acme:bs"));
+    let app = app_with_shared_tokens(Arc::clone(&tokens));
+
+    // Issue, then revoke, then assert the revoked token is rejected.
+    let (_, issued) = send_with(app.clone(), Method::POST, "/v1/keys", None, Some("bs")).await;
+    let token = issued["token"].as_str().unwrap().to_owned();
+    let id = issued["id"].as_str().unwrap().to_owned();
+
+    // Sanity: token works before revoke.
+    let (status, _) = send_with(app.clone(), Method::GET, "/v1/vms", None, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Revoke by id.
+    let (status, _) = send_with(
+        app.clone(),
+        Method::DELETE,
+        &format!("/v1/keys/{id}"),
+        None,
+        Some("bs"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Now the issued token is no longer accepted.
+    let (status, body) = send_with(app, Method::GET, "/v1/vms", None, Some(&token)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["code"], "unauthorized");
+}
+
+#[tokio::test]
+async fn keys_delete_other_orgs_id_returns_404() {
+    let tokens = Arc::new(ApiTokens::from_csv("acme:acme-bs,globex:globex-bs"));
+    let app = app_with_shared_tokens(Arc::clone(&tokens));
+
+    // acme issues a key; globex tries to revoke it.
+    let (_, issued) = send_with(app.clone(), Method::POST, "/v1/keys", None, Some("acme-bs")).await;
+    let acme_id = issued["id"].as_str().unwrap();
+    let acme_token = issued["token"].as_str().unwrap().to_owned();
+
+    let (status, body) = send_with(
+        app.clone(),
+        Method::DELETE,
+        &format!("/v1/keys/{acme_id}"),
+        None,
+        Some("globex-bs"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "unknown_key");
+
+    // acme's token still works.
+    let (status, _) = send_with(app, Method::GET, "/v1/vms", None, Some(&acme_token)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn keys_delete_unknown_id_returns_404() {
+    let tokens = Arc::new(ApiTokens::from_csv("acme:bs"));
+    let app = app_with_shared_tokens(tokens);
+    let (status, body) = send_with(
+        app,
+        Method::DELETE,
+        "/v1/keys/nvk_does-not-exist",
+        None,
+        Some("bs"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "unknown_key");
+}
+
+#[tokio::test]
+async fn keys_endpoints_require_auth() {
+    let tokens = Arc::new(ApiTokens::from_csv("acme:bs"));
+    let app = app_with_shared_tokens(tokens);
+    let (status, _) = send(app.clone(), Method::POST, "/v1/keys", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send(app.clone(), Method::GET, "/v1/keys", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send(app, Method::DELETE, "/v1/keys/nvk_anything", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

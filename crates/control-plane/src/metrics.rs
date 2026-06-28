@@ -37,8 +37,21 @@ use std::sync::Mutex;
 pub struct Metrics {
     /// Successful fork count, keyed by token fingerprint.
     forks_total: Mutex<HashMap<String, u64>>,
+    /// Successful fork count, keyed by org id. Same denominator the
+    /// billing pipeline consumes: `rate(nanovm_forks_total_by_org{org="..."}[5m])`
+    /// is the per-org fork rate, which Stripe Metering / Orb / etc.
+    /// turn into the monthly bill. Token-level counters stay around
+    /// for operator-side per-key triage.
+    forks_total_by_org: Mutex<HashMap<String, u64>>,
+    /// Cumulative fork wall-time (ms) by org. Lets the billing pipeline
+    /// charge by compute-seconds instead of (or in addition to) fork
+    /// count.
+    fork_latency_ms_sum_by_org: Mutex<HashMap<String, u64>>,
     /// Fork attempts rejected by the per-token quota (429).
     throttled_total: Mutex<HashMap<String, u64>>,
+    /// Fork attempts rejected by the per-token quota (429), keyed by
+    /// org id. Useful for the noisy-neighbor dashboard.
+    throttled_total_by_org: Mutex<HashMap<String, u64>>,
     /// Sum of fork wall-time in milliseconds.
     fork_latency_ms_sum: AtomicU64,
     /// Number of latency observations recorded.
@@ -55,22 +68,62 @@ impl Metrics {
         Self::default()
     }
 
-    /// Record a successful fork: bump the per-token counter and the
-    /// latency sum/count.
-    pub fn record_fork(&self, token_fp: &str, latency_ms: u64) {
+    /// Record a successful fork: bump the per-token and per-org
+    /// counters and the global latency sum/count.
+    ///
+    /// `org` is the calling org's id (e.g. `"acme"`); `token_fp` is
+    /// the non-cryptographic fingerprint of the bearer token. Both
+    /// are needed because billing rolls up per org while operator
+    /// triage often needs per-token breakdown.
+    pub fn record_fork(&self, token_fp: &str, org: &str, latency_ms: u64) {
         if let Ok(mut map) = self.forks_total.lock() {
             *map.entry(token_fp.to_owned()).or_insert(0) += 1;
+        }
+        if let Ok(mut map) = self.forks_total_by_org.lock() {
+            *map.entry(org.to_owned()).or_insert(0) += 1;
+        }
+        if let Ok(mut map) = self.fork_latency_ms_sum_by_org.lock() {
+            *map.entry(org.to_owned()).or_insert(0) += latency_ms;
         }
         self.fork_latency_ms_sum
             .fetch_add(latency_ms, Ordering::Relaxed);
         self.fork_latency_ms_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a fork attempt that was rejected by the quota.
-    pub fn record_throttled(&self, token_fp: &str) {
+    /// Record a fork attempt that was rejected by the quota. Splits
+    /// across the per-token and per-org throttle counters.
+    pub fn record_throttled(&self, token_fp: &str, org: &str) {
         if let Ok(mut map) = self.throttled_total.lock() {
             *map.entry(token_fp.to_owned()).or_insert(0) += 1;
         }
+        if let Ok(mut map) = self.throttled_total_by_org.lock() {
+            *map.entry(org.to_owned()).or_insert(0) += 1;
+        }
+    }
+
+    /// Snapshot the per-org fork counters as `(org, count, total_ms)`
+    /// triples. Used by `GET /v1/usage/by-org` to render the
+    /// caller's billing-relevant totals without scraping `/metrics`.
+    pub fn forks_by_org_snapshot(&self) -> Vec<(String, u64, u64)> {
+        let counts = self
+            .forks_total_by_org
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        let sums = self
+            .fork_latency_ms_sum_by_org
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        let mut keys: std::collections::BTreeSet<String> = counts.keys().cloned().collect();
+        keys.extend(sums.keys().cloned());
+        keys.into_iter()
+            .map(|k| {
+                let c = counts.get(&k).copied().unwrap_or(0);
+                let s = sums.get(&k).copied().unwrap_or(0);
+                (k, c, s)
+            })
+            .collect()
     }
 
     /// Record a fork served from the warm pool.
@@ -99,6 +152,40 @@ impl Metrics {
             }
         }
 
+        // Per-org rollup — the series the billing pipeline consumes.
+        out.push_str(
+            "# HELP nanovm_forks_total_by_org Successful forks, rolled up per org (billing dimension).\n",
+        );
+        out.push_str("# TYPE nanovm_forks_total_by_org counter\n");
+        if let Ok(map) = self.forks_total_by_org.lock() {
+            for (org, n) in sorted_pairs(&map) {
+                let org = org
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r");
+                let _ = writeln!(out, "nanovm_forks_total_by_org{{org=\"{org}\"}} {n}");
+            }
+        }
+
+        out.push_str(
+            "# HELP nanovm_fork_latency_ms_sum_by_org Cumulative fork wall-time (ms), per org.\n",
+        );
+        out.push_str("# TYPE nanovm_fork_latency_ms_sum_by_org counter\n");
+        if let Ok(map) = self.fork_latency_ms_sum_by_org.lock() {
+            for (org, n) in sorted_pairs(&map) {
+                let org = org
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r");
+                let _ = writeln!(
+                    out,
+                    "nanovm_fork_latency_ms_sum_by_org{{org=\"{org}\"}} {n}"
+                );
+            }
+        }
+
         out.push_str(
             "# HELP nanovm_fork_quota_throttled_total Fork attempts rejected by per-token quota.\n",
         );
@@ -108,6 +195,24 @@ impl Metrics {
                 let _ = writeln!(
                     out,
                     "nanovm_fork_quota_throttled_total{{token=\"{fp}\"}} {n}"
+                );
+            }
+        }
+
+        out.push_str(
+            "# HELP nanovm_fork_quota_throttled_total_by_org Quota-rejected forks, per org.\n",
+        );
+        out.push_str("# TYPE nanovm_fork_quota_throttled_total_by_org counter\n");
+        if let Ok(map) = self.throttled_total_by_org.lock() {
+            for (org, n) in sorted_pairs(&map) {
+                let org = org
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r");
+                let _ = writeln!(
+                    out,
+                    "nanovm_fork_quota_throttled_total_by_org{{org=\"{org}\"}} {n}"
                 );
             }
         }
@@ -175,9 +280,9 @@ mod tests {
     #[test]
     fn forks_accumulate_per_token_and_total_latency() {
         let m = Metrics::new();
-        m.record_fork("tok-alpha-12", 7);
-        m.record_fork("tok-alpha-12", 9);
-        m.record_fork("tok-beta-12", 14);
+        m.record_fork("tok-alpha-12", "acme", 7);
+        m.record_fork("tok-alpha-12", "acme", 9);
+        m.record_fork("tok-beta-12", "globex", 14);
         let text = m.render_text();
         assert!(text.contains("nanovm_forks_total{token=\"tok-alpha-12\"} 2"));
         assert!(text.contains("nanovm_forks_total{token=\"tok-beta-12\"} 1"));
@@ -186,24 +291,52 @@ mod tests {
     }
 
     #[test]
+    fn forks_roll_up_per_org_with_latency_sum() {
+        let m = Metrics::new();
+        m.record_fork("tok-alpha-12", "acme", 7);
+        m.record_fork("tok-alpha-12", "acme", 9);
+        m.record_fork("tok-beta-12", "globex", 14);
+        let text = m.render_text();
+        assert!(text.contains("nanovm_forks_total_by_org{org=\"acme\"} 2"));
+        assert!(text.contains("nanovm_forks_total_by_org{org=\"globex\"} 1"));
+        assert!(text.contains("nanovm_fork_latency_ms_sum_by_org{org=\"acme\"} 16"));
+        assert!(text.contains("nanovm_fork_latency_ms_sum_by_org{org=\"globex\"} 14"));
+    }
+
+    #[test]
     fn throttle_counters_are_separate_from_success() {
         let m = Metrics::new();
-        m.record_fork("tok-alpha-12", 5);
-        m.record_throttled("tok-alpha-12");
-        m.record_throttled("tok-alpha-12");
+        m.record_fork("tok-alpha-12", "acme", 5);
+        m.record_throttled("tok-alpha-12", "acme");
+        m.record_throttled("tok-alpha-12", "acme");
         let text = m.render_text();
         assert!(text.contains("nanovm_forks_total{token=\"tok-alpha-12\"} 1"));
         assert!(
             text.contains("nanovm_fork_quota_throttled_total{token=\"tok-alpha-12\"} 2"),
             "throttle line missing:\n{text}"
         );
+        assert!(text.contains("nanovm_fork_quota_throttled_total_by_org{org=\"acme\"} 2"));
+    }
+
+    #[test]
+    fn forks_by_org_snapshot_returns_count_and_total_ms_per_org() {
+        let m = Metrics::new();
+        m.record_fork("tok-alpha-12", "acme", 7);
+        m.record_fork("tok-alpha-12", "acme", 9);
+        m.record_fork("tok-beta-12", "globex", 14);
+        let snap = m.forks_by_org_snapshot();
+        // BTreeSet keys → sorted output.
+        assert_eq!(
+            snap,
+            vec![("acme".to_owned(), 2, 16), ("globex".to_owned(), 1, 14),]
+        );
     }
 
     #[test]
     fn exposition_is_deterministically_sorted_by_label() {
         let m = Metrics::new();
-        m.record_fork("tok-zzz-12", 1);
-        m.record_fork("tok-aaa-12", 1);
+        m.record_fork("tok-zzz-12", "default", 1);
+        m.record_fork("tok-aaa-12", "default", 1);
         let text = m.render_text();
         let aaa = text.find("tok-aaa-12").unwrap();
         let zzz = text.find("tok-zzz-12").unwrap();

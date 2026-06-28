@@ -266,6 +266,9 @@ pub fn router() -> Router<AppState> {
             post(crate::snapshot_export::import_snapshot),
         )
         .route("/usage", get(usage))
+        .route("/usage/by-org", get(usage_by_org))
+        .route("/keys", get(crate::keys::list_keys).post(crate::keys::issue_key))
+        .route("/keys/:id", axum::routing::delete(crate::keys::revoke_key))
         .route("/health", get(health))
         // route_layer is bottom-up: the LAST `.route_layer` runs FIRST.
         // require_audit must see *authenticated* calls only, so register
@@ -497,7 +500,7 @@ async fn fork_snapshot(
             .as_deref()
             .map(token_fingerprint)
             .unwrap_or_else(|| "anonymous".to_owned());
-        state.metrics.record_throttled(&fp);
+        state.metrics.record_throttled(&fp, org.as_str());
         return Err(ApiError::TooManyRequests {
             code: "fork_quota_exceeded",
             message: format!("fork quota exceeded; retry after {retry_after_secs} second(s)"),
@@ -515,7 +518,7 @@ async fn fork_snapshot(
         state.metrics.record_warm_miss();
         state.hypervisor.restore(snap_id)?
     };
-    state.ownership.record_vm(handle.id, org);
+    state.ownership.record_vm(handle.id, org.clone());
     let fork_ms = started.elapsed().as_millis() as u64;
 
     let mut fork_count = 1u64;
@@ -524,7 +527,7 @@ async fn fork_snapshot(
         .as_deref()
         .map(token_fingerprint)
         .unwrap_or_else(|| "anonymous".to_owned());
-    state.metrics.record_fork(&fp, fork_ms);
+    state.metrics.record_fork(&fp, org.as_str(), fork_ms);
     if let Some(token) = bearer {
         let mut usage = state
             .fork_usage
@@ -569,6 +572,62 @@ async fn usage(
         fork_count: entry.count,
         fork_total_ms: entry.total_ms,
     }))
+}
+
+/// `GET /v1/usage/by-org` — caller's per-org fork totals. Returns
+/// the caller's own org by default; an operator-scoped token can
+/// pass `?all=1` to receive every org's totals (used by the billing
+/// pipeline to push monthly invoices).
+///
+/// Response shape:
+/// ```json
+/// { "orgs": [{ "org_id": "acme", "fork_count": 1234, "fork_total_ms": 56789 }, …] }
+/// ```
+async fn usage_by_org(
+    State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
+    Query(query): Query<UsageByOrgQuery>,
+) -> Result<Json<UsageByOrgResponse>, ApiError> {
+    let snapshot = state.metrics.forks_by_org_snapshot();
+    let want_all = query.all.unwrap_or(false);
+    // Operator-scoped tokens (i.e. members of the default-or-explicit
+    // operator org) can request the full view. We treat the
+    // [`OrgId::default_org()`] as the operator org for now — same
+    // convention as the audit log defaults to. A dedicated "admin"
+    // scope lands once we have a richer token model.
+    let is_operator = org == OrgId::default_org();
+    let orgs: Vec<OrgUsageEntry> = snapshot
+        .into_iter()
+        .filter(|(org_id, _, _)| want_all && is_operator || org_id == org.as_str())
+        .map(|(org_id, fork_count, fork_total_ms)| OrgUsageEntry {
+            org_id,
+            fork_count,
+            fork_total_ms,
+        })
+        .collect();
+    Ok(Json(UsageByOrgResponse { orgs }))
+}
+
+/// Query parameters for `/v1/usage/by-org`.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct UsageByOrgQuery {
+    /// When `Some(true)`, an operator-scoped caller receives every
+    /// org's totals instead of their own.
+    pub all: Option<bool>,
+}
+
+/// Response body for `/v1/usage/by-org`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct UsageByOrgResponse {
+    pub orgs: Vec<OrgUsageEntry>,
+}
+
+/// One row in [`UsageByOrgResponse`].
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct OrgUsageEntry {
+    pub org_id: String,
+    pub fork_count: u64,
+    pub fork_total_ms: u64,
 }
 
 /// `GET /v1/health` — structured health endpoint with backend label,
