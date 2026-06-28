@@ -17,6 +17,7 @@ members = [
     "crates/vmm-ipc",
     "crates/nanovm-vmm-child",
     "crates/nanovm-jailer",
+    "crates/nanovm-fleet",
 ]
 
 [workspace.package]

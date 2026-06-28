@@ -1724,6 +1724,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanovm-fleet"
+version = "0.0.3"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "vm-core",
+ "vmm-ipc",
+]
+
+[[package]]
 name = "nanovm-jailer"
 version = "0.0.3"
 dependencies = [
