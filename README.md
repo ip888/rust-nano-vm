@@ -134,9 +134,9 @@ its own cgroup and its own crash domain. Shipping in 6 small PRs:
 |----|--------------------------------------|------------------------------------|
 | 1  | `vmm-ipc` — wire contract            | ✅ merged (#115)                   |
 | 2  | `nanovm-vmm-child` — single-VM worker | ✅ merged (#116)                  |
-| 3  | `nanovm-jailer` — per-VM cgroup + execve | this PR                        |
-| 4  | process-fleet `Hypervisor` impl      | next                               |
-| 5  | pre-warmed VMM-process pool          | after PR-4                         |
+| 3  | `nanovm-jailer` — per-VM cgroup + execve | ✅ merged (#117)               |
+| 4  | `nanovm-fleet` — process-fleet `Hypervisor` impl | this PR                |
+| 5  | cross-worker restore + pre-warmed VMM-process pool | after PR-4           |
 | 6  | flip default + delete in-process path | final                             |
 
 8. **Durable snapshots on S3 / MinIO / R2.** Snapshots aren't

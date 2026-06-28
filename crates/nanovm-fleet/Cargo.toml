@@ -1,0 +1,29 @@
+[package]
+name = "nanovm-fleet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Process-fleet Hypervisor backend for rust-nano-vm. Spawns one nanovm-jailer per VM and forwards Hypervisor methods over vmm-ipc — gives every VM its own cgroup and its own crash domain. PR-4 of the per-VM cgroup isolation arc."
+keywords = ["microvm", "hypervisor", "ipc", "cgroups", "rust-nano-vm"]
+categories = ["virtualization"]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+vm-core.workspace = true
+vmm-ipc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "process", "io-util", "macros", "rt", "rt-multi-thread", "time", "sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "io-util", "net"] }
+
+[lints]
+workspace = true
