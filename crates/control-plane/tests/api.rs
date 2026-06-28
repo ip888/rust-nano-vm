@@ -2550,3 +2550,156 @@ async fn import_missing_snapshot_returns_404() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ===================== per-org metering & /v1/usage/by-org ============
+
+#[tokio::test]
+async fn metrics_endpoint_exposes_per_org_fork_series() {
+    let app = app_with_two_orgs();
+
+    let (_, vh) = send_with(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        Some("acme-token"),
+    )
+    .await;
+    let vm = vh["id"].as_u64().unwrap();
+    send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm}/start"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    let (_, sh) = send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm}/snapshot"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    let snap = sh["id"].as_u64().unwrap();
+    for _ in 0..2 {
+        send_with(
+            app.clone(),
+            Method::POST,
+            &format!("/v1/snapshots/{snap}/fork"),
+            None,
+            Some("acme-token"),
+        )
+        .await;
+    }
+
+    let (status, body) = send(app, Method::GET, "/metrics", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = body.as_str().unwrap_or_default();
+    assert!(
+        text.contains("nanovm_forks_total_by_org{org=\"acme\"} 2"),
+        "expected per-org series in /metrics; got:\n{text}"
+    );
+    assert!(text.contains("nanovm_fork_latency_ms_sum_by_org{org=\"acme\"}"));
+}
+
+#[tokio::test]
+async fn usage_by_org_returns_callers_own_org_by_default() {
+    let app = app_with_two_orgs();
+
+    let (_, vh) = send_with(
+        app.clone(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({})),
+        Some("acme-token"),
+    )
+    .await;
+    let vm = vh["id"].as_u64().unwrap();
+    send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm}/start"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    let (_, sh) = send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm}/snapshot"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    let snap = sh["id"].as_u64().unwrap();
+    send_with(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/snapshots/{snap}/fork"),
+        None,
+        Some("acme-token"),
+    )
+    .await;
+
+    let (status, body) = send_with(
+        app.clone(),
+        Method::GET,
+        "/v1/usage/by-org",
+        None,
+        Some("acme-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let orgs = body["orgs"].as_array().unwrap();
+    assert_eq!(orgs.len(), 1);
+    assert_eq!(orgs[0]["org_id"], "acme");
+    assert_eq!(orgs[0]["fork_count"], 1);
+
+    let (_, body) = send_with(
+        app,
+        Method::GET,
+        "/v1/usage/by-org",
+        None,
+        Some("globex-token"),
+    )
+    .await;
+    assert_eq!(body["orgs"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn usage_by_org_all_view_is_operator_scoped() {
+    // Auth-disabled router → caller is the default-org (operator surface).
+    let app = app();
+    let (_, vh) = send(app.clone(), Method::POST, "/v1/vms", Some(json!({}))).await;
+    let vm = vh["id"].as_u64().unwrap();
+    send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm}/start"),
+        None,
+    )
+    .await;
+    let (_, sh) = send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/vms/{vm}/snapshot"),
+        None,
+    )
+    .await;
+    let snap = sh["id"].as_u64().unwrap();
+    send(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/snapshots/{snap}/fork"),
+        None,
+    )
+    .await;
+
+    let (status, body) = send(app, Method::GET, "/v1/usage/by-org?all=true", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let orgs = body["orgs"].as_array().unwrap();
+    assert!(!orgs.is_empty());
+    assert_eq!(orgs[0]["org_id"], "default");
+}
