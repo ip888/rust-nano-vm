@@ -112,14 +112,32 @@ them via `MAP_PRIVATE` copy-on-write.
    bomb, OOM allocator loop, busy-spin vCPU) trips the kernel's cap
    instead of taking the host with it. **v1 scope: process-wide,
    not per-VM** — every VM hosted by the VMM shares the budget. Per-VM
-   caps need the multi-process rearchitecture and land in a later
-   milestone; for the monolithic VMM this still bounds blast radius
-   on the host. Requires cgroup v2; only the controller(s) you actually
-   request need to be delegated to the VMM's parent (memory-only configs
-   don't need cpu, and vice versa). Under systemd: `Delegate=memory`,
-   `Delegate=cpu`, or `Delegate=memory cpu` depending on which knobs
-   you set. See
-   [`crates/vm-kvm/src/cgroups.rs`](crates/vm-kvm/src/cgroups.rs).
+   caps land in the **per-VM cgroup isolation arc** below — see the
+   roadmap table — and use `nanovm-jailer` to give every VM its own
+   `memory.max` + `cpu.max`. For the monolithic VMM, the process-wide
+   knob still bounds blast radius on the host. Requires cgroup v2;
+   only the controller(s) you actually request need to be delegated
+   to the VMM's parent (memory-only configs don't need cpu, and vice
+   versa). Under systemd: `Delegate=memory`, `Delegate=cpu`, or
+   `Delegate=memory cpu` depending on which knobs you set. See
+   [`crates/vm-kvm/src/cgroups.rs`](crates/vm-kvm/src/cgroups.rs)
+   for the process-wide path and
+   [`crates/nanovm-jailer/`](crates/nanovm-jailer/) for the per-VM
+   shim.
+
+### Per-VM cgroup isolation arc (in progress)
+
+Splits the monolithic VMM into a process-fleet model so each VM gets
+its own cgroup and its own crash domain. Shipping in 6 small PRs:
+
+| PR | Crate / change                       | Status                             |
+|----|--------------------------------------|------------------------------------|
+| 1  | `vmm-ipc` — wire contract            | ✅ merged (#115)                   |
+| 2  | `nanovm-vmm-child` — single-VM worker | ✅ merged (#116)                  |
+| 3  | `nanovm-jailer` — per-VM cgroup + execve | this PR                        |
+| 4  | process-fleet `Hypervisor` impl      | next                               |
+| 5  | pre-warmed VMM-process pool          | after PR-4                         |
+| 6  | flip default + delete in-process path | final                             |
 
 8. **Durable snapshots on S3 / MinIO / R2.** Snapshots aren't
    pinned to one host: `POST /v1/snapshots/:id/export` uploads
