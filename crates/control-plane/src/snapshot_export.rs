@@ -8,7 +8,7 @@
 use axum::{
     extract::{
         rejection::{JsonRejection, PathRejection},
-        Path, State,
+        Extension, Path, State,
     },
     http::StatusCode,
     Json,
@@ -16,6 +16,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use vm_core::SnapshotId;
 
+use crate::auth::OrgId;
 use crate::error::ApiError;
 use crate::routes::AppState;
 
@@ -67,10 +68,14 @@ pub(crate) struct ImportResponse {
 
 pub(crate) async fn export_snapshot(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     id: Result<Path<u64>, PathRejection>,
     body: Result<Json<ExportRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ExportResponse>), ApiError> {
     let Path(id) = id?;
+    let snap = SnapshotId(id);
+    // Cross-org access check before doing anything expensive.
+    state.ownership().require_snapshot_access(snap, &org)?;
     let Json(req) = body.unwrap_or(Json(ExportRequest::default()));
     let store = state
         .snapshot_store()
@@ -82,7 +87,6 @@ pub(crate) async fn export_snapshot(
         })?
         .clone();
 
-    let snap = SnapshotId(id);
     let dir = state
         .hypervisor()
         .snapshot_export_dir(snap)?
@@ -114,6 +118,7 @@ pub(crate) async fn export_snapshot(
 
 pub(crate) async fn import_snapshot(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     body: Result<Json<ImportRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ImportResponse>), ApiError> {
     let Json(req) = body?;
@@ -153,6 +158,12 @@ pub(crate) async fn import_snapshot(
         .await
         .map_err(|e| ApiError::InternalDyn(format!("adopt task panicked: {e}")))?
         .map_err(ApiError::from)?;
+
+    // Record ownership so the importing org sees the snapshot in
+    // `/v1/snapshots` lists and can `restore` / `fork` / `delete` it.
+    // Without this the adopted snapshot lands in the default-org
+    // bucket and isn't reachable from a non-operator caller.
+    state.ownership().record_snapshot(local_id, org);
 
     // Best-effort cleanup of the temp dir — the backend has copied
     // what it needs into its own storage.

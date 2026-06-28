@@ -145,9 +145,9 @@ impl AppState {
     }
 
     /// Borrow the per-org ownership map. Used by sibling modules
-    /// (`sandbox`, `snapshot_export`) that need to record/check
-    /// resource ownership outside the main handlers in this file.
-    #[allow(dead_code)]
+    /// (`sandbox`, `snapshot_export`, `exec_stream`) that need to
+    /// record/check resource ownership outside the main handlers in
+    /// this file.
     pub(crate) fn ownership(&self) -> &Arc<OwnershipMap> {
         &self.ownership
     }

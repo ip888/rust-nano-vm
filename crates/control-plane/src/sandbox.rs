@@ -24,12 +24,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{rejection::JsonRejection, State},
+    extract::{rejection::JsonRejection, Extension, State},
     Json,
 };
 use serde::{Deserialize, Serialize};
 use vm_core::{GuestExecRequest, Hypervisor, SnapshotId, VmId};
 
+use crate::auth::OrgId;
 use crate::error::ApiError;
 use crate::routes::AppState;
 
@@ -222,10 +223,18 @@ impl DispatchOutcome {
 
 pub(crate) async fn sandbox_invoke(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     body: Result<Json<SandboxInvokeRequest>, JsonRejection>,
 ) -> Result<Json<SandboxResult>, ApiError> {
     let Json(req) = body?;
     let snapshot_id = resolve_snapshot(req.snapshot)?;
+
+    // Cross-org access check: the caller must own (or be the default
+    // org for) the source snapshot. Without this any org could fork
+    // a sandbox from another tenant's snapshot.
+    state
+        .ownership()
+        .require_snapshot_access(snapshot_id, &org)?;
 
     let started = Instant::now();
     let (handle, cold_start) = match state.warm_pool().take(snapshot_id) {
@@ -239,6 +248,10 @@ pub(crate) async fn sandbox_invoke(
         }
     };
     let vm_id = handle.id;
+    // Record the ephemeral VM's owner so any concurrent operation
+    // that happens to touch it (rare in the sandbox flow but possible
+    // via `/v1/vms/:id/*` if the caller knows the id) is gated.
+    state.ownership().record_vm(vm_id, org.clone());
 
     let outcome = dispatch(state.hypervisor(), vm_id, req.action);
 
@@ -250,6 +263,7 @@ pub(crate) async fn sandbox_invoke(
     if let Err(err) = state.hypervisor().destroy(vm_id) {
         tracing::warn!(vm_id = vm_id.0, ?err, "sandbox: VM destroy failed");
     }
+    state.ownership().forget_vm(vm_id);
 
     let outcome = outcome?;
     Ok(Json(SandboxResult {

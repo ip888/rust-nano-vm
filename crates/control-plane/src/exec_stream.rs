@@ -33,7 +33,7 @@ use std::time::Duration;
 use axum::{
     extract::{
         rejection::{JsonRejection, PathRejection},
-        Path, State,
+        Extension, Path, State,
     },
     response::sse::{Event, KeepAlive, Sse},
     Json,
@@ -54,6 +54,7 @@ use vm_core::{ExecFrame, VmId};
 const SSE_BUFFER: usize = 64;
 
 use crate::api::ExecRequest;
+use crate::auth::OrgId;
 use crate::error::ApiError;
 use crate::routes::AppState;
 
@@ -73,10 +74,18 @@ struct ExitPayload {
 /// bearer-token gate and audit row as every other mutating call.
 pub(crate) async fn exec_vm_stream(
     State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
     id: Result<Path<u64>, PathRejection>,
     body: Result<Json<ExecRequest>, JsonRejection>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
     let Path(id) = id?;
+    let vm_id = VmId(id);
+
+    // Cross-org access check BEFORE we even look at the body so a
+    // forbidden caller can't probe the VM's existence by sending an
+    // invalid body and reading the 4xx variant.
+    state.ownership().require_vm_access(vm_id, &org)?;
+
     let Json(req) = body?;
 
     // Spawn the backend's blocking stream BEFORE we return the SSE
@@ -84,9 +93,7 @@ pub(crate) async fn exec_vm_stream(
     // InvalidTransition, Unsupported) surface as a normal JSON error
     // envelope with the correct status, not as an SSE stream that
     // immediately closes.
-    let mut stream = state
-        .hypervisor()
-        .exec_in_guest_stream(VmId(id), req.into())?;
+    let mut stream = state.hypervisor().exec_in_guest_stream(vm_id, req.into())?;
 
     // Bounded channel + `blocking_send` is the backpressure path:
     // the producer parks when the SSE consumer can't keep up,
