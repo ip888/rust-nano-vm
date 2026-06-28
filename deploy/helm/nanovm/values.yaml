@@ -70,14 +70,33 @@ nodeSelector:
 tolerations: []
 affinity: {}
 
+# ---- Tokens Secret wiring --------------------------------------------
+# By default the chart creates an opaque Secret named `<release>-tokens`
+# with one key, `NANOVM_API_TOKENS`. To manage tokens out-of-band
+# (sealed-secrets, ExternalSecrets, Vault, ...) point the chart at a
+# pre-existing Secret with the same key shape:
+#
+#   tokensSecret:
+#     existingSecret: my-tokens-secret
+#
+# When `existingSecret` is set, `config.apiTokens` is ignored and the
+# chart's own Secret is not rendered.
+tokensSecret:
+  existingSecret: ""
+
 # ---- Configuration ---------------------------------------------------
 config:
-  # `acme:tok1,acme:tok2,globex:tok3` form is recommended for any
-  # multi-tenant deployment (see auth.rs for the env shape).
-  # Provided here as a literal for first-boot testing only — production
-  # deployments should pull this from a SealedSecret / external secret
-  # operator. Empty value disables auth (NEVER in production).
-  apiTokens: "dev-token"
+  # `acme:tok1,acme:tok2,globex:tok3` form is the recommended shape for
+  # multi-tenant deployments (see auth.rs for the env spec).
+  #
+  # **REQUIRED** unless `tokensSecret.existingSecret` is set. The chart
+  # fails `helm install` if you leave this empty AND don't point at an
+  # external Secret — we never silently ship an auth-disabled deployment.
+  #
+  # To opt in to auth-disabled mode for a throwaway dev cluster, set
+  # this to the literal string `"NONE"` (chart renders an empty token
+  # set; binary then runs auth-off and logs a WARN line at startup).
+  apiTokens: ""
   # Wall-clock fork quota in tokens-per-second per bearer.
   forkQuotaPerSec: 10
   # JSONL audit destination. Defaults to /var/log/nanovm/audit.jsonl,
