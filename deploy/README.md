@@ -59,8 +59,7 @@ Production overrides worth setting:
 
 ```yaml
 image:
-  tag: "0.0.4"  # pin to a released version, never `latest`
-
+  tag: "0.0.3"  # pin to a released version, never `latest`
 config:
   apiTokens: ""           # leave empty; set via SealedSecret / external-secrets
   forkQuotaPerSec: 50
