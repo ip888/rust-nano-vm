@@ -100,6 +100,13 @@ pub struct FleetConfig {
     /// covers debug builds + cold disk. Hitting the timeout
     /// surfaces as [`VmError::Backend`].
     pub spawn_timeout: Duration,
+    /// Target number of pre-spawned idle workers to keep around
+    /// so `create_vm` is a socket-pop instead of a full
+    /// `Command::spawn` + handshake. `0` disables (default — the
+    /// pool costs RSS for the idle workers, and most operators
+    /// don't need sub-ms cold-start). Each idle worker holds an
+    /// open connection but no VM until `create_vm` claims it.
+    pub warm_pool_size: usize,
 }
 
 impl Default for FleetConfig {
@@ -112,8 +119,18 @@ impl Default for FleetConfig {
             default_cpu_quota_pct: None,
             cgroup_parent: None,
             spawn_timeout: Duration::from_secs(5),
+            warm_pool_size: 0,
         }
     }
+}
+
+/// One pre-spawned idle worker waiting to be claimed by the next
+/// `create_vm`. Carries the orchestrator-side VM id the jailer was
+/// spawned under (the cgroup name uses it) so `create_vm` can
+/// return a stable handle.
+struct WarmEntry {
+    vm_id: VmId,
+    slot: WorkerSlot,
 }
 
 /// One worker subprocess + the **persistent** IPC stream we talk
@@ -132,6 +149,15 @@ struct Worker {
     /// Open IPC stream to the worker. Closed in `destroy` (sends
     /// `Shutdown` + drops); the worker exits on EOF.
     stream: Option<UnixStream>,
+    /// Worker-side VmId for the (single) VM hosted by this
+    /// worker. Set on first successful `CreateVm` / `Restore`; the
+    /// fleet remaps every subsequent request from the
+    /// orchestrator's id space into this id before sending. Without
+    /// this remap the worker's backend would see `UnknownVm`
+    /// every time the orchestrator counter drifted from the
+    /// worker's internal `VmId::next()` (which it always does
+    /// once a Restore-spawned worker is involved).
+    worker_vm_id: Option<VmId>,
 }
 
 impl std::fmt::Debug for Worker {
@@ -194,6 +220,12 @@ pub struct ProcessFleet {
     /// control plane creates a dedicated worker pool when it
     /// installs the fleet.
     runtime: Arc<tokio::runtime::Runtime>,
+    /// Pre-spawned idle workers waiting for `create_vm`. Each
+    /// entry is a fully-handshaken worker that hasn't seen
+    /// `CreateVm` yet. `create_vm` pops the front; a separate
+    /// refill keeps the queue at `config.warm_pool_size`. Empty
+    /// when `warm_pool_size == 0`.
+    warm_pool: Mutex<std::collections::VecDeque<WarmEntry>>,
 }
 
 impl std::fmt::Debug for ProcessFleet {
@@ -220,13 +252,60 @@ impl ProcessFleet {
             .enable_time()
             .thread_name("nanovm-fleet-ipc")
             .build()?;
-        Ok(Self {
+        let fleet = Self {
             config,
             workers: RwLock::new(HashMap::new()),
             snapshot_owner: RwLock::new(HashMap::new()),
             next_vm_id: AtomicU64::new(1),
             runtime: Arc::new(runtime),
-        })
+            warm_pool: Mutex::new(std::collections::VecDeque::new()),
+        };
+        // Synchronously fill the pool to its target depth so the
+        // first `create_vm` already hits the warm path. A failure
+        // here surfaces as the constructor error so a
+        // misconfigured deployment doesn't silently fall back to
+        // a cold pool — better to fail fast at startup than to
+        // discover the misconfig under load.
+        fleet.refill_warm_pool()?;
+        Ok(fleet)
+    }
+
+    /// Pre-spawn workers until the warm pool is at its target
+    /// depth. Called from the constructor and from `create_vm`
+    /// (to refill after a take). Returns the first spawn error;
+    /// the pool may end up partially filled, which is fine — the
+    /// next `create_vm` either pops the existing entries or
+    /// retries the spawn.
+    fn refill_warm_pool(&self) -> Result<(), std::io::Error> {
+        if self.config.warm_pool_size == 0 {
+            return Ok(());
+        }
+        let mut pool = self.warm_pool.lock().expect("warm pool lock");
+        while pool.len() < self.config.warm_pool_size {
+            let vm_id = VmId(self.next_vm_id.fetch_add(1, Ordering::Relaxed));
+            match self.spawn_worker(vm_id) {
+                Ok(slot) => pool.push_back(WarmEntry { vm_id, slot }),
+                Err(e) => {
+                    return Err(std::io::Error::other(format!("refill warm pool: {e}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Pop the next idle worker from the warm pool, if any.
+    /// Returns the orchestrator id the worker was spawned under +
+    /// the slot. The slot's `worker_vm_id` is still `None` — the
+    /// caller's `CreateVm` round-trip records it.
+    fn take_warm(&self) -> Option<WarmEntry> {
+        self.warm_pool.lock().expect("warm pool lock").pop_front()
+    }
+
+    /// Number of pre-spawned workers currently idle. Test +
+    /// observability helper.
+    #[doc(hidden)]
+    pub fn warm_pool_len(&self) -> usize {
+        self.warm_pool.lock().expect("warm pool lock").len()
     }
 
     /// Spawn a jailer subprocess for a new VM, wait for the
@@ -276,6 +355,7 @@ impl ProcessFleet {
                 child: Some(child),
                 socket,
                 stream: Some(stream),
+                worker_vm_id: None,
             }))),
             Err(e) => {
                 // Worker never came up. Kill the jailer (and by
@@ -306,6 +386,29 @@ impl ProcessFleet {
     /// the request stream.
     fn dispatch(&self, id: VmId, req: Request) -> VmResult<Response> {
         let slot = self.worker_for(id)?;
+        self.dispatch_to_slot(&slot, req)
+    }
+
+    /// Translate the orchestrator's `id` to the worker-internal
+    /// id, build the request via the closure, and dispatch. Used
+    /// for every method that carries a `VmId` (start/stop/state/
+    /// vm_meta/snapshot/destroy/exec/file ops). Returns
+    /// `Backend("worker id not yet assigned")` if called before
+    /// the worker has acknowledged a `CreateVm` / `Restore` —
+    /// shouldn't happen on the public path since `create_vm` only
+    /// inserts into the workers map after a successful round-trip.
+    fn dispatch_remapped<F>(&self, orchestrator_id: VmId, build: F) -> VmResult<Response>
+    where
+        F: FnOnce(VmId) -> Request,
+    {
+        let slot = self.worker_for(orchestrator_id)?;
+        let worker_id = {
+            let guard = slot.lock().expect("worker lock");
+            guard
+                .worker_vm_id
+                .ok_or_else(|| VmError::Backend("worker id not yet assigned for this VM".into()))?
+        };
+        let req = build(worker_id);
         self.dispatch_to_slot(&slot, req)
     }
 
@@ -417,8 +520,24 @@ fn framing_to_io(e: vmm_ipc::framing::FrameError) -> std::io::Error {
 
 impl Hypervisor for ProcessFleet {
     fn create_vm(&self, cfg: &VmConfig) -> VmResult<VmHandle> {
-        let vm_id = VmId(self.next_vm_id.fetch_add(1, Ordering::Relaxed));
-        let slot = self.spawn_worker(vm_id)?;
+        // Hot path: claim a pre-spawned worker. Cold path: spawn
+        // a fresh one (warm pool is empty / disabled).
+        let (vm_id, slot, served_warm) = match self.take_warm() {
+            Some(entry) => (entry.vm_id, entry.slot, true),
+            None => {
+                let id = VmId(self.next_vm_id.fetch_add(1, Ordering::Relaxed));
+                let slot = self.spawn_worker(id)?;
+                (id, slot, false)
+            }
+        };
+        // Best-effort refill: don't block create_vm on it (we
+        // already have a worker), and don't surface refill failures
+        // as user errors.
+        if served_warm {
+            if let Err(e) = self.refill_warm_pool() {
+                tracing::warn!(error = %e, "warm pool refill failed");
+            }
+        }
         let resp = self.dispatch_to_slot(
             &slot,
             Request::CreateVm {
@@ -429,10 +548,14 @@ impl Hypervisor for ProcessFleet {
             Response::VmHandle(h) => Ok(h),
             other => Err(other),
         })?;
-        // Worker assigns its own VmId internally; we always trust
-        // the orchestrator-side id (the cgroup is named after
-        // `vm_id` and the worker just lives in it). If the worker
-        // returned a different id, replace it.
+        // Record the worker's internal id so subsequent requests
+        // can be remapped; the orchestrator's id is the only thing
+        // the public surface ever sees (the cgroup is named after
+        // it, and ownership maps key off it).
+        {
+            let mut guard = slot.lock().expect("worker lock");
+            guard.worker_vm_id = Some(handle.id);
+        }
         let handle = VmHandle {
             id: vm_id,
             ..handle
@@ -445,7 +568,7 @@ impl Hypervisor for ProcessFleet {
     }
 
     fn start(&self, id: VmId) -> VmResult<()> {
-        let resp = self.dispatch(id, Request::Start { id })?;
+        let resp = self.dispatch_remapped(id, |worker_id| Request::Start { id: worker_id })?;
         unwrap_response(resp, |r| match r {
             Response::Empty => Ok(()),
             other => Err(other),
@@ -453,7 +576,7 @@ impl Hypervisor for ProcessFleet {
     }
 
     fn stop(&self, id: VmId) -> VmResult<()> {
-        let resp = self.dispatch(id, Request::Stop { id })?;
+        let resp = self.dispatch_remapped(id, |worker_id| Request::Stop { id: worker_id })?;
         unwrap_response(resp, |r| match r {
             Response::Empty => Ok(()),
             other => Err(other),
@@ -461,7 +584,7 @@ impl Hypervisor for ProcessFleet {
     }
 
     fn state(&self, id: VmId) -> VmResult<VmState> {
-        let resp = self.dispatch(id, Request::State { id })?;
+        let resp = self.dispatch_remapped(id, |worker_id| Request::State { id: worker_id })?;
         unwrap_response(resp, |r| match r {
             Response::State { state } => Ok(state),
             other => Err(other),
@@ -469,7 +592,7 @@ impl Hypervisor for ProcessFleet {
     }
 
     fn snapshot(&self, id: VmId) -> VmResult<SnapshotId> {
-        let resp = self.dispatch(id, Request::Snapshot { id })?;
+        let resp = self.dispatch_remapped(id, |worker_id| Request::Snapshot { id: worker_id })?;
         let snap = unwrap_response(resp, |r| match r {
             Response::Snapshot { id } => Ok(id),
             other => Err(other),
@@ -481,29 +604,80 @@ impl Hypervisor for ProcessFleet {
         Ok(snap)
     }
 
-    fn restore(&self, _snap: SnapshotId) -> VmResult<VmHandle> {
-        // Snapshots live inside the worker that captured them
-        // (single-VM workers + in-memory state). Cross-worker
-        // restore needs the snapshot blob to leave that worker
-        // — either via the durable snapshot store
-        // (`snapshot_export` / `snapshot_adopt`) or via a
-        // shared-state refactor. Both land in PR-5 of the arc.
-        // The mock-backend in-process path still works for
-        // operators that haven't switched to the fleet yet.
-        Err(VmError::Backend(
-            "restore not yet supported on the process-fleet backend; \
-             cross-worker snapshot transfer ships in PR-5. Use the \
-             in-process backend for the snapshot/restore/fork path \
-             until then."
-                .into(),
-        ))
+    fn restore(&self, snap: SnapshotId) -> VmResult<VmHandle> {
+        // Cross-worker restore: the originating worker exports
+        // the snapshot to an on-disk directory; we spawn a fresh
+        // worker and ask it to adopt the same directory; then
+        // call Restore on the new worker against the just-adopted
+        // local id.
+        let owner_vm = self
+            .snapshot_owner
+            .read()
+            .expect("snapshot owner lock")
+            .get(&snap)
+            .copied()
+            .ok_or(VmError::UnknownSnapshot(snap))?;
+        let owner_slot = self.worker_for(owner_vm)?;
+        let export = self.dispatch_to_slot(&owner_slot, Request::SnapshotExportDir { id: snap })?;
+        let dir = match unwrap_response(export, |r| match r {
+            Response::OptPath { path } => Ok(path),
+            other => Err(other),
+        })? {
+            Some(d) => d,
+            None => {
+                return Err(VmError::Backend(format!(
+                    "snapshot {} can't be exported on this backend; \
+                     cross-worker restore needs a backend that surfaces \
+                     snapshot state on disk (mock-fleet returns None today)",
+                    snap.0
+                )));
+            }
+        };
+
+        let new_vm_id = VmId(self.next_vm_id.fetch_add(1, Ordering::Relaxed));
+        let new_slot = self.spawn_worker(new_vm_id)?;
+        // Tell the fresh worker to ingest the exported directory.
+        let adopt = self.dispatch_to_slot(&new_slot, Request::SnapshotAdopt { dir })?;
+        let local_snap = unwrap_response(adopt, |r| match r {
+            Response::Snapshot { id } => Ok(id),
+            other => Err(other),
+        })?;
+        // Then do the actual restore against the worker-local id.
+        let resp = self.dispatch_to_slot(&new_slot, Request::Restore { id: local_snap })?;
+        let handle = unwrap_response(resp, |r| match r {
+            Response::VmHandle(h) => Ok(h),
+            other => Err(other),
+        })?;
+        // Record the worker-internal id of the restored VM so
+        // subsequent state/start/stop/destroy/etc translate
+        // correctly. Without this every follow-up op would
+        // surface `UnknownVm` (the worker's mock backend
+        // assigned its own VmId from `VmId::next()` which won't
+        // match the orchestrator counter).
+        {
+            let mut guard = new_slot.lock().expect("worker lock");
+            guard.worker_vm_id = Some(handle.id);
+        }
+        let handle = VmHandle {
+            id: new_vm_id,
+            ..handle
+        };
+        self.workers
+            .write()
+            .expect("workers lock")
+            .insert(new_vm_id, new_slot);
+        Ok(handle)
     }
 
     fn destroy(&self, id: VmId) -> VmResult<()> {
         let slot = self.worker_for(id)?;
         // Cooperative shutdown — best-effort. The Worker's Drop
-        // SIGKILLs if this doesn't land in time.
-        let _ = self.dispatch_to_slot(&slot, Request::Destroy { id });
+        // SIGKILLs if this doesn't land in time. Translate to the
+        // worker-internal id before asking it to destroy.
+        let worker_id = slot.lock().expect("worker lock").worker_vm_id;
+        if let Some(wid) = worker_id {
+            let _ = self.dispatch_to_slot(&slot, Request::Destroy { id: wid });
+        }
         let _ = self.dispatch_to_slot(&slot, Request::Shutdown);
         self.workers.write().expect("workers lock").remove(&id);
         // The Arc may live on briefly in a concurrent caller; the
@@ -584,7 +758,7 @@ impl Hypervisor for ProcessFleet {
     }
 
     fn vm_meta(&self, id: VmId) -> VmResult<VmMeta> {
-        let resp = self.dispatch(id, Request::VmMeta { id })?;
+        let resp = self.dispatch_remapped(id, |worker_id| Request::VmMeta { id: worker_id })?;
         unwrap_response(resp, |r| match r {
             Response::VmMeta(m) => Ok(m),
             other => Err(other),
@@ -592,7 +766,8 @@ impl Hypervisor for ProcessFleet {
     }
 
     fn exec_in_guest(&self, id: VmId, req: GuestExecRequest) -> VmResult<GuestExecResult> {
-        let resp = self.dispatch(id, Request::ExecInGuest { id, req })?;
+        let resp =
+            self.dispatch_remapped(id, |worker_id| Request::ExecInGuest { id: worker_id, req })?;
         unwrap_response(resp, |r| match r {
             Response::ExecResult(res) => Ok(res),
             other => Err(other),
@@ -600,15 +775,12 @@ impl Hypervisor for ProcessFleet {
     }
 
     fn write_file(&self, id: VmId, path: String, content: Vec<u8>, mode: u32) -> VmResult<u64> {
-        let resp = self.dispatch(
-            id,
-            Request::WriteFile {
-                id,
-                path,
-                content,
-                mode,
-            },
-        )?;
+        let resp = self.dispatch_remapped(id, |worker_id| Request::WriteFile {
+            id: worker_id,
+            path,
+            content,
+            mode,
+        })?;
         unwrap_response(resp, |r| match r {
             Response::Written { bytes } => Ok(bytes),
             other => Err(other),
@@ -616,7 +788,10 @@ impl Hypervisor for ProcessFleet {
     }
 
     fn read_file(&self, id: VmId, path: String) -> VmResult<Vec<u8>> {
-        let resp = self.dispatch(id, Request::ReadFile { id, path })?;
+        let resp = self.dispatch_remapped(id, |worker_id| Request::ReadFile {
+            id: worker_id,
+            path,
+        })?;
         unwrap_response(resp, |r| match r {
             Response::Bytes { content } => Ok(content),
             other => Err(other),

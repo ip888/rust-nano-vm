@@ -72,20 +72,35 @@ fleet.destroy(h.id)?;
 
 The control plane plugs `Arc<ProcessFleet>` into `AppState::new(...)` the same way it accepts `Arc<MockHypervisor>` or `Arc<KvmHypervisor>` today.
 
-## Scope of PR-4
+## Scope
 
-**Implemented:**
+**Implemented (PR-4 + PR-5):**
 - `create_vm`, `start`, `stop`, `state`, `vm_meta`, `destroy`
 - `snapshot`, `list_snapshots`, `delete_snapshot`, `snapshot_meta`
 - `list_vms` — synthesizes from the fleet's worker map
 - `exec_in_guest`, `read_file`, `write_file`
 - Cooperative shutdown + SIGKILL-on-Drop for leaked workers
+- **`restore` (PR-5)** — cross-worker via the owner's `snapshot_export_dir` → fresh worker's `snapshot_adopt`. The new VM lives in its own process / cgroup, not the owner's. Backends that don't expose snapshot state on disk (return `None` from `snapshot_export_dir`) surface a clear "cross-worker restore unsupported on this backend" error instead of silently producing an empty VM.
+- **Pre-warmed worker pool (PR-5)** — `FleetConfig::warm_pool_size = N` pre-spawns N idle workers at construction time. `create_vm` pops from the queue (sub-ms; no `fork`/`exec`/handshake) and best-effort-refills. Default is `0` (cold spawn every time) because the pool costs RSS for idle workers and most operators don't need sub-ms cold-start.
 
 **Deliberately deferred:**
 
-- `restore` — returns `VmError::Backend` with a message pointing to PR-5. Snapshots live inside the worker that captured them (single-VM workers + in-memory state); cross-worker restore needs either the durable snapshot store path or a shared-state refactor. Both land in PR-5 of the arc. The in-process `MockHypervisor` / `KvmHypervisor` paths still work for the snapshot/restore/fork workflow until PR-5 ships.
-- `exec_in_guest_stream` — SSE-over-IPC needs its own framing addition to `vmm-ipc`. PR-5 / PR-6.
-- `snapshot_export_dir` / `snapshot_adopt` — same wire-extension story as streaming exec.
+- `exec_in_guest_stream` — SSE-over-IPC needs its own framing addition to `vmm-ipc`. PR-6.
+- Fleet-side `snapshot_export_dir` / `snapshot_adopt` trait passthrough — currently used only internally for cross-worker restore; control-plane callers still go through the in-process backend for `/v1/snapshots/:id/export` + `/v1/snapshots/import`.
+
+## Warm-pool quick start
+
+```rust,no_run
+use nanovm_fleet::{FleetConfig, ProcessFleet};
+
+let fleet = ProcessFleet::new(FleetConfig {
+    warm_pool_size: 4,          // 4 idle workers always ready
+    ..Default::default()
+})?;
+// fleet.warm_pool_len() == 4 at this point;
+// create_vm now hits the warm path and refills in the background.
+# Ok::<(), std::io::Error>(())
+```
 
 ## Sync ↔ async bridge
 

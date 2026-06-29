@@ -137,6 +137,14 @@ pub fn dispatch(hv: &Arc<dyn Hypervisor>, req: Request) -> Response {
             Ok(bytes) => Response::Written { bytes },
             Err(e) => (&e).into(),
         },
+        Request::SnapshotExportDir { id } => match hv.snapshot_export_dir(id) {
+            Ok(path) => Response::OptPath { path },
+            Err(e) => (&e).into(),
+        },
+        Request::SnapshotAdopt { dir } => match hv.snapshot_adopt(&dir) {
+            Ok(snap_id) => Response::Snapshot { id: snap_id },
+            Err(e) => (&e).into(),
+        },
     }
 }
 
