@@ -20,6 +20,11 @@ path = "src/bin/openapi.rs"
 [dependencies]
 vm-core.workspace = true
 vm-mock.workspace = true
+# Process-fleet Hypervisor backend, gated by NANOVM_BACKEND=fleet
+# at runtime. The dep stays in the default build because the
+# control plane needs to be able to wire it on demand without a
+# feature-flag rebuild — operators flip a single env var.
+nanovm-fleet.workspace = true
 # `s3` is propagated from the control-plane's own `s3` feature; the
 # bin opts in via `cargo build --features s3` to ship a binary with
 # durable S3 snapshot storage. The default build still works without

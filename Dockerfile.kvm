@@ -38,7 +38,11 @@ WORKDIR /src
 COPY . .
 
 RUN cargo build --release --locked --features kvm \
-    -p control-plane --bin nanovm-control-plane
+    -p control-plane --bin nanovm-control-plane && \
+    cargo build --release --locked \
+    -p nanovm-jailer --bin nanovm-jailer && \
+    cargo build --release --locked \
+    -p nanovm-vmm-child --bin nanovm-vmm-child
 
 # ---- Stage 2: runtime ------------------------------------------------
 FROM gcr.io/distroless/cc-debian12:debug-nonroot
@@ -46,6 +50,14 @@ FROM gcr.io/distroless/cc-debian12:debug-nonroot
 COPY --from=builder \
      /src/target/release/nanovm-control-plane \
      /usr/local/bin/nanovm-control-plane
+# Per-VM cgroup isolation binaries — present in every KVM image so
+# operators can flip `NANOVM_BACKEND=fleet` without rebuilding.
+COPY --from=builder \
+     /src/target/release/nanovm-jailer \
+     /usr/local/bin/nanovm-jailer
+COPY --from=builder \
+     /src/target/release/nanovm-vmm-child \
+     /usr/local/bin/nanovm-vmm-child
 
 # Bind to all interfaces by default — port mapping works out of the box.
 ENV NANOVM_CONTROL_PLANE_ADDR=0.0.0.0:8080

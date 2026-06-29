@@ -136,8 +136,8 @@ its own cgroup and its own crash domain. Shipping in 6 small PRs:
 | 2  | `nanovm-vmm-child` — single-VM worker | ✅ merged (#116)                  |
 | 3  | `nanovm-jailer` — per-VM cgroup + execve | ✅ merged (#117)               |
 | 4  | `nanovm-fleet` — process-fleet `Hypervisor` impl | ✅ merged                |
-| 5  | cross-worker restore + pre-warmed VMM-process pool | this PR              |
-| 6  | flip default + delete in-process path | final                             |
+| 5  | cross-worker restore + pre-warmed VMM-process pool | ✅ merged              |
+| 6  | wire fleet into control-plane (`NANOVM_BACKEND=fleet`) | this PR        |
 
 8. **Durable snapshots on S3 / MinIO / R2.** Snapshots aren't
    pinned to one host: `POST /v1/snapshots/:id/export` uploads
