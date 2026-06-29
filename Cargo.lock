@@ -835,6 +835,7 @@ dependencies = [
  "axum",
  "base64",
  "http-body-util",
+ "nanovm-fleet",
  "reqwest",
  "serde",
  "serde_json",
