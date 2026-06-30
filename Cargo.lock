@@ -835,6 +835,7 @@ dependencies = [
  "axum",
  "base64",
  "http-body-util",
+ "nanovm-fleet",
  "reqwest",
  "serde",
  "serde_json",
@@ -1721,6 +1722,20 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nanovm-fleet"
+version = "0.0.3"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "vm-core",
+ "vmm-ipc",
 ]
 
 [[package]]

@@ -74,6 +74,38 @@ spec:
             - name: NANOVM_SNAPSHOT_STORE
               value: {{ .Values.config.snapshotStore | quote }}
             {{- end }}
+            {{- if .Values.config.tokenStorePath }}
+            - name: NANOVM_TOKEN_STORE_PATH
+              value: {{ .Values.config.tokenStorePath | quote }}
+            {{- end }}
+            {{- if .Values.config.backend }}
+            - name: NANOVM_BACKEND
+              value: {{ .Values.config.backend | quote }}
+            {{- end }}
+            {{- if eq (default "mock" .Values.config.backend) "fleet" }}
+            - name: NANOVM_FLEET_JAILER_BINARY
+              value: "/usr/local/bin/nanovm-jailer"
+            - name: NANOVM_FLEET_VMM_CHILD_BINARY
+              value: "/usr/local/bin/nanovm-vmm-child"
+            {{- with .Values.config.fleet }}
+            - name: NANOVM_FLEET_SOCKET_DIR
+              value: {{ .socketDir | default "/var/run/nanovm" | quote }}
+            - name: NANOVM_FLEET_WARM_POOL_SIZE
+              value: {{ .warmPoolSize | default 0 | quote }}
+            {{- if .memoryLimitMib }}
+            - name: NANOVM_FLEET_MEMORY_LIMIT_MIB
+              value: {{ .memoryLimitMib | quote }}
+            {{- end }}
+            {{- if .cpuQuotaPct }}
+            - name: NANOVM_FLEET_CPU_QUOTA_PCT
+              value: {{ .cpuQuotaPct | quote }}
+            {{- end }}
+            {{- if .cgroupParent }}
+            - name: NANOVM_FLEET_CGROUP_PARENT
+              value: {{ .cgroupParent | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
           envFrom:
             - secretRef:
                 name: {{ include "nanovm.secretName" . }}

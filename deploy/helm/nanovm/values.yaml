@@ -112,6 +112,32 @@ config:
   snapshotStore: ""
   # Extra RUST_LOG directives (defaults to "info").
   rustLog: "info"
+  # Where to persist runtime-issued API keys (POST /v1/keys). Empty
+  # → in-memory only (keys lost on restart). Set to a path under a
+  # PVC for production. The chart wires this to the same /var/lib/nanovm
+  # emptyDir as the audit log by default — promote to a PVC if you
+  # want survival across pod recreation.
+  tokenStorePath: "/var/lib/nanovm/tokens.json"
+  # Hypervisor backend:
+  #   - `mock` (default): in-process MockHypervisor (no /dev/kvm needed).
+  #   - `fleet`: spawn one nanovm-jailer per VM. Each VM gets its own
+  #     cgroup and crash domain. Requires the KVM image (which ships
+  #     the jailer + worker binaries) and a delegated parent cgroup
+  #     (systemd Delegate=memory cpu, or root + manual delegation).
+  backend: "mock"
+  # Fleet-only knobs — ignored unless `backend == fleet`.
+  fleet:
+    socketDir: "/var/run/nanovm"
+    # Pre-spawned idle workers (0 disables; non-zero pre-pays the
+    # spawn cost so create_vm is socket-pop-fast). Each idle worker
+    # holds an open connection but no VM until `create_vm` claims it.
+    warmPoolSize: 0
+    # Optional default per-VM caps the jailer writes into the
+    # cgroup. Empty values skip the corresponding controller.
+    memoryLimitMib: ""
+    cpuQuotaPct: ""
+    # Override the parent cgroup. Unset = use the pod's own.
+    cgroupParent: ""
 
 service:
   type: ClusterIP

@@ -187,6 +187,28 @@ pub enum Request {
     /// killed worker (SIGKILL on cgroup OOM, etc.) is the
     /// uncooperative path the orchestrator must also handle.
     Shutdown,
+    /// Ask the worker for an on-disk directory that holds the
+    /// captured snapshot bytes. The orchestrator uses it for
+    /// cross-worker `restore`: it asks the owner worker to export,
+    /// then asks a *different* worker to [`Request::SnapshotAdopt`]
+    /// the same directory. Backends that don't expose snapshot
+    /// state on disk (mock, today's KVM) return
+    /// [`Response::OptPath`] with `path: None`; the fleet then
+    /// surfaces a clear "cross-worker restore unsupported on this
+    /// backend" error instead of silently producing an empty VM.
+    SnapshotExportDir {
+        /// The snapshot id.
+        id: SnapshotId,
+    },
+    /// Adopt a snapshot from a directory previously produced by
+    /// [`Request::SnapshotExportDir`] on another worker (or out-
+    /// of-band via the durable store). Returns a fresh
+    /// [`SnapshotId`] in the adopting worker's local id space.
+    SnapshotAdopt {
+        /// Absolute path to the snapshot directory. Same shape
+        /// the durable snapshot store dumps locally on `get`.
+        dir: std::path::PathBuf,
+    },
 }
 
 /// One child → control-plane response. Each variant pairs with one
@@ -238,6 +260,15 @@ pub enum Response {
     Written {
         /// Bytes written.
         bytes: u64,
+    },
+    /// Reply to [`Request::SnapshotExportDir`]. `None` means the
+    /// backend doesn't expose snapshot state on disk for this id
+    /// — the orchestrator should surface a "cross-worker restore
+    /// unsupported" error rather than trying to adopt nothing.
+    OptPath {
+        /// Absolute path to the snapshot directory, or `None` if
+        /// this backend can't export it.
+        path: Option<std::path::PathBuf>,
     },
     /// Any operation that failed. The `code` field is stable
     /// machine-readable; `message` is human-readable and free to

@@ -2,6 +2,8 @@
 
 Three production paths, ordered by setup cost.
 
+> **Already deployed?** See [ONBOARDING.md](ONBOARDING.md) for the operator playbook on turning a signed customer into a billable tenant in ~10 minutes (token issuance → ingress → per-org telemetry → billing query).
+
 ## Path 1 — Fly.io (~5 minutes)
 
 Fly.io's performance machines expose `/dev/kvm` directly. Cheapest way to get a real-KVM nanovm online today.

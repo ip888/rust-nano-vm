@@ -21,6 +21,35 @@
 //!   `json` for newline-delimited structured logs aimed at log
 //!   aggregators (Loki / Datadog / CloudWatch / OpenSearch). Set to
 //!   `json` on every reachable deployment.
+//! - `NANOVM_TOKEN_STORE_PATH` — path to a JSON file the control plane
+//!   uses to persist runtime-issued API keys (`POST /v1/keys`) across
+//!   restarts. Unset → in-memory only (keys are lost on restart, fine
+//!   for ephemeral dev). Set to a path on persistent storage for any
+//!   production deployment where tenants self-serve their keys.
+//! - `NANOVM_BACKEND` — Hypervisor backend to install. Values:
+//!     - `mock` (default) — in-process `MockHypervisor`, no /dev/kvm
+//!       needed. Right pick for CI, smoke tests, and the "single
+//!       binary on Fly.io" deploy shape.
+//!     - `fleet` — process-fleet backend (`nanovm-fleet`). Spawns
+//!       one `nanovm-jailer` subprocess per VM and forwards
+//!       hypervisor methods over IPC. Gives each VM its own cgroup
+//!       and its own crash domain. Requires the jailer + worker
+//!       binaries on disk; see `NANOVM_FLEET_*` env vars below.
+//! - `NANOVM_FLEET_JAILER_BINARY` — absolute path to `nanovm-jailer`
+//!   when `NANOVM_BACKEND=fleet`. Default `/usr/local/bin/nanovm-jailer`.
+//! - `NANOVM_FLEET_VMM_CHILD_BINARY` — absolute path to
+//!   `nanovm-vmm-child`. Default `/usr/local/bin/nanovm-vmm-child`.
+//! - `NANOVM_FLEET_SOCKET_DIR` — directory the fleet creates per-VM
+//!   Unix sockets in. Default `/var/run/nanovm`.
+//! - `NANOVM_FLEET_WARM_POOL_SIZE` — pre-spawned idle workers the
+//!   fleet keeps ready. `0` (default) disables; non-zero pre-pays
+//!   the spawn cost so `create_vm` is a socket-pop.
+//! - `NANOVM_FLEET_MEMORY_LIMIT_MIB` / `NANOVM_FLEET_CPU_QUOTA_PCT` —
+//!   default per-VM caps the jailer writes into the cgroup. Unset =
+//!   no cap on that controller.
+//! - `NANOVM_FLEET_CGROUP_PARENT` — override the parent cgroup. Unset
+//!   = use the control-plane's own cgroup (right under a systemd
+//!   `Delegate=memory cpu` unit).
 
 #![forbid(unsafe_code)]
 
@@ -50,6 +79,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         info!(count = tokens.len(), "bearer-token auth enabled");
     }
+    if let Ok(path) = std::env::var("NANOVM_TOKEN_STORE_PATH") {
+        if !path.is_empty() {
+            info!(path = %path, "runtime token persistence enabled");
+        }
+    } else {
+        info!(
+            "runtime token persistence disabled \
+             (set NANOVM_TOKEN_STORE_PATH=/var/lib/nanovm/tokens.json to enable)"
+        );
+    }
 
     let audit = AuditLog::from_env();
     if let Some(path) = audit.path() {
@@ -63,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let hypervisor: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    let (hypervisor, backend_label) = build_hypervisor()?;
     let warm_pool = WarmPool::from_env(Arc::clone(&hypervisor));
     if warm_pool.is_disabled() {
         info!("warm pool disabled (set NANOVM_WARM_POOL_PER_SNAPSHOT=N to enable)");
@@ -87,7 +126,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(
             AppState::new(hypervisor)
                 .with_warm_pool(warm_pool)
-                .with_snapshot_store(snapshot_store),
+                .with_snapshot_store(snapshot_store)
+                .with_backend_label(backend_label),
         );
 
     let listener = TcpListener::bind(&addr).await?;
@@ -97,6 +137,92 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// `(Hypervisor handle, static backend label)` — the build_hypervisor
+/// return shape. Aliased to keep the function signature within
+/// clippy's type-complexity threshold.
+type BackendChoice = (Arc<dyn vm_core::Hypervisor>, &'static str);
+
+/// Pick a Hypervisor backend based on `NANOVM_BACKEND`.
+/// Returns the trait object + the static label used by
+/// `GET /v1/health` and the Prometheus exposition.
+///
+/// - `mock` (default): in-process [`MockHypervisor`]. No /dev/kvm
+///   needed; ships in every binary.
+/// - `fleet`: [`nanovm_fleet::ProcessFleet`] driven by
+///   `NANOVM_FLEET_*` env vars. Spawns one
+///   `nanovm-jailer` per VM and forwards methods over IPC.
+fn build_hypervisor() -> Result<BackendChoice, Box<dyn std::error::Error>> {
+    let backend = std::env::var("NANOVM_BACKEND").unwrap_or_else(|_| "mock".to_string());
+    match backend.as_str() {
+        "" | "mock" => {
+            info!("backend: mock (in-process MockHypervisor)");
+            Ok((std::sync::Arc::new(MockHypervisor::new()), "mock"))
+        }
+        "fleet" => {
+            let cfg = fleet_config_from_env();
+            info!(
+                jailer = %cfg.jailer_binary.display(),
+                worker = %cfg.vmm_child_binary.display(),
+                socket_dir = %cfg.socket_dir.display(),
+                warm_pool = cfg.warm_pool_size,
+                memory_mib = ?cfg.default_memory_limit_mib,
+                cpu_quota_pct = ?cfg.default_cpu_quota_pct,
+                "backend: fleet (process-fleet via nanovm-jailer)"
+            );
+            let fleet = nanovm_fleet::ProcessFleet::new(cfg)
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+            Ok((std::sync::Arc::new(fleet), "fleet"))
+        }
+        other => Err(format!(
+            "NANOVM_BACKEND={other:?} is not recognised; valid values: mock, fleet"
+        )
+        .into()),
+    }
+}
+
+/// Translate `NANOVM_FLEET_*` env vars into a [`FleetConfig`].
+/// Missing values fall back to the [`FleetConfig::default`] shape.
+fn fleet_config_from_env() -> nanovm_fleet::FleetConfig {
+    use std::path::PathBuf;
+    let mut cfg = nanovm_fleet::FleetConfig::default();
+    if let Ok(p) = std::env::var("NANOVM_FLEET_JAILER_BINARY") {
+        if !p.is_empty() {
+            cfg.jailer_binary = PathBuf::from(p);
+        }
+    }
+    if let Ok(p) = std::env::var("NANOVM_FLEET_VMM_CHILD_BINARY") {
+        if !p.is_empty() {
+            cfg.vmm_child_binary = PathBuf::from(p);
+        }
+    }
+    if let Ok(p) = std::env::var("NANOVM_FLEET_SOCKET_DIR") {
+        if !p.is_empty() {
+            cfg.socket_dir = PathBuf::from(p);
+        }
+    }
+    if let Ok(n) = std::env::var("NANOVM_FLEET_WARM_POOL_SIZE") {
+        if let Ok(n) = n.parse::<usize>() {
+            cfg.warm_pool_size = n;
+        }
+    }
+    if let Ok(n) = std::env::var("NANOVM_FLEET_MEMORY_LIMIT_MIB") {
+        if let Ok(n) = n.parse::<u64>() {
+            cfg.default_memory_limit_mib = Some(n);
+        }
+    }
+    if let Ok(n) = std::env::var("NANOVM_FLEET_CPU_QUOTA_PCT") {
+        if let Ok(n) = n.parse::<u32>() {
+            cfg.default_cpu_quota_pct = Some(n);
+        }
+    }
+    if let Ok(p) = std::env::var("NANOVM_FLEET_CGROUP_PARENT") {
+        if !p.is_empty() {
+            cfg.cgroup_parent = Some(PathBuf::from(p));
+        }
+    }
+    cfg
 }
 
 /// Bootstrap tracing. Honours `RUST_LOG` for level filtering (default
