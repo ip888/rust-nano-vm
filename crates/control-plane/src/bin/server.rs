@@ -155,31 +155,47 @@ type BackendChoice = (Arc<dyn vm_core::Hypervisor>, &'static str);
 ///   `nanovm-jailer` per VM and forwards methods over IPC.
 fn build_hypervisor() -> Result<BackendChoice, Box<dyn std::error::Error>> {
     let backend = std::env::var("NANOVM_BACKEND").unwrap_or_else(|_| "mock".to_string());
-    match backend.as_str() {
-        "" | "mock" => {
-            info!("backend: mock (in-process MockHypervisor)");
-            Ok((std::sync::Arc::new(MockHypervisor::new()), "mock"))
-        }
-        "fleet" => {
-            let cfg = fleet_config_from_env();
-            info!(
-                jailer = %cfg.jailer_binary.display(),
-                worker = %cfg.vmm_child_binary.display(),
-                socket_dir = %cfg.socket_dir.display(),
-                warm_pool = cfg.warm_pool_size,
-                memory_mib = ?cfg.default_memory_limit_mib,
-                cpu_quota_pct = ?cfg.default_cpu_quota_pct,
-                "backend: fleet (process-fleet via nanovm-jailer)"
-            );
-            let fleet = nanovm_fleet::ProcessFleet::new(cfg)
-                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
-            Ok((std::sync::Arc::new(fleet), "fleet"))
-        }
-        other => Err(format!(
-            "NANOVM_BACKEND={other:?} is not recognised; valid values: mock, fleet"
-        )
-        .into()),
-    }
+    let (hv, default_label): (std::sync::Arc<dyn vm_core::Hypervisor>, &'static str) =
+        match backend.as_str() {
+            "" | "mock" => {
+                info!("backend: mock (in-process MockHypervisor)");
+                (std::sync::Arc::new(MockHypervisor::new()), "mock")
+            }
+            "fleet" => {
+                let cfg = fleet_config_from_env();
+                info!(
+                    jailer = %cfg.jailer_binary.display(),
+                    worker = %cfg.vmm_child_binary.display(),
+                    socket_dir = %cfg.socket_dir.display(),
+                    warm_pool = cfg.warm_pool_size,
+                    memory_mib = ?cfg.default_memory_limit_mib,
+                    cpu_quota_pct = ?cfg.default_cpu_quota_pct,
+                    "backend: fleet (process-fleet via nanovm-jailer)"
+                );
+                let fleet = nanovm_fleet::ProcessFleet::new(cfg)
+                    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+                (std::sync::Arc::new(fleet), "fleet")
+            }
+            other => {
+                return Err(format!(
+                    "NANOVM_BACKEND={other:?} is not recognised; valid values: mock, fleet"
+                )
+                .into());
+            }
+        };
+    // Optional operator override for the label surfaced on `/v1/health`
+    // and prometheus `nanovm_up`. Lets `Dockerfile.kvm` advertise itself
+    // as `"kvm-fleet"` even though the backend picker only distinguishes
+    // `"mock"` / `"fleet"` internally.
+    //
+    // Leaking a small startup-once String → `&'static str` is fine here:
+    // AppState.backend_label needs `&'static str`, and this label lives
+    // for the entire process anyway.
+    let label: &'static str = match std::env::var("NANOVM_BACKEND_LABEL") {
+        Ok(s) if !s.is_empty() => Box::leak(s.into_boxed_str()),
+        _ => default_label,
+    };
+    Ok((hv, label))
 }
 
 /// Translate `NANOVM_FLEET_*` env vars into a [`FleetConfig`].

@@ -72,8 +72,22 @@ ENV NANOVM_CONTROL_PLANE_ADDR=0.0.0.0:8080
 # the mock image uses. Operators can flip this back to `mock` at
 # runtime with `-e NANOVM_BACKEND=mock`.
 ENV NANOVM_BACKEND=fleet
-# Real backends should advertise themselves on /v1/health.
-ENV NANOVM_BACKEND_LABEL=kvm
+# The fleet backend creates one Unix socket per VM. The default
+# `/var/run/nanovm` is not writable as the `nonroot` uid we run as
+# (65532), so the first `POST /v1/vms` would fail with `create
+# socket_dir: Permission denied`. `/tmp` is writable for everyone
+# in distroless and the sockets are per-VM ephemeral, so parking
+# them there is safe. Operators who want a persistent path can
+# override with `-e NANOVM_FLEET_SOCKET_DIR=/data/nanovm-sockets`
+# and mount a writable volume.
+ENV NANOVM_FLEET_SOCKET_DIR=/tmp/nanovm-fleet
+# `/v1/health` reports this label. The control-plane binary picks
+# `"mock"` or `"fleet"` from `NANOVM_BACKEND`; this env override
+# lets a KVM-featured deployment self-report as `"kvm-fleet"` so
+# monitoring can tell KVM-workers apart from mock-workers behind
+# the same `fleet` backend at a glance. Read by `build_hypervisor()`
+# in `crates/control-plane/src/bin/server.rs`.
+ENV NANOVM_BACKEND_LABEL=kvm-fleet
 
 EXPOSE 8080
 
