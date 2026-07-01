@@ -50,14 +50,20 @@ cargo run -p bench --features kvm --release --bin nanovm-fork-bench -- \
 
 Don't take the benchmark numbers on trust — **stand up a real, live
 control plane on real hardware, in about 5 minutes, and watch it work
-under load**:
+under load**. Two paths, same dashboards, same production image:
 
 ```sh
 cd deploy/live-demo
+
+# Path A — Linux + /dev/kvm (Omarchy, Arch, Ubuntu, …). Zero cloud spend.
+./up-local.sh    # 3 docker containers on your host: control-plane, Prometheus, Grafana
+./load.sh
+./tail-local.sh
+
+# Path B — macOS / M1 / Windows / no local KVM. ~$0.30/hr while running.
 ./up.sh          # deploys the KVM image to a Fly.io performance machine
-                 # + boots local Prometheus + Grafana pointed at it
-./load.sh        # in one terminal: multi-org traffic generator
-./tail.sh        # in another: streams RUST_LOG + audit JSONL
+./load.sh
+./tail.sh
 ```
 
 Open [`http://localhost:3000/d/nanovm-overview`](http://localhost:3000/d/nanovm-overview) and watch:

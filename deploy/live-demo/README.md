@@ -1,14 +1,23 @@
 # Live-KVM demo
 
-**A real `rust-nano-vm` control plane, driving real KVM ioctls on a real Linux kernel, on real cloud hardware, with real Prometheus scraping real metrics into real Grafana dashboards — one command up, one command down.**
+**A real `rust-nano-vm` control plane, driving real KVM ioctls on a real Linux kernel, with real Prometheus scraping real metrics into real Grafana dashboards — one command up, one command down.**
 
 This directory is a self-contained answer to *"show me the platform is production quality, not just a passing test suite."* Stand it up in about 5 minutes, share the Grafana URL with a prospect, watch panels move under load, tear it down. Nothing here is simulated or mocked.
+
+## Two paths — pick one
+
+| Your host | Command | Cost | What runs where |
+|---|---|---|---|
+| **Linux + `/dev/kvm`** (Omarchy, Arch, Ubuntu, Fedora, bare-metal Debian, …) | `./up-local.sh` | $0 | Real KVM ioctls on **your host kernel**. Control plane + Prometheus + Grafana all in docker on your box. |
+| **macOS (Intel or M1/M2/M3/M4), Windows, or no local KVM** | `./up.sh` | ~$0.30/hr while running | Real KVM ioctls on a **Fly.io performance machine**. Prometheus + Grafana on your laptop, pointed at the Fly URL. |
+
+Everything downstream — dashboards, load generator, audit-log tailing — is the same either way. Both paths use the same production `nanovm-control-plane-kvm` image and the same `nanovm-overview.json` dashboard the Helm chart ships.
 
 ## What you'll see
 
 | Thing you'll see | Where |
 |---|---|
-| Real `/dev/kvm` on a Linux 6.1+ kernel | `curl https://<app>.fly.dev/v1/health` → `"backend":"kvm"` |
+| Real `/dev/kvm` on a Linux 6.1+ kernel | `curl <base-url>/v1/health` → `"backend":"kvm"` (base = `http://localhost:8080` for Path A, `https://<app>.fly.dev` for Path B) |
 | Real KVM snapshot/restore | Grafana → *nanovm-overview* → **Fork latency p50/p99** panel (100-300 ms range, not `sleep(50)`) |
 | Real multi-tenant per-org metering | Grafana → **Forks by org** panel (3 diverging lines: acme / globex / initech) |
 | Real fork-quota throttling | Grafana → **Throttled forks** panel (429 curve climbing on `acme`) |
@@ -17,7 +26,43 @@ This directory is a self-contained answer to *"show me the platform is productio
 | Real JSONL audit log | Same terminal, interleaved: every `fork` / `snapshot` / `delete` privileged call |
 | Real Prometheus alert rules | Prometheus → Alerts tab shows the 4 shipped alerts evaluating live |
 
-## Prerequisites (~2 min)
+## Path A — Local (Linux + KVM, zero cloud spend)
+
+For Omarchy / Arch / Ubuntu / Fedora / any Linux box with `/dev/kvm`. Runs everything on your host in three docker containers: control-plane (with `--device=/dev/kvm`), Prometheus, Grafana.
+
+### Preflight
+
+```sh
+ls -l /dev/kvm                           # /dev/kvm exists, group `kvm`
+egrep -c '(vmx|svm)' /proc/cpuinfo       # > 0 (Intel vmx or AMD svm)
+docker compose version                   # docker + compose plugin present
+```
+
+If `/dev/kvm` is missing, install KVM (Arch/Omarchy: `sudo pacman -S qemu-full`; Debian family: `sudo apt install qemu-kvm`) and reboot / `sudo modprobe kvm-intel` (or `kvm-amd`).
+
+### Bring it up
+
+```sh
+cd deploy/live-demo
+./up-local.sh          # pulls the KVM image, mints tokens, starts 3 containers
+./load.sh              # in another terminal: multi-org traffic generator
+./tail-local.sh        # in another: docker logs + audit JSONL, interleaved
+```
+
+Then open [`http://localhost:3000/d/nanovm-overview`](http://localhost:3000/d/nanovm-overview) — same dashboard, real KVM on your host.
+
+### Tear down
+
+```sh
+./down-local.sh                  # stop 3 containers, drop audit-log volume
+./down-local.sh --keep-audit     # keep the audit JSONL volume for later inspection
+```
+
+## Path B — Fly.io (macOS / M1 / Windows / no local KVM, ~$0.30/hr while running)
+
+For laptops without `/dev/kvm`. Deploys the same KVM image to a Fly.io **performance-2x** machine (the CPU kind that exposes `/dev/kvm`) and points a local Prometheus + Grafana at it.
+
+### Prerequisites (~2 min)
 
 On your laptop:
 
@@ -28,7 +73,7 @@ On your laptop:
 
 **No local KVM required.** The KVM ioctls happen inside the Fly.io performance machine's kernel — your laptop is just watching.
 
-## Bring it up
+### Bring it up
 
 ```sh
 cd deploy/live-demo
