@@ -26,6 +26,14 @@
 //!   restarts. Unset → in-memory only (keys are lost on restart, fine
 //!   for ephemeral dev). Set to a path on persistent storage for any
 //!   production deployment where tenants self-serve their keys.
+//! - `NANOVM_OWNERSHIP_STORE` — path to a SQLite file that records
+//!   which org owns which VM / snapshot. Unset → in-memory only, and
+//!   after any restart every VM/snapshot falls back to the default org
+//!   (fine for single-tenant / mock deploys; catastrophic for
+//!   multi-tenant SaaS — one customer's VM becomes reachable to every
+//!   other). Requires the binary built with `--features sqlite`.
+//!   Accepts either `sqlite:///data/nanovm.sqlite` or a bare
+//!   `/data/nanovm.sqlite` path.
 //! - `NANOVM_BACKEND` — Hypervisor backend to install. Values:
 //!     - `mock` (default) — in-process `MockHypervisor`, no /dev/kvm
 //!       needed. Right pick for CI, smoke tests, and the "single
@@ -120,6 +128,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => info!("durable snapshot store disabled (set NANOVM_SNAPSHOT_STORE to enable)"),
     }
 
+    // Persistent ownership map when NANOVM_OWNERSHIP_STORE is set;
+    // otherwise stays in-memory (the default). Fail at startup rather
+    // than serving one customer's VM to another after a redeploy.
+    let ownership = control_plane::OwnershipMap::from_env()
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+
     let app = router()
         .layer(Extension(tokens))
         .layer(Extension(audit))
@@ -127,7 +141,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             AppState::new(hypervisor)
                 .with_warm_pool(warm_pool)
                 .with_snapshot_store(snapshot_store)
-                .with_backend_label(backend_label),
+                .with_backend_label(backend_label)
+                .with_ownership_map(Arc::new(ownership)),
         );
 
     let listener = TcpListener::bind(&addr).await?;
