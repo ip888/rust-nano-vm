@@ -34,7 +34,11 @@ done
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-BIN="$REPO_ROOT/target/debug/nanovm-control-plane"
+# Honour CARGO_TARGET_DIR (contributors who share a target dir across
+# checkouts don't want us silently building into ./target). Fall back
+# to `./target` when the env var is unset, matching cargo's default.
+TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+BIN="$TARGET_DIR/debug/nanovm-control-plane"
 echo "${BLU}building nanovm-control-plane (cached on subsequent runs)…${RST}"
 cargo build -q -p control-plane --bin nanovm-control-plane 2>&1 | tail -3 || {
     echo "${RED}build failed; fix that before running smoke.sh${RST}"
@@ -154,7 +158,9 @@ assert_status "right bearer → 200"   GET "$P/v1/vms" 200 "${A_HDR[@]}"
 step "3 — full VM lifecycle through REST"
 # -------------------------------------------------------------------------
 vm=$(curl -fsX POST "$P/v1/vms" "${A_HDR[@]}" "${JSON_HDR[@]}" -d '{}' | jq .id)
-[[ -n "$vm" && "$vm" != "null" ]] && pass "create_vm returns numeric id" || fail "create_vm" "got '$vm'"
+# Assert the id is actually numeric (control-plane returns a u64; a
+# string id would still be non-null and mislead this check into passing).
+[[ "$vm" =~ ^[0-9]+$ ]] && pass "create_vm returns numeric id" || fail "create_vm" "got '$vm'"
 
 state=$(curl -fs "$P/v1/vms/$vm" "${A_HDR[@]}" | jq -r .state)
 assert_eq "fresh VM state is 'created'" "$state" "created"
@@ -281,7 +287,14 @@ AUDIT="$TMP/audit.jsonl"
 start_server NANOVM_API_TOKENS=acme:acme-tok NANOVM_AUDIT_LOG="$AUDIT" || { fail "boot §11" ""; exit 1; }
 curl -fsX POST "$P/v1/vms" "${A_HDR[@]}" "${JSON_HDR[@]}" -d '{}' > /dev/null
 
-lines=$(wc -l < "$AUDIT" 2>/dev/null || echo 0)
+# The audit writer flushes asynchronously — polling to ~2 s ceiling
+# so a slow FS or a heavily-loaded CI runner doesn't false-negative.
+lines=0
+for _ in $(seq 1 20); do
+    lines=$(wc -l < "$AUDIT" 2>/dev/null || echo 0)
+    [[ "$lines" -ge 1 ]] && break
+    sleep 0.1
+done
 [[ "$lines" -ge 1 ]] && pass "audit log captured $lines write(s)" || fail "audit log" "no rows in $AUDIT"
 jq -e . "$AUDIT" > /dev/null 2>&1 && pass "audit lines are valid JSON" || fail "audit JSON" "malformed"
 
@@ -289,10 +302,14 @@ jq -e . "$AUDIT" > /dev/null 2>&1 && pass "audit lines are valid JSON" || fail "
 step "12 — structured JSON logs"
 # -------------------------------------------------------------------------
 start_server NANOVM_API_TOKENS=acme:acme-tok NANOVM_LOG_FORMAT=json || { fail "boot §12" ""; exit 1; }
-# The bind log is on stderr — give the run a moment to flush.
-sleep 0.3
-# Pull the first non-empty line and confirm it's JSON.
-line=$(grep -m1 '^{' "$LOG" || true)
+# Poll for the first JSON line — a fixed sleep flakes on slow CI
+# runners where the writer hasn't flushed yet. ~2 s ceiling.
+line=""
+for _ in $(seq 1 20); do
+    line=$(grep -m1 '^{' "$LOG" 2>/dev/null || true)
+    [[ -n "$line" ]] && break
+    sleep 0.1
+done
 if [[ -n "$line" ]] && echo "$line" | jq -e .level > /dev/null 2>&1; then
     pass "logs emit valid JSON with .level field"
 else
@@ -351,11 +368,15 @@ else
     skip "helm tests" "helm not installed"
 fi
 
-if cargo run -q -p control-plane --bin nanovm-openapi > "$TMP/openapi.json" 2>/dev/null; then
+# The `nanovm-openapi` bin is part of the shipped surface — a
+# failure to render the OpenAPI spec is a real regression (routers
+# have desynced from their schemas), not a "skip". Capture stderr so
+# the operator sees the diagnostic.
+if cargo run -q -p control-plane --bin nanovm-openapi > "$TMP/openapi.json" 2> "$TMP/openapi.err"; then
     n=$(jq '.paths | length' "$TMP/openapi.json")
     [[ "$n" -ge 10 ]] && pass "openapi.json describes $n endpoints" || fail "openapi" "only $n paths"
 else
-    skip "openapi" "nanovm-openapi bin failed; not required"
+    fail "openapi render" "$(tail -5 "$TMP/openapi.err")"
 fi
 
 # =========================================================================

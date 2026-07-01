@@ -21,6 +21,10 @@ log() { printf '\033[36m➜\033[0m %s\n' "$*"; }
 die() { printf '\033[31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 
 command -v docker >/dev/null 2>&1 || die "docker not on PATH"
+docker compose version >/dev/null 2>&1 || die "docker compose plugin not installed. Install via 'sudo pacman -S docker-compose' (Arch/Omarchy), 'sudo apt install docker-compose-plugin' (Debian family), or Docker Desktop (macOS/Windows)."
+command -v envsubst >/dev/null 2>&1 || die "envsubst not on PATH — install 'gettext' package (all major distros)."
+command -v flyctl   >/dev/null 2>&1 || die "flyctl not on PATH — install: https://fly.io/docs/hands-on/install-flyctl/"
+command -v curl     >/dev/null 2>&1 || die "curl not on PATH"
 
 # ---- Step 1: deploy control plane to Fly.io -------------------------
 log "step 1/3: deploying control plane to Fly.io (real KVM)"
