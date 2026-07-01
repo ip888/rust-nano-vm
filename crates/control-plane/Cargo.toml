@@ -38,8 +38,14 @@ tower.workspace = true
 tower-http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Optional SQLite backing for the OwnershipStore trait. Statically
+# links libsqlite via `rusqlite/bundled` so a distroless runtime image
+# doesn't need a system libsqlite3. Only pulled when the `sqlite`
+# feature is on.
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 [features]
 default = []
@@ -47,6 +53,12 @@ default = []
 # to the `snapshot/s3` feature so `aws-sdk-s3` only ships when the
 # operator actually wants it.
 s3 = ["snapshot/s3"]
+# Adds the SQLite OwnershipStore backend. Without this feature the
+# ownership map is in-memory only (safe for single-tenant / mock
+# demos, but multi-tenant SaaS loses org→VM mappings on restart).
+# When on, set `NANOVM_OWNERSHIP_STORE=/path/to/nanovm.sqlite` at
+# runtime to activate persistence.
+sqlite = ["dep:rusqlite"]
 
 [dev-dependencies]
 base64.workspace = true

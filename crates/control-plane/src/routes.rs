@@ -175,6 +175,17 @@ impl AppState {
         self
     }
 
+    /// Install a pre-built [`OwnershipMap`] (typically a
+    /// SQLite-backed store from
+    /// [`OwnershipMap::from_env`](crate::ownership::OwnershipMap::from_env)).
+    /// Defaults to an in-memory map when this isn't called, so unit
+    /// tests that construct `AppState` inline continue to work without
+    /// touching the filesystem.
+    pub fn with_ownership_map(mut self, ownership: Arc<OwnershipMap>) -> Self {
+        self.ownership = ownership;
+        self
+    }
+
     /// Enable the warm-fork pool with `per_snapshot` pre-restored VMs
     /// per source snapshot. `0` is a no-op (keeps the default disabled
     /// pool). The pool shares this state's hypervisor `Arc`.
