@@ -59,6 +59,18 @@ __all__ = [
 ]
 
 
+def __getattr__(name):
+    """Lazy exposure of the async client so users who don't opt into
+    the `nanovm[async]` extra don't need `httpx` installed just to
+    `import nanovm`.
+    """
+    if name == "AsyncClient":
+        from .aio import AsyncClient
+
+        return AsyncClient
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
