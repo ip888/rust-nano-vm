@@ -148,9 +148,16 @@ load; the dashboard moves in real time.
 </p>
 <pre><code>git clone https://github.com/ip888/Rust-nano-vm.git
 cd Rust-nano-vm/deploy/live-demo
+
+# Path A — Linux + /dev/kvm (Omarchy, Arch, Ubuntu, …). Zero cloud spend.
+./up-local.sh    # 3 docker containers on your host: control-plane, Prometheus, Grafana
+./load.sh
+./tail-local.sh
+
+# Path B — macOS, M1/M2/M3/M4, Windows, or no local KVM. ~$0.30/hr while up.
 ./up.sh          # deploys the KVM image to Fly.io + local Prometheus/Grafana
-./load.sh        # multi-org traffic generator (acme / globex / initech)
-./tail.sh        # tails RUST_LOG + audit JSONL from the Fly machine</code></pre>
+./load.sh
+./tail.sh</code></pre>
 <p>
 Then open <code>http://localhost:3000/d/nanovm-overview</code> and watch:
 </p>

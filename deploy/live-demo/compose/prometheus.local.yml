@@ -1,0 +1,21 @@
+# Prometheus config for the local-KVM demo. Scrapes the sibling
+# `control-plane` service over the compose bridge network — no HTTPS,
+# no public URL, no env-var substitution needed.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    env: local-demo
+
+rule_files:
+  - /etc/prometheus/alerts.yaml
+
+scrape_configs:
+  - job_name: nanovm
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - control-plane:8080
+        labels:
+          instance: local
