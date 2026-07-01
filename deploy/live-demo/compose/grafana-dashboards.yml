@@ -1,0 +1,18 @@
+# Grafana provisioning: auto-load every dashboard mounted at
+# /var/lib/grafana/dashboards/. The compose file mounts
+# `deploy/grafana/dashboards/` there, so `nanovm-overview.json` shows
+# up automatically under the "nanovm" folder.
+
+apiVersion: 1
+
+providers:
+  - name: nanovm
+    orgId: 1
+    folder: nanovm
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

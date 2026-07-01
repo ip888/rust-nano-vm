@@ -1,0 +1,72 @@
+# Fly.io app manifest for the live-KVM demo.
+#
+# One machine, `performance-2x` CPU kind (so /dev/kvm is actually
+# exposed to the container), 4 GiB RAM, JSON logs. The image is the
+# production `nanovm-control-plane-kvm` published on ghcr.io — same
+# binary you'd deploy to your own AWS *.metal box.
+#
+# `deploy.sh` next to this file is the one-command bring-up. It runs
+# `flyctl apps create` if the app doesn't exist, plants tokens as
+# secrets, and does `flyctl deploy`. Rename `app` below (and pass
+# NANOVM_LIVE_DEMO_APP to the scripts) if you need a different name.
+
+app = "nanovm-live-demo"
+primary_region = "iad"
+
+[build]
+  image = "ghcr.io/ip888/nanovm-control-plane-kvm:latest"
+
+[env]
+  NANOVM_CONTROL_PLANE_ADDR = "0.0.0.0:8080"
+  RUST_LOG = "info,tower_http=info"
+  # JSON logs so Fly.io's log stream is machine-parseable — the
+  # `tail.sh` script relies on this to pretty-print interesting fields.
+  NANOVM_LOG_FORMAT = "json"
+  NANOVM_BACKEND_LABEL = "kvm"
+  # Fork quota tuned so `load.sh` can visibly hit the throttle and the
+  # dashboard's 429 series lights up. Bump both for real workloads.
+  NANOVM_FORK_RPS = "5"
+  NANOVM_FORK_BURST = "10"
+  # Pre-warm 4 children per snapshot so the fork panel shows a hit
+  # ratio > 0 — otherwise every fork is a cold KVM restore and the
+  # "warm pool" panel is a flat zero.
+  NANOVM_WARM_POOL_PER_SNAPSHOT = "4"
+  # Audit log path (emptyDir-equivalent; container-local). `tail.sh`
+  # streams this via `flyctl ssh console`.
+  NANOVM_AUDIT_LOG = "/var/log/nanovm/audit.jsonl"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Keep the machine alive so Prometheus scrapes don't wake it on every
+  # tick — auto-stop is nice for real workloads but noisy for demos.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 200
+    soft_limit = 100
+
+# `performance-*` CPU kind is what unlocks /dev/kvm on Fly.io. A
+# `shared-cpu-*` machine does NOT expose it and this demo won't work.
+[[vm]]
+  cpu_kind = "performance"
+  cpus = 2
+  memory = "4gb"
+
+# Health check hits the control-plane's public /healthz (unauth by
+# design — the endpoint returns 200 with a static body, no VM state).
+[[services.http_checks]]
+  interval = "10s"
+  timeout = "2s"
+  grace_period = "10s"
+  method = "get"
+  path = "/healthz"
+  protocol = "http"
+
+[metrics]
+  port = 8080
+  path = "/metrics"

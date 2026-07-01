@@ -1,0 +1,16 @@
+# Grafana provisioning: point at the compose-local Prometheus. The
+# datasource UID is what the dashboard JSON references, so don't
+# rename it.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s
