@@ -44,10 +44,14 @@ If `/dev/kvm` is missing, install KVM (Arch/Omarchy: `sudo pacman -S qemu-full`;
 
 ```sh
 cd deploy/live-demo
-./up-local.sh          # pulls the KVM image, mints tokens, starts 3 containers
+./up-local.sh          # gets the KVM image, mints tokens, starts 3 containers
 ./load.sh              # in another terminal: multi-org traffic generator
 ./tail-local.sh        # in another: docker logs + audit JSONL, interleaved
 ```
+
+`up-local.sh` first tries to pull `ghcr.io/ip888/nanovm-control-plane-kvm:latest` from GHCR (published by `.github/workflows/docker.yml` on every semver tag). If that fails — the image hasn't been published to the repo you're building from, or you're offline — it falls back to a local `docker build -f Dockerfile.kvm .` from the repo root. **First-time local build takes ~5 min** (cold Rust workspace + `--features kvm`); subsequent runs hit the docker layer cache and finish in seconds.
+
+Skip the build entirely on rebuilds — the script skips both pull and build if the tag already exists locally.
 
 Then open [`http://localhost:3000/d/nanovm-overview`](http://localhost:3000/d/nanovm-overview) — same dashboard, real KVM on your host.
 
