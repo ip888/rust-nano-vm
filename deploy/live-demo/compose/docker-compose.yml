@@ -5,7 +5,10 @@
 #
 # Grafana is anonymous-Admin so you can share the URL with a prospect
 # without them needing a login. Change GF_AUTH_* below if you want the
-# usual login form.
+# usual login form. Ports bind 127.0.0.1 only — anon-Admin Grafana on
+# 0.0.0.0 would expose the dashboard to your LAN, which for a demo
+# machine on an untrusted network is a real footgun. Tunnel to a
+# prospect via `ssh -L` or `cloudflared tunnel` when you want to share.
 
 services:
   prometheus:
@@ -13,7 +16,7 @@ services:
     container_name: nanovm-demo-prometheus
     restart: unless-stopped
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       # The alerts file already lives under deploy/prometheus/ — reuse
@@ -31,7 +34,7 @@ services:
     container_name: nanovm-demo-grafana
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       # Anonymous Admin so anyone with the URL can view + edit panels.
       # For a real deployment flip these off and set GF_SECURITY_ADMIN_PASSWORD.

@@ -42,17 +42,20 @@ PIDS=()
 trap 'kill "${PIDS[@]}" 2>/dev/null || true; exit 0' INT TERM
 
 echo "─── control-plane RUST_LOG (Fly.io) ───────────────────────────"
+# jq first so it sees clean JSON; then prefix. Prefixing first would
+# feed jq `[log] {json}` which fails, and under `set -o pipefail` the
+# whole script would exit.
 ( flyctl logs --app "$NANOVM_LIVE_DEMO_APP" 2>/dev/null \
-    | sed -u 's/^/\x1b[35m[log]\x1b[0m /' \
-    | "${FMT[@]}"
+    | "${FMT[@]}" \
+    | sed -u 's/^/\x1b[35m[log]\x1b[0m /'
 ) &
 PIDS+=("$!")
 
 echo "─── /var/log/nanovm/audit.jsonl (Fly.io) ──────────────────────"
 ( flyctl ssh console --app "$NANOVM_LIVE_DEMO_APP" \
     -C 'tail -F /var/log/nanovm/audit.jsonl' 2>/dev/null \
-    | sed -u 's/^/\x1b[33m[audit]\x1b[0m /' \
-    | "${FMT[@]}"
+    | "${FMT[@]}" \
+    | sed -u 's/^/\x1b[33m[audit]\x1b[0m /'
 ) &
 PIDS+=("$!")
 

@@ -34,7 +34,12 @@ else
 fi
 
 # ---- Generate + persist tokens --------------------------------------
-gen_token() { openssl rand -hex 24 2>/dev/null || head -c 24 /dev/urandom | xxd -p; }
+gen_token() {
+  # openssl is the fast path; POSIX `od` is the fallback (xxd isn't
+  # POSIX and Alpine/BusyBox hosts don't have it).
+  openssl rand -hex 24 2>/dev/null \
+    || od -An -tx1 -N24 /dev/urandom | tr -d ' \n'
+}
 
 if [[ ! -f "$ENV_FILE" ]]; then
   log "generating fresh per-org tokens → $ENV_FILE"
