@@ -45,10 +45,28 @@ async fn spawn_worker(tmp: &tempfile::TempDir) -> (Child, PathBuf) {
 }
 
 async fn connect(socket: &PathBuf) -> UnixStream {
-    timeout(Duration::from_secs(2), UnixStream::connect(socket))
+    // spawn_worker returns as soon as the socket path exists, but on
+    // Linux the file can appear a moment before the listen() backlog
+    // is actually queuing SYNs — a same-tick connect() then races and
+    // gets ECONNREFUSED. Retry briefly so the framing tests aren't
+    // flaky under CI runner load. 50 × 20 ms = 1 s ceiling, wrapped in
+    // the same 2 s timeout as before so a truly dead worker still
+    // fails fast.
+    let attempt = async {
+        for _ in 0..50 {
+            match UnixStream::connect(socket).await {
+                Ok(s) => return s,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("connect failed: {e:?}"),
+            }
+        }
+        panic!("connect kept getting ECONNREFUSED after 1 s of retries")
+    };
+    timeout(Duration::from_secs(2), attempt)
         .await
         .expect("connect timed out")
-        .expect("connect failed")
 }
 
 async fn roundtrip(stream: &mut UnixStream, req: Request) -> Response {
