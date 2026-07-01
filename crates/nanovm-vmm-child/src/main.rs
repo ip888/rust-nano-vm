@@ -18,6 +18,10 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::net::UnixListener;
 use vm_core::Hypervisor;
+
+#[cfg(feature = "kvm")]
+use vm_kvm::KvmHypervisor;
+#[cfg(not(feature = "kvm"))]
 use vm_mock::MockHypervisor;
 
 #[derive(Debug, Parser)]
@@ -54,7 +58,20 @@ async fn main() -> anyhow::Result<()> {
     let listener = UnixListener::bind(&args.socket)?;
     tracing::info!(socket = %args.socket.display(), "nanovm-vmm-child listening");
 
-    let hv: Arc<dyn Hypervisor> = Arc::new(MockHypervisor::new());
+    // Backend selection is a compile-time toggle so the binary is
+    // one path — no runtime env var, no dispatch. `Dockerfile.kvm`
+    // builds with `--features kvm` for production; dev builds
+    // (macOS, CI without /dev/kvm) keep the mock.
+    #[cfg(feature = "kvm")]
+    let hv: Arc<dyn Hypervisor> = {
+        tracing::info!("backend: kvm (KvmHypervisor, opening /dev/kvm)");
+        Arc::new(KvmHypervisor::new()?)
+    };
+    #[cfg(not(feature = "kvm"))]
+    let hv: Arc<dyn Hypervisor> = {
+        tracing::info!("backend: mock (MockHypervisor, no /dev/kvm)");
+        Arc::new(MockHypervisor::new())
+    };
 
     // Wait for exactly one connection — the orchestrator's. Race
     // it against Ctrl-C / SIGTERM so an idle worker doesn't hang

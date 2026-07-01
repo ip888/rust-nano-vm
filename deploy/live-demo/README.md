@@ -13,6 +13,25 @@ This directory is a self-contained answer to *"show me the platform is productio
 
 Everything downstream — dashboards, load generator, audit-log tailing — is the same either way. Both paths use the same production `nanovm-control-plane-kvm` image and the same `nanovm-overview.json` dashboard the Helm chart ships.
 
+## What "real KVM" means today
+
+Since the process-fleet arc landed (PRs #115-#132), the shape is:
+
+```
+  REST client ─►  nanovm-control-plane  (in this container)
+                         │
+                         │  spawns one worker per VM
+                         ▼
+              nanovm-jailer  ─►  nanovm-vmm-child  (built --features kvm)
+                                       │
+                                       ▼
+                                   /dev/kvm   ◄── real KVM ioctls
+```
+
+The KVM image bundles `nanovm-vmm-child` built with `--features kvm`, so every VM the REST API creates gets its own worker process holding an open `/dev/kvm` handle. `NANOVM_BACKEND=fleet` is the container's default env; you don't have to set it.
+
+**What still lands as follow-up:** the image doesn't yet bundle a default kernel + rootfs, so `POST /v1/vms` with the built-in `VmConfig::default()` will fail to boot (worker returns "kernel not found"). You'll still see the whole REST surface + Prometheus wiring + audit log working end-to-end because a fork-quota reject, an unauth 401, a per-org meter, and a warm-pool hit all fire *before* the actual kernel-load step. Bundling a minimal Alpine kernel + rootfs into the image is the next PR — until then, the "watch a real kernel boot inside a VM" step is only reachable through the bench binary (`cargo run -p bench --features kvm --release --bin nanovm-fork-bench`), which points at a fixture kernel checked into the repo.
+
 ## What you'll see
 
 | Thing you'll see | Where |

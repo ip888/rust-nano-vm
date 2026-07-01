@@ -1,12 +1,18 @@
 # syntax=docker/dockerfile:1.6
 #
-# Production image of `nanovm-control-plane` built with `--features kvm`.
+# Production image with real KVM under the REST API.
 #
-# Differs from the default `Dockerfile` in two ways:
+# Differs from the default `Dockerfile` in three ways:
 #
-#   1. Built with `--features kvm`, so the binary actually drives KVM
-#      ioctls instead of the in-process mock backend.
-#   2. Runtime image switches from distroless `cc-debian12:nonroot`
+#   1. Bundles the process-fleet trio (control-plane + jailer +
+#      vmm-child), with `nanovm-vmm-child` built as `--features kvm`
+#      so the worker really opens `/dev/kvm` and drives KVM ioctls
+#      instead of the in-process mock. The control-plane itself has
+#      no `kvm` feature — the KVM code lives in the worker.
+#   2. Defaults `NANOVM_BACKEND=fleet` so the control-plane routes
+#      to a KVM-enabled worker per VM (rather than the in-process
+#      `MockHypervisor` the default binary uses).
+#   3. Runtime image switches from distroless `cc-debian12:nonroot`
 #      to `cc-debian12:debug-nonroot` so an operator can `exec` into
 #      the container during incident triage. (No package manager;
 #      busybox only.)
@@ -37,11 +43,11 @@ WORKDIR /src
 # kvm-ioctls + kvm-bindings only need libc; no system deps to install.
 COPY . .
 
-RUN cargo build --release --locked --features kvm \
+RUN cargo build --release --locked \
     -p control-plane --bin nanovm-control-plane && \
     cargo build --release --locked \
     -p nanovm-jailer --bin nanovm-jailer && \
-    cargo build --release --locked \
+    cargo build --release --locked --features kvm \
     -p nanovm-vmm-child --bin nanovm-vmm-child
 
 # ---- Stage 2: runtime ------------------------------------------------
@@ -61,6 +67,11 @@ COPY --from=builder \
 
 # Bind to all interfaces by default — port mapping works out of the box.
 ENV NANOVM_CONTROL_PLANE_ADDR=0.0.0.0:8080
+# Route every VM to a spawned KVM-enabled `nanovm-vmm-child` worker
+# (via `nanovm-jailer`), rather than the in-process `MockHypervisor`
+# the mock image uses. Operators can flip this back to `mock` at
+# runtime with `-e NANOVM_BACKEND=mock`.
+ENV NANOVM_BACKEND=fleet
 # Real backends should advertise themselves on /v1/health.
 ENV NANOVM_BACKEND_LABEL=kvm
 
