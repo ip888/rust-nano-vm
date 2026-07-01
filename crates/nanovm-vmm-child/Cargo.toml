@@ -26,6 +26,23 @@ tracing-subscriber.workspace = true
 vm-core = { workspace = true, features = ["serde"] }
 vm-mock.workspace = true
 vmm-ipc.workspace = true
+# Real KVM backend. Optional so `cargo test --workspace` on any host
+# (incl. macOS with no /dev/kvm) still builds the worker with the
+# mock backend. The `kvm` feature below forwards to `vm-kvm/kvm`;
+# `Dockerfile.kvm` builds the worker with `--features kvm` so the
+# production image drives real KVM ioctls, while dev builds without
+# the feature keep working on any platform.
+vm-kvm = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enable the real KVM hypervisor inside the worker. Requires Linux
+# with /dev/kvm at runtime; the binary opens it in `main()` via
+# `KvmHypervisor::new()`. Without this feature the worker falls
+# back to the in-process `MockHypervisor` (so it still boots on
+# macOS / Windows / CI containers without KVM, useful for testing
+# the vmm-ipc wire loop end-to-end).
+kvm = ["dep:vm-kvm", "vm-kvm/kvm"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "net", "process", "macros", "rt-multi-thread", "time"] }

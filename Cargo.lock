@@ -1778,6 +1778,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vm-core",
+ "vm-kvm",
  "vm-mock",
  "vmm-ipc",
 ]
