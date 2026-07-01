@@ -65,9 +65,39 @@ source "$ENV_FILE"
 export KVM_GID
 export NANOVM_API_TOKENS="acme:$ACME_TOKEN,globex:$GLOBEX_TOKEN,initech:$INITECH_TOKEN"
 
-# ---- Pull the KVM image once so the first `up` isn't dominated by network.
-log "pulling nanovm-control-plane-kvm:latest (if missing)"
-docker pull ghcr.io/ip888/nanovm-control-plane-kvm:latest >/dev/null
+# ---- Get the KVM image ---------------------------------------------
+# Preferred: pull the pre-built image from GHCR. The `docker.yml`
+# workflow only publishes on semver tag pushes (v*.*.*), so on a
+# repo without a tagged release the GHCR image doesn't exist yet
+# and the pull returns "denied". Fall back to a local build from
+# Dockerfile.kvm in that case — takes ~5 min the first time, then
+# docker's layer cache keeps re-runs fast.
+IMAGE="ghcr.io/ip888/nanovm-control-plane-kvm:latest"
+
+have_image_locally() {
+  docker image inspect "$IMAGE" >/dev/null 2>&1
+}
+
+# Resolve the repo root — this file lives at <repo>/deploy/live-demo/,
+# so the Dockerfile.kvm we need is 2 dirs up.
+REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+
+if have_image_locally; then
+  log "image $IMAGE already present locally — skipping pull/build"
+else
+  log "trying to pull $IMAGE from GHCR"
+  if docker pull "$IMAGE" >/dev/null 2>&1; then
+    log "pulled $IMAGE from GHCR"
+  else
+    warn "GHCR pull failed (image not published yet? denied? offline?)"
+    log "falling back to local build from $REPO_ROOT/Dockerfile.kvm"
+    [[ -f "$REPO_ROOT/Dockerfile.kvm" ]] \
+      || die "Dockerfile.kvm not found at $REPO_ROOT/Dockerfile.kvm — pass NANOVM_LIVE_DEMO_REPO_ROOT=<path> to override."
+    log "building $IMAGE from source — first build takes ~5 min (cold Rust workspace)"
+    docker build -t "$IMAGE" -f "$REPO_ROOT/Dockerfile.kvm" "$REPO_ROOT"
+    log "local build complete"
+  fi
+fi
 
 # ---- Bring the stack up ---------------------------------------------
 log "starting control-plane + Prometheus + Grafana (docker compose)"
