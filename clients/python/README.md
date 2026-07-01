@@ -8,13 +8,73 @@ not like a generated stub of the OpenAPI.
 ## Install
 
 ```sh
-pip install nanovm
+pip install nanovm                        # sync client only (requests)
+pip install "nanovm[async]"               # + AsyncClient (httpx)
+pip install "nanovm[langchain]"           # + LangChain NanoVMTool
+pip install "nanovm[openai]"              # + OpenAI Assistants adapter
+pip install "nanovm[agents]"              # everything above
 ```
 
 Or, from a working checkout (development install):
 
 ```sh
 pip install ./clients/python
+```
+
+## Give your AI agent a real sandbox in three lines
+
+LangChain / LangGraph:
+
+```python
+import nanovm
+from nanovm.agents.langchain import NanoVMTool
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
+
+sandbox = nanovm.Client("https://api.nanovm.example.com", token="acme-…")
+tools   = NanoVMTool(sandbox, snapshot=12)   # 12 = a pre-built python-data-science snapshot
+
+agent = create_react_agent(ChatOpenAI(model="gpt-4o"), tools)
+agent.invoke({"messages": [("user", "Compute pi to 40 digits")]})
+```
+
+Each tool call is a fresh microVM fork — `~12 ms` on real KVM. An agent that hits its tool 100× per task pays `~1.2 s` of sandbox overhead total. Compare to E2B (`150-400 ms × 100 = 30-40 s`) or Modal Sandbox (`~200 ms × 100 = 20 s`).
+
+OpenAI Assistants / Responses / Chat Completions:
+
+```python
+from openai import OpenAI
+import nanovm
+from nanovm.agents.openai import tool_schemas, dispatch_tool_call
+
+llm     = OpenAI()
+sandbox = nanovm.Client("http://localhost:8080", token="dev-token")
+tools   = tool_schemas()          # plain dicts, ready to pass to `tools=`
+
+messages = [{"role": "user", "content": "Compute pi to 40 digits"}]
+while True:
+    rsp = llm.chat.completions.create(model="gpt-4o", messages=messages, tools=tools)
+    msg = rsp.choices[0].message
+    messages.append(msg)
+    if not msg.tool_calls:
+        print(msg.content); break
+    for call in msg.tool_calls:
+        result = dispatch_tool_call(sandbox, call.function.name, call.function.arguments)
+        messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+```
+
+## Async client
+
+```python
+import asyncio, nanovm
+
+async def main():
+    async with nanovm.AsyncClient("http://localhost:8080", token="dev-token") as client:
+        # Retries 429/502/503/504 with exponential backoff; honours Retry-After.
+        result = await client.execute_python("print(1 + 1)")
+        print(result.stdout)          # "2\n"
+
+asyncio.run(main())
 ```
 
 PyPI releases are cut by [`.github/workflows/python-publish.yml`](../../.github/workflows/python-publish.yml)
