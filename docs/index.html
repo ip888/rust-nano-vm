@@ -82,6 +82,7 @@
   </p>
   <div class="cta">
     <a class="btn primary" href="https://github.com/ip888/Rust-nano-vm">Star on GitHub</a>
+    <a class="btn" href="#live-demo">Live demo</a>
     <a class="btn" href="#install">Install</a>
     <a class="btn" href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/blog/01-mmap-private.md">Read the trick</a>
     <a class="btn" href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/blog/03-regulated-ai-sandboxes.md">Regulated deployments</a>
@@ -133,6 +134,42 @@ all of them via <code>MAP_PRIVATE</code> copy-on-write.
     <tr><td>Control plane</td><td>included (proprietary)</td><td>bring your own</td><td class="good">included (axum)</td></tr>
   </tbody>
 </table>
+
+<h2 id="live-demo">Live demo (real KVM, ~5 min to stand up)</h2>
+<p>
+Benchmarks are one thing; a running system under load is another.
+The <a href="https://github.com/ip888/Rust-nano-vm/tree/main/deploy/live-demo"><code>deploy/live-demo/</code></a>
+directory ships everything needed to stand up a <strong>real
+<code>rust-nano-vm</code> control plane on a real Fly.io
+performance machine — with <code>/dev/kvm</code> actually mapped in —
+and point a local Prometheus + Grafana at it</strong>. One command
+brings it up; a traffic generator drives realistic multi-tenant
+load; the dashboard moves in real time.
+</p>
+<pre><code>git clone https://github.com/ip888/Rust-nano-vm.git
+cd Rust-nano-vm/deploy/live-demo
+./up.sh          # deploys the KVM image to Fly.io + local Prometheus/Grafana
+./load.sh        # multi-org traffic generator (acme / globex / initech)
+./tail.sh        # tails RUST_LOG + audit JSONL from the Fly machine</code></pre>
+<p>
+Then open <code>http://localhost:3000/d/nanovm-overview</code> and watch:
+</p>
+<ul>
+  <li><strong>Real KVM restore latencies</strong> on the fork p50/p99 panel — 100-300 ms range on a Fly <code>performance-2x</code>, not a mocked <code>sleep(50)</code>.</li>
+  <li><strong>Per-org fork counters</strong> diverge live as the three synthetic tenants hit the API at different rates.</li>
+  <li><strong>Fork-quota 429s</strong> climb on the noisy tenant as it trips the token bucket.</li>
+  <li><strong>Warm-pool hit ratio</strong> settles above zero as pre-restored children absorb the fork burst.</li>
+  <li><strong>Structured JSON logs</strong> and <strong>JSONL audit</strong> stream side-by-side in the tail terminal — one line per privileged API call.</li>
+</ul>
+<p>
+The Grafana dashboard JSON and Prometheus alert rules used here are
+byte-identical to what the Helm chart ships. Cost: ~$0.30/hr while
+the Fly machine is running (a couple of dollars for a full working
+day of demoing). <code>./down.sh</code> scales it to zero.
+Full walkthrough:
+<a href="https://github.com/ip888/Rust-nano-vm/blob/main/deploy/live-demo/README.md">
+deploy/live-demo/README.md</a>.
+</p>
 
 <h2>What's special</h2>
 <ol>

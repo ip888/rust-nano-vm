@@ -1,0 +1,51 @@
+# Local Prometheus + Grafana stack pointed at the live Fly.io control
+# plane. `../up.sh` orchestrates env-var substitution + startup; don't
+# invoke this file directly (Prometheus can't read env vars in its
+# scrape config, so we render prometheus.yml before starting).
+#
+# Grafana is anonymous-Admin so you can share the URL with a prospect
+# without them needing a login. Change GF_AUTH_* below if you want the
+# usual login form.
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: nanovm-demo-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # The alerts file already lives under deploy/prometheus/ — reuse
+      # it verbatim so this demo can't drift from the real production
+      # rules.
+      - ../../prometheus/alerts.yaml:/etc/prometheus/alerts.yaml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+      - --web.enable-lifecycle
+      - --log.level=warn
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: nanovm-demo-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Anonymous Admin so anyone with the URL can view + edit panels.
+      # For a real deployment flip these off and set GF_SECURITY_ADMIN_PASSWORD.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_LOG_LEVEL: "warn"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./grafana-datasource.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
+      - ./grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/nanovm.yml:ro
+      # Mount the SAME dashboard JSON the Helm chart ships — this demo
+      # stack shows exactly what a production Grafana would show.
+      - ../../grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus

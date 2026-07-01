@@ -46,6 +46,37 @@ cargo run -p bench --features kvm --release --bin nanovm-fork-bench -- \
     --forks 100 --warm-pool 8
 ```
 
+## Live demo (real KVM, ~5 min to stand up)
+
+Don't take the benchmark numbers on trust — **stand up a real, live
+control plane on real hardware, in about 5 minutes, and watch it work
+under load**:
+
+```sh
+cd deploy/live-demo
+./up.sh          # deploys the KVM image to a Fly.io performance machine
+                 # + boots local Prometheus + Grafana pointed at it
+./load.sh        # in one terminal: multi-org traffic generator
+./tail.sh        # in another: streams RUST_LOG + audit JSONL
+```
+
+Open [`http://localhost:3000/d/nanovm-overview`](http://localhost:3000/d/nanovm-overview) and watch:
+
+- fork counters climb (per-org labels diverge on the *Forks by org* panel)
+- fork-quota **429s** show up on the throttled panel as the noisy tenant trips the token bucket
+- warm-pool **hit ratio** settles above zero as the pool refills after cold KVM restores
+- **real KVM restore latencies** (100–300 ms range on a Fly `performance-2x`, not a mocked `sleep(50)`)
+- **audit JSONL** streaming next to structured `RUST_LOG` in the tail terminal
+
+Every panel is drawn from real Prometheus scrapes of the real
+`/metrics` endpoint on the real control plane. The Grafana dashboard
+JSON and Prometheus alert rules are byte-identical to what the Helm
+chart ships — what you see in the demo is what an operator sees in
+production. Full walkthrough + tear-down: [`deploy/live-demo/README.md`](deploy/live-demo/README.md).
+
+Cost: ~$0.30/hr for the Fly machine, negligible bandwidth. `./down.sh`
+scales it to zero.
+
 ## Why this exists
 
 Every AI coding agent — Claude Code, Cursor, Devin, OpenHands, aider,

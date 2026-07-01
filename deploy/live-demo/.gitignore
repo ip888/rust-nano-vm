@@ -1,0 +1,6 @@
+# Written by fly/deploy.sh — contains raw API tokens for the demo Fly app.
+# Never check these in; regenerate by deleting this file and re-running deploy.sh.
+.env.local
+
+# Rendered by up.sh from prometheus.yml.tpl at bring-up time.
+compose/prometheus.yml
