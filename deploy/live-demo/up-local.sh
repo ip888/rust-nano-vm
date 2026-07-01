@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #
 # Bring the live-KVM demo up entirely on your local Linux + KVM box.
-# No cloud, no accounts, no cost. Runs 4 docker containers:
+# No cloud, no accounts, no cost. Runs 3 docker containers:
 #
 #   1. nanovm-control-plane-kvm — the REAL binary, /dev/kvm mapped in
 #   2. Prometheus                — scraping (1) at 15 s
 #   3. Grafana                   — same dashboard as the Fly.io demo
-#   4. (no fourth — load.sh + tail-local.sh run on the host)
+#
+# load.sh + tail-local.sh run on the host, not in containers.
 #
 # Requires:
 #   - Linux host with /dev/kvm (Intel `vmx` or AMD `svm`)
@@ -44,7 +45,12 @@ log "host /dev/kvm belongs to gid $KVM_GID (kvm group)"
 # ---- Generate fresh per-org tokens ----------------------------------
 ENV_FILE="$HERE/.env.local"
 if [[ ! -f "$ENV_FILE" ]]; then
-  gen_token() { openssl rand -hex 24 2>/dev/null || head -c 24 /dev/urandom | xxd -p; }
+  # openssl is the fast path; POSIX `od` is the fallback (xxd isn't
+  # POSIX and Alpine/BusyBox hosts don't have it).
+  gen_token() {
+    openssl rand -hex 24 2>/dev/null \
+      || od -An -tx1 -N24 /dev/urandom | tr -d ' \n'
+  }
   ACME_TOKEN="$(gen_token)"
   GLOBEX_TOKEN="$(gen_token)"
   INITECH_TOKEN="$(gen_token)"
@@ -79,17 +85,23 @@ have_image_locally() {
 }
 
 # Resolve the repo root — this file lives at <repo>/deploy/live-demo/,
-# so the Dockerfile.kvm we need is 2 dirs up.
-REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+# so the Dockerfile.kvm we need is 2 dirs up. Overridable for exotic
+# layouts (e.g. a symlinked checkout, a nested subtree).
+REPO_ROOT="${NANOVM_LIVE_DEMO_REPO_ROOT:-$(cd "$HERE/../.." && pwd)}"
 
 if have_image_locally; then
   log "image $IMAGE already present locally — skipping pull/build"
 else
   log "trying to pull $IMAGE from GHCR"
-  if docker pull "$IMAGE" >/dev/null 2>&1; then
+  # Capture pull stderr so the operator can see the real reason on
+  # failure (`denied` = image not yet published; `unauthorized` = bad
+  # creds; `no such host` = DNS/offline). Suppressing stderr wholesale
+  # here loses that signal.
+  pull_err=$(docker pull "$IMAGE" 2>&1 >/dev/null) && pull_ok=1 || pull_ok=0
+  if [[ "$pull_ok" == "1" ]]; then
     log "pulled $IMAGE from GHCR"
   else
-    warn "GHCR pull failed (image not published yet? denied? offline?)"
+    warn "GHCR pull failed: ${pull_err##*$'\n'}"
     log "falling back to local build from $REPO_ROOT/Dockerfile.kvm"
     [[ -f "$REPO_ROOT/Dockerfile.kvm" ]] \
       || die "Dockerfile.kvm not found at $REPO_ROOT/Dockerfile.kvm — pass NANOVM_LIVE_DEMO_REPO_ROOT=<path> to override."

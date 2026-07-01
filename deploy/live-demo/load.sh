@@ -59,11 +59,23 @@ lifecycle_once() {
     -H "Content-Type: application/json" \
     -d '{"cpus":1,"memory_mib":128,"kernel":"vmlinux","rootfs":"rootfs.ext4"}' \
     | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2) || return 0
+  [[ -n "$vm_id" ]] || return 0
 
-  # Snapshot it.
+  # Start before snapshotting. The real-KVM backend refuses to
+  # snapshot a Created VM (needs Running for a coherent CPU-state
+  # capture); the mock accepts either. Start is idempotent enough
+  # that an InvalidTransition here just moves on.
+  curl -sS -o /dev/null -X POST "$BASE_URL/v1/vms/$vm_id/start" \
+    -H "Authorization: Bearer $token" || true
+
+  # Snapshot it. SnapshotId is a u64 on the wire (crates/vm-core/src/lib.rs:42),
+  # so parse as a number — an earlier version of this script parsed it
+  # as a JSON string, resulting in an empty snap_id and every fork below
+  # returning 404.
   snap_id=$(curl -fsS -X POST "$BASE_URL/v1/vms/$vm_id/snapshot" \
     -H "Authorization: Bearer $token" \
-    | grep -o '"id":"[^"]*"' | cut -d'"' -f4) || return 0
+    | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2) || return 0
+  [[ -n "$snap_id" ]] || { warn_and_cleanup "$vm_id" "" "$token"; return 0; }
 
   # Fork three times so we visibly move `forks_total` per iteration.
   for _ in 1 2 3; do
@@ -77,13 +89,31 @@ lifecycle_once() {
   # Exec something in one fresh fork so `exec` panels move too.
   fork_id=$(curl -fsS -X POST "$BASE_URL/v1/snapshots/$snap_id/fork" \
     -H "Authorization: Bearer $token" \
-    | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2) || return 0
+    | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2) || true
   if [[ -n "$fork_id" ]]; then
     curl -sS -o /dev/null -X POST "$BASE_URL/v1/vms/$fork_id/exec" \
       -H "Authorization: Bearer $token" \
       -H "Content-Type: application/json" \
       -d '{"cmd":["/bin/echo","live-demo"],"timeout_ms":2000}' || true
     curl -sS -o /dev/null -X DELETE "$BASE_URL/v1/vms/$fork_id" \
+      -H "Authorization: Bearer $token" || true
+  fi
+
+  # Delete the base VM + snapshot at the end of each iteration so a
+  # long run doesn't exhaust the demo app's per-org quota / disk.
+  warn_and_cleanup "$vm_id" "$snap_id" "$token"
+}
+
+# Best-effort resource cleanup — quiet on failure so we don't spam
+# logs when the resource is already gone.
+warn_and_cleanup() {
+  local vm_id="$1" snap_id="$2" token="$3"
+  if [[ -n "$snap_id" ]]; then
+    curl -sS -o /dev/null -X DELETE "$BASE_URL/v1/snapshots/$snap_id" \
+      -H "Authorization: Bearer $token" || true
+  fi
+  if [[ -n "$vm_id" ]]; then
+    curl -sS -o /dev/null -X DELETE "$BASE_URL/v1/vms/$vm_id" \
       -H "Authorization: Bearer $token" || true
   fi
 }
