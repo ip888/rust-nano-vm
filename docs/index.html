@@ -83,9 +83,9 @@
   <div class="cta">
     <a class="btn primary" href="https://github.com/ip888/Rust-nano-vm">Star on GitHub</a>
     <a class="btn" href="#live-demo">Live demo</a>
+    <a class="btn" href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/local-llm-agent.md">Local LLM guide</a>
     <a class="btn" href="#install">Install</a>
     <a class="btn" href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/blog/01-mmap-private.md">Read the trick</a>
-    <a class="btn" href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/blog/03-regulated-ai-sandboxes.md">Regulated deployments</a>
   </div>
 </header>
 
@@ -236,6 +236,17 @@ all assets on the
 
 <h2>Use cases this is built for</h2>
 <ul>
+  <li><strong>Local LLM developers.</strong> If you run
+  <code>ollama</code> / <code>vllm</code> / <code>llama.cpp</code> on
+  your laptop to skip cloud-LLM bills, your agent's tool calls
+  (<code>execute_python</code>, shell, file IO) still need a real
+  sandbox — <code>subprocess</code> on your host is unsafe,
+  Docker is weak isolation. Point your LangChain / OpenAI-SDK / MCP
+  agent at a local <code>nanovm</code> and every tool call is a
+  ~12 ms <code>/dev/kvm</code> fork on your host kernel. Nothing
+  leaves the box. See
+  <a href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/local-llm-agent.md">Run your local LLM's agent tools inside real microVMs →</a>.
+  </li>
   <li><strong>AI agent eval pipelines.</strong> Fan out 1000 variants of a base
   image to run a benchmark in parallel; throw them away in milliseconds. See
   <a href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/blog/04-12ms-eval-fanout.md">12 ms fan-out for AI-agent eval pipelines →</a>
