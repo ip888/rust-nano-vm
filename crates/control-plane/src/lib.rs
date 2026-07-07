@@ -46,6 +46,8 @@
 mod api;
 mod audit;
 mod auth;
+#[cfg(feature = "billing")]
+pub mod billing;
 mod error;
 mod exec_stream;
 pub mod fork_quota;
