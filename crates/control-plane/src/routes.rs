@@ -101,6 +101,13 @@ pub struct AppState {
     /// Human-readable backend label surfaced on `GET /v1/health`
     /// (e.g. `"mock"`, `"kvm"`). Defaults to `"mock"` in `new()`.
     backend_label: &'static str,
+    /// Optional Stripe billing context. `Some` when the binary was
+    /// built with `--features billing` AND
+    /// `BillingConfig::from_env()` returned `Some` at startup. The
+    /// `POST /v1/signup` and `GET /v1/billing/portal` handlers 503
+    /// with `code: "billing_disabled"` when this is `None`.
+    #[cfg(feature = "billing")]
+    billing: Option<crate::billing::BillingCtx>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -141,7 +148,26 @@ impl AppState {
             start_instant: Instant::now(),
             started_at: rfc3339_now(),
             backend_label: "mock",
+            #[cfg(feature = "billing")]
+            billing: None,
         }
+    }
+
+    /// Install the Stripe billing context. `None` disables
+    /// `POST /v1/signup` + `GET /v1/billing/portal` (they return
+    /// 503 `billing_disabled`). Only present when the `billing`
+    /// feature is compiled in.
+    #[cfg(feature = "billing")]
+    pub fn with_billing(mut self, billing: Option<crate::billing::BillingCtx>) -> Self {
+        self.billing = billing;
+        self
+    }
+
+    /// Borrow the billing context, if configured. Used by the two
+    /// billing handlers to reach into Stripe + the billing store.
+    #[cfg(feature = "billing")]
+    pub(crate) fn billing_ctx(&self) -> Option<&crate::billing::BillingCtx> {
+        self.billing.as_ref()
     }
 
     /// Borrow the per-org ownership map. Used by sibling modules
@@ -280,12 +306,25 @@ pub fn router() -> Router<AppState> {
         .route("/usage/by-org", get(usage_by_org))
         .route("/keys", get(crate::keys::list_keys).post(crate::keys::issue_key))
         .route("/keys/:id", axum::routing::delete(crate::keys::revoke_key))
-        .route("/health", get(health))
+        .route("/health", get(health));
+    // Billing portal is inside the tenant-auth layer — the caller is a
+    // known tenant asking to manage their own subscription.
+    #[cfg(feature = "billing")]
+    let v1 = v1.route(
+        "/billing/portal",
+        get(crate::billing::billing_portal_handler),
+    );
+    let v1 = v1
         // route_layer is bottom-up: the LAST `.route_layer` runs FIRST.
         // require_audit must see *authenticated* calls only, so register
         // it INNER (here) and require_token OUTER (after this).
         .route_layer(middleware::from_fn(audit::require_audit))
         .route_layer(middleware::from_fn(auth::require_token));
+    // Signup is *outside* the tenant-auth layer — the caller is
+    // provisioning a fresh org and doesn't have a tenant token yet.
+    // The handler self-authenticates against NANOVM_SIGNUP_TOKEN.
+    #[cfg(feature = "billing")]
+    let v1 = v1.route("/signup", post(crate::billing::signup_handler));
 
     Router::new()
         .route("/healthz", get(healthz))

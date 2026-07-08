@@ -134,16 +134,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ownership = control_plane::OwnershipMap::from_env()
         .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
 
+    // Optional Stripe billing context. `None` when the `billing`
+    // feature is off OR when any of STRIPE_SECRET_KEY /
+    // STRIPE_BILLING_PORTAL_RETURN_URL / NANOVM_SIGNUP_TOKEN is unset.
+    // The signup / billing_portal handlers return 503 `billing_disabled`
+    // in that case.
+    #[cfg(feature = "billing")]
+    let billing_ctx = build_billing_ctx();
+    #[cfg(feature = "billing")]
+    if billing_ctx.is_some() {
+        info!("billing enabled: POST /v1/signup + GET /v1/billing/portal live");
+    } else {
+        info!("billing disabled (set STRIPE_SECRET_KEY + STRIPE_BILLING_PORTAL_RETURN_URL + NANOVM_SIGNUP_TOKEN to enable)");
+    }
+
+    let state = AppState::new(hypervisor)
+        .with_warm_pool(warm_pool)
+        .with_snapshot_store(snapshot_store)
+        .with_backend_label(backend_label)
+        .with_ownership_map(Arc::new(ownership));
+    #[cfg(feature = "billing")]
+    let state = state.with_billing(billing_ctx);
+
     let app = router()
         .layer(Extension(tokens))
         .layer(Extension(audit))
-        .with_state(
-            AppState::new(hypervisor)
-                .with_warm_pool(warm_pool)
-                .with_snapshot_store(snapshot_store)
-                .with_backend_label(backend_label)
-                .with_ownership_map(Arc::new(ownership)),
-        );
+        .with_state(state);
 
     let listener = TcpListener::bind(&addr).await?;
     info!(%addr, "nanovm-control-plane listening");
@@ -311,4 +327,51 @@ async fn shutdown_signal() {
     }
 
     info!("shutdown signal received, draining");
+}
+
+/// Compose a [`control_plane::billing::BillingCtx`] from env when all
+/// three Stripe vars are set. Returns `None` when billing is not fully
+/// configured — the handlers 503 with `billing_disabled` on requests.
+///
+/// Billing state persists into the same SQLite file the ownership store
+/// uses. When `NANOVM_OWNERSHIP_STORE` is unset, falls back to
+/// `InMemoryBillingStore` with a loud warning — fine for tests and demos,
+/// catastrophic for prod SaaS.
+#[cfg(feature = "billing")]
+fn build_billing_ctx() -> Option<control_plane::billing::BillingCtx> {
+    let cfg = control_plane::billing::BillingConfig::from_env()?;
+    let store: std::sync::Arc<dyn control_plane::billing::BillingStore> =
+        match std::env::var("NANOVM_OWNERSHIP_STORE")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            Some(spec) => {
+                let path = spec.strip_prefix("sqlite://").unwrap_or(&spec);
+                match control_plane::billing::SqliteBillingStore::open(path) {
+                    Ok(s) => std::sync::Arc::new(s),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "billing: SqliteBillingStore::open failed; falling back to in-memory"
+                        );
+                        std::sync::Arc::new(control_plane::billing::InMemoryBillingStore::default())
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "billing: NANOVM_OWNERSHIP_STORE unset; using InMemoryBillingStore. \
+                 Stripe customer ids will be lost on restart — DO NOT use in prod."
+                );
+                std::sync::Arc::new(control_plane::billing::InMemoryBillingStore::default())
+            }
+        };
+    let stripe = std::sync::Arc::new(control_plane::billing::StripeClient::new(
+        cfg.stripe_secret_key.clone(),
+    ));
+    Some(control_plane::billing::BillingCtx {
+        config: cfg,
+        store,
+        stripe,
+    })
 }
