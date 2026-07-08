@@ -236,6 +236,18 @@ all assets on the
 
 <h2>Use cases this is built for</h2>
 <ul>
+  <li><strong>You tried LangChain Sandbox (Pyodide) and hit its wall.</strong>
+  <a href="https://github.com/langchain-ai/langchain-sandbox"><code>langchain-sandbox</code></a>
+  runs Python-only, no shell, no <code>pip install</code>, no long-running
+  processes — genuinely great for pure-Python tool calls. The moment
+  the model wants <code>subprocess.run(["curl", ...])</code>,
+  <code>pip install playwright</code>, a Node/Go binary, or a real
+  filesystem that persists between calls, WASM stops. That's the
+  workload nanovm is built for. Real Linux VM, real kernel, real
+  <code>apt install</code>, ~12 ms cold-start, still fits in a single
+  Rust binary. Full 13-axis comparison in
+  <a href="https://github.com/ip888/Rust-nano-vm/blob/main/docs/comparison.md#vs-langchain-sandbox-pyodide--deno">docs/comparison.md →</a>.
+  </li>
   <li><strong>Local LLM developers.</strong> If you run
   <code>ollama</code> / <code>vllm</code> / <code>llama.cpp</code> on
   your laptop to skip cloud-LLM bills, your agent's tool calls

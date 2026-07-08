@@ -26,6 +26,28 @@ sandbox runs local, the agent code is yours. This is the sweet spot for
 developers who use their laptop for LLM experimentation *because* it
 saves money vs cloud APIs — you'd want to keep it that way.
 
+## Wait — should you use `langchain-sandbox` (Pyodide) instead?
+
+[LangChain shipped](https://www.langchain.com/blog/running-untrusted-agent-code-without-a-sandbox)
+`langchain-sandbox`, which runs Python via Pyodide (CPython → WASM)
+inside Deno's permission-flag runtime. Zero infrastructure — install a
+package, run in-process, ~50-100 ms cold-start.
+
+**Honestly: if your model only writes pure Python against stdlib +
+Pyodide-compatible wheels (numpy, pandas, scipy), and it never needs
+`pip install X`, or a shell command, or a native binary — `langchain-sandbox`
+is faster and simpler. Use it.**
+
+Come back to this guide the moment any of these become true:
+
+- The model needs `pip install torch` / `playwright` / `opencv` / anything native
+- The model writes `subprocess.run(["curl", …])` / `git` / `apt install`
+- The agent's tool needs to leave state on the filesystem between calls
+- You need a real per-user audit log or per-tenant hardware isolation
+- The tool call needs to run a long-lived process (Jupyter kernel, dev server)
+
+Full comparison across 13 axes: [`docs/comparison.md`](comparison.md#vs-langchain-sandbox-pyodide--deno).
+
 ## Prerequisites
 
 - **Linux with `/dev/kvm`** — Omarchy, Arch, Ubuntu, Fedora, any distro
