@@ -33,6 +33,52 @@ E2B is the closest commercial incumbent.
 | Protocol | Proprietary SDK | Open `agent-sandbox-proto` spec |
 | Pricing | Managed per-second | OSS free; optional managed cloud |
 
+## vs LangChain Sandbox (Pyodide + Deno)
+
+LangChain's [`langchain-sandbox`](https://github.com/langchain-ai/langchain-sandbox)
+runs untrusted Python via **Pyodide** (CPython compiled to WebAssembly)
+inside **Deno**'s permission-flag runtime. The blog post frames this as
+"running untrusted code without a sandbox" — technically there IS a
+sandbox (the WASM VM), but there's no VM/container to run: it's a
+package you install into your host process.
+
+This is a *very* smart choice for a specific slice of workloads, and
+it eats the low end of the "give my agent a sandbox" market. Where it
+stops is where a real microVM starts:
+
+| Axis | LangChain Sandbox | rust-nano-vm |
+| --- | --- | --- |
+| Setup effort | `pip install langchain-sandbox` | Docker + `/dev/kvm` (or Fly.io) |
+| Cold start | ~50-100 ms (WASM init) | ~12 ms (KVM `MAP_PRIVATE` fork) |
+| Pure Python (stdlib + Pyodide-compat wheels) | ✅ great | ✅ |
+| Native-code Python (`torch`, `playwright`, `opencv`, `scipy`, …) | ❌ Pyodide package set only | ✅ real CPython + `pip install` |
+| Shell commands (`curl`, `git`, `apt`, `sh -c "…"`) | ❌ no shell | ✅ |
+| Non-Python runtimes (Node.js, Go, Rust, R, Julia) | ❌ Python-only | ✅ |
+| Long-running processes (Jupyter kernel, dev server, DB) | ❌ WASM is per-call | ✅ VM stays running |
+| Persistent filesystem between tool calls | ❌ WASM memory dies with the call | ✅ real ext4 rootfs |
+| Multi-tenant hardware-enforced isolation | ⚠️ WASM VMs share the host process | ✅ per-VM cgroups + seccomp |
+| Forensic audit log (per privileged action) | ❌ not built-in | ✅ JSONL audit + Prometheus per-org meter |
+| Syscall filter (seccomp-BPF) | ⚠️ Deno permissions ≠ real seccomp | ✅ shipped (`crates/vm-kvm/src/seccomp.rs`) |
+| Regulated-industry audit story (HIPAA / PCI / SOC 2) | ⚠️ WASM viable but non-standard for auditors | ✅ real Linux VM, familiar to auditors |
+| Cost at 100 tool-calls-per-task | Free (in-process) | Free local; ~$0.30/hr Fly.io |
+| Distribution | Python package | Single Rust binary + optional Helm chart |
+
+**Use LangChain Sandbox when:** the model only writes pure Python
+against stdlib + numpy / pandas / scipy (Pyodide wheels exist for
+these), you never need shell, and you're running one agent per host
+(personal projects, single-tenant apps). It's genuinely faster and
+simpler for that shape.
+
+**Use rust-nano-vm when:** the model ever needs `pip install X`
+against a non-Pyodide package, calls a shell command, spawns a
+subprocess that must outlive the tool call, writes files that must
+persist across calls, or you're running a multi-tenant SaaS that
+needs hardware isolation between customers and a per-org billing
+meter.
+
+The two aren't mutually exclusive; a production agent can route
+cheap Python-only calls to Pyodide and everything else to nanovm.
+
 ## vs containers (Docker / gVisor / runsc / Kata)
 
 | Axis | Containers | rust-nano-vm |
@@ -48,7 +94,8 @@ a microVM is the right primitive.
 
 ## When to choose what
 
-- **Need fastest possible cold start for agent eval?** rust-nano-vm.
+- **Model only writes pure Python, never needs shell / `pip install` / a native package?** LangChain Sandbox (Pyodide + Deno).
+- **Need fastest possible cold start for agent eval, or the model needs shell / native packages / a real filesystem?** rust-nano-vm.
 - **General serverless function platform?** Firecracker.
 - **Managed service, no ops?** E2B.
 - **Shared-kernel OK, want the simplest thing?** Docker.

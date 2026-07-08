@@ -83,6 +83,43 @@ production. Full walkthrough + tear-down: [`deploy/live-demo/README.md`](deploy/
 Cost: ~$0.30/hr for the Fly machine, negligible bandwidth. `./down.sh`
 scales it to zero.
 
+## Run this next to your local LLM (Ollama / vLLM / llama.cpp)
+
+Locally-hosted models are the whole point of "avoid cloud LLM spend"
+— but the agent's tool calls (`execute_python`, shell, file IO) still
+need a real sandbox, not `subprocess.run()` on your laptop. Three
+terminals get you there:
+
+```sh
+# Terminal 1 — local model on your GPU (Ollama example; llama.cpp / vLLM / LM Studio all work).
+ollama serve & ollama pull llama3.1:8b
+
+# Terminal 2 — nanovm sandbox on your host's real /dev/kvm.
+cd deploy/live-demo && ./up-local.sh
+
+# Terminal 3 — your agent.
+uv add "nanovm[langchain]" langchain-openai langgraph   # or `pip install …`
+```
+
+Then wire your agent to point the LLM at `http://localhost:11434/v1`
+and the tools at `http://localhost:8080`:
+
+```python
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
+import nanovm
+from nanovm.agents.langchain import NanoVMTool
+
+llm     = ChatOpenAI(model="llama3.1:8b", base_url="http://localhost:11434/v1", api_key="ollama")
+sandbox = nanovm.Client("http://localhost:8080", token="$ACME_TOKEN")
+agent   = create_react_agent(llm, NanoVMTool(sandbox))
+```
+
+Every tool call is a real `/dev/kvm` fork in ~12 ms on your host
+kernel. Nothing leaves the laptop — model local, sandbox local, API
+key never sent to a cloud. Full walkthrough, including Claude
+Desktop / Cursor via MCP and pre-built snapshot images: [`docs/local-llm-agent.md`](docs/local-llm-agent.md).
+
 ## Why this exists
 
 Every AI coding agent — Claude Code, Cursor, Devin, OpenHands, aider,
