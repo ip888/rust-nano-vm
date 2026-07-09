@@ -2,7 +2,7 @@
 #
 # Production image with real KVM under the REST API.
 #
-# Differs from the default `Dockerfile` in three ways:
+# Differs from the default `Dockerfile` in four ways:
 #
 #   1. Bundles the process-fleet trio (control-plane + jailer +
 #      vmm-child), with `nanovm-vmm-child` built as `--features kvm`
@@ -16,6 +16,12 @@
 #      to `cc-debian12:debug-nonroot` so an operator can `exec` into
 #      the container during incident triage. (No package manager;
 #      busybox only.)
+#   4. Bundles a Firecracker sample vmlinux + Alpine rootfs.ext4 at
+#      `/usr/local/share/nanovm/`, with `NANOVM_DEFAULT_KERNEL_PATH`
+#      / `NANOVM_DEFAULT_ROOTFS_PATH` set. `POST /v1/vms {}` (empty
+#      body) succeeds and boots Alpine out of the box; explicit
+#      `kernel` / `rootfs` in the request still wins. See
+#      `tools/kvm-images/` for the fetch + pin workflow.
 #
 # Both images use the same uid 65532 (`nonroot`). The container needs
 # `/dev/kvm` mapped in at runtime:
@@ -50,7 +56,19 @@ RUN cargo build --release --locked \
     cargo build --release --locked --features kvm \
     -p nanovm-vmm-child --bin nanovm-vmm-child
 
-# ---- Stage 2: runtime ------------------------------------------------
+# ---- Stage 2: fetch a default kernel + rootfs ------------------------
+# Firecracker's `hello` sample (~55 MiB total) is enough to boot Alpine
+# under KVM. This makes `POST /v1/vms {}` succeed against the shipped
+# image out of the box; operators wanting a beefier userspace override
+# `NANOVM_DEFAULT_ROOTFS_PATH` at runtime with `-v` + `-e`.
+# See tools/kvm-images/README.md for the pinning workflow.
+FROM debian:bookworm-slim AS kvm-images
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY tools/kvm-images/fetch.sh /fetch.sh
+RUN sh /fetch.sh /kvm-images
+
+# ---- Stage 3: runtime ------------------------------------------------
 FROM gcr.io/distroless/cc-debian12:debug-nonroot
 
 COPY --from=builder \
@@ -64,6 +82,12 @@ COPY --from=builder \
 COPY --from=builder \
      /src/target/release/nanovm-vmm-child \
      /usr/local/bin/nanovm-vmm-child
+# Default kernel + Alpine rootfs — makes `POST /v1/vms {}` succeed
+# out of the box. Callers that want their own userspace pass explicit
+# `kernel`/`rootfs` in the request body OR set
+# `NANOVM_DEFAULT_ROOTFS_PATH` at runtime.
+COPY --from=kvm-images /kvm-images/vmlinux     /usr/local/share/nanovm/vmlinux
+COPY --from=kvm-images /kvm-images/rootfs.ext4 /usr/local/share/nanovm/rootfs.ext4
 
 # Bind to all interfaces by default — port mapping works out of the box.
 ENV NANOVM_CONTROL_PLANE_ADDR=0.0.0.0:8080
@@ -88,6 +112,15 @@ ENV NANOVM_FLEET_SOCKET_DIR=/tmp/nanovm-fleet
 # the same `fleet` backend at a glance. Read by `build_hypervisor()`
 # in `crates/control-plane/src/bin/server.rs`.
 ENV NANOVM_BACKEND_LABEL=kvm-fleet
+# Server-side defaults so `POST /v1/vms {}` (empty body) succeeds
+# against the bundled kernel + rootfs. Request-supplied `kernel` /
+# `rootfs` / `cmdline` always win (see
+# `crates/control-plane/src/api.rs::VmConfigDefaults::apply_to`).
+# Override at runtime with `-v /host/img:/img -e NANOVM_DEFAULT_ROOTFS_PATH=/img/rootfs.ext4`
+# to boot a customer-supplied userspace.
+ENV NANOVM_DEFAULT_KERNEL_PATH=/usr/local/share/nanovm/vmlinux
+ENV NANOVM_DEFAULT_ROOTFS_PATH=/usr/local/share/nanovm/rootfs.ext4
+ENV NANOVM_DEFAULT_KERNEL_CMDLINE="console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw"
 
 EXPOSE 8080
 
