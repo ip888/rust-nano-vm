@@ -36,11 +36,18 @@
 #![allow(missing_docs)]
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::Json,
+    Extension,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{ApiTokens, IssuedToken, OrgId};
+use crate::error::ApiError;
 
 // -------- DTOs ----------------------------------------------------------
 
@@ -374,6 +381,112 @@ pub fn slugify(input: &str) -> String {
         out.pop();
     }
     out
+}
+
+// -------- Route wiring -------------------------------------------------
+
+/// Sub-state carried on [`crate::AppState`] when the `billing` feature
+/// is enabled at compile-time AND `BillingConfig::from_env()` returned
+/// `Some` at startup. Access via [`crate::AppState::billing`].
+#[derive(Clone)]
+pub struct BillingCtx {
+    pub config: BillingConfig,
+    pub store: Arc<dyn BillingStore>,
+    pub stripe: Arc<StripeClient>,
+}
+
+impl std::fmt::Debug for BillingCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BillingCtx")
+            .field("config", &self.config)
+            .field("store", &"<dyn BillingStore>")
+            .field("stripe", &"<StripeClient>")
+            .finish()
+    }
+}
+
+/// `POST /v1/signup` axum handler. Self-authenticates against
+/// `NANOVM_SIGNUP_TOKEN` — the standard tenant auth middleware
+/// deliberately does NOT run on this route, because the caller is an
+/// operator provisioning a *new* org and by definition has no tenant
+/// token yet.
+pub(crate) async fn signup_handler(
+    State(state): State<crate::AppState>,
+    Extension(tokens): Extension<Arc<ApiTokens>>,
+    headers: HeaderMap,
+    body: Result<Json<SignupRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<(StatusCode, Json<SignupResponse>), ApiError> {
+    let ctx = state.billing_ctx().ok_or(ApiError::Unsupported {
+        code: "billing_disabled",
+        message: "billing endpoints require the `billing` feature + \
+                  STRIPE_SECRET_KEY, STRIPE_BILLING_PORTAL_RETURN_URL, \
+                  NANOVM_SIGNUP_TOKEN env vars"
+            .into(),
+    })?;
+    let Json(req) = body?;
+    let bearer = extract_bearer(&headers);
+    let resp = signup(
+        &ctx.config,
+        &tokens,
+        ctx.store.as_ref(),
+        &ctx.stripe,
+        bearer.as_deref(),
+        req,
+    )
+    .await
+    .map_err(billing_to_api_error)?;
+    Ok((StatusCode::CREATED, Json(resp)))
+}
+
+/// `GET /v1/billing/portal` axum handler. Reaches this handler ONLY
+/// after `auth::require_token` middleware injected the caller's
+/// [`OrgId`], so `Extension<OrgId>` is always present here.
+pub(crate) async fn billing_portal_handler(
+    State(state): State<crate::AppState>,
+    Extension(org): Extension<OrgId>,
+) -> Result<Json<PortalResponse>, ApiError> {
+    let ctx = state.billing_ctx().ok_or(ApiError::Unsupported {
+        code: "billing_disabled",
+        message: "billing endpoints require the `billing` feature + Stripe env vars".into(),
+    })?;
+    let resp = billing_portal(&ctx.config, ctx.store.as_ref(), &ctx.stripe, &org)
+        .await
+        .map_err(billing_to_api_error)?;
+    Ok(Json(resp))
+}
+
+fn extract_bearer(headers: &HeaderMap) -> Option<String> {
+    let raw = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    raw.strip_prefix("Bearer ").map(str::to_string)
+}
+
+fn billing_to_api_error(e: BillingError) -> ApiError {
+    match e {
+        BillingError::Disabled => ApiError::Unsupported {
+            code: "billing_disabled",
+            message: "billing endpoints not configured".into(),
+        },
+        BillingError::BadSignupToken => {
+            ApiError::Unauthorized("signup requires NANOVM_SIGNUP_TOKEN as the bearer".into())
+        }
+        BillingError::InvalidOrg => {
+            ApiError::Bad("org name must contain at least one alphanumeric character".into())
+        }
+        BillingError::NoCustomerForOrg(org) => ApiError::NotFound {
+            code: "no_billing_customer",
+            message: format!("no Stripe customer recorded for org {org:?}; did you signup?"),
+        },
+        BillingError::StripeApi { status, message } => {
+            ApiError::Bad(format!("stripe api error ({status}): {message}"))
+        }
+        BillingError::StripeTransport(msg) => {
+            ApiError::InternalDyn(format!("stripe transport error: {msg}"))
+        }
+        BillingError::Store(inner) => ApiError::InternalDyn(inner.to_string()),
+    }
 }
 
 // -------- Tests --------------------------------------------------------
