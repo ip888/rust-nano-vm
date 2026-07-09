@@ -108,6 +108,11 @@ pub struct AppState {
     /// with `code: "billing_disabled"` when this is `None`.
     #[cfg(feature = "billing")]
     billing: Option<crate::billing::BillingCtx>,
+    /// Server-side fallbacks applied to a [`crate::api::CreateVmRequest`]
+    /// when its `kernel` / `rootfs` / `cmdline` fields are unset.
+    /// Read once at startup from `NANOVM_DEFAULT_*` env vars. Empty by
+    /// default so existing tests + mock deploys keep working.
+    vm_defaults: crate::api::VmConfigDefaults,
 }
 
 impl std::fmt::Debug for AppState {
@@ -150,7 +155,17 @@ impl AppState {
             backend_label: "mock",
             #[cfg(feature = "billing")]
             billing: None,
+            vm_defaults: crate::api::VmConfigDefaults::default(),
         }
+    }
+
+    /// Install `NANOVM_DEFAULT_*` server-side fallbacks. The
+    /// `create_vm` handler applies these when the request omits
+    /// `kernel` / `rootfs` / `cmdline` so `POST /v1/vms {}` succeeds
+    /// on a KVM image with bundled kernel + rootfs.
+    pub fn with_vm_defaults(mut self, defaults: crate::api::VmConfigDefaults) -> Self {
+        self.vm_defaults = defaults;
+        self
     }
 
     /// Install the Stripe billing context. `None` disables
@@ -371,7 +386,13 @@ async fn create_vm(
     body: Result<Json<CreateVmRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<VmHandleDto>), ApiError> {
     let Json(req) = body?;
-    let handle = state.hypervisor.create_vm(&req.into())?;
+    // Server-side defaults (from `NANOVM_DEFAULT_*`) fill any field the
+    // request left unset. Request wins on every field that IS set.
+    // This is what makes `POST /v1/vms {}` succeed on a KVM image with
+    // bundled kernel + rootfs.
+    let mut cfg: vm_core::VmConfig = req.into();
+    state.vm_defaults.apply_to(&mut cfg);
+    let handle = state.hypervisor.create_vm(&cfg)?;
     state.ownership.record_vm(handle.id, org);
     Ok((StatusCode::CREATED, Json(handle.into())))
 }

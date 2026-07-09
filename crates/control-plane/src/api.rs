@@ -59,6 +59,62 @@ impl From<CreateVmRequest> for VmConfig {
     }
 }
 
+/// Server-side defaults for `kernel` / `rootfs` / `cmdline` used when a
+/// `CreateVmRequest` omits them. Populated at startup from the
+/// `NANOVM_DEFAULT_KERNEL_PATH` / `NANOVM_DEFAULT_ROOTFS_PATH` /
+/// `NANOVM_DEFAULT_KERNEL_CMDLINE` env vars. Lives on
+/// [`crate::AppState`]; the `create_vm` handler applies them before
+/// dispatch. Request-supplied fields always win.
+#[derive(Debug, Clone, Default)]
+pub struct VmConfigDefaults {
+    /// Fallback kernel path.
+    pub kernel: Option<PathBuf>,
+    /// Fallback rootfs path.
+    pub rootfs: Option<PathBuf>,
+    /// Fallback kernel cmdline.
+    pub cmdline: Option<String>,
+}
+
+impl VmConfigDefaults {
+    /// Read from env. Any unset var stays `None`; the handler falls
+    /// through to the request field's own default in that case.
+    pub fn from_env() -> Self {
+        Self {
+            kernel: std::env::var("NANOVM_DEFAULT_KERNEL_PATH")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            rootfs: std::env::var("NANOVM_DEFAULT_ROOTFS_PATH")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            cmdline: std::env::var("NANOVM_DEFAULT_KERNEL_CMDLINE")
+                .ok()
+                .filter(|s| !s.is_empty()),
+        }
+    }
+
+    /// Apply defaults to `cfg` — request fields win, defaults fill any
+    /// gap. Called from the `create_vm` handler.
+    pub fn apply_to(&self, cfg: &mut VmConfig) {
+        if cfg.kernel.is_none() {
+            cfg.kernel = self.kernel.clone();
+        }
+        if cfg.rootfs.is_none() {
+            cfg.rootfs = self.rootfs.clone();
+        }
+        // Empty cmdline from the request means "no override" — a
+        // deliberately empty cmdline is a rare, backend-specific need
+        // (raw `flat_binary` VMs) that goes through a different code
+        // path and doesn't pass through this handler.
+        if cfg.cmdline.is_empty() {
+            if let Some(d) = &self.cmdline {
+                cfg.cmdline.clone_from(d);
+            }
+        }
+    }
+}
+
 /// Lifecycle state on the wire. Kept separate from [`VmState`] so we can
 /// control the JSON rendering (snake_case) without forcing vm-core to depend
 /// on serde.
@@ -1200,4 +1256,91 @@ pub fn openapi_spec() -> Value {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod vm_defaults_tests {
+    use super::*;
+
+    fn cfg(kernel: Option<&str>, rootfs: Option<&str>, cmdline: &str) -> VmConfig {
+        VmConfig {
+            vcpus: 1,
+            memory_mib: 128,
+            kernel: kernel.map(PathBuf::from),
+            flat_binary: None,
+            initrd: None,
+            rootfs: rootfs.map(PathBuf::from),
+            cmdline: cmdline.into(),
+            vsock_cid: None,
+            snapshot_dir: None,
+        }
+    }
+
+    #[test]
+    fn defaults_fill_missing_fields() {
+        let defaults = VmConfigDefaults {
+            kernel: Some(PathBuf::from("/img/vmlinux")),
+            rootfs: Some(PathBuf::from("/img/rootfs.ext4")),
+            cmdline: Some("console=ttyS0 root=/dev/vda".into()),
+        };
+        let mut c = cfg(None, None, "");
+        defaults.apply_to(&mut c);
+        assert_eq!(
+            c.kernel.as_deref(),
+            Some(std::path::Path::new("/img/vmlinux"))
+        );
+        assert_eq!(
+            c.rootfs.as_deref(),
+            Some(std::path::Path::new("/img/rootfs.ext4"))
+        );
+        assert_eq!(c.cmdline, "console=ttyS0 root=/dev/vda");
+    }
+
+    #[test]
+    fn request_fields_win_over_defaults() {
+        let defaults = VmConfigDefaults {
+            kernel: Some(PathBuf::from("/default/vmlinux")),
+            rootfs: Some(PathBuf::from("/default/rootfs.ext4")),
+            cmdline: Some("default cmdline".into()),
+        };
+        let mut c = cfg(
+            Some("/custom/vmlinux"),
+            Some("/custom/rootfs.ext4"),
+            "custom cmdline",
+        );
+        defaults.apply_to(&mut c);
+        assert_eq!(
+            c.kernel.as_deref(),
+            Some(std::path::Path::new("/custom/vmlinux"))
+        );
+        assert_eq!(
+            c.rootfs.as_deref(),
+            Some(std::path::Path::new("/custom/rootfs.ext4"))
+        );
+        assert_eq!(c.cmdline, "custom cmdline");
+    }
+
+    #[test]
+    fn empty_defaults_are_noop() {
+        let defaults = VmConfigDefaults::default();
+        let mut c = cfg(None, None, "");
+        defaults.apply_to(&mut c);
+        assert!(c.kernel.is_none());
+        assert!(c.rootfs.is_none());
+        assert_eq!(c.cmdline, "");
+    }
+
+    #[test]
+    fn partial_defaults_fill_only_the_configured_fields() {
+        let defaults = VmConfigDefaults {
+            kernel: Some(PathBuf::from("/img/vmlinux")),
+            rootfs: None,
+            cmdline: None,
+        };
+        let mut c = cfg(None, None, "");
+        defaults.apply_to(&mut c);
+        assert!(c.kernel.is_some());
+        assert!(c.rootfs.is_none());
+        assert_eq!(c.cmdline, "");
+    }
 }

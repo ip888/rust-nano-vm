@@ -62,7 +62,7 @@ pub mod snapshot_store;
 mod time;
 pub mod warm_pool;
 
-pub use api::openapi_spec;
+pub use api::{openapi_spec, VmConfigDefaults};
 pub use audit::AuditLog;
 pub use auth::{ApiTokens, IssuedToken, OrgId, RuntimeTokenInfo, TokenId};
 pub use fork_quota::ForkQuota;

@@ -26,6 +26,15 @@
 //!   restarts. Unset → in-memory only (keys are lost on restart, fine
 //!   for ephemeral dev). Set to a path on persistent storage for any
 //!   production deployment where tenants self-serve their keys.
+//! - `NANOVM_DEFAULT_KERNEL_PATH` — absolute path to the kernel image
+//!   used as the fallback when `POST /v1/vms` omits `kernel`. Set to
+//!   `/usr/local/share/nanovm/vmlinux` by `Dockerfile.kvm` so
+//!   `POST /v1/vms {}` boots against the KVM backend out of the box.
+//! - `NANOVM_DEFAULT_ROOTFS_PATH` — same for rootfs. Set to
+//!   `/usr/local/share/nanovm/rootfs.ext4` by `Dockerfile.kvm`.
+//! - `NANOVM_DEFAULT_KERNEL_CMDLINE` — cmdline used when the request's
+//!   is empty. Recommended default (Firecracker kernel): `console=ttyS0
+//!   reboot=k panic=1 pci=off root=/dev/vda rw`. Unset → no cmdline.
 //! - `NANOVM_OWNERSHIP_STORE` — path to a SQLite file that records
 //!   which org owns which VM / snapshot. Unset → in-memory only, and
 //!   after any restart every VM/snapshot falls back to the default org
@@ -148,11 +157,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("billing disabled (set STRIPE_SECRET_KEY + STRIPE_BILLING_PORTAL_RETURN_URL + NANOVM_SIGNUP_TOKEN to enable)");
     }
 
+    // Read `NANOVM_DEFAULT_KERNEL_PATH` / `NANOVM_DEFAULT_ROOTFS_PATH` /
+    // `NANOVM_DEFAULT_KERNEL_CMDLINE` once. When set (typically by
+    // `Dockerfile.kvm`, which bakes a kernel + rootfs into the image),
+    // `POST /v1/vms` with an empty body succeeds against the KVM
+    // backend. Unset → the existing "request must supply kernel/rootfs"
+    // shape is preserved.
+    let vm_defaults = control_plane::VmConfigDefaults::from_env();
+    match (&vm_defaults.kernel, &vm_defaults.rootfs) {
+        (Some(k), Some(r)) => {
+            info!(kernel = %k.display(), rootfs = %r.display(), "VmConfig defaults: kernel + rootfs present, empty POST /v1/vms will boot")
+        }
+        (Some(k), None) => info!(kernel = %k.display(), "VmConfig defaults: kernel-only"),
+        (None, Some(r)) => info!(rootfs = %r.display(), "VmConfig defaults: rootfs-only"),
+        (None, None) => info!(
+            "VmConfig defaults unset (set NANOVM_DEFAULT_KERNEL_PATH + NANOVM_DEFAULT_ROOTFS_PATH to enable empty-body POST /v1/vms)"
+        ),
+    }
+
     let state = AppState::new(hypervisor)
         .with_warm_pool(warm_pool)
         .with_snapshot_store(snapshot_store)
         .with_backend_label(backend_label)
-        .with_ownership_map(Arc::new(ownership));
+        .with_ownership_map(Arc::new(ownership))
+        .with_vm_defaults(vm_defaults);
     #[cfg(feature = "billing")]
     let state = state.with_billing(billing_ctx);
 
