@@ -6,11 +6,12 @@
 
 This walkthrough shows how to pair a locally-hosted LLM (Ollama /
 llama.cpp / vLLM / LM Studio) with a `rust-nano-vm` sandbox so that
-every tool call your AI agent makes — `execute_python`,
-`execute_shell`, `read_file`, `write_file` — runs in a real
-`/dev/kvm` microVM instead of your host process. Compared to letting
-the model shell out directly, or wrapping it in a Docker container,
-you get:
+every tool call your AI agent makes — `execute_python` and
+`execute_shell` via the `NanoVMTool` LangChain adapter, plus
+`read_file` / `write_file` / `list_files` if you also wire the MCP
+bridge — runs in a real `/dev/kvm` microVM instead of your host process.
+Compared to letting the model shell out directly, or wrapping it in a
+Docker container, you get:
 
 |                        | Direct exec | Docker    | **`rust-nano-vm` local** | E2B / Modal (cloud) |
 | ---------------------- | ----------- | --------- | ------------------------ | ------------------- |
@@ -42,7 +43,7 @@ Come back to this guide the moment any of these become true:
 
 - The model needs `pip install torch` / `playwright` / `opencv` / anything native
 - The model writes `subprocess.run(["curl", …])` / `git` / `apt install`
-- The agent's tool needs to leave state on the filesystem between calls
+- The agent's tool needs to leave state on the filesystem between calls (needs the `/v1/vms` lifecycle — keep a VM alive between exec calls — not the fork-and-destroy `/v1/sandbox/invoke` path)
 - You need a real per-user audit log or per-tenant hardware isolation
 - The tool call needs to run a long-lived process (Jupyter kernel, dev server)
 
@@ -219,7 +220,7 @@ sandbox actions as MCP tools your editor's LLM can call:
       "command": "/path/to/nanovm-mcp",
       "env": {
         "NANOVM_BASE_URL": "http://localhost:8080",
-        "NANOVM_TOKEN":    "your-token-from-.env.local"
+        "NANOVM_API_TOKEN": "your-token-from-.env.local"
       }
     }
   }
@@ -245,13 +246,13 @@ The fix: **create the snapshot once, fork forever**.
 export TOKEN=$(source deploy/live-demo/.env.local; echo $ACME_TOKEN)
 vm=$(curl -fsX POST http://localhost:8080/v1/vms \
      -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-     -d '{}' | jq .id)
+     -d '{}' | jq -r .id)
 curl -fsX POST http://localhost:8080/v1/vms/$vm/start -H "Authorization: Bearer $TOKEN"
 curl -fsX POST http://localhost:8080/v1/vms/$vm/exec \
      -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
      -d '{"cmd":["/bin/sh","-c","pip install pandas numpy scikit-learn"]}'
 snapshot=$(curl -fsX POST http://localhost:8080/v1/vms/$vm/snapshot \
-           -H "Authorization: Bearer $TOKEN" | jq .id)
+           -H "Authorization: Bearer $TOKEN" | jq -r .id)
 echo "snapshot id: $snapshot"     # → e.g. 42
 ```
 

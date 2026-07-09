@@ -70,6 +70,16 @@ impl SqliteStore {
         // rely on it.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Retry-on-busy for up to 5 s instead of the default (fail
+        // immediately). Two connections against the same file — one
+        // from OwnershipStore, one from the billing table — can race
+        // on WAL checkpoint; without busy_timeout a concurrent writer
+        // sees `SQLITE_BUSY` and the caller's ownership write is
+        // silently dropped by the `warn!`-and-continue facade. Losing
+        // an ownership write means a fresh redeploy could serve one
+        // customer's VM to another org — the exact failure mode this
+        // module exists to prevent.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Self {
             conn: Mutex::new(conn),
         };

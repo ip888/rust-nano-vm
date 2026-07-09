@@ -206,7 +206,17 @@ impl OwnershipMap {
     /// opened or migrated. Called once at startup in `server.rs`.
     pub fn from_env() -> Result<Self, OwnershipStoreError> {
         match std::env::var("NANOVM_OWNERSHIP_STORE") {
-            Err(_) => Ok(Self::new_in_memory()),
+            // Unset → fall through to in-memory. Silent, matches the
+            // documented behaviour.
+            Err(std::env::VarError::NotPresent) => Ok(Self::new_in_memory()),
+            // Present-but-non-UTF-8: refuse to boot. Silently
+            // downgrading to in-memory here would mean a mangled Docker
+            // env var reverts a prod deploy to non-persistent — the
+            // caller expected persistence and there's no signal
+            // otherwise. Better to fail startup loudly.
+            Err(std::env::VarError::NotUnicode(bytes)) => Err(OwnershipStoreError::Backend(
+                format!("NANOVM_OWNERSHIP_STORE is not valid UTF-8: {bytes:?}"),
+            )),
             Ok(spec) if spec.is_empty() => Ok(Self::new_in_memory()),
             Ok(spec) => {
                 let path = spec.strip_prefix("sqlite://").unwrap_or(&spec);

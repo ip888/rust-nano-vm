@@ -105,13 +105,14 @@ Then wire your agent to point the LLM at `http://localhost:11434/v1`
 and the tools at `http://localhost:8080`:
 
 ```python
+import os
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 import nanovm
 from nanovm.agents.langchain import NanoVMTool
 
 llm     = ChatOpenAI(model="llama3.1:8b", base_url="http://localhost:11434/v1", api_key="ollama")
-sandbox = nanovm.Client("http://localhost:8080", token="$ACME_TOKEN")
+sandbox = nanovm.Client("http://localhost:8080", token=os.environ["ACME_TOKEN"])
 agent   = create_react_agent(llm, NanoVMTool(sandbox))
 ```
 

@@ -55,7 +55,7 @@ stops is where a real microVM starts:
 | Shell commands (`curl`, `git`, `apt`, `sh -c "…"`) | ❌ no shell | ✅ |
 | Non-Python runtimes (Node.js, Go, Rust, R, Julia) | ❌ Python-only | ✅ |
 | Long-running processes (Jupyter kernel, dev server, DB) | ❌ WASM is per-call | ✅ VM stays running |
-| Persistent filesystem between tool calls | ❌ WASM memory dies with the call | ✅ real ext4 rootfs |
+| Persistent filesystem between tool calls | ❌ WASM memory dies with the call | ✅ real ext4 rootfs (when you keep a VM alive via `/v1/vms` — `/v1/sandbox/invoke` is fork→run→destroy) |
 | Multi-tenant hardware-enforced isolation | ⚠️ WASM VMs share the host process | ✅ per-VM cgroups + seccomp |
 | Forensic audit log (per privileged action) | ❌ not built-in | ✅ JSONL audit + Prometheus per-org meter |
 | Syscall filter (seccomp-BPF) | ⚠️ Deno permissions ≠ real seccomp | ✅ shipped (`crates/vm-kvm/src/seccomp.rs`) |

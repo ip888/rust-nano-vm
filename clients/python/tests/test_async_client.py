@@ -80,8 +80,8 @@ async def test_health_typed_response():
 @pytest.mark.asyncio
 async def test_429_retries_then_succeeds():
     responses = [
-        (429, {"code": "quota_exceeded", "message": "rps ceiling"}, {"retry-after": "0"}),
-        (429, {"code": "quota_exceeded", "message": "rps ceiling"}, {"retry-after": "0"}),
+        (429, {"error": {"code": "quota_exceeded", "message": "rps ceiling"}}, {"retry-after": "0"}),
+        (429, {"error": {"code": "quota_exceeded", "message": "rps ceiling"}}, {"retry-after": "0"}),
         (200, {"stdout": "ok\n", "stderr": "", "exit_code": 0, "duration_ms": 1}),
     ]
     async with _client(responses) as client:
@@ -93,7 +93,7 @@ async def test_429_retries_then_succeeds():
 async def test_429_with_no_more_retries_raises_rate_limited():
     # max_retries=0 → first 429 becomes terminal.
     async with _client(
-        [(429, {"code": "quota_exceeded", "message": "over"}, {"retry-after": "3"})],
+        [(429, {"error": {"code": "quota_exceeded", "message": "over"}}, {"retry-after": "3"})],
         max_retries=0,
     ) as client:
         with pytest.raises(RateLimited) as ex:
@@ -105,7 +105,7 @@ async def test_429_with_no_more_retries_raises_rate_limited():
 @pytest.mark.asyncio
 async def test_401_short_circuits_no_retry():
     responses = [
-        (401, {"code": "unauthenticated", "message": "bad token"}),
+        (401, {"error": {"code": "unauthenticated", "message": "bad token"}}),
         # If we retried, this second response would be consumed.
         # It isn't, so the assertion below (len == 1) proves we short-circuited.
         (200, {"stdout": "shouldnt-reach", "stderr": "", "exit_code": 0, "duration_ms": 0}),
@@ -119,7 +119,7 @@ async def test_401_short_circuits_no_retry():
 
 @pytest.mark.asyncio
 async def test_404_maps_to_not_found():
-    responses = [(404, {"code": "unknown_snapshot", "message": "no such id"})]
+    responses = [(404, {"error": {"code": "unknown_snapshot", "message": "no such id"}})]
     async with _client(responses) as client:
         with pytest.raises(NotFoundError):
             await client.execute_python("pass", snapshot=999)
