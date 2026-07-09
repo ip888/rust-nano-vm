@@ -30,7 +30,7 @@ Since the process-fleet arc landed (PRs #115-#132), the shape is:
 
 The KVM image bundles `nanovm-vmm-child` built with `--features kvm`, so every VM the REST API creates gets its own worker process holding an open `/dev/kvm` handle. `NANOVM_BACKEND=fleet` is the container's default env; you don't have to set it.
 
-**What still lands as follow-up:** the image doesn't yet bundle a default kernel + rootfs, so `POST /v1/vms` with the built-in `VmConfig::default()` will fail to boot (worker returns "kernel not found"). You'll still see the whole REST surface + Prometheus wiring + audit log working end-to-end because a fork-quota reject, an unauth 401, a per-org meter, and a warm-pool hit all fire *before* the actual kernel-load step. Bundling a minimal Alpine kernel + rootfs into the image is the next PR — until then, the "watch a real kernel boot inside a VM" step is only reachable through the bench binary (`cargo run -p bench --features kvm --release --bin nanovm-fork-bench`), which points at a fixture kernel checked into the repo.
+**End-to-end boot works out of the box.** The image bundles a Firecracker sample vmlinux + Alpine rootfs at `/usr/local/share/nanovm/{vmlinux,rootfs.ext4}` (see [`tools/kvm-images/`](../../tools/kvm-images/)). `POST /v1/vms {}` (empty body) boots the bundled Alpine on the KVM backend. Callers that want their own userspace pass `kernel` / `rootfs` in the request body, or override the image env at deploy time with `-v /host/img:/img -e NANOVM_DEFAULT_ROOTFS_PATH=/img/rootfs.ext4`.
 
 ## What you'll see
 
