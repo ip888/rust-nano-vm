@@ -141,6 +141,20 @@ systemd unit for the same: `deploy/systemd/nanovm.service` (TODO follow-up).
 
 The Helm chart defaults to the KVM image; switch the `image.repository` to the plain repository if you want the mock backend in cluster (useful for staging clusters without `/dev/kvm`).
 
+## Default kernel + rootfs (server-side fallback)
+
+By default the KVM backend requires each `POST /v1/vms` request to specify `kernel` and `rootfs` paths — the control plane doesn't ship an opinionated Linux. To let clients call `POST /v1/vms {}` (empty body) and get a working VM, set three env vars pointing at a kernel + rootfs already present on the machine / inside the container:
+
+| Env var | Purpose | Example |
+|---|---|---|
+| `NANOVM_DEFAULT_KERNEL_PATH` | Absolute path to a kernel image (`vmlinux` or `bzImage`) | `/usr/local/share/nanovm/vmlinux` |
+| `NANOVM_DEFAULT_ROOTFS_PATH` | Absolute path to a rootfs image | `/usr/local/share/nanovm/rootfs.ext4` |
+| `NANOVM_DEFAULT_KERNEL_CMDLINE` | Kernel cmdline for the default boot | `console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw` |
+
+Server-side defaults **only apply when the request field is unset** — request-supplied values always win. Unset any of the three and callers must supply that field on every request.
+
+Baking the kernel + rootfs into `Dockerfile.kvm` (so `docker run ghcr.io/ip888/nanovm-control-plane-kvm` works out of the box) is a follow-up PR (Stream C1b in the plan). Today an operator provides them via `docker run -v /host/img:/img -e NANOVM_DEFAULT_KERNEL_PATH=/img/vmlinux …` or Helm `extraVolumes` + `env`.
+
 ## Honest non-features
 
 - **No auto-scaling.** The control plane is stateful (VM ids, snapshot ids, ownership map are all in-memory today). A multi-replica deployment is HA-blast-radius only — pin clients to one replica via session affinity if you need stable ids.
