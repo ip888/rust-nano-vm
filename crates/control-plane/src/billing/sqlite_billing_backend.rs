@@ -3,7 +3,9 @@
 //!
 //! Uses the same SQLite file as the ownership store. Its own table
 //! (`stripe_customers`) lives alongside `vms` / `snapshots`, migrated
-//! independently via `PRAGMA user_version`.
+//! independently via `PRAGMA application_id`. The ownership store
+//! uses `PRAGMA user_version`; we deliberately use a different PRAGMA
+//! slot so the two subsystems can evolve their schemas independently.
 //!
 //! ## Concurrency
 //!
@@ -43,6 +45,13 @@ impl SqliteBillingStore {
         let conn = Connection::open(path.as_ref())?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // 5 s busy_timeout — same reasoning as the ownership store.
+        // Two SQLite connections against the same file (one from
+        // OwnershipStore, one from BillingStore) can contend during
+        // WAL checkpoint; without this a signup's Stripe customer
+        // write can be silently dropped, stranding the customer's
+        // subscription without a mapping.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Self {
             conn: Mutex::new(conn),
         };

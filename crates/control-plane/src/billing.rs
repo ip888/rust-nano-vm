@@ -188,13 +188,26 @@ pub use sqlite_billing_backend::SqliteBillingStore;
 // -------- Stripe client ------------------------------------------------
 
 /// Thin reqwest wrapper for the two Stripe endpoints this crate needs.
-#[derive(Debug)]
+///
+/// `Debug` is implemented manually to avoid leaking `secret_key` into
+/// logs / panic backtraces / structured tracing output. The public
+/// derive would print the field verbatim.
 pub struct StripeClient {
     http: reqwest::Client,
     secret_key: String,
     /// Base URL — production always uses `https://api.stripe.com`.
-    /// Tests point this at a wiremock instance via [`StripeClient::with_base`].
+    /// Tests point this at a wiremock instance via
+    /// [`StripeClient::with_base`].
     base_url: String,
+}
+
+impl std::fmt::Debug for StripeClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StripeClient")
+            .field("secret_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
 }
 
 impl StripeClient {
@@ -202,6 +215,9 @@ impl StripeClient {
         Self::with_base(secret_key, "https://api.stripe.com")
     }
 
+    /// Test-only base-URL override. Hidden from rustdoc so it can't
+    /// creep into production call-sites.
+    #[doc(hidden)]
     pub fn with_base(secret_key: impl Into<String>, base: impl Into<String>) -> Self {
         Self {
             http: reqwest::Client::builder()
@@ -214,12 +230,22 @@ impl StripeClient {
     }
 
     /// Create a Stripe customer for a signup.
+    ///
+    /// `name` is the human-readable org name shown on Stripe invoices +
+    /// dashboard. `org_slug` is the stable internal id used both as the
+    /// nanovm `OrgId` and as `metadata[org_id]` so Stripe → nanovm
+    /// reconciliation stays deterministic across `name` renames.
     pub async fn create_customer(
         &self,
         email: &str,
-        org: &str,
+        name: &str,
+        org_slug: &str,
     ) -> Result<StripeCustomer, BillingError> {
-        let params = [("email", email), ("name", org), ("metadata[org_id]", org)];
+        let params = [
+            ("email", email),
+            ("name", name),
+            ("metadata[org_id]", org_slug),
+        ];
         let resp = self
             .http
             .post(format!("{}/v1/customers", self.base_url))
@@ -309,11 +335,18 @@ fn extract_error_message(bytes: &[u8]) -> Option<String> {
 
 // -------- Handler functions -------------------------------------------
 
-/// Signup semantic. Route-layer wiring lands in a follow-up PR; this
-/// function encodes the contract.
+/// Signup semantic.
 ///
-/// Steps: verify admin bearer → slugify org → mint first API key →
-/// create Stripe customer → persist org → customer_id.
+/// Steps: verify admin bearer → slugify org → **call Stripe** → mint
+/// first API key → persist org → customer_id.
+///
+/// Order matters: Stripe runs first because it's the fallible external
+/// call. If we minted + persisted the API key before Stripe and Stripe
+/// then failed, the retry would collide with the still-live key and
+/// the operator would have to hand-clean state. With Stripe first, a
+/// failure returns the error to the caller and leaves state untouched
+/// — retries are safe. The token mint is a pure local op; ordering it
+/// after Stripe is essentially free.
 pub async fn signup(
     cfg: &BillingConfig,
     tokens: &ApiTokens,
@@ -332,9 +365,20 @@ pub async fn signup(
     }
     let org_id = OrgId(org_slug.clone());
 
-    let issued: IssuedToken = tokens.issue(org_id.clone());
-    let customer = stripe.create_customer(&req.email, &org_slug).await?;
+    // 1) External call first — the only step that can fail with side
+    //    effects landing outside our control (a customer object on
+    //    Stripe). If it fails, we return before any local state
+    //    mutation, so a retry is safe.
+    let customer = stripe
+        .create_customer(&req.email, &req.org, &org_slug)
+        .await?;
+    // 2) Persist the mapping BEFORE minting the token so a signup that
+    //    crashes between these two steps loses the token, not the
+    //    Stripe binding — the operator can reissue a token via the
+    //    normal `/v1/keys` route, but a lost customer id is untraceable.
     store.record_customer(&org_id, &customer.id)?;
+    // 3) Local mint. Can't fail; safe to run last.
+    let issued: IssuedToken = tokens.issue(org_id);
 
     Ok(SignupResponse {
         org: org_slug,

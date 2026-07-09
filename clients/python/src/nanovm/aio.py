@@ -284,9 +284,13 @@ class AsyncClient:
                 return {}
 
             # 429 with Retry-After: honour it verbatim rather than the
-            # backoff schedule.
+            # backoff schedule. `Retry-After: 0` means "retry immediately",
+            # which is a valid signal — don't fall through to backoff via
+            # `or` (falsy) since that would over-wait. Only fall back
+            # when the header is genuinely absent (parser returns None).
             if resp.status_code == 429 and attempt < self._max_retries:
-                wait_s = _retry_after_seconds(resp) or _backoff(attempt)
+                retry_after = _retry_after_seconds(resp)
+                wait_s = retry_after if retry_after is not None else _backoff(attempt)
                 await asyncio.sleep(wait_s)
                 attempt += 1
                 continue
@@ -323,13 +327,27 @@ def _retry_after_seconds(resp: httpx.Response) -> Optional[float]:
 def _raise_for_status(resp: httpx.Response) -> None:
     """Map a non-2xx response to a typed :class:`NanovmError` subclass.
     Same shape as :meth:`nanovm.Client._raise_for_response`.
+
+    The control-plane wraps errors as ``{"error": {"code": …, "message": …}}``
+    (see ``crates/control-plane/src/error.rs``). Older revisions of this
+    module read flat top-level ``code``/``message``, silently losing the
+    structured error code on every 4xx/5xx. Both shapes are accepted here
+    for forward-compat, but the nested envelope is the canonical form.
     """
     try:
         body = resp.json() if resp.content else {}
     except ValueError:
         body = {}
-    code = body.get("code")
-    message = body.get("message") or resp.text or f"HTTP {resp.status_code}"
+    envelope = body.get("error") if isinstance(body, dict) else None
+    if isinstance(envelope, dict):
+        code = envelope.get("code")
+        message = envelope.get("message")
+    else:
+        # Legacy / flat shape: some future endpoints might emit it too.
+        code = body.get("code") if isinstance(body, dict) else None
+        message = body.get("message") if isinstance(body, dict) else None
+    if not message:
+        message = resp.text or f"HTTP {resp.status_code}"
     status = resp.status_code
     if status == 401:
         raise AuthError(message, code=code, status=status)
@@ -338,10 +356,14 @@ def _raise_for_status(resp: httpx.Response) -> None:
     if status == 409:
         raise ConflictError(message, code=code, status=status)
     if status == 429:
-        # RateLimited's __init__ hardcodes `code="too_many_requests"`
+        # `RateLimited`'s __init__ hardcodes `code="too_many_requests"`
         # and `status=429` in the sync client — match that shape so the
-        # exception is indistinguishable from a sync-raised one.
-        retry_after = int(_retry_after_seconds(resp) or 0)
+        # exception is indistinguishable from a sync-raised one. Default
+        # `retry_after` to 1 (not 0) when the header is missing: 0 would
+        # tell a caller-side retry loop to hammer immediately, which
+        # defeats the throttle's purpose.
+        retry_after_val = _retry_after_seconds(resp)
+        retry_after = int(retry_after_val) if retry_after_val is not None else 1
         raise RateLimited(message, retry_after)
     raise NanovmError(message, code=code, status=status)
 

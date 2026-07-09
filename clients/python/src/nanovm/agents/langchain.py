@@ -8,9 +8,9 @@ The typical shape::
     from nanovm.agents.langchain import NanoVMTool
 
     client = nanovm.Client("https://api.nanovm.example.com", token="acme-…")
-    tool   = NanoVMTool(client, snapshot=12)   # pre-built "python-3.12-ds" snapshot
+    tools  = NanoVMTool(client, snapshot=12)   # returns the [python, shell] list
 
-    agent = create_react_agent(ChatOpenAI(model="gpt-4o"), [tool])
+    agent = create_react_agent(ChatOpenAI(model="gpt-4o"), tools)
     agent.invoke({"messages": [("user", "Compute the correlation matrix …")]})
 
 The tool exposes two functions to the LLM: ``execute_python`` and

@@ -241,8 +241,10 @@ all assets on the
   runs Python-only, no shell, no <code>pip install</code>, no long-running
   processes — genuinely great for pure-Python tool calls. The moment
   the model wants <code>subprocess.run(["curl", ...])</code>,
-  <code>pip install playwright</code>, a Node/Go binary, or a real
-  filesystem that persists between calls, WASM stops. That's the
+  <code>pip install playwright</code>, a Node/Go binary, or a
+  keep-alive VM whose ext4 rootfs survives between exec calls
+  (nanovm's <code>/v1/vms</code> lifecycle, not the fork-and-destroy
+  <code>/v1/sandbox/invoke</code> path), WASM stops. That's the
   workload nanovm is built for. Real Linux VM, real kernel, real
   <code>apt install</code>, ~12 ms cold-start, still fits in a single
   Rust binary. Full 13-axis comparison in

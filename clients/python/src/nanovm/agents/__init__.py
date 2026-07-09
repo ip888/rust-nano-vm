@@ -15,9 +15,13 @@ which frontend their agent runs through:
   speak function-tools natively). No third-party dependency; the
   standard ``nanovm`` install is enough.
 
-Both adapters take an existing :class:`nanovm.Client` (or an
-:class:`nanovm.AsyncClient`) plus an optional ``snapshot`` id — set
-this to a **pre-built sandbox snapshot** (e.g. one that already has
+Both adapters take a synchronous :class:`nanovm.Client` under the
+hood — LangChain's ``_arun`` shim and OpenAI's dispatcher call the
+sync ``.execute_python`` / ``.execute_shell`` methods. A future PR
+will add first-class :class:`nanovm.AsyncClient` support for
+frameworks driving true async I/O (LangGraph on a busy event loop,
+FastAPI background workers). Pass an optional ``snapshot`` id to
+target a **pre-built sandbox snapshot** (e.g. one that already has
 ``pandas``, ``numpy``, ``scikit-learn`` restored) so every tool call
 is a warm-pool fork rather than a cold KVM boot.
 
