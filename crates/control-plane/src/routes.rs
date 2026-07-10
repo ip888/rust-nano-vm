@@ -578,6 +578,12 @@ async fn fork_snapshot(
     let bearer = extract_bearer(&headers);
     // Gate before doing any work — quota exhaustion is the common bad-day
     // signal, so it should be cheap to surface.
+    //
+    // Two independent buckets: per-token (runaway-key safety net) and
+    // per-org (tier enforcement). Either failing throttles the request.
+    // The tier lookup is billing-feature-gated; non-billing builds fall
+    // back to the env default per-org.
+    let (tier_rps, tier_burst) = resolve_tier_limits(&state, &org);
     if let Err(retry_after_secs) = state.fork_quota.try_acquire(bearer.as_deref()) {
         let fp = bearer
             .as_deref()
@@ -587,6 +593,22 @@ async fn fork_snapshot(
         return Err(ApiError::TooManyRequests {
             code: "fork_quota_exceeded",
             message: format!("fork quota exceeded; retry after {retry_after_secs} second(s)"),
+            retry_after_secs,
+        });
+    }
+    if let Err(retry_after_secs) =
+        state
+            .fork_quota
+            .try_acquire_org(org.as_str(), tier_rps, tier_burst)
+    {
+        let fp = bearer
+            .as_deref()
+            .map(token_fingerprint)
+            .unwrap_or_else(|| "anonymous".to_owned());
+        state.metrics.record_throttled(&fp, org.as_str());
+        return Err(ApiError::TooManyRequests {
+            code: "fork_quota_exceeded",
+            message: format!("org fork quota exceeded; retry after {retry_after_secs} second(s)"),
             retry_after_secs,
         });
     }
@@ -726,6 +748,31 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         uptime_secs: state.start_instant.elapsed().as_secs(),
         started_at: state.started_at.clone(),
     })
+}
+
+/// Look up the caller's tier-scoped rate + burst overrides for the
+/// per-org fork bucket. Returns `(None, None)` when billing isn't
+/// compiled in, or when the caller has no configured tier — the
+/// per-org bucket then uses the env default (same shape as pre-tier).
+///
+/// The lookup is three cheap store hits + a HashMap probe. Not
+/// cached: subscription state changes flow through the webhook
+/// handler and land in the store, and re-reading here means a tier
+/// upgrade is enforced on the next fork without a restart.
+fn resolve_tier_limits(state: &AppState, org: &OrgId) -> (Option<f64>, Option<u32>) {
+    #[cfg(feature = "billing")]
+    {
+        if let Some(ctx) = state.billing_ctx() {
+            let plan = crate::billing::resolve_plan(&ctx.tiers, ctx.store.as_ref(), org);
+            if let Some(tier) = plan.plan {
+                // Burst mirrors rps by default — same shape as
+                // `NANOVM_FORK_BURST` fallback in `ForkQuota::from_env`.
+                return (Some(f64::from(tier.rps)), Some(tier.rps.max(1)));
+            }
+        }
+    }
+    let _ = (state, org); // silence unused warnings on non-billing builds
+    (None, None)
 }
 
 /// Pull the bearer token out of the `Authorization: Bearer …` header, if
