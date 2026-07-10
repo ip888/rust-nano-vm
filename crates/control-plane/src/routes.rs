@@ -329,6 +329,10 @@ pub fn router() -> Router<AppState> {
         "/billing/portal",
         get(crate::billing::billing_portal_handler),
     );
+    // Plan resolution — same auth layer; the caller sees their own
+    // plan only.
+    #[cfg(feature = "billing")]
+    let v1 = v1.route("/billing/plan", get(crate::billing::plan_handler));
     let v1 = v1
         // route_layer is bottom-up: the LAST `.route_layer` runs FIRST.
         // require_audit must see *authenticated* calls only, so register

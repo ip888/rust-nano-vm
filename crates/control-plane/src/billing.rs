@@ -82,6 +82,145 @@ pub struct PortalResponse {
     pub url: String,
 }
 
+// -------- Plan tiers ---------------------------------------------------
+
+/// A named plan tier — Stripe `price_id` → human name + effective
+/// fork-quota rate (requests per second). The follow-up "wire into
+/// ForkQuota" PR will consult `rps` when checking a caller's org.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlanTier {
+    /// Human name shown on the dashboard (e.g. `"pro"`, `"enterprise"`).
+    pub name: String,
+    /// Sustained rate limit in forks/second.
+    pub rps: u32,
+}
+
+/// `NANOVM_PLAN_TIERS` config. Format:
+/// `price_ABC=free:5,price_XYZ=pro:100,price_ENT=enterprise:1000`.
+///
+/// Each triple is `stripe_price_id=name:rps`; separators between
+/// triples are commas; the parser is intentionally permissive on
+/// whitespace + trailing commas. A default fallback (when the caller
+/// has no subscription) uses `default_rps`, which comes from the
+/// existing `NANOVM_FORK_RPS` env var (already read by [`crate::ForkQuota`]).
+#[derive(Debug, Clone, Default)]
+pub struct PlanTiers {
+    /// `price_id → tier`
+    by_price_id: HashMap<String, PlanTier>,
+}
+
+impl PlanTiers {
+    /// Parse `NANOVM_PLAN_TIERS` if set. Unset → empty map (no tiers
+    /// configured; the fork-quota fallback still applies). Malformed
+    /// entries are logged and skipped so a typo doesn't crash boot.
+    pub fn from_env() -> Self {
+        let raw = std::env::var("NANOVM_PLAN_TIERS").unwrap_or_default();
+        Self::parse(&raw)
+    }
+
+    /// Same as [`from_env`](Self::from_env) but takes the raw string
+    /// directly — useful in tests.
+    pub fn parse(raw: &str) -> Self {
+        let mut by_price_id = HashMap::new();
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let Some((price_id, tail)) = entry.split_once('=') else {
+                tracing::warn!(entry, "NANOVM_PLAN_TIERS: skipping entry without `=`");
+                continue;
+            };
+            let Some((name, rps)) = tail.split_once(':') else {
+                tracing::warn!(entry, "NANOVM_PLAN_TIERS: skipping entry without `:rps`");
+                continue;
+            };
+            let Ok(rps) = rps.trim().parse::<u32>() else {
+                tracing::warn!(entry, "NANOVM_PLAN_TIERS: rps not a u32; skipping");
+                continue;
+            };
+            by_price_id.insert(
+                price_id.trim().to_string(),
+                PlanTier {
+                    name: name.trim().to_string(),
+                    rps,
+                },
+            );
+        }
+        Self { by_price_id }
+    }
+
+    /// Number of configured tiers.
+    pub fn len(&self) -> usize {
+        self.by_price_id.len()
+    }
+
+    /// True when no tiers are configured (unset env var).
+    pub fn is_empty(&self) -> bool {
+        self.by_price_id.is_empty()
+    }
+
+    /// Look up a tier by Stripe price id.
+    pub fn get(&self, price_id: &str) -> Option<&PlanTier> {
+        self.by_price_id.get(price_id)
+    }
+}
+
+/// The resolved billing plan for a caller, returned by
+/// `GET /v1/billing/plan`. `plan` is `None` when the caller has no
+/// subscription (never signed up, or their sub was deleted) — the
+/// dashboard renders this as "Free".
+#[derive(Debug, Serialize)]
+pub struct PlanResponse {
+    /// Named tier (e.g. `"pro"`), or `None` when the caller has no
+    /// active subscription mapped to a configured tier.
+    pub plan: Option<PlanTier>,
+    /// Raw Stripe subscription status (`active`, `trialing`,
+    /// `past_due`, `canceled`, …). `None` when no subscription event
+    /// has been seen for this org.
+    pub subscription_status: Option<String>,
+    /// Stripe price id currently on file — useful for operators
+    /// debugging why a subscription didn't map to a named tier
+    /// (typo in `NANOVM_PLAN_TIERS`? new price id?).
+    pub price_id: Option<String>,
+}
+
+/// Resolve the current plan for an org: look up its Stripe customer
+/// id, fetch its subscription state, map the price_id via
+/// [`PlanTiers`]. All three lookups are cheap and stateless.
+pub fn resolve_plan(tiers: &PlanTiers, store: &dyn BillingStore, org: &OrgId) -> PlanResponse {
+    let customer_id = match store.get_customer(org) {
+        Some(cid) => cid,
+        None => {
+            return PlanResponse {
+                plan: None,
+                subscription_status: None,
+                price_id: None,
+            };
+        }
+    };
+    let sub = match store.get_subscription(&customer_id) {
+        Some(s) => s,
+        None => {
+            return PlanResponse {
+                plan: None,
+                subscription_status: None,
+                price_id: None,
+            };
+        }
+    };
+    let plan = sub
+        .price_id
+        .as_deref()
+        .and_then(|pid| tiers.get(pid))
+        .cloned();
+    PlanResponse {
+        plan,
+        subscription_status: Some(sub.status),
+        price_id: sub.price_id,
+    }
+}
+
 // -------- BillingConfig ------------------------------------------------
 
 /// Runtime billing configuration. All three fields are required — a
@@ -650,6 +789,9 @@ pub struct BillingCtx {
     pub config: BillingConfig,
     pub store: Arc<dyn BillingStore>,
     pub stripe: Arc<StripeClient>,
+    /// Named plan tiers from `NANOVM_PLAN_TIERS`. Empty when unset;
+    /// the plan endpoint then returns `plan: null` for every caller.
+    pub tiers: PlanTiers,
 }
 
 impl std::fmt::Debug for BillingCtx {
@@ -710,6 +852,21 @@ pub(crate) async fn billing_portal_handler(
         .await
         .map_err(billing_to_api_error)?;
     Ok(Json(resp))
+}
+
+/// `GET /v1/billing/plan` — return the resolved plan for the caller's
+/// org. Tenant-authenticated: the caller's `OrgId` is injected by the
+/// standard token middleware. Cheap: three in-memory / SQLite lookups,
+/// no external calls.
+pub(crate) async fn plan_handler(
+    State(state): State<crate::AppState>,
+    Extension(org): Extension<OrgId>,
+) -> Result<Json<PlanResponse>, ApiError> {
+    let ctx = state.billing_ctx().ok_or(ApiError::Unsupported {
+        code: "billing_disabled",
+        message: "billing endpoints require the `billing` feature + Stripe env vars".into(),
+    })?;
+    Ok(Json(resolve_plan(&ctx.tiers, ctx.store.as_ref(), &org)))
 }
 
 fn extract_bearer(headers: &HeaderMap) -> Option<String> {
@@ -1346,6 +1503,117 @@ mod tests {
         assert_eq!(e.id, "evt_x");
         assert_eq!(e.event_type, "customer.subscription.updated");
         assert!(e.data.is_some());
+    }
+
+    // ---- PlanTiers -----------------------------------------------
+
+    #[test]
+    fn plan_tiers_empty_when_env_unset() {
+        let t = PlanTiers::parse("");
+        assert!(t.is_empty());
+        assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn plan_tiers_parse_happy_path() {
+        let t = PlanTiers::parse("price_free=free:5,price_pro=pro:100,price_ent=enterprise:1000");
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.get("price_pro").unwrap().name, "pro");
+        assert_eq!(t.get("price_pro").unwrap().rps, 100);
+        assert!(t.get("price_ent").is_some());
+    }
+
+    #[test]
+    fn plan_tiers_skip_malformed_entries_but_keep_valid_ones() {
+        let t = PlanTiers::parse(
+            "price_ok=pro:50,broken_no_equals,price_bad=missing_rps,,price_good=free:5",
+        );
+        assert_eq!(t.len(), 2);
+        assert!(t.get("price_ok").is_some());
+        assert!(t.get("price_good").is_some());
+        assert!(t.get("broken_no_equals").is_none());
+        assert!(t.get("price_bad").is_none());
+    }
+
+    #[test]
+    fn plan_tiers_trims_whitespace() {
+        let t = PlanTiers::parse(" price_x = pro : 42 , price_y = free : 1 ");
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.get("price_x").unwrap().name, "pro");
+        assert_eq!(t.get("price_x").unwrap().rps, 42);
+    }
+
+    // ---- resolve_plan ---------------------------------------------
+
+    #[test]
+    fn resolve_plan_returns_none_when_org_has_no_customer() {
+        let store = InMemoryBillingStore::default();
+        let tiers = PlanTiers::parse("price_pro=pro:100");
+        let r = resolve_plan(&tiers, &store, &OrgId::new("nobody"));
+        assert!(r.plan.is_none());
+        assert!(r.subscription_status.is_none());
+        assert!(r.price_id.is_none());
+    }
+
+    #[test]
+    fn resolve_plan_returns_none_when_customer_has_no_subscription() {
+        let store = InMemoryBillingStore::default();
+        store
+            .record_customer(&OrgId::new("acme"), "cus_ACME")
+            .unwrap();
+        let tiers = PlanTiers::parse("price_pro=pro:100");
+        let r = resolve_plan(&tiers, &store, &OrgId::new("acme"));
+        assert!(r.plan.is_none());
+        assert!(r.subscription_status.is_none());
+    }
+
+    #[test]
+    fn resolve_plan_maps_price_id_to_named_tier() {
+        let store = InMemoryBillingStore::default();
+        store.record_customer(&OrgId::new("acme"), "cus_A").unwrap();
+        store
+            .record_subscription(
+                "cus_A",
+                &SubscriptionState {
+                    subscription_id: "sub_1".into(),
+                    status: "active".into(),
+                    price_id: Some("price_pro".into()),
+                    updated_at: "2026-07-10T00:00:00Z".into(),
+                },
+            )
+            .unwrap();
+        let tiers = PlanTiers::parse("price_pro=pro:100");
+        let r = resolve_plan(&tiers, &store, &OrgId::new("acme"));
+        assert_eq!(r.plan.as_ref().unwrap().name, "pro");
+        assert_eq!(r.plan.as_ref().unwrap().rps, 100);
+        assert_eq!(r.subscription_status.as_deref(), Some("active"));
+        assert_eq!(r.price_id.as_deref(), Some("price_pro"));
+    }
+
+    #[test]
+    fn resolve_plan_returns_subscription_but_null_tier_when_price_id_unknown() {
+        // Operator forgot to update NANOVM_PLAN_TIERS after adding a
+        // new Stripe price. The plan endpoint still reports the raw
+        // subscription state so the dashboard can render "Unknown
+        // plan (contact support)" instead of misreporting free.
+        let store = InMemoryBillingStore::default();
+        store.record_customer(&OrgId::new("acme"), "cus_A").unwrap();
+        store
+            .record_subscription(
+                "cus_A",
+                &SubscriptionState {
+                    subscription_id: "sub_1".into(),
+                    status: "active".into(),
+                    price_id: Some("price_UNMAPPED".into()),
+                    updated_at: "2026-07-10T00:00:00Z".into(),
+                },
+            )
+            .unwrap();
+        let tiers = PlanTiers::parse("price_pro=pro:100");
+        let r = resolve_plan(&tiers, &store, &OrgId::new("acme"));
+        assert!(r.plan.is_none());
+        assert_eq!(r.subscription_status.as_deref(), Some("active"));
+        assert_eq!(r.price_id.as_deref(), Some("price_UNMAPPED"));
     }
 
     #[test]
