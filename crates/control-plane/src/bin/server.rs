@@ -31,6 +31,11 @@
 //!   three are set (and the binary is built `--features billing`),
 //!   `POST /v1/signup` and `GET /v1/billing/portal` go live. Never
 //!   commit; wire via `flyctl secrets set` / Helm value / K8s Secret.
+//! - `NANOVM_PLAN_TIERS` — map Stripe price ids to named tiers +
+//!   fork RPS. Format:
+//!   `price_ABC=free:5,price_XYZ=pro:100,price_ENT=enterprise:1000`.
+//!   Read at startup; drives `GET /v1/billing/plan`. Unwiring into
+//!   fork quota lands in the follow-up "tier-based fork quota" PR.
 //! - `STRIPE_WEBHOOK_SIGNING_SECRET` — the `whsec_…` value from your
 //!   Stripe webhook endpoint. When set, `POST /v1/stripe/webhook`
 //!   accepts events with a valid `Stripe-Signature` header
@@ -408,9 +413,15 @@ fn build_billing_ctx() -> Option<control_plane::billing::BillingCtx> {
     let stripe = std::sync::Arc::new(control_plane::billing::StripeClient::new(
         cfg.stripe_secret_key.clone(),
     ));
+    let tiers = control_plane::billing::PlanTiers::from_env();
+    tracing::info!(
+        tier_count = tiers.len(),
+        "billing: plan tiers configured (NANOVM_PLAN_TIERS)"
+    );
     Some(control_plane::billing::BillingCtx {
         config: cfg,
         store,
         stripe,
+        tiers,
     })
 }
