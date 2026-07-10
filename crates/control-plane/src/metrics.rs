@@ -79,6 +79,11 @@ pub struct Metrics {
     warm_pool_hits: AtomicU64,
     /// `/fork` calls that fell through to a cold restore.
     warm_pool_misses: AtomicU64,
+    /// Stripe webhook events observed, keyed by Stripe's `type` string
+    /// (e.g. `invoice.paid`, `customer.subscription.updated`).
+    /// Cardinality is bounded by Stripe's own event-type enum, so this
+    /// is safe to label-by-value.
+    stripe_events_total: Mutex<HashMap<String, u64>>,
 }
 
 impl Metrics {
@@ -153,6 +158,17 @@ impl Metrics {
     /// Record a fork that fell through to a cold restore.
     pub fn record_warm_miss(&self) {
         self.warm_pool_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a Stripe webhook event, keyed by event type string.
+    /// Called from the billing webhook handler regardless of whether
+    /// there's a specific side effect — the counter is the operator's
+    /// dashboard for "are we still receiving events" and, more
+    /// importantly, "how many invoices are failing per hour".
+    pub fn record_stripe_event(&self, event_type: &str) {
+        if let Ok(mut map) = self.stripe_events_total.lock() {
+            *map.entry(event_type.to_owned()).or_insert(0) += 1;
+        }
     }
 
     /// Render the Prometheus text exposition for these metrics.
@@ -258,6 +274,20 @@ impl Metrics {
             self.warm_pool_misses.load(Ordering::Relaxed)
         );
 
+        out.push_str(
+            "# HELP nanovm_stripe_webhook_events_total Stripe webhook events observed, by type.\n",
+        );
+        out.push_str("# TYPE nanovm_stripe_webhook_events_total counter\n");
+        if let Ok(map) = self.stripe_events_total.lock() {
+            for (event_type, n) in sorted_pairs(&map) {
+                let event_type = escape_label(event_type.as_str());
+                let _ = writeln!(
+                    out,
+                    "nanovm_stripe_webhook_events_total{{event_type=\"{event_type}\"}} {n}"
+                );
+            }
+        }
+
         out
     }
 }
@@ -343,6 +373,24 @@ mod tests {
         assert!(text.contains("nanovm_forks_total_by_org{org=\"globex\"} 1"));
         assert!(text.contains("nanovm_fork_latency_ms_sum_by_org{org=\"acme\"} 16"));
         assert!(text.contains("nanovm_fork_latency_ms_sum_by_org{org=\"globex\"} 14"));
+    }
+
+    #[test]
+    fn stripe_events_accumulate_and_render_by_type() {
+        let m = Metrics::new();
+        m.record_stripe_event("invoice.paid");
+        m.record_stripe_event("invoice.paid");
+        m.record_stripe_event("invoice.payment_failed");
+        m.record_stripe_event("customer.subscription.updated");
+        let text = m.render_text();
+        assert!(text.contains("# TYPE nanovm_stripe_webhook_events_total counter"));
+        assert!(text.contains("nanovm_stripe_webhook_events_total{event_type=\"invoice.paid\"} 2"));
+        assert!(text.contains(
+            "nanovm_stripe_webhook_events_total{event_type=\"invoice.payment_failed\"} 1"
+        ));
+        assert!(text.contains(
+            "nanovm_stripe_webhook_events_total{event_type=\"customer.subscription.updated\"} 1"
+        ));
     }
 
     #[test]
