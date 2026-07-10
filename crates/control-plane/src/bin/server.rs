@@ -26,6 +26,17 @@
 //!   restarts. Unset → in-memory only (keys are lost on restart, fine
 //!   for ephemeral dev). Set to a path on persistent storage for any
 //!   production deployment where tenants self-serve their keys.
+//! - `STRIPE_SECRET_KEY` / `STRIPE_BILLING_PORTAL_RETURN_URL` /
+//!   `NANOVM_SIGNUP_TOKEN` — Stripe billing credentials. When all
+//!   three are set (and the binary is built `--features billing`),
+//!   `POST /v1/signup` and `GET /v1/billing/portal` go live. Never
+//!   commit; wire via `flyctl secrets set` / Helm value / K8s Secret.
+//! - `STRIPE_WEBHOOK_SIGNING_SECRET` — the `whsec_…` value from your
+//!   Stripe webhook endpoint. When set, `POST /v1/stripe/webhook`
+//!   accepts events with a valid `Stripe-Signature` header
+//!   (HMAC-SHA256 of `timestamp.payload`, within a 300 s replay
+//!   window). Unset → the webhook endpoint returns 501
+//!   `webhook_disabled`.
 //! - `NANOVM_DEFAULT_KERNEL_PATH` — absolute path to the kernel image
 //!   used as the fallback when `POST /v1/vms` omits `kernel`. Set to
 //!   `/usr/local/share/nanovm/vmlinux` by `Dockerfile.kvm` so

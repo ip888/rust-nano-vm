@@ -50,6 +50,11 @@ rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 # variant so distroless doesn't need OpenSSL. Optional; only pulled
 # when the `billing` feature is on.
 reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots"], optional = true }
+# HMAC-SHA256 for Stripe webhook signature verification. Both crates
+# are already in the dep tree via reqwest/rustls; declaring them
+# directly keeps the billing module's use explicit + testable.
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [features]
 default = []
@@ -67,7 +72,7 @@ sqlite = ["dep:rusqlite"]
 # `sqlite` (Stripe customer_id needs to survive control-plane
 # restart). Wire STRIPE_SECRET_KEY, STRIPE_BILLING_PORTAL_RETURN_URL,
 # NANOVM_SIGNUP_TOKEN at deploy time.
-billing = ["dep:reqwest", "sqlite"]
+billing = ["dep:reqwest", "dep:hmac", "dep:sha2", "sqlite"]
 
 [dev-dependencies]
 base64.workspace = true
