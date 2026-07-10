@@ -166,10 +166,58 @@ pub enum BillingError {
 
 // -------- BillingStore -------------------------------------------------
 
-/// Persistence for the org → Stripe customer id mapping.
+/// Persistence for the org → Stripe customer + subscription state.
 pub trait BillingStore: Send + Sync + std::fmt::Debug {
     fn record_customer(&self, org: &OrgId, customer_id: &str) -> Result<(), BillingStoreError>;
     fn get_customer(&self, org: &OrgId) -> Option<String>;
+
+    /// Record (or overwrite) subscription state for a given Stripe
+    /// `customer_id`. Called from the webhook handler on any
+    /// `customer.subscription.*` event.
+    ///
+    /// The lookup key is the Stripe customer id, not `OrgId`, because
+    /// the webhook payload carries the customer id; the org lookup
+    /// happens via `org_by_customer` when a caller wants the
+    /// tenant-facing view.
+    fn record_subscription(
+        &self,
+        customer_id: &str,
+        state: &SubscriptionState,
+    ) -> Result<(), BillingStoreError>;
+
+    /// Look up the current subscription state for `customer_id`, if
+    /// any. `None` when the customer was created but never had a
+    /// subscription event.
+    fn get_subscription(&self, customer_id: &str) -> Option<SubscriptionState>;
+
+    /// Reverse lookup — find the org that owns a given Stripe
+    /// `customer_id`. Used by the webhook handler to route
+    /// `customer.subscription.*` back to the org whose fork quota
+    /// (or feature toggles) should change. `None` when the customer
+    /// isn't associated with any org (typically a data issue —
+    /// signup succeeded on Stripe but crashed before persisting).
+    fn org_by_customer(&self, customer_id: &str) -> Option<OrgId>;
+}
+
+/// Subscription state persisted per Stripe customer. Kept minimal —
+/// the follow-up "tier-based fork quota" PR reads `status` + `price_id`
+/// to decide the caller's per-org rate limit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscriptionState {
+    /// Stripe subscription id (`sub_…`).
+    pub subscription_id: String,
+    /// Stripe's raw status string — one of `active`, `trialing`,
+    /// `past_due`, `canceled`, `incomplete`, `incomplete_expired`,
+    /// `paused`, `unpaid`. Stored verbatim so future Stripe
+    /// additions round-trip without a code change.
+    pub status: String,
+    /// Stripe price id (`price_…`) of the primary subscription item.
+    /// Maps to your product catalogue (free / pro / enterprise) by
+    /// application config (`NANOVM_PLAN_TIERS`).
+    pub price_id: Option<String>,
+    /// RFC 3339 timestamp of the last update — for observability +
+    /// operator triage. Set by the store on write.
+    pub updated_at: String,
 }
 
 /// Errors from [`BillingStore`] backends.
@@ -183,7 +231,10 @@ pub enum BillingStoreError {
 /// demos; catastrophic for prod SaaS. Use [`SqliteBillingStore`] there.
 #[derive(Debug, Default)]
 pub struct InMemoryBillingStore {
+    /// `org → stripe_customer_id`
     map: Mutex<HashMap<OrgId, String>>,
+    /// `stripe_customer_id → subscription state`
+    subs: Mutex<HashMap<String, SubscriptionState>>,
 }
 
 impl BillingStore for InMemoryBillingStore {
@@ -195,6 +246,26 @@ impl BillingStore for InMemoryBillingStore {
     fn get_customer(&self, org: &OrgId) -> Option<String> {
         let guard = self.map.lock().expect("billing map poisoned");
         guard.get(org).cloned()
+    }
+    fn record_subscription(
+        &self,
+        customer_id: &str,
+        state: &SubscriptionState,
+    ) -> Result<(), BillingStoreError> {
+        let mut guard = self.subs.lock().expect("billing subs poisoned");
+        guard.insert(customer_id.to_string(), state.clone());
+        Ok(())
+    }
+    fn get_subscription(&self, customer_id: &str) -> Option<SubscriptionState> {
+        let guard = self.subs.lock().expect("billing subs poisoned");
+        guard.get(customer_id).cloned()
+    }
+    fn org_by_customer(&self, customer_id: &str) -> Option<OrgId> {
+        let guard = self.map.lock().expect("billing map poisoned");
+        guard
+            .iter()
+            .find(|(_, id)| id.as_str() == customer_id)
+            .map(|(o, _)| o.clone())
     }
 }
 
@@ -682,15 +753,106 @@ pub(crate) async fn stripe_webhook_handler(
     verify_webhook_signature(header, &body, secret, now, 300).map_err(webhook_to_api_error)?;
     let event: StripeEvent = serde_json::from_slice(&body)
         .map_err(|e| ApiError::Bad(format!("webhook body is not valid JSON: {e}")))?;
-    // Downstream handlers land in a follow-up PR (tier routing,
-    // subscription lifecycle). For now just log + 200 so Stripe's
-    // webhook dashboard shows the endpoint as healthy.
     tracing::info!(
         event_id = %event.id,
         event_type = %event.event_type,
         "stripe webhook received"
     );
+    // Route the event. Unknown event types return 200 (Stripe treats
+    // 2xx as "delivered"; returning 5xx would cause retries), but we
+    // log them so an operator can see what's arriving.
+    route_webhook_event(ctx.store.as_ref(), &event);
     Ok(StatusCode::OK)
+}
+
+/// Route a `StripeEvent` to its side effect. Only `customer.subscription.*`
+/// events currently persist state; the rest are logged + dropped so
+/// Stripe's health check passes.
+///
+/// **Follow-up**: `invoice.paid` → mark subscription "active" and
+/// reset any past-due dunning state; `customer.deleted` → tombstone
+/// the org's billing row. Kept out of scope so this PR stays focused.
+pub(crate) fn route_webhook_event(store: &dyn BillingStore, event: &StripeEvent) {
+    match event.event_type.as_str() {
+        "customer.subscription.created"
+        | "customer.subscription.updated"
+        | "customer.subscription.deleted" => match parse_subscription_object(event) {
+            Ok((customer_id, state)) => {
+                if let Err(e) = store.record_subscription(&customer_id, &state) {
+                    tracing::error!(
+                        error = %e,
+                        customer_id,
+                        "webhook: record_subscription failed"
+                    );
+                } else {
+                    tracing::info!(
+                        customer_id,
+                        subscription_id = %state.subscription_id,
+                        status = %state.status,
+                        price_id = ?state.price_id,
+                        event_type = %event.event_type,
+                        "webhook: recorded subscription state"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                event_id = %event.id,
+                event_type = %event.event_type,
+                "webhook: could not parse subscription object"
+            ),
+        },
+        other => tracing::debug!(event_type = other, "webhook: no handler, ignored"),
+    }
+}
+
+/// Extract `(customer_id, SubscriptionState)` from a
+/// `customer.subscription.*` event's `data.object`. Stripe's event
+/// envelope wraps the subscription at `event.data.object`; the fields
+/// we care about are `id`, `customer`, `status`, and the primary
+/// item's price id at `items.data[0].price.id`.
+fn parse_subscription_object(
+    event: &StripeEvent,
+) -> Result<(String, SubscriptionState), &'static str> {
+    let data = event.data.as_ref().ok_or("event has no data")?;
+    let object = data.get("object").ok_or("data.object missing")?;
+    let subscription_id = object
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("data.object.id missing")?
+        .to_string();
+    let customer_id = object
+        .get("customer")
+        .and_then(|v| v.as_str())
+        .ok_or("data.object.customer missing")?
+        .to_string();
+    let status = object
+        .get("status")
+        .and_then(|v| v.as_str())
+        .ok_or("data.object.status missing")?
+        .to_string();
+    // Primary subscription item's price id. Stripe multi-item
+    // subscriptions do exist; we pick the first one which matches the
+    // common single-item shape most SaaS deploys use. A follow-up can
+    // extend this to enumerate multi-item subscriptions.
+    let price_id = object
+        .get("items")
+        .and_then(|v| v.get("data"))
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|item| item.get("price"))
+        .and_then(|price| price.get("id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Ok((
+        customer_id,
+        SubscriptionState {
+            subscription_id,
+            status,
+            price_id,
+            updated_at: crate::time::rfc3339_now(),
+        },
+    ))
 }
 
 fn webhook_to_api_error(e: WebhookError) -> ApiError {
@@ -854,6 +1016,110 @@ mod tests {
         assert!(!constant_time_eq_hex("abc", "abcd"));
         assert!(constant_time_eq_hex("abc", "abc"));
         assert!(!constant_time_eq_hex("abc", "abd"));
+    }
+
+    #[test]
+    fn parse_subscription_extracts_customer_status_and_price() {
+        let event = StripeEvent {
+            id: "evt_1".into(),
+            event_type: "customer.subscription.updated".into(),
+            data: Some(serde_json::json!({
+                "object": {
+                    "id": "sub_ABC",
+                    "customer": "cus_ACME",
+                    "status": "active",
+                    "items": {
+                        "data": [
+                            {"price": {"id": "price_PRO"}}
+                        ]
+                    }
+                }
+            })),
+        };
+        let (cid, state) = parse_subscription_object(&event).unwrap();
+        assert_eq!(cid, "cus_ACME");
+        assert_eq!(state.subscription_id, "sub_ABC");
+        assert_eq!(state.status, "active");
+        assert_eq!(state.price_id.as_deref(), Some("price_PRO"));
+    }
+
+    #[test]
+    fn parse_subscription_missing_price_is_ok_returns_none() {
+        let event = StripeEvent {
+            id: "evt_1".into(),
+            event_type: "customer.subscription.deleted".into(),
+            data: Some(serde_json::json!({
+                "object": {
+                    "id": "sub_ABC",
+                    "customer": "cus_ACME",
+                    "status": "canceled",
+                }
+            })),
+        };
+        let (_, state) = parse_subscription_object(&event).unwrap();
+        assert_eq!(state.status, "canceled");
+        assert!(state.price_id.is_none());
+    }
+
+    #[test]
+    fn parse_subscription_rejects_missing_required_fields() {
+        for missing in ["id", "customer", "status"] {
+            let mut obj = serde_json::json!({
+                "id": "sub_X",
+                "customer": "cus_X",
+                "status": "active",
+            });
+            obj.as_object_mut().unwrap().remove(missing);
+            let event = StripeEvent {
+                id: "evt".into(),
+                event_type: "customer.subscription.updated".into(),
+                data: Some(serde_json::json!({ "object": obj })),
+            };
+            assert!(
+                parse_subscription_object(&event).is_err(),
+                "missing {missing} should fail parse"
+            );
+        }
+    }
+
+    #[test]
+    fn route_persists_subscription_and_updates_org_lookup() {
+        let store = InMemoryBillingStore::default();
+        store
+            .record_customer(&OrgId::new("acme"), "cus_ACME")
+            .unwrap();
+        assert!(store.get_subscription("cus_ACME").is_none());
+
+        let event = StripeEvent {
+            id: "evt_1".into(),
+            event_type: "customer.subscription.updated".into(),
+            data: Some(serde_json::json!({
+                "object": {
+                    "id": "sub_A", "customer": "cus_ACME",
+                    "status": "active",
+                    "items": {"data":[{"price":{"id":"price_pro"}}]}
+                }
+            })),
+        };
+        route_webhook_event(&store, &event);
+
+        let s = store.get_subscription("cus_ACME").expect("recorded");
+        assert_eq!(s.status, "active");
+        assert_eq!(s.price_id.as_deref(), Some("price_pro"));
+        // Reverse lookup by customer id still works.
+        assert_eq!(store.org_by_customer("cus_ACME"), Some(OrgId::new("acme")));
+    }
+
+    #[test]
+    fn route_ignores_unknown_event_types() {
+        let store = InMemoryBillingStore::default();
+        let event = StripeEvent {
+            id: "evt_1".into(),
+            event_type: "invoice.paid".into(),
+            data: None,
+        };
+        route_webhook_event(&store, &event); // must not panic; also no-op
+        assert!(store.get_subscription("cus_ANY").is_none());
     }
 
     #[test]
