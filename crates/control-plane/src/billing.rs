@@ -103,6 +103,12 @@ pub struct BillingConfig {
     /// demand. Read from `NANOVM_SIGNUP_TOKEN`. Never appears in
     /// Debug output.
     pub signup_token: String,
+    /// Stripe webhook signing secret (`whsec_…`) — read from
+    /// `STRIPE_WEBHOOK_SIGNING_SECRET`. Used to verify the
+    /// `Stripe-Signature` header on `POST /v1/stripe/webhook`.
+    /// `None` when unset, in which case the webhook endpoint returns
+    /// 503 `billing_disabled`. Never appears in Debug output.
+    pub webhook_signing_secret: Option<String>,
 }
 
 impl std::fmt::Debug for BillingConfig {
@@ -111,17 +117,27 @@ impl std::fmt::Debug for BillingConfig {
             .field("stripe_secret_key", &"<redacted>")
             .field("portal_return_url", &self.portal_return_url)
             .field("signup_token", &"<redacted>")
+            .field(
+                "webhook_signing_secret",
+                &self.webhook_signing_secret.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
 
 impl BillingConfig {
-    /// `None` when any required env var is unset.
+    /// `None` when any of the three core env vars is unset. The
+    /// webhook signing secret is optional — it's read separately
+    /// because a deploy can want `/v1/signup` + `/v1/billing/portal`
+    /// live without accepting webhooks yet.
     pub fn from_env() -> Option<Self> {
         Some(Self {
             stripe_secret_key: std::env::var("STRIPE_SECRET_KEY").ok()?,
             portal_return_url: std::env::var("STRIPE_BILLING_PORTAL_RETURN_URL").ok()?,
             signup_token: std::env::var("NANOVM_SIGNUP_TOKEN").ok()?,
+            webhook_signing_secret: std::env::var("STRIPE_WEBHOOK_SIGNING_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty()),
         })
     }
 }
@@ -427,6 +443,132 @@ pub fn slugify(input: &str) -> String {
     out
 }
 
+// -------- Webhook signature verification ------------------------------
+
+/// Errors from webhook signature verification.
+#[derive(Debug, thiserror::Error)]
+pub enum WebhookError {
+    #[error("webhook signing secret not configured")]
+    NotConfigured,
+    #[error("missing Stripe-Signature header")]
+    MissingHeader,
+    #[error("malformed Stripe-Signature header (expected `t=…,v1=…`)")]
+    MalformedHeader,
+    #[error("timestamp {ts} outside tolerance window (now={now}, tolerance={tolerance_secs}s)")]
+    StaleTimestamp {
+        ts: i64,
+        now: i64,
+        tolerance_secs: i64,
+    },
+    #[error("signature mismatch")]
+    SignatureMismatch,
+    #[error("body is not valid JSON: {0}")]
+    BadJson(String),
+}
+
+/// Parse a `Stripe-Signature` header and return `(timestamp, v1_signatures)`.
+///
+/// Stripe's canonical form is `t=<unix_ts>,v1=<hex_sig>[,v1=<hex_sig>...]`.
+/// Multiple `v1=` values may be present during signing-secret rotation —
+/// we accept a valid match against any one.
+fn parse_stripe_signature(header: &str) -> Result<(i64, Vec<String>), WebhookError> {
+    let mut timestamp: Option<i64> = None;
+    let mut v1s: Vec<String> = Vec::new();
+    for part in header.split(',') {
+        let (k, v) = part.split_once('=').ok_or(WebhookError::MalformedHeader)?;
+        match k.trim() {
+            "t" => {
+                timestamp = Some(
+                    v.trim()
+                        .parse()
+                        .map_err(|_| WebhookError::MalformedHeader)?,
+                )
+            }
+            "v1" => v1s.push(v.trim().to_string()),
+            // Ignore v0 + unknown schemes — Stripe reserves the right to add
+            // new ones, and skipping them keeps forward-compat safe.
+            _ => {}
+        }
+    }
+    let ts = timestamp.ok_or(WebhookError::MalformedHeader)?;
+    if v1s.is_empty() {
+        return Err(WebhookError::MalformedHeader);
+    }
+    Ok((ts, v1s))
+}
+
+/// Constant-time comparison of two hex-encoded byte strings.
+fn constant_time_eq_hex(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.bytes().zip(b.bytes()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Verify a Stripe webhook payload against the `Stripe-Signature`
+/// header per <https://stripe.com/docs/webhooks/signatures>.
+///
+/// - `header`: the raw `Stripe-Signature` header value
+/// - `payload`: the raw HTTP body bytes (**do not** re-encode a
+///   parsed JSON value — Stripe signs the exact bytes)
+/// - `secret`: the `whsec_…` signing secret from the Stripe dashboard
+/// - `now`: current unix time (parameter for testability)
+/// - `tolerance_secs`: replay window — Stripe recommends 300 (5 min)
+pub fn verify_webhook_signature(
+    header: &str,
+    payload: &[u8],
+    secret: &str,
+    now: i64,
+    tolerance_secs: i64,
+) -> Result<(), WebhookError> {
+    use hmac::{Mac, SimpleHmac};
+    use sha2::Sha256;
+
+    let (ts, v1s) = parse_stripe_signature(header)?;
+    if (now - ts).abs() > tolerance_secs {
+        return Err(WebhookError::StaleTimestamp {
+            ts,
+            now,
+            tolerance_secs,
+        });
+    }
+    let mut mac = <SimpleHmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts any key length");
+    mac.update(ts.to_string().as_bytes());
+    mac.update(b".");
+    mac.update(payload);
+    let computed = hex_encode(&mac.finalize().into_bytes());
+    if v1s.iter().any(|v1| constant_time_eq_hex(&computed, v1)) {
+        Ok(())
+    } else {
+        Err(WebhookError::SignatureMismatch)
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        write!(&mut out, "{b:02x}").expect("String write cannot fail");
+    }
+    out
+}
+
+/// Stripe webhook event envelope — just the fields we route on for now.
+/// The rest of the object graph is ignored by `serde`.
+#[derive(Debug, Deserialize)]
+pub struct StripeEvent {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub event_type: String,
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+}
+
 // -------- Route wiring -------------------------------------------------
 
 /// Sub-state carried on [`crate::AppState`] when the `billing` feature
@@ -507,6 +649,67 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     raw.strip_prefix("Bearer ").map(str::to_string)
 }
 
+/// `POST /v1/stripe/webhook` — verify signature, log the event,
+/// return 200. Downstream event routing (subscription tier changes,
+/// customer.deleted, invoice.paid) lives in a follow-up PR; this one
+/// gets the signature-verification wall standing.
+pub(crate) async fn stripe_webhook_handler(
+    State(state): State<crate::AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, ApiError> {
+    let ctx = state.billing_ctx().ok_or(ApiError::Unsupported {
+        code: "billing_disabled",
+        message: "billing endpoints require the `billing` feature + Stripe env vars".into(),
+    })?;
+    let secret = ctx
+        .config
+        .webhook_signing_secret
+        .as_ref()
+        .ok_or(ApiError::Unsupported {
+            code: "webhook_disabled",
+            message: "STRIPE_WEBHOOK_SIGNING_SECRET not configured".into(),
+        })?;
+    let header = headers
+        .get("stripe-signature")
+        .ok_or_else(|| ApiError::Bad("missing Stripe-Signature header".into()))?
+        .to_str()
+        .map_err(|_| ApiError::Bad("Stripe-Signature is not valid UTF-8".into()))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    verify_webhook_signature(header, &body, secret, now, 300).map_err(webhook_to_api_error)?;
+    let event: StripeEvent = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::Bad(format!("webhook body is not valid JSON: {e}")))?;
+    // Downstream handlers land in a follow-up PR (tier routing,
+    // subscription lifecycle). For now just log + 200 so Stripe's
+    // webhook dashboard shows the endpoint as healthy.
+    tracing::info!(
+        event_id = %event.id,
+        event_type = %event.event_type,
+        "stripe webhook received"
+    );
+    Ok(StatusCode::OK)
+}
+
+fn webhook_to_api_error(e: WebhookError) -> ApiError {
+    match e {
+        WebhookError::NotConfigured => ApiError::Unsupported {
+            code: "webhook_disabled",
+            message: "STRIPE_WEBHOOK_SIGNING_SECRET not configured".into(),
+        },
+        WebhookError::MissingHeader
+        | WebhookError::MalformedHeader
+        | WebhookError::StaleTimestamp { .. }
+        | WebhookError::SignatureMismatch
+        | WebhookError::BadJson(_) => ApiError::Forbidden {
+            code: "invalid_signature",
+            message: e.to_string(),
+        },
+    }
+}
+
 fn billing_to_api_error(e: BillingError) -> ApiError {
     match e {
         BillingError::Disabled => ApiError::Unsupported {
@@ -539,6 +742,129 @@ fn billing_to_api_error(e: BillingError) -> ApiError {
 mod tests {
     use super::*;
 
+    /// Sign a payload the same way Stripe would — helper for the tests
+    /// below. Returns the `t=…,v1=…` header value.
+    fn sign(secret: &str, payload: &[u8], ts: i64) -> String {
+        use hmac::{Mac, SimpleHmac};
+        use sha2::Sha256;
+        let mut mac = <SimpleHmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(ts.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(payload);
+        let sig = hex_encode(&mac.finalize().into_bytes());
+        format!("t={ts},v1={sig}")
+    }
+
+    #[test]
+    fn verify_accepts_a_correctly_signed_payload() {
+        let body = br#"{"id":"evt_1","type":"customer.subscription.updated"}"#;
+        let ts = 1_700_000_000;
+        let header = sign("whsec_hush", body, ts);
+        assert!(verify_webhook_signature(&header, body, "whsec_hush", ts, 300).is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_wrong_secret() {
+        let body = br#"{"id":"evt_1"}"#;
+        let ts = 1_700_000_000;
+        let header = sign("whsec_hush", body, ts);
+        let err = verify_webhook_signature(&header, body, "whsec_WRONG", ts, 300).unwrap_err();
+        assert!(matches!(err, WebhookError::SignatureMismatch));
+    }
+
+    #[test]
+    fn verify_rejects_mutated_payload() {
+        let body = br#"{"id":"evt_1"}"#;
+        let ts = 1_700_000_000;
+        let header = sign("whsec_hush", body, ts);
+        let err =
+            verify_webhook_signature(&header, br#"{"id":"evt_TAMPERED"}"#, "whsec_hush", ts, 300)
+                .unwrap_err();
+        assert!(matches!(err, WebhookError::SignatureMismatch));
+    }
+
+    #[test]
+    fn verify_rejects_stale_timestamp() {
+        let body = br#"{"id":"evt_1"}"#;
+        let ts = 1_700_000_000;
+        let header = sign("whsec_hush", body, ts);
+        // now is 301 s after the signing timestamp → outside tolerance.
+        let err = verify_webhook_signature(&header, body, "whsec_hush", ts + 301, 300).unwrap_err();
+        assert!(matches!(err, WebhookError::StaleTimestamp { .. }));
+    }
+
+    #[test]
+    fn verify_rejects_stale_timestamp_from_the_future_too() {
+        let body = br#"{}"#;
+        let ts = 1_700_000_000;
+        let header = sign("whsec_hush", body, ts);
+        // A `now` 400 s BEFORE the timestamp is equally suspicious —
+        // Stripe rounds server clocks but a caller clock 5+ min ahead
+        // suggests a replay against a rewound host clock.
+        let err = verify_webhook_signature(&header, body, "whsec_hush", ts - 400, 300).unwrap_err();
+        assert!(matches!(err, WebhookError::StaleTimestamp { .. }));
+    }
+
+    #[test]
+    fn verify_rejects_malformed_header() {
+        let body = b"{}";
+        let cases = [
+            "",                   // empty
+            "t=",                 // no timestamp value
+            "v1=abc",             // no timestamp key
+            "t=abc,v1=def",       // timestamp not an int
+            "t=1700000000",       // no v1
+            "t=1700000000,x=1",   // no v1 (unknown scheme)
+            "t=1700000000v1=abc", // missing `=`
+        ];
+        for c in cases {
+            let err =
+                verify_webhook_signature(c, body, "whsec_hush", 1_700_000_000, 300).unwrap_err();
+            assert!(
+                matches!(err, WebhookError::MalformedHeader),
+                "case {c:?} should return MalformedHeader, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_accepts_any_valid_v1_when_multiple_present() {
+        // During signing-key rotation Stripe emits multiple v1= values
+        // signed with different secrets. We must accept if *any* match.
+        let body = br#"{"id":"evt_r"}"#;
+        let ts = 1_700_000_000;
+        let good = sign("whsec_new", body, ts);
+        // Strip the `t=…,` prefix off the "old-secret" signature so we
+        // can inject it as a second v1= entry alongside the good one.
+        let bad_only = sign("whsec_old", body, ts);
+        let bad_v1 = bad_only.split(",v1=").nth(1).unwrap();
+        let header = format!("{good},v1={bad_v1}");
+        assert!(verify_webhook_signature(&header, body, "whsec_new", ts, 300).is_ok());
+    }
+
+    #[test]
+    fn parse_signature_ignores_unknown_scheme_values() {
+        let (ts, v1s) = parse_stripe_signature("t=1234,v0=deprecated,v1=abc,v2=future").unwrap();
+        assert_eq!(ts, 1234);
+        assert_eq!(v1s, vec!["abc".to_string()]);
+    }
+
+    #[test]
+    fn constant_time_eq_hex_rejects_length_mismatch() {
+        assert!(!constant_time_eq_hex("abc", "abcd"));
+        assert!(constant_time_eq_hex("abc", "abc"));
+        assert!(!constant_time_eq_hex("abc", "abd"));
+    }
+
+    #[test]
+    fn stripe_event_parses_minimum_fields() {
+        let raw = br#"{"id":"evt_x","type":"customer.subscription.updated","data":{"object":{}}}"#;
+        let e: StripeEvent = serde_json::from_slice(raw).unwrap();
+        assert_eq!(e.id, "evt_x");
+        assert_eq!(e.event_type, "customer.subscription.updated");
+        assert!(e.data.is_some());
+    }
+
     #[test]
     fn slugify_collapses_separators_and_trims_dashes() {
         assert_eq!(slugify("Acme Inc."), "acme-inc");
@@ -554,6 +880,7 @@ mod tests {
             stripe_secret_key: "sk_test_ohno".into(),
             portal_return_url: "http://ok".into(),
             signup_token: "hush".into(),
+            webhook_signing_secret: None,
         };
         let s = format!("{cfg:?}");
         assert!(!s.contains("sk_test_ohno"));
@@ -579,6 +906,7 @@ mod tests {
             stripe_secret_key: "sk_test_x".into(),
             portal_return_url: "http://ok".into(),
             signup_token: "admin".into(),
+            webhook_signing_secret: None,
         };
         let tokens = ApiTokens::default();
         let store = InMemoryBillingStore::default();
@@ -599,6 +927,7 @@ mod tests {
             stripe_secret_key: "sk_test_x".into(),
             portal_return_url: "http://ok".into(),
             signup_token: "admin".into(),
+            webhook_signing_secret: None,
         };
         let tokens = ApiTokens::default();
         let store = InMemoryBillingStore::default();
@@ -619,6 +948,7 @@ mod tests {
             stripe_secret_key: "sk_test_x".into(),
             portal_return_url: "http://ok".into(),
             signup_token: "admin".into(),
+            webhook_signing_secret: None,
         };
         let tokens = ApiTokens::default();
         let store = InMemoryBillingStore::default();
@@ -639,6 +969,7 @@ mod tests {
             stripe_secret_key: "sk_test_x".into(),
             portal_return_url: "http://ok".into(),
             signup_token: "admin".into(),
+            webhook_signing_secret: None,
         };
         let store = InMemoryBillingStore::default();
         let stripe = StripeClient::new("sk_test_x");

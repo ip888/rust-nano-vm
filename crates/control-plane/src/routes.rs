@@ -340,6 +340,14 @@ pub fn router() -> Router<AppState> {
     // The handler self-authenticates against NANOVM_SIGNUP_TOKEN.
     #[cfg(feature = "billing")]
     let v1 = v1.route("/signup", post(crate::billing::signup_handler));
+    // Stripe webhook — also outside tenant auth. The caller is Stripe;
+    // authentication is HMAC-SHA256 of the payload against
+    // STRIPE_WEBHOOK_SIGNING_SECRET, verified inside the handler.
+    #[cfg(feature = "billing")]
+    let v1 = v1.route(
+        "/stripe/webhook",
+        post(crate::billing::stripe_webhook_handler),
+    );
 
     Router::new()
         .route("/healthz", get(healthz))
