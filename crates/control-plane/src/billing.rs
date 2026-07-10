@@ -758,6 +758,10 @@ pub(crate) async fn stripe_webhook_handler(
         event_type = %event.event_type,
         "stripe webhook received"
     );
+    // Bump the observability counter before routing so unknown event
+    // types (which have no side effect) still show up in `/metrics`.
+    // Cardinality is bounded by Stripe's own event-type enum.
+    state.metrics().record_stripe_event(&event.event_type);
     // Route the event. Unknown event types return 200 (Stripe treats
     // 2xx as "delivered"; returning 5xx would cause retries), but we
     // log them so an operator can see what's arriving.
@@ -765,13 +769,15 @@ pub(crate) async fn stripe_webhook_handler(
     Ok(StatusCode::OK)
 }
 
-/// Route a `StripeEvent` to its side effect. Only `customer.subscription.*`
-/// events currently persist state; the rest are logged + dropped so
-/// Stripe's health check passes.
+/// Route a `StripeEvent` to its side effect. Persists subscription
+/// state on `customer.subscription.*`, and structured-logs invoice
+/// lifecycle events (`invoice.paid`, `invoice.payment_failed`) so ops
+/// dashboards can surface payment-flow health without waiting for the
+/// downstream `customer.subscription.updated` that Stripe sends after.
 ///
-/// **Follow-up**: `invoice.paid` → mark subscription "active" and
-/// reset any past-due dunning state; `customer.deleted` → tombstone
-/// the org's billing row. Kept out of scope so this PR stays focused.
+/// Everything else returns without side effect (2xx to Stripe; a 5xx
+/// would provoke retries) but the outer handler still records a
+/// per-event-type counter for observability.
 pub(crate) fn route_webhook_event(store: &dyn BillingStore, event: &StripeEvent) {
     match event.event_type.as_str() {
         "customer.subscription.created"
@@ -802,8 +808,91 @@ pub(crate) fn route_webhook_event(store: &dyn BillingStore, event: &StripeEvent)
                 "webhook: could not parse subscription object"
             ),
         },
+        "invoice.paid" => match parse_invoice_object(event) {
+            Ok(inv) => tracing::info!(
+                event_id = %event.id,
+                customer_id = %inv.customer_id,
+                invoice_id = %inv.invoice_id,
+                amount_paid = inv.amount_paid,
+                hosted_invoice_url = ?inv.hosted_invoice_url,
+                "webhook: invoice paid"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                event_id = %event.id,
+                "webhook: could not parse invoice.paid object"
+            ),
+        },
+        "invoice.payment_failed" => match parse_invoice_object(event) {
+            Ok(inv) => tracing::warn!(
+                event_id = %event.id,
+                customer_id = %inv.customer_id,
+                invoice_id = %inv.invoice_id,
+                amount_due = inv.amount_due,
+                hosted_invoice_url = ?inv.hosted_invoice_url,
+                "webhook: invoice payment failed"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                event_id = %event.id,
+                "webhook: could not parse invoice.payment_failed object"
+            ),
+        },
         other => tracing::debug!(event_type = other, "webhook: no handler, ignored"),
     }
+}
+
+/// Fields we care about from a Stripe `invoice` object.
+#[derive(Debug, PartialEq, Eq)]
+struct InvoiceObject {
+    invoice_id: String,
+    customer_id: String,
+    /// Cents (Stripe's smallest currency unit). `amount_paid` on
+    /// invoice.paid, may still be 0 on invoice.payment_failed.
+    amount_paid: i64,
+    /// Cents. Non-zero on invoice.payment_failed indicates what the
+    /// customer owes.
+    amount_due: i64,
+    /// Stripe's hosted receipt/pay-invoice URL — the operator can
+    /// hand this to the customer when triaging a failed payment.
+    hosted_invoice_url: Option<String>,
+}
+
+/// Extract the invoice fields we log from an `invoice.*` event's
+/// `data.object`. Only `customer` is required; the rest fall back to
+/// sensible defaults so a partial payload still yields a log line.
+fn parse_invoice_object(event: &StripeEvent) -> Result<InvoiceObject, &'static str> {
+    let data = event.data.as_ref().ok_or("event has no data")?;
+    let object = data.get("object").ok_or("data.object missing")?;
+    let customer_id = object
+        .get("customer")
+        .and_then(|v| v.as_str())
+        .ok_or("data.object.customer missing")?
+        .to_string();
+    let invoice_id = object
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<none>")
+        .to_string();
+    let amount_paid = object
+        .get("amount_paid")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let amount_due = object
+        .get("amount_due")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let hosted_invoice_url = object
+        .get("hosted_invoice_url")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Ok(InvoiceObject {
+        invoice_id,
+        customer_id,
+        amount_paid,
+        amount_due,
+        hosted_invoice_url,
+    })
 }
 
 /// Extract `(customer_id, SubscriptionState)` from a
@@ -1115,11 +1204,139 @@ mod tests {
         let store = InMemoryBillingStore::default();
         let event = StripeEvent {
             id: "evt_1".into(),
-            event_type: "invoice.paid".into(),
+            event_type: "customer.updated".into(),
             data: None,
         };
         route_webhook_event(&store, &event); // must not panic; also no-op
         assert!(store.get_subscription("cus_ANY").is_none());
+    }
+
+    #[test]
+    fn route_deleted_persists_canceled_status() {
+        // customer.subscription.deleted arrives with status="canceled" —
+        // we persist it so the plan resolver / dashboard can distinguish
+        // "canceled" from "never subscribed".
+        let store = InMemoryBillingStore::default();
+        store
+            .record_customer(&OrgId::new("acme"), "cus_ACME")
+            .unwrap();
+        let event = StripeEvent {
+            id: "evt_del".into(),
+            event_type: "customer.subscription.deleted".into(),
+            data: Some(serde_json::json!({
+                "object": {
+                    "id": "sub_A", "customer": "cus_ACME",
+                    "status": "canceled",
+                }
+            })),
+        };
+        route_webhook_event(&store, &event);
+        let s = store.get_subscription("cus_ACME").expect("recorded");
+        assert_eq!(s.status, "canceled");
+        assert!(s.price_id.is_none());
+    }
+
+    #[test]
+    fn parse_invoice_extracts_customer_and_amounts() {
+        let event = StripeEvent {
+            id: "evt_p".into(),
+            event_type: "invoice.paid".into(),
+            data: Some(serde_json::json!({
+                "object": {
+                    "id": "in_ABC",
+                    "customer": "cus_ACME",
+                    "amount_paid": 1000,
+                    "amount_due": 0,
+                    "hosted_invoice_url": "https://stripe.example/i/abc",
+                }
+            })),
+        };
+        let inv = parse_invoice_object(&event).unwrap();
+        assert_eq!(inv.invoice_id, "in_ABC");
+        assert_eq!(inv.customer_id, "cus_ACME");
+        assert_eq!(inv.amount_paid, 1000);
+        assert_eq!(inv.amount_due, 0);
+        assert_eq!(
+            inv.hosted_invoice_url.as_deref(),
+            Some("https://stripe.example/i/abc")
+        );
+    }
+
+    #[test]
+    fn parse_invoice_missing_optionals_falls_back_to_defaults() {
+        // Real prod payloads may omit amounts / hosted url on
+        // certain edge cases (e.g. $0 trials). Only `customer` is
+        // required; the rest have sensible defaults.
+        let event = StripeEvent {
+            id: "evt_p".into(),
+            event_type: "invoice.payment_failed".into(),
+            data: Some(serde_json::json!({
+                "object": { "customer": "cus_ACME" }
+            })),
+        };
+        let inv = parse_invoice_object(&event).unwrap();
+        assert_eq!(inv.customer_id, "cus_ACME");
+        assert_eq!(inv.invoice_id, "<none>");
+        assert_eq!(inv.amount_paid, 0);
+        assert_eq!(inv.amount_due, 0);
+        assert!(inv.hosted_invoice_url.is_none());
+    }
+
+    #[test]
+    fn parse_invoice_missing_customer_errors() {
+        let event = StripeEvent {
+            id: "evt_p".into(),
+            event_type: "invoice.paid".into(),
+            data: Some(serde_json::json!({ "object": { "id": "in_x" } })),
+        };
+        assert!(parse_invoice_object(&event).is_err());
+    }
+
+    #[test]
+    fn route_invoice_paid_does_not_touch_subscription_state() {
+        // invoice.paid logs but must not mutate stored subscription
+        // state — the paired customer.subscription.updated event
+        // Stripe sends after is the authoritative signal.
+        let store = InMemoryBillingStore::default();
+        store
+            .record_customer(&OrgId::new("acme"), "cus_ACME")
+            .unwrap();
+        store
+            .record_subscription(
+                "cus_ACME",
+                &SubscriptionState {
+                    subscription_id: "sub_A".into(),
+                    status: "past_due".into(),
+                    price_id: Some("price_pro".into()),
+                    updated_at: "2026-07-10T00:00:00Z".into(),
+                },
+            )
+            .unwrap();
+
+        let event = StripeEvent {
+            id: "evt_p".into(),
+            event_type: "invoice.paid".into(),
+            data: Some(serde_json::json!({
+                "object": { "id": "in_A", "customer": "cus_ACME",
+                            "amount_paid": 1000 }
+            })),
+        };
+        route_webhook_event(&store, &event);
+
+        // Untouched.
+        let s = store.get_subscription("cus_ACME").expect("still there");
+        assert_eq!(s.status, "past_due");
+    }
+
+    #[test]
+    fn route_invoice_paid_with_missing_data_does_not_panic() {
+        let store = InMemoryBillingStore::default();
+        let event = StripeEvent {
+            id: "evt_p".into(),
+            event_type: "invoice.paid".into(),
+            data: None, // handler must warn-log and continue
+        };
+        route_webhook_event(&store, &event);
     }
 
     #[test]
