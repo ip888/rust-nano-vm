@@ -21,10 +21,13 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::auth::OrgId;
 
-use super::{BillingStore, BillingStoreError};
+use super::{BillingStore, BillingStoreError, SubscriptionState};
 
 /// Schema version for the billing table.
-const SCHEMA_VERSION: u32 = 1;
+///
+/// v1 → v2 adds subscription columns to `stripe_customers` so the
+/// webhook handler can persist `customer.subscription.*` state.
+const SCHEMA_VERSION: u32 = 2;
 
 /// SQLite-backed [`BillingStore`].
 #[derive(Debug)]
@@ -90,6 +93,20 @@ impl SqliteBillingStore {
                 );",
             )?;
         }
+        if current < 2 {
+            // v1 → v2: add subscription-state columns + a lookup index
+            // on customer_id for the webhook handler's reverse
+            // lookups. `ADD COLUMN` in SQLite requires each column in
+            // its own statement.
+            tx.execute_batch(
+                "ALTER TABLE stripe_customers ADD COLUMN subscription_id TEXT;
+                 ALTER TABLE stripe_customers ADD COLUMN subscription_status TEXT;
+                 ALTER TABLE stripe_customers ADD COLUMN price_id TEXT;
+                 ALTER TABLE stripe_customers ADD COLUMN updated_at TEXT;
+                 CREATE UNIQUE INDEX IF NOT EXISTS stripe_customers_by_customer_id
+                     ON stripe_customers(customer_id);",
+            )?;
+        }
         tx.execute_batch(&format!("PRAGMA application_id = {SCHEMA_VERSION}"))?;
         tx.commit()?;
         tracing::info!(
@@ -135,6 +152,82 @@ impl BillingStore for SqliteBillingStore {
         })
         .ok()
         .flatten()
+    }
+
+    fn record_subscription(
+        &self,
+        customer_id: &str,
+        state: &SubscriptionState,
+    ) -> Result<(), BillingStoreError> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE stripe_customers
+                    SET subscription_id     = ?1,
+                        subscription_status = ?2,
+                        price_id            = ?3,
+                        updated_at          = ?4
+                  WHERE customer_id = ?5",
+                params![
+                    state.subscription_id,
+                    state.status,
+                    state.price_id,
+                    state.updated_at,
+                    customer_id,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn get_subscription(&self, customer_id: &str) -> Option<SubscriptionState> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT subscription_id, subscription_status, price_id, updated_at
+                   FROM stripe_customers
+                  WHERE customer_id = ?1",
+                params![customer_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+        })
+        .ok()
+        .flatten()
+        .and_then(|(sid, status, price_id, updated_at)| {
+            // A row exists but no webhook event has updated it yet →
+            // no subscription state.
+            match (sid, status, updated_at) {
+                (Some(subscription_id), Some(status), Some(updated_at)) => {
+                    Some(SubscriptionState {
+                        subscription_id,
+                        status,
+                        price_id,
+                        updated_at,
+                    })
+                }
+                _ => None,
+            }
+        })
+    }
+
+    fn org_by_customer(&self, customer_id: &str) -> Option<OrgId> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT org FROM stripe_customers WHERE customer_id = ?1",
+                params![customer_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        })
+        .ok()
+        .flatten()
+        .map(|s| OrgId::new(&s))
     }
 }
 
@@ -189,5 +282,58 @@ mod tests {
         let _ = SqliteBillingStore::open(&path).unwrap();
         let _ = SqliteBillingStore::open(&path).unwrap();
         let _ = SqliteBillingStore::open(&path).unwrap();
+    }
+
+    #[test]
+    fn subscription_round_trips_through_sqlite() {
+        let dir = tempdir().unwrap();
+        let store = SqliteBillingStore::open(dir.path().join("b.sqlite")).unwrap();
+        store
+            .record_customer(&OrgId::new("acme"), "cus_ACME")
+            .unwrap();
+        let sub = SubscriptionState {
+            subscription_id: "sub_A".into(),
+            status: "active".into(),
+            price_id: Some("price_PRO".into()),
+            updated_at: "2026-07-10T00:00:00Z".into(),
+        };
+        store.record_subscription("cus_ACME", &sub).unwrap();
+        assert_eq!(store.get_subscription("cus_ACME"), Some(sub));
+        assert_eq!(store.org_by_customer("cus_ACME"), Some(OrgId::new("acme")));
+    }
+
+    #[test]
+    fn no_subscription_yet_returns_none() {
+        let dir = tempdir().unwrap();
+        let store = SqliteBillingStore::open(dir.path().join("b.sqlite")).unwrap();
+        store
+            .record_customer(&OrgId::new("acme"), "cus_ACME")
+            .unwrap();
+        assert!(store.get_subscription("cus_ACME").is_none());
+    }
+
+    #[test]
+    fn subscription_survives_reopening_the_same_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("b.sqlite");
+        {
+            let s = SqliteBillingStore::open(&path).unwrap();
+            s.record_customer(&OrgId::new("acme"), "cus_ACME").unwrap();
+            s.record_subscription(
+                "cus_ACME",
+                &SubscriptionState {
+                    subscription_id: "sub_A".into(),
+                    status: "active".into(),
+                    price_id: Some("price_PRO".into()),
+                    updated_at: "2026-07-10T00:00:00Z".into(),
+                },
+            )
+            .unwrap();
+        }
+        let reopened = SqliteBillingStore::open(&path).unwrap();
+        let sub = reopened.get_subscription("cus_ACME").unwrap();
+        assert_eq!(sub.status, "active");
+        assert_eq!(sub.subscription_id, "sub_A");
+        assert_eq!(sub.price_id.as_deref(), Some("price_PRO"));
     }
 }
