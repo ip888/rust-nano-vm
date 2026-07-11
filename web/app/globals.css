@@ -1,0 +1,24 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Body defaults — kept plain so utility classes on the layout do the
+ * real work. Dark mode uses the same accent hues; the surface tone
+ * flips via CSS custom props further down. */
+:root {
+  color-scheme: light dark;
+}
+
+html,
+body {
+  background: #f7f8fb;
+  color: #111827;
+}
+
+@media (prefers-color-scheme: dark) {
+  html,
+  body {
+    background: #0b1220;
+    color: #e5e7eb;
+  }
+}
