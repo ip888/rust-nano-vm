@@ -399,6 +399,86 @@ pub fn router() -> Router<AppState> {
         // extensions; tracing logs inherit the id via the span.
         .layer(middleware::from_fn(request_id::with_request_id))
         .layer(TraceLayer::new_for_http())
+        // CORS goes OUTSIDE the request-id layer so a browser preflight
+        // (OPTIONS with no bearer) doesn't allocate a request-id it
+        // never uses. When `NANOVM_CORS_ORIGIN` is unset (default), the
+        // returned layer is a no-op — same behaviour as before.
+        .layer(cors_layer_from_env())
+}
+
+/// Build a `CorsLayer` from `NANOVM_CORS_ORIGIN`. Accepts:
+///
+/// - **unset** or empty → returns a permissive-nothing layer that
+///   does not touch the response (effectively disabled). Same shape
+///   as pre-CORS builds.
+/// - **comma-separated list of origins** (e.g. `https://app.nanovm.io,
+///   http://localhost:3000`) → each origin is allow-listed
+///   individually. Credentials (cookies, `Authorization` header) are
+///   allowed. Preflight cache is 1 hour.
+/// - the sentinel `*` → allow any origin. Only sensible for
+///   fully-public read APIs; `Authorization: Bearer …` requests will
+///   still work because credentials are NOT sent under `*`.
+///
+/// Rejects an origin with a malformed URL by logging and skipping —
+/// the whole config isn't torn down because one entry is bad.
+fn cors_layer_from_env() -> tower_http::cors::CorsLayer {
+    let raw = std::env::var("NANOVM_CORS_ORIGIN").unwrap_or_default();
+    cors_layer_from(&raw)
+}
+
+/// Same as [`cors_layer_from_env`] but takes the raw config value
+/// directly. Split out so tests can exercise the parser without
+/// mutating process env (workspace forbids `unsafe`).
+pub fn cors_layer_from(raw: &str) -> tower_http::cors::CorsLayer {
+    use axum::http::{HeaderValue, Method};
+    use tower_http::cors::{AllowOrigin, CorsLayer};
+
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return CorsLayer::new(); // no-op
+    }
+    let base = CorsLayer::new()
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::ACCEPT,
+        ])
+        .max_age(std::time::Duration::from_secs(3600));
+    if raw == "*" {
+        // `Any` origin + credentials is a CORS spec violation — a
+        // browser drops the response. Deliberately allow the origin
+        // without credentials so public GETs (like /openapi.json) work
+        // from any tab.
+        return base.allow_origin(AllowOrigin::any());
+    }
+    let mut origins: Vec<HeaderValue> = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        match HeaderValue::from_str(entry) {
+            Ok(v) => origins.push(v),
+            Err(e) => tracing::warn!(
+                error = %e,
+                origin = entry,
+                "NANOVM_CORS_ORIGIN: skipping malformed origin"
+            ),
+        }
+    }
+    if origins.is_empty() {
+        return CorsLayer::new(); // all entries were malformed
+    }
+    base.allow_origin(AllowOrigin::list(origins))
+        .allow_credentials(true)
 }
 
 async fn healthz() -> &'static str {

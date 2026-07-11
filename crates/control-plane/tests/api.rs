@@ -2975,3 +2975,93 @@ async fn exec_stream_rejects_cross_org_vm() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"]["code"], "cross_org");
 }
+
+// -------- CORS -----------------------------------------------------
+
+#[tokio::test]
+async fn cors_default_is_off_no_allow_origin_header() {
+    // NANOVM_CORS_ORIGIN is unset in the test env, so the CORS layer
+    // is a no-op — a browser-style preflight must not receive an
+    // Access-Control-Allow-Origin header. This locks the "opt-in"
+    // posture: an operator who does nothing gets no CORS behavior.
+    let app = app();
+    let req = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/healthz")
+        .header("origin", "https://evil.example")
+        .header("access-control-request-method", "GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(
+        resp.headers().get("access-control-allow-origin").is_none(),
+        "CORS must be off by default"
+    );
+}
+
+#[tokio::test]
+async fn cors_layer_with_wildcard_echoes_any_origin() {
+    // Build a router with an explicit wildcard-CORS layer via the
+    // `cors_layer_from` helper (bypasses env). Confirm a preflight
+    // gets the wildcard.
+    use control_plane::cors_layer_from;
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    let app = router()
+        .layer(Extension(Arc::new(ApiTokens::default())))
+        .with_state(AppState::new(hv))
+        .layer(cors_layer_from("*"));
+    let req = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/healthz")
+        .header("origin", "https://any.example")
+        .header("access-control-request-method", "GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let allow = resp
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert_eq!(allow, "*", "wildcard config should emit `*`");
+}
+
+#[tokio::test]
+async fn cors_layer_with_explicit_origin_echoes_that_origin_only() {
+    use control_plane::cors_layer_from;
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    let app = router()
+        .layer(Extension(Arc::new(ApiTokens::default())))
+        .with_state(AppState::new(hv))
+        .layer(cors_layer_from("https://app.nanovm.io"));
+    // Allowed origin — preflight succeeds with echoed value.
+    let req = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/healthz")
+        .header("origin", "https://app.nanovm.io")
+        .header("access-control-request-method", "GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default(),
+        "https://app.nanovm.io"
+    );
+    // Different origin — layer must NOT emit an
+    // Access-Control-Allow-Origin, so the browser blocks the request.
+    let req = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/healthz")
+        .header("origin", "https://evil.example")
+        .header("access-control-request-method", "GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(
+        resp.headers().get("access-control-allow-origin").is_none(),
+        "non-listed origin must NOT be echoed"
+    );
+}

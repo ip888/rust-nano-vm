@@ -54,6 +54,13 @@
 //!   `http://localhost:8080/v1/signup/verify` (dev only).
 //! - `NANOVM_SIGNUP_TOKEN_TTL_SECS` — magic-link lifetime. Default
 //!   `900` (15 min).
+//! - `NANOVM_CORS_ORIGIN` — comma-separated list of origins allowed
+//!   to hit the API from a browser (e.g.
+//!   `https://app.your-saas.com,http://localhost:3000`). Special
+//!   value `*` allows any origin (credentials are then dropped —
+//!   fine for public read-only surfaces). Unset → no CORS headers
+//!   emitted (server-to-server calls unaffected; browsers can't
+//!   reach the API). Prereq for the web dashboard.
 //! - `NANOVM_BILLING_REPORT_SECS` — enable the metered-billing
 //!   reporter and set its tick interval. Unset / `0` → disabled (no
 //!   background task, no Stripe traffic). Typical prod: `60`. Only
