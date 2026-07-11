@@ -1,7 +1,13 @@
 #!/bin/sh
-# Fetch a pinned Firecracker sample kernel + rootfs pair suitable for
-# booting a Linux microVM. Verifies SHA-256 checksums so a compromised
-# CDN can't inject an image.
+# Fetch a Firecracker sample kernel + rootfs pair suitable for booting a
+# Linux microVM.
+#
+# Currently the SHA-256 checksums below are set to `SKIP` — this is a
+# bootstrap posture, NOT a shipping posture. Pinning real digests is a
+# follow-up: capture the checksums from a known-good run, wire them
+# into `KERNEL_SHA`/`ROOTFS_SHA` below (see the comment on those
+# variables), and bump `SCHEMA_VERSION` so a stale Docker cache
+# rebuilds. Until then, a compromised CDN could substitute the image.
 #
 # Called from `Dockerfile.kvm`'s builder stage. Can also be run by an
 # operator on the host to populate a directory the KVM binary is
@@ -23,12 +29,15 @@ set -eu
 
 SCHEMA_VERSION=1
 
-# Pinned URLs + SHA-256 checksums. Verify with:
+# Pinned URLs. The `*_SHA` values are set to `SKIP` intentionally: this
+# is the bootstrap posture. Capture the real digest with:
 #   curl -L "$URL" | sha256sum
+# then replace `SKIP` here and bump `SCHEMA_VERSION`. `fetch_verify`
+# treats `SKIP` as "warn + continue" and any hex value as "enforce".
 KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/img/hello/kernel/hello-vmlinux.bin"
-KERNEL_SHA="a5bfd85c1b7f4f5f9e9c37c9f6cfc6dab72e1a52b1a30e1b8f6f1b5f5a1c1f1a"
+KERNEL_SHA="SKIP"
 ROOTFS_URL="https://s3.amazonaws.com/spec.ccfc.min/img/hello/fsfiles/hello-rootfs.ext4"
-ROOTFS_SHA="4a1e6f0e6f0a5f8f5f9e9c37c9f6cfc6dab72e1a52b1a30e1b8f6f1b5f5a1c1f1"
+ROOTFS_SHA="SKIP"
 
 if [ $# -ne 1 ]; then
     printf 'usage: %s <target-dir>\n' "$0" >&2
@@ -65,10 +74,10 @@ fetch_verify() {
     printf '✓ %s (%s)\n' "$dest" "$(du -h "$dest" | awk '{print $1}')" >&2
 }
 
-# NB: the SHA-256s above are placeholders. Set them to SKIP for the
-# first bootstrap; a follow-up PR pins the real values captured from
-# a known-good run. See tools/kvm-images/README.md for the workflow.
-fetch_verify "$KERNEL_URL" "SKIP" "$TARGET/vmlinux"
-fetch_verify "$ROOTFS_URL" "SKIP" "$TARGET/rootfs.ext4"
+# See the header comment on `KERNEL_SHA`/`ROOTFS_SHA` for the pinning
+# workflow. Threading the variables through here (rather than hard-coding
+# `SKIP`) means flipping to real digests is a one-line change at the top.
+fetch_verify "$KERNEL_URL" "$KERNEL_SHA" "$TARGET/vmlinux"
+fetch_verify "$ROOTFS_URL" "$ROOTFS_SHA" "$TARGET/rootfs.ext4"
 
 printf '\ndone. schema version: %s\n' "$SCHEMA_VERSION" >&2

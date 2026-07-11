@@ -347,10 +347,20 @@ pub fn router() -> Router<AppState> {
     // Stripe webhook — also outside tenant auth. The caller is Stripe;
     // authentication is HMAC-SHA256 of the payload against
     // STRIPE_WEBHOOK_SIGNING_SECRET, verified inside the handler.
+    //
+    // Per-route body-size limit is critical here: the endpoint is
+    // unauthenticated (only HMAC-verified *after* the body is fully
+    // buffered) and the handler eagerly loads the payload into
+    // `axum::body::Bytes`. Without a cap, an attacker could send an
+    // arbitrarily large body and force the server to allocate it before
+    // the HMAC check ever runs. 64 KiB is orders of magnitude larger
+    // than any real Stripe event payload (largest known invoice event
+    // is ~10 KiB); tune up only if a legitimate event trips the limit.
     #[cfg(feature = "billing")]
     let v1 = v1.route(
         "/stripe/webhook",
-        post(crate::billing::stripe_webhook_handler),
+        post(crate::billing::stripe_webhook_handler)
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
     );
 
     Router::new()
@@ -399,7 +409,10 @@ async fn create_vm(
 ) -> Result<(StatusCode, Json<VmHandleDto>), ApiError> {
     let Json(req) = body?;
     // Server-side defaults (from `NANOVM_DEFAULT_*`) fill any field the
-    // request left unset. Request wins on every field that IS set.
+    // request left unset. For `kernel`/`rootfs` a set field wins over
+    // the default; for `cmdline` an empty string is treated as "unset"
+    // (the wire type can't tell "omitted" from "explicit empty") and
+    // falls through to the default. See `VmConfigDefaults::apply_to`.
     // This is what makes `POST /v1/vms {}` succeed on a KVM image with
     // bundled kernel + rootfs.
     let mut cfg: vm_core::VmConfig = req.into();
@@ -581,9 +594,10 @@ async fn fork_snapshot(
     //
     // Two independent buckets: per-token (runaway-key safety net) and
     // per-org (tier enforcement). Either failing throttles the request.
-    // The tier lookup is billing-feature-gated; non-billing builds fall
-    // back to the env default per-org.
-    let (tier_rps, tier_burst) = resolve_tier_limits(&state, &org);
+    // We check per-token first because it's a pure HashMap-lookup +
+    // arithmetic; only if that passes do we consult BillingStore for
+    // the tier lookup. That way a runaway key exhausting its bucket
+    // returns 429 without hitting the billing store on every request.
     if let Err(retry_after_secs) = state.fork_quota.try_acquire(bearer.as_deref()) {
         let fp = bearer
             .as_deref()
@@ -596,6 +610,7 @@ async fn fork_snapshot(
             retry_after_secs,
         });
     }
+    let (tier_rps, tier_burst) = resolve_tier_limits(&state, &org);
     if let Err(retry_after_secs) =
         state
             .fork_quota

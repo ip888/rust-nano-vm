@@ -136,14 +136,18 @@ impl ForkQuota {
         if self.is_disabled() {
             return Ok(());
         }
-        // A mis-configured tier (rps <= 0 or NaN) must not divide by
-        // zero downstream, so we ignore such overrides and fall back to
-        // the env default. `self.rps` is guaranteed > 0 here because
-        // `is_disabled()` above already short-circuited the zero case.
+        // A mis-configured tier (rps <= 0 or NaN, or burst = 0) must not
+        // divide by zero or permanently deny the caller — ignore such
+        // overrides and fall back to the env default. `self.rps` is
+        // guaranteed > 0 here because `is_disabled()` above already
+        // short-circuited the zero case.
         let rps = rps_override
             .filter(|v| v.is_finite() && *v > 0.0)
             .unwrap_or(self.rps);
-        let burst = burst_override.map(f64::from).unwrap_or(self.burst);
+        let burst = burst_override
+            .filter(|b| *b > 0)
+            .map(f64::from)
+            .unwrap_or(self.burst);
         let mut buckets = self.org_buckets.lock().expect("fork-quota mutex poisoned");
         take_one(&mut buckets, org, rps, burst)
     }

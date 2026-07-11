@@ -159,7 +159,7 @@ impl BillingStore for SqliteBillingStore {
         customer_id: &str,
         state: &SubscriptionState,
     ) -> Result<(), BillingStoreError> {
-        self.with_conn(|c| {
+        let updated = self.with_conn(|c| {
             c.execute(
                 "UPDATE stripe_customers
                     SET subscription_id     = ?1,
@@ -174,9 +174,20 @@ impl BillingStore for SqliteBillingStore {
                     state.updated_at,
                     customer_id,
                 ],
-            )?;
-            Ok(())
-        })
+            )
+        })?;
+        if updated == 0 {
+            // Webhook arrived for a customer we never persisted (signup
+            // crashed after Stripe returned, or the event was replayed
+            // against a fresh SQLite file). Returning Ok would silently
+            // drop the state and make the caller log "recorded" for a
+            // no-op — surface the miss so ops sees it in tracing +
+            // metrics rather than only in a future support ticket.
+            return Err(BillingStoreError::Backend(format!(
+                "record_subscription: no stripe_customers row for customer_id={customer_id:?}"
+            )));
+        }
+        Ok(())
     }
 
     fn get_subscription(&self, customer_id: &str) -> Option<SubscriptionState> {
