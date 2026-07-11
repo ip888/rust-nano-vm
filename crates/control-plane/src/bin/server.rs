@@ -54,6 +54,15 @@
 //!   `http://localhost:8080/v1/signup/verify` (dev only).
 //! - `NANOVM_SIGNUP_TOKEN_TTL_SECS` — magic-link lifetime. Default
 //!   `900` (15 min).
+//! - `NANOVM_BILLING_REPORT_SECS` — enable the metered-billing
+//!   reporter and set its tick interval. Unset / `0` → disabled (no
+//!   background task, no Stripe traffic). Typical prod: `60`. Only
+//!   effective when `--features billing` is on AND
+//!   `BillingConfig::from_env()` returned `Some`. Reports
+//!   `nanovm_forks_total_by_org` deltas to Stripe `usage_records`
+//!   with `action=increment`; the primary subscription item id
+//!   (`si_…`) comes from the persisted subscription state that the
+//!   webhook handler populated.
 //! - `NANOVM_DEFAULT_KERNEL_PATH` — absolute path to the kernel image
 //!   used as the fallback when `POST /v1/vms` omits `kernel`. Set to
 //!   `/usr/local/share/nanovm/vmlinux` by `Dockerfile.kvm` so
@@ -220,6 +229,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "billing")]
     let state = state.with_billing(billing_ctx);
 
+    // Metered-billing reporter. Off by default. Enabled when
+    // NANOVM_BILLING_REPORT_SECS is set to a positive integer AND
+    // BillingCtx is Some. The handle is held for the process lifetime;
+    // the graceful-shutdown branch runs first and lets in-flight HTTP
+    // finish, then this handle drops, stopping the reporter.
+    #[cfg(feature = "billing")]
+    let _reporter_handle = spawn_billing_reporter_if_configured(&state);
+
     let app = router()
         .layer(Extension(tokens))
         .layer(Extension(audit))
@@ -232,6 +249,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Wire the metered-billing reporter if billing is configured AND
+/// `NANOVM_BILLING_REPORT_SECS` is set. Returns `None` in every other
+/// case (silently — `NANOVM_BILLING_REPORT_SECS` unset is normal for
+/// dev / self-hosted).
+#[cfg(feature = "billing")]
+fn spawn_billing_reporter_if_configured(
+    state: &AppState,
+) -> Option<control_plane::billing::UsageReporterHandle> {
+    let config = control_plane::billing::UsageReporterConfig::from_env()?;
+    let ctx = state.billing_ctx_pub()?;
+    info!(
+        interval_secs = config.interval.as_secs(),
+        "metered-billing reporter enabled"
+    );
+    Some(control_plane::billing::usage_reporter::spawn(
+        config,
+        Arc::clone(state.metrics()),
+        Arc::clone(&ctx.store),
+        Arc::clone(&ctx.stripe),
+    ))
 }
 
 /// `(Hypervisor handle, static backend label)` — the build_hypervisor

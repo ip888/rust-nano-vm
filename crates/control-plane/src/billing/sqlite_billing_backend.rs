@@ -30,7 +30,9 @@ use super::{BillingStore, BillingStoreError, PendingSignup, SubscriptionState};
 /// - v2 → v3 adds `pending_signups` so `POST /v1/signup/request` can
 ///   store a magic-link token (hashed) that `POST /v1/signup/verify`
 ///   later consumes atomically.
-const SCHEMA_VERSION: u32 = 3;
+/// - v3 → v4 adds `subscription_item_id` to `stripe_customers` so the
+///   metered-usage reporter can POST `usage_records` per customer.
+const SCHEMA_VERSION: u32 = 4;
 
 /// SQLite-backed [`BillingStore`].
 #[derive(Debug)]
@@ -130,6 +132,14 @@ impl SqliteBillingStore {
                      ON pending_signups(expires_at);",
             )?;
         }
+        if current < 4 {
+            // v3 → v4: add subscription_item_id column. Existing rows
+            // land as NULL — the reporter treats that as "no meter
+            // configured for this customer yet" and no-ops until
+            // Stripe re-sends `customer.subscription.updated` (which
+            // it does on every billing-period roll).
+            tx.execute_batch("ALTER TABLE stripe_customers ADD COLUMN subscription_item_id TEXT;")?;
+        }
         tx.execute_batch(&format!("PRAGMA application_id = {SCHEMA_VERSION}"))?;
         tx.commit()?;
         tracing::info!(
@@ -185,16 +195,18 @@ impl BillingStore for SqliteBillingStore {
         let updated = self.with_conn(|c| {
             c.execute(
                 "UPDATE stripe_customers
-                    SET subscription_id     = ?1,
-                        subscription_status = ?2,
-                        price_id            = ?3,
-                        updated_at          = ?4
-                  WHERE customer_id = ?5",
+                    SET subscription_id      = ?1,
+                        subscription_status  = ?2,
+                        price_id             = ?3,
+                        updated_at           = ?4,
+                        subscription_item_id = ?5
+                  WHERE customer_id = ?6",
                 params![
                     state.subscription_id,
                     state.status,
                     state.price_id,
                     state.updated_at,
+                    state.subscription_item_id,
                     customer_id,
                 ],
             )
@@ -216,7 +228,8 @@ impl BillingStore for SqliteBillingStore {
     fn get_subscription(&self, customer_id: &str) -> Option<SubscriptionState> {
         self.with_conn(|c| {
             c.query_row(
-                "SELECT subscription_id, subscription_status, price_id, updated_at
+                "SELECT subscription_id, subscription_status, price_id,
+                        updated_at, subscription_item_id
                    FROM stripe_customers
                   WHERE customer_id = ?1",
                 params![customer_id],
@@ -226,6 +239,7 @@ impl BillingStore for SqliteBillingStore {
                         r.get::<_, Option<String>>(1)?,
                         r.get::<_, Option<String>>(2)?,
                         r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
@@ -233,21 +247,24 @@ impl BillingStore for SqliteBillingStore {
         })
         .ok()
         .flatten()
-        .and_then(|(sid, status, price_id, updated_at)| {
-            // A row exists but no webhook event has updated it yet →
-            // no subscription state.
-            match (sid, status, updated_at) {
-                (Some(subscription_id), Some(status), Some(updated_at)) => {
-                    Some(SubscriptionState {
-                        subscription_id,
-                        status,
-                        price_id,
-                        updated_at,
-                    })
+        .and_then(
+            |(sid, status, price_id, updated_at, subscription_item_id)| {
+                // A row exists but no webhook event has updated it yet →
+                // no subscription state.
+                match (sid, status, updated_at) {
+                    (Some(subscription_id), Some(status), Some(updated_at)) => {
+                        Some(SubscriptionState {
+                            subscription_id,
+                            status,
+                            price_id,
+                            subscription_item_id,
+                            updated_at,
+                        })
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
-        })
+            },
+        )
     }
 
     fn org_by_customer(&self, customer_id: &str) -> Option<OrgId> {
@@ -403,6 +420,7 @@ mod tests {
             subscription_id: "sub_A".into(),
             status: "active".into(),
             price_id: Some("price_PRO".into()),
+            subscription_item_id: None,
             updated_at: "2026-07-10T00:00:00Z".into(),
         };
         store.record_subscription("cus_ACME", &sub).unwrap();
@@ -511,6 +529,7 @@ mod tests {
                     subscription_id: "sub_A".into(),
                     status: "active".into(),
                     price_id: Some("price_PRO".into()),
+                    subscription_item_id: None,
                     updated_at: "2026-07-10T00:00:00Z".into(),
                 },
             )
