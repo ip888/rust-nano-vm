@@ -1174,7 +1174,11 @@ async fn fork_returns_429_with_retry_after_when_quota_exhausted() {
 }
 
 #[tokio::test]
-async fn fork_quota_is_per_token() {
+async fn fork_quota_org_bucket_is_shared_across_tokens_of_the_same_org() {
+    // Two tokens for the SAME org must share the per-org bucket —
+    // otherwise a customer could just mint more tokens to bypass their
+    // plan-tier fork ceiling. Alpha exhausts the org bucket (burst=1);
+    // beta then hits 429 even though its per-token bucket is untouched.
     let app = app_with_tight_quota(ApiTokens::from_csv("alpha,beta"));
     let snap = snapshot_a_fresh_vm(&app, Some("alpha")).await;
     let path = format!("/v1/snapshots/{snap}/fork");
@@ -1182,14 +1186,19 @@ async fn fork_quota_is_per_token() {
     let (sa, _) = send_with(app.clone(), Method::POST, &path, None, Some("alpha")).await;
     assert_eq!(sa, StatusCode::CREATED);
 
-    // beta's bucket is untouched — should pass.
+    // beta shares the default org bucket — that's now empty.
     let (sb, _) = send_with(app.clone(), Method::POST, &path, None, Some("beta")).await;
-    assert_eq!(sb, StatusCode::CREATED);
+    assert_eq!(sb, StatusCode::TOO_MANY_REQUESTS);
 
-    // alpha is now throttled.
+    // alpha is also throttled (both by its per-token bucket and the org bucket).
     let (sa2, _) = send_with(app.clone(), Method::POST, &path, None, Some("alpha")).await;
     assert_eq!(sa2, StatusCode::TOO_MANY_REQUESTS);
 }
+
+// Cross-org isolation of the per-org bucket is covered by unit tests
+// in fork_quota.rs (`org_buckets_are_isolated_between_orgs`) — an
+// integration equivalent would need a separate snapshot per org
+// (ownership prevents cross-org fork), which adds no coverage.
 
 #[tokio::test]
 async fn fork_with_disabled_quota_passes_through() {
