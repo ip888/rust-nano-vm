@@ -21,13 +21,16 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::auth::OrgId;
 
-use super::{BillingStore, BillingStoreError, SubscriptionState};
+use super::{BillingStore, BillingStoreError, PendingSignup, SubscriptionState};
 
 /// Schema version for the billing table.
 ///
-/// v1 → v2 adds subscription columns to `stripe_customers` so the
-/// webhook handler can persist `customer.subscription.*` state.
-const SCHEMA_VERSION: u32 = 2;
+/// - v1 → v2 adds subscription columns to `stripe_customers` so the
+///   webhook handler can persist `customer.subscription.*` state.
+/// - v2 → v3 adds `pending_signups` so `POST /v1/signup/request` can
+///   store a magic-link token (hashed) that `POST /v1/signup/verify`
+///   later consumes atomically.
+const SCHEMA_VERSION: u32 = 3;
 
 /// SQLite-backed [`BillingStore`].
 #[derive(Debug)]
@@ -105,6 +108,26 @@ impl SqliteBillingStore {
                  ALTER TABLE stripe_customers ADD COLUMN updated_at TEXT;
                  CREATE UNIQUE INDEX IF NOT EXISTS stripe_customers_by_customer_id
                      ON stripe_customers(customer_id);",
+            )?;
+        }
+        if current < 3 {
+            // v2 → v3: `pending_signups` for self-serve magic-link flow.
+            // token_hash is the SHA-256 hex of the token that was mailed;
+            // the raw token never enters this table.
+            //
+            // UNIQUE on email so re-requesting a signup for the same
+            // address replaces the prior row (via ON CONFLICT below),
+            // never leaves two live tokens for one address.
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS pending_signups (
+                    token_hash TEXT PRIMARY KEY,
+                    email      TEXT NOT NULL UNIQUE,
+                    org_name   TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
+                 CREATE INDEX IF NOT EXISTS pending_signups_by_expires_at
+                     ON pending_signups(expires_at);",
             )?;
         }
         tx.execute_batch(&format!("PRAGMA application_id = {SCHEMA_VERSION}"))?;
@@ -240,6 +263,80 @@ impl BillingStore for SqliteBillingStore {
         .flatten()
         .map(|s| OrgId::new(&s))
     }
+
+    fn record_pending_signup(&self, signup: &PendingSignup) -> Result<(), BillingStoreError> {
+        // ON CONFLICT on `email` UPSERTs, so re-requesting a signup for
+        // the same email replaces the prior token_hash rather than
+        // leaving both live. ON CONFLICT on `token_hash` (the PK) covers
+        // the extremely unlikely collision case.
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO pending_signups
+                    (token_hash, email, org_name, created_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(email) DO UPDATE SET
+                    token_hash = excluded.token_hash,
+                    org_name   = excluded.org_name,
+                    created_at = excluded.created_at,
+                    expires_at = excluded.expires_at",
+                params![
+                    signup.token_hash,
+                    signup.email,
+                    signup.org_name,
+                    signup.created_at,
+                    signup.expires_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn take_pending_signup(&self, token_hash: &str, now: &str) -> Option<PendingSignup> {
+        let mut guard = self.conn.lock().ok()?;
+        let tx = guard.transaction().ok()?;
+        // SELECT then DELETE inside the same transaction — SQLite's
+        // WAL mode + BEGIN IMMEDIATE (default here) means a concurrent
+        // verify against the same token blocks until we commit, so the
+        // token can be redeemed at most once. WHERE guards on
+        // expires_at so an expired row is treated as absent even if
+        // GC hasn't run yet.
+        let row = tx
+            .query_row(
+                "SELECT email, org_name, created_at, expires_at
+                   FROM pending_signups
+                  WHERE token_hash = ?1 AND expires_at >= ?2",
+                params![token_hash, now],
+                |r| {
+                    Ok(PendingSignup {
+                        token_hash: token_hash.to_owned(),
+                        email: r.get::<_, String>(0)?,
+                        org_name: r.get::<_, String>(1)?,
+                        created_at: r.get::<_, String>(2)?,
+                        expires_at: r.get::<_, String>(3)?,
+                    })
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        tx.execute(
+            "DELETE FROM pending_signups WHERE token_hash = ?1",
+            params![token_hash],
+        )
+        .ok()?;
+        tx.commit().ok()?;
+        Some(row)
+    }
+
+    fn gc_expired_signups(&self, now: &str) -> Result<u64, BillingStoreError> {
+        let deleted = self.with_conn(|c| {
+            c.execute(
+                "DELETE FROM pending_signups WHERE expires_at < ?1",
+                params![now],
+            )
+        })?;
+        Ok(deleted as u64)
+    }
 }
 
 #[cfg(test)]
@@ -321,6 +418,84 @@ mod tests {
             .record_customer(&OrgId::new("acme"), "cus_ACME")
             .unwrap();
         assert!(store.get_subscription("cus_ACME").is_none());
+    }
+
+    #[test]
+    fn pending_signup_round_trips_through_sqlite() {
+        let dir = tempdir().unwrap();
+        let store = SqliteBillingStore::open(dir.path().join("b.sqlite")).unwrap();
+        let signup = PendingSignup {
+            token_hash: "abc123".into(),
+            email: "a@example.com".into(),
+            org_name: "Acme".into(),
+            created_at: "2026-07-10T00:00:00.000Z".into(),
+            expires_at: "2999-01-01T00:00:00.000Z".into(),
+        };
+        store.record_pending_signup(&signup).unwrap();
+        let taken = store
+            .take_pending_signup(&signup.token_hash, "2026-07-11T00:00:00.000Z")
+            .expect("row exists and not yet expired");
+        assert_eq!(taken.email, "a@example.com");
+        // Second take → consumed.
+        assert!(store
+            .take_pending_signup(&signup.token_hash, "2026-07-11T00:00:00.000Z")
+            .is_none());
+    }
+
+    #[test]
+    fn pending_signup_expiry_short_circuits_take() {
+        let dir = tempdir().unwrap();
+        let store = SqliteBillingStore::open(dir.path().join("b.sqlite")).unwrap();
+        let signup = PendingSignup {
+            token_hash: "abc123".into(),
+            email: "a@example.com".into(),
+            org_name: "Acme".into(),
+            created_at: "2020-01-01T00:00:00.000Z".into(),
+            expires_at: "2020-01-01T00:00:01.000Z".into(),
+        };
+        store.record_pending_signup(&signup).unwrap();
+        // `now` past expiry: take returns None; row is NOT deleted
+        // by take (leave that to GC).
+        assert!(store
+            .take_pending_signup(&signup.token_hash, "2020-01-01T00:00:02.000Z")
+            .is_none());
+        // GC picks it up.
+        assert_eq!(
+            store
+                .gc_expired_signups("2020-01-01T00:00:02.000Z")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn re_request_replaces_prior_token_for_same_email_via_upsert() {
+        let dir = tempdir().unwrap();
+        let store = SqliteBillingStore::open(dir.path().join("b.sqlite")).unwrap();
+        let a = PendingSignup {
+            token_hash: "hash-a".into(),
+            email: "same@example.com".into(),
+            org_name: "Acme".into(),
+            created_at: "2026-07-10T00:00:00.000Z".into(),
+            expires_at: "2999-01-01T00:00:00.000Z".into(),
+        };
+        let b = PendingSignup {
+            token_hash: "hash-b".into(),
+            email: "same@example.com".into(),
+            org_name: "Acme".into(),
+            created_at: "2026-07-10T00:00:01.000Z".into(),
+            expires_at: "2999-01-01T00:00:00.000Z".into(),
+        };
+        store.record_pending_signup(&a).unwrap();
+        store.record_pending_signup(&b).unwrap();
+        // Old token invalid — the UNIQUE(email) upsert replaced the row.
+        assert!(store
+            .take_pending_signup("hash-a", "2026-07-11T00:00:00.000Z")
+            .is_none());
+        // New token good.
+        assert!(store
+            .take_pending_signup("hash-b", "2026-07-11T00:00:00.000Z")
+            .is_some());
     }
 
     #[test]

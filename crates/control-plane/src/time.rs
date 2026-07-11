@@ -11,11 +11,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// millisecond precision and a literal `Z` (UTC) suffix:
 /// `YYYY-MM-DDTHH:MM:SS.mmmZ`. 24 characters, always.
 pub(crate) fn rfc3339_now() -> String {
+    rfc3339_offset(0)
+}
+
+/// Wall-clock time offset by `offset_secs` seconds, in the same RFC
+/// 3339 shape as [`rfc3339_now`]. Negative offsets are supported;
+/// underflow past the epoch clamps to `1970-01-01T00:00:00.000Z`.
+/// Used for computing token expiry timestamps that can be lexicographically
+/// compared with other RFC 3339 UTC strings.
+pub(crate) fn rfc3339_offset(offset_secs: i64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let secs = now.as_secs();
     let millis = now.subsec_millis();
+    // i64 + u64 → do arithmetic in i64 with saturating, then clamp
+    // to 0. Underflow past epoch → 0 (we never emit negative years).
+    let secs = (now.as_secs() as i64).saturating_add(offset_secs).max(0) as u64;
     let (year, month, day) = civil_from_days((secs / 86_400) as i64);
     let s_of_day = (secs % 86_400) as u32;
     let h = s_of_day / 3600;

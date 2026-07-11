@@ -55,6 +55,10 @@ reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots"], op
 # directly keeps the billing module's use explicit + testable.
 hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
+# OS RNG for magic-link signup tokens. `getrandom` is transitively in
+# the tree via reqwest/rustls; declaring 0.2 explicitly keeps the API
+# stable across upstream churn (0.3+ renamed the entry point).
+getrandom = { version = "0.2", optional = true }
 
 [features]
 default = []
@@ -72,7 +76,7 @@ sqlite = ["dep:rusqlite"]
 # `sqlite` (Stripe customer_id needs to survive control-plane
 # restart). Wire STRIPE_SECRET_KEY, STRIPE_BILLING_PORTAL_RETURN_URL,
 # NANOVM_SIGNUP_TOKEN at deploy time.
-billing = ["dep:reqwest", "dep:hmac", "dep:sha2", "sqlite"]
+billing = ["dep:reqwest", "dep:hmac", "dep:sha2", "dep:getrandom", "sqlite"]
 
 [dev-dependencies]
 base64.workspace = true
