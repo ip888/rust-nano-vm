@@ -82,6 +82,37 @@ pub struct PortalResponse {
     pub url: String,
 }
 
+/// `POST /v1/signup/request` request body — the self-serve entrypoint.
+/// No admin bearer required; server-side rate-limited per IP.
+#[derive(Debug, Deserialize)]
+pub struct SignupRequestRequest {
+    /// Email to send the magic link to. Also becomes the Stripe
+    /// customer's `email`.
+    pub email: String,
+    /// Human-readable org name. Slugified server-side to the internal
+    /// `OrgId` on activation.
+    pub org: String,
+}
+
+/// `POST /v1/signup/request` response — deliberately opaque about
+/// whether the email exists. The client is told "if that address is
+/// eligible, check your inbox" regardless of validity so an attacker
+/// can't enumerate registered addresses by watching the response.
+#[derive(Debug, Serialize)]
+pub struct SignupRequestResponse {
+    /// Constant string. Always the same value regardless of outcome.
+    pub message: String,
+}
+
+/// `POST /v1/signup/verify` request body — carries the magic-link token
+/// the user pasted from their email.
+#[derive(Debug, Deserialize)]
+pub struct SignupVerifyRequest {
+    /// The raw token from the magic-link URL. Server hashes with
+    /// SHA-256 to look up the pending signup.
+    pub token: String,
+}
+
 // -------- Plan tiers ---------------------------------------------------
 
 /// A named plan tier — Stripe `price_id` → human name + effective
@@ -259,6 +290,17 @@ pub struct BillingConfig {
     /// 501 `webhook_disabled` (via [`crate::error::ApiError::Unsupported`]).
     /// Never appears in Debug output.
     pub webhook_signing_secret: Option<String>,
+    /// Base URL the magic-link email points at. The signup handler
+    /// appends `?token=<raw>` and sends the result. Read from
+    /// `NANOVM_SIGNUP_VERIFY_URL`; typically
+    /// `https://app.your-saas.com/signup/verify`. Defaults to
+    /// `http://localhost:8080/v1/signup/verify` for dev.
+    pub signup_verify_url: String,
+    /// Magic-link token lifetime in seconds. Read from
+    /// `NANOVM_SIGNUP_TOKEN_TTL_SECS`. Defaults to 900 (15 min) —
+    /// short enough to limit exposure of a leaked email, long enough
+    /// to survive a lazy inbox client.
+    pub signup_token_ttl_secs: i64,
 }
 
 impl std::fmt::Debug for BillingConfig {
@@ -288,6 +330,15 @@ impl BillingConfig {
             webhook_signing_secret: std::env::var("STRIPE_WEBHOOK_SIGNING_SECRET")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            signup_verify_url: std::env::var("NANOVM_SIGNUP_VERIFY_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "http://localhost:8080/v1/signup/verify".into()),
+            signup_token_ttl_secs: std::env::var("NANOVM_SIGNUP_TOKEN_TTL_SECS")
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(900),
         })
     }
 }
@@ -304,6 +355,8 @@ pub enum BillingError {
     BadSignupToken,
     #[error("org name must contain at least one alphanumeric character")]
     InvalidOrg,
+    #[error("magic-link token is unknown or expired")]
+    InvalidSignupToken,
     #[error("no stripe customer recorded for org {0:?}")]
     NoCustomerForOrg(String),
     #[error("stripe api error ({status}): {message}")]
@@ -347,6 +400,30 @@ pub trait BillingStore: Send + Sync + std::fmt::Debug {
     /// isn't associated with any org (typically a data issue —
     /// signup succeeded on Stripe but crashed before persisting).
     fn org_by_customer(&self, customer_id: &str) -> Option<OrgId>;
+
+    /// Record a pending self-serve signup. The token itself is never
+    /// stored — only its SHA-256 hash — so a compromised backup can't
+    /// be used to activate outstanding invitations. Called from
+    /// `POST /v1/signup/request` after generating a fresh magic-link
+    /// token.
+    ///
+    /// If a row with the same `token_hash` already exists (extremely
+    /// unlikely for a 24-byte random token, but theoretically possible),
+    /// the store must overwrite it so the fresh token wins. If a row
+    /// with the same email exists but a different hash, it must be
+    /// replaced so re-requesting a signup invalidates the prior token.
+    fn record_pending_signup(&self, signup: &PendingSignup) -> Result<(), BillingStoreError>;
+
+    /// Consume a pending signup by its `token_hash`. Returns `Some` and
+    /// deletes the row iff it exists AND `expires_at` is still in the
+    /// future relative to `now` (RFC 3339). Expired rows are treated as
+    /// absent (and should be swept by `gc_expired_signups`). This is
+    /// the atomic point that prevents a token being redeemed twice.
+    fn take_pending_signup(&self, token_hash: &str, now: &str) -> Option<PendingSignup>;
+
+    /// Delete pending-signup rows whose `expires_at` is < `now`. Called
+    /// periodically by the control-plane. Returns the count removed.
+    fn gc_expired_signups(&self, now: &str) -> Result<u64, BillingStoreError>;
 }
 
 /// Subscription state persisted per Stripe customer. Kept minimal —
@@ -373,6 +450,32 @@ pub struct SubscriptionState {
     pub updated_at: String,
 }
 
+/// Pending self-serve signup — a token was emailed to the applicant
+/// but they haven't clicked it yet.
+///
+/// The plaintext token is never stored; instead its SHA-256 hex hash
+/// lands here. Verify-side lookup hashes the caller-supplied token and
+/// looks up by hash. This keeps a compromised backup from being able
+/// to activate outstanding invitations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSignup {
+    /// SHA-256 hex of the token that was mailed to `email`.
+    pub token_hash: String,
+    /// Where the magic link was sent. Also becomes the Stripe customer
+    /// email on activation.
+    pub email: String,
+    /// Human-readable org name the applicant provided. Slugified on
+    /// activation to derive the `OrgId`.
+    pub org_name: String,
+    /// RFC 3339 timestamp of creation — audit/observability only.
+    pub created_at: String,
+    /// RFC 3339 timestamp beyond which `take_pending_signup` refuses to
+    /// return the row. Enforced by both the store lookup AND the periodic
+    /// GC pass — belt-and-braces because a persistent SQLite file could
+    /// otherwise accumulate stale rows if GC is skipped.
+    pub expires_at: String,
+}
+
 /// Errors from [`BillingStore`] backends.
 #[derive(Debug, thiserror::Error)]
 pub enum BillingStoreError {
@@ -388,6 +491,9 @@ pub struct InMemoryBillingStore {
     map: Mutex<HashMap<OrgId, String>>,
     /// `stripe_customer_id → subscription state`
     subs: Mutex<HashMap<String, SubscriptionState>>,
+    /// `token_hash → PendingSignup`. Populated by `POST /v1/signup/request`,
+    /// consumed atomically by `POST /v1/signup/verify`.
+    pending: Mutex<HashMap<String, PendingSignup>>,
 }
 
 impl BillingStore for InMemoryBillingStore {
@@ -430,6 +536,32 @@ impl BillingStore for InMemoryBillingStore {
             .iter()
             .find(|(_, id)| id.as_str() == customer_id)
             .map(|(o, _)| o.clone())
+    }
+    fn record_pending_signup(&self, signup: &PendingSignup) -> Result<(), BillingStoreError> {
+        let mut guard = self.pending.lock().expect("pending signups poisoned");
+        // Invalidate any prior row for the same email so re-requesting a
+        // signup replaces the old token instead of leaving two live at
+        // once. Same shape SQLite enforces via a UNIQUE index.
+        guard.retain(|_, s| s.email != signup.email);
+        guard.insert(signup.token_hash.clone(), signup.clone());
+        Ok(())
+    }
+    fn take_pending_signup(&self, token_hash: &str, now: &str) -> Option<PendingSignup> {
+        let mut guard = self.pending.lock().expect("pending signups poisoned");
+        let entry = guard.remove(token_hash)?;
+        // Expired rows are treated as absent: don't return them and don't
+        // put them back (the GC pass will pick them up if it runs first,
+        // but if verify beats the sweeper we still remove them here).
+        if entry.expires_at.as_str() < now {
+            return None;
+        }
+        Some(entry)
+    }
+    fn gc_expired_signups(&self, now: &str) -> Result<u64, BillingStoreError> {
+        let mut guard = self.pending.lock().expect("pending signups poisoned");
+        let before = guard.len();
+        guard.retain(|_, s| s.expires_at.as_str() >= now);
+        Ok((before - guard.len()) as u64)
     }
 }
 
@@ -584,7 +716,283 @@ fn extract_error_message(bytes: &[u8]) -> Option<String> {
         .map(|e| e.error.message)
 }
 
+// -------- Email delivery ----------------------------------------------
+
+/// How the control plane delivers signup magic links.
+///
+/// Prod deploys wire a real provider (Resend / Postmark / SES) via
+/// [`ResendEmailSender`]. Local dev + self-hosted single-tenant boxes
+/// use [`LogEmailSender`] — the magic link is written to the tracing
+/// output at `info` so the operator can copy-paste it during testing.
+pub trait EmailSender: Send + Sync + std::fmt::Debug {
+    /// Deliver a magic-link email. `verify_url` is the fully-formed
+    /// URL the recipient must open to activate the signup. Returns an
+    /// error if the delivery could not be enqueued; a delivery that's
+    /// silently dropped by the upstream (e.g. wrong `From` domain) is
+    /// beyond this layer.
+    fn send_magic_link<'a>(
+        &'a self,
+        to: &'a str,
+        verify_url: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), EmailError>> + Send + 'a>>;
+}
+
+/// Delivery failures. `Transport` covers network/HTTP-layer errors,
+/// `Provider` covers a 4xx/5xx from the upstream mail service with the
+/// message they returned so ops can triage.
+#[derive(Debug, thiserror::Error)]
+pub enum EmailError {
+    #[error("email transport error: {0}")]
+    Transport(String),
+    #[error("email provider error ({status}): {message}")]
+    Provider { status: u16, message: String },
+}
+
+/// Development / self-hosted sender. Emits the magic link to
+/// `tracing::info!` and considers that a successful send. **Never**
+/// use in prod: the operator's log aggregator would leak the token to
+/// anyone with log read.
+#[derive(Debug, Default)]
+pub struct LogEmailSender;
+
+impl EmailSender for LogEmailSender {
+    fn send_magic_link<'a>(
+        &'a self,
+        to: &'a str,
+        verify_url: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), EmailError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            tracing::info!(
+                to,
+                verify_url,
+                "magic link (LogEmailSender — copy this into your browser)"
+            );
+            Ok(())
+        })
+    }
+}
+
+/// Production sender backed by Resend (`https://resend.com`). Chose
+/// Resend for the smallest possible surface area (single JSON POST,
+/// no OAuth, works from a distroless container against
+/// `rustls-tls-webpki-roots`).
+pub struct ResendEmailSender {
+    http: reqwest::Client,
+    api_key: String,
+    /// `From:` header — must be a verified sender in the Resend dashboard.
+    from: String,
+}
+
+impl std::fmt::Debug for ResendEmailSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResendEmailSender")
+            .field("api_key", &"<redacted>")
+            .field("from", &self.from)
+            .finish()
+    }
+}
+
+impl ResendEmailSender {
+    pub fn new(api_key: impl Into<String>, from: impl Into<String>) -> Self {
+        Self {
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("build reqwest client"),
+            api_key: api_key.into(),
+            from: from.into(),
+        }
+    }
+}
+
+impl EmailSender for ResendEmailSender {
+    fn send_magic_link<'a>(
+        &'a self,
+        to: &'a str,
+        verify_url: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), EmailError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let subject = "Verify your nanovm signup";
+            let html = format!(
+                "<p>Someone (hopefully you) started a signup for this address at nanovm.</p>\
+                 <p><a href=\"{verify_url}\">Click here to verify and finish setting up your account</a>.</p>\
+                 <p>This link expires in 15 minutes. If you didn't request it, ignore this email.</p>"
+            );
+            let text = format!(
+                "Someone (hopefully you) started a signup for this address at nanovm.\n\n\
+                 Verify: {verify_url}\n\n\
+                 This link expires in 15 minutes. If you didn't request it, ignore this email."
+            );
+            let body = serde_json::json!({
+                "from": self.from,
+                "to": [to],
+                "subject": subject,
+                "html": html,
+                "text": text,
+            });
+            let resp = self
+                .http
+                .post("https://api.resend.com/emails")
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| EmailError::Transport(e.to_string()))?;
+            let status = resp.status();
+            if status.is_success() {
+                Ok(())
+            } else {
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| EmailError::Transport(e.to_string()))?;
+                let message = extract_error_message(&bytes)
+                    .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+                Err(EmailError::Provider {
+                    status: status.as_u16(),
+                    message,
+                })
+            }
+        })
+    }
+}
+
 // -------- Handler functions -------------------------------------------
+
+/// Hash a magic-link token with SHA-256 → lowercase hex. Both sides
+/// of the flow (record + take) go through here so the store never
+/// touches the plaintext token.
+pub(crate) fn hash_signup_token(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(token.as_bytes());
+    let bytes = h.finalize();
+    hex_encode(&bytes)
+}
+
+/// Generate a fresh 24-byte URL-safe token. Uses `rand::rngs::OsRng`
+/// via `getrandom` (already in the reqwest transitive dep tree, no new
+/// crate needed here — we call `getrandom` directly).
+fn mint_signup_token() -> String {
+    let mut buf = [0u8; 24];
+    getrandom::getrandom(&mut buf).expect("getrandom is available on all supported platforms");
+    // Base64-url without padding: 24 bytes → 32 chars, only [A-Za-z0-9_-].
+    // Hand-rolled so we don't pull in a base64-url dep for this one use.
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(32);
+    for chunk in buf.chunks(3) {
+        let a = chunk[0];
+        let b = chunk[1];
+        let c = chunk[2];
+        out.push(ALPHA[(a >> 2) as usize] as char);
+        out.push(ALPHA[(((a & 0b11) << 4) | (b >> 4)) as usize] as char);
+        out.push(ALPHA[(((b & 0b1111) << 2) | (c >> 6)) as usize] as char);
+        out.push(ALPHA[(c & 0b111111) as usize] as char);
+    }
+    out
+}
+
+/// Self-serve signup step 1: create a pending signup and email the
+/// magic link. Returns the same opaque response whether the address
+/// is new, already-live, or malformed — this stops the endpoint from
+/// leaking existence of a registered address (a common enumeration
+/// vector on signup forms).
+///
+/// The token itself is never stored; only its SHA-256 hash lands in
+/// `pending_signups`. The email carries the raw token, embedded in a
+/// URL of the form `{verify_url_base}?token={raw}`.
+pub async fn signup_request(
+    store: &dyn BillingStore,
+    email: &dyn EmailSender,
+    verify_url_base: &str,
+    ttl_secs: i64,
+    req: SignupRequestRequest,
+) -> Result<SignupRequestResponse, BillingError> {
+    // Minimal validation. We don't reject on "email looks weird" —
+    // the mail provider is authoritative, and rejecting narrowly here
+    // would risk leaking which local-part shapes are accepted.
+    let email_addr = req.email.trim().to_owned();
+    let org_name = req.org.trim().to_owned();
+    if !email_addr.contains('@') || org_name.is_empty() {
+        // Return the SAME opaque response so the caller can't tell
+        // what failed. Log at debug for ops.
+        tracing::debug!("signup_request: rejecting malformed input (opaque response returned)");
+        return Ok(SignupRequestResponse {
+            message: "If that address is eligible, a verification link has been sent.".into(),
+        });
+    }
+
+    let token = mint_signup_token();
+    let token_hash = hash_signup_token(&token);
+    let now = crate::time::rfc3339_now();
+    let expires_at = crate::time::rfc3339_offset(ttl_secs);
+    let pending = PendingSignup {
+        token_hash,
+        email: email_addr.clone(),
+        org_name,
+        created_at: now,
+        expires_at,
+    };
+    // Persist BEFORE sending the email so a delivery failure doesn't
+    // leave a phantom accepted signup the recipient can't verify. If
+    // record fails we return an opaque OK too — the operator sees the
+    // error in tracing, the user sees "check your inbox" (they'll
+    // notice the missing email and retry).
+    if let Err(e) = store.record_pending_signup(&pending) {
+        tracing::error!(
+            error = %e,
+            email = %email_addr,
+            "signup_request: failed to persist pending signup"
+        );
+        return Ok(SignupRequestResponse {
+            message: "If that address is eligible, a verification link has been sent.".into(),
+        });
+    }
+    let verify_url = format!("{verify_url_base}?token={token}");
+    if let Err(e) = email.send_magic_link(&email_addr, &verify_url).await {
+        tracing::error!(
+            error = %e,
+            email = %email_addr,
+            "signup_request: failed to deliver magic link"
+        );
+    }
+    Ok(SignupRequestResponse {
+        message: "If that address is eligible, a verification link has been sent.".into(),
+    })
+}
+
+/// Self-serve signup step 2: activate a pending signup using the token
+/// from the magic link. Reuses the same "Stripe customer → persist →
+/// mint API key" sequence as the admin `signup` path.
+pub async fn signup_verify(
+    tokens: &ApiTokens,
+    store: &dyn BillingStore,
+    stripe: &StripeClient,
+    req: SignupVerifyRequest,
+) -> Result<SignupResponse, BillingError> {
+    let token_hash = hash_signup_token(&req.token);
+    let now = crate::time::rfc3339_now();
+    let pending = store
+        .take_pending_signup(&token_hash, &now)
+        .ok_or(BillingError::InvalidSignupToken)?;
+    let org_slug = slugify(&pending.org_name);
+    if org_slug.is_empty() {
+        return Err(BillingError::InvalidOrg);
+    }
+    let org_id = OrgId(org_slug.clone());
+    let customer = stripe
+        .create_customer(&pending.email, &pending.org_name, &org_slug)
+        .await?;
+    store.record_customer(&org_id, &customer.id)?;
+    let issued: IssuedToken = tokens.issue(org_id);
+    Ok(SignupResponse {
+        org: org_slug,
+        api_key: issued.token,
+        stripe_customer_id: customer.id,
+    })
+}
 
 /// Signup semantic.
 ///
@@ -822,6 +1230,10 @@ pub struct BillingCtx {
     /// Named plan tiers from `NANOVM_PLAN_TIERS`. Empty when unset;
     /// the plan endpoint then returns `plan: null` for every caller.
     pub tiers: PlanTiers,
+    /// How magic-link emails go out. Defaults to [`LogEmailSender`]
+    /// (dev/self-hosted); wire [`ResendEmailSender`] in prod by setting
+    /// `RESEND_API_KEY` + `NANOVM_SIGNUP_FROM`.
+    pub email: Arc<dyn EmailSender>,
 }
 
 impl std::fmt::Debug for BillingCtx {
@@ -864,6 +1276,58 @@ pub(crate) async fn signup_handler(
     )
     .await
     .map_err(billing_to_api_error)?;
+    Ok((StatusCode::CREATED, Json(resp)))
+}
+
+/// `POST /v1/signup/request` axum handler. Self-serve — no bearer.
+/// Rate-limited at the route layer (see routes.rs). Returns the same
+/// opaque body regardless of outcome so callers can't enumerate live
+/// email addresses; the operator sees the real story in tracing.
+pub(crate) async fn signup_request_handler(
+    State(state): State<crate::AppState>,
+    body: Result<Json<SignupRequestRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<(StatusCode, Json<SignupRequestResponse>), ApiError> {
+    let ctx = state.billing_ctx().ok_or(ApiError::Unsupported {
+        code: "billing_disabled",
+        message: "billing endpoints require the `billing` feature + Stripe env vars".into(),
+    })?;
+    // Body-parse errors get the opaque response too — same rationale
+    // as the email-doesn't-exist path.
+    let Ok(Json(req)) = body else {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(SignupRequestResponse {
+                message: "If that address is eligible, a verification link has been sent.".into(),
+            }),
+        ));
+    };
+    let resp = signup_request(
+        ctx.store.as_ref(),
+        ctx.email.as_ref(),
+        &ctx.config.signup_verify_url,
+        ctx.config.signup_token_ttl_secs,
+        req,
+    )
+    .await
+    .map_err(billing_to_api_error)?;
+    Ok((StatusCode::ACCEPTED, Json(resp)))
+}
+
+/// `POST /v1/signup/verify` axum handler. Consumes the magic-link
+/// token, activates the pending signup, returns the first API key.
+pub(crate) async fn signup_verify_handler(
+    State(state): State<crate::AppState>,
+    Extension(tokens): Extension<Arc<ApiTokens>>,
+    body: Result<Json<SignupVerifyRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<(StatusCode, Json<SignupResponse>), ApiError> {
+    let ctx = state.billing_ctx().ok_or(ApiError::Unsupported {
+        code: "billing_disabled",
+        message: "billing endpoints require the `billing` feature + Stripe env vars".into(),
+    })?;
+    let Json(req) = body?;
+    let resp = signup_verify(&tokens, ctx.store.as_ref(), &ctx.stripe, req)
+        .await
+        .map_err(billing_to_api_error)?;
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
@@ -1171,6 +1635,10 @@ fn billing_to_api_error(e: BillingError) -> ApiError {
             ApiError::InternalDyn(format!("stripe transport error: {msg}"))
         }
         BillingError::Store(inner) => ApiError::InternalDyn(inner.to_string()),
+        BillingError::InvalidSignupToken => ApiError::Bad(
+            "magic-link token is unknown or expired; request a fresh one via POST /v1/signup/request"
+                .into(),
+        ),
     }
 }
 
@@ -1662,6 +2130,8 @@ mod tests {
             portal_return_url: "http://ok".into(),
             signup_token: "hush".into(),
             webhook_signing_secret: None,
+            signup_verify_url: "http://localhost:8080/v1/signup/verify".into(),
+            signup_token_ttl_secs: 900,
         };
         let s = format!("{cfg:?}");
         assert!(!s.contains("sk_test_ohno"));
@@ -1688,6 +2158,8 @@ mod tests {
             portal_return_url: "http://ok".into(),
             signup_token: "admin".into(),
             webhook_signing_secret: None,
+            signup_verify_url: "http://localhost:8080/v1/signup/verify".into(),
+            signup_token_ttl_secs: 900,
         };
         let tokens = ApiTokens::default();
         let store = InMemoryBillingStore::default();
@@ -1709,6 +2181,8 @@ mod tests {
             portal_return_url: "http://ok".into(),
             signup_token: "admin".into(),
             webhook_signing_secret: None,
+            signup_verify_url: "http://localhost:8080/v1/signup/verify".into(),
+            signup_token_ttl_secs: 900,
         };
         let tokens = ApiTokens::default();
         let store = InMemoryBillingStore::default();
@@ -1730,6 +2204,8 @@ mod tests {
             portal_return_url: "http://ok".into(),
             signup_token: "admin".into(),
             webhook_signing_secret: None,
+            signup_verify_url: "http://localhost:8080/v1/signup/verify".into(),
+            signup_token_ttl_secs: 900,
         };
         let tokens = ApiTokens::default();
         let store = InMemoryBillingStore::default();
@@ -1751,6 +2227,8 @@ mod tests {
             portal_return_url: "http://ok".into(),
             signup_token: "admin".into(),
             webhook_signing_secret: None,
+            signup_verify_url: "http://localhost:8080/v1/signup/verify".into(),
+            signup_token_ttl_secs: 900,
         };
         let store = InMemoryBillingStore::default();
         let stripe = StripeClient::new("sk_test_x");
@@ -1761,5 +2239,197 @@ mod tests {
             BillingError::NoCustomerForOrg(s) => assert_eq!(s, "nobody"),
             other => panic!("expected NoCustomerForOrg, got {other:?}"),
         }
+    }
+
+    // -------- Self-serve signup (magic-link) tests -----------------
+
+    #[test]
+    fn hash_signup_token_is_deterministic() {
+        let a = hash_signup_token("hello");
+        let b = hash_signup_token("hello");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64); // sha256 → 32 bytes → 64 hex chars
+    }
+
+    #[test]
+    fn hash_signup_token_differs_between_inputs() {
+        assert_ne!(hash_signup_token("a"), hash_signup_token("b"));
+    }
+
+    #[test]
+    fn mint_signup_token_is_url_safe_32_chars() {
+        let t = mint_signup_token();
+        assert_eq!(t.len(), 32, "24 bytes → 32 base64url chars");
+        for ch in t.chars() {
+            assert!(
+                ch.is_ascii_alphanumeric() || ch == '-' || ch == '_',
+                "non-URL-safe char {ch:?} in {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_memory_pending_signup_round_trips() {
+        let store = InMemoryBillingStore::default();
+        let now = crate::time::rfc3339_now();
+        let expires_at = crate::time::rfc3339_offset(60);
+        let signup = PendingSignup {
+            token_hash: hash_signup_token("secret-token"),
+            email: "a@example.com".into(),
+            org_name: "Acme".into(),
+            created_at: now.clone(),
+            expires_at,
+        };
+        store.record_pending_signup(&signup).unwrap();
+        let taken = store
+            .take_pending_signup(&signup.token_hash, &now)
+            .expect("must return the row before expiry");
+        assert_eq!(taken.email, "a@example.com");
+        assert_eq!(taken.org_name, "Acme");
+        // Consumed → second take is None.
+        assert!(store
+            .take_pending_signup(&signup.token_hash, &now)
+            .is_none());
+    }
+
+    #[test]
+    fn in_memory_pending_signup_expiry_is_enforced_at_take() {
+        let store = InMemoryBillingStore::default();
+        let signup = PendingSignup {
+            token_hash: hash_signup_token("secret-token"),
+            email: "a@example.com".into(),
+            org_name: "Acme".into(),
+            created_at: "2020-01-01T00:00:00.000Z".into(),
+            expires_at: "2020-01-01T00:00:01.000Z".into(),
+        };
+        store.record_pending_signup(&signup).unwrap();
+        // `now` is one second after expiry.
+        let now = "2020-01-01T00:00:02.000Z";
+        assert!(store.take_pending_signup(&signup.token_hash, now).is_none());
+    }
+
+    #[test]
+    fn in_memory_re_request_replaces_prior_token_for_same_email() {
+        let store = InMemoryBillingStore::default();
+        let expires_at = crate::time::rfc3339_offset(60);
+        let a = PendingSignup {
+            token_hash: hash_signup_token("token-a"),
+            email: "a@example.com".into(),
+            org_name: "Acme".into(),
+            created_at: crate::time::rfc3339_now(),
+            expires_at: expires_at.clone(),
+        };
+        let b = PendingSignup {
+            token_hash: hash_signup_token("token-b"),
+            email: "a@example.com".into(),
+            org_name: "Acme".into(),
+            created_at: crate::time::rfc3339_now(),
+            expires_at,
+        };
+        store.record_pending_signup(&a).unwrap();
+        store.record_pending_signup(&b).unwrap();
+        let now = crate::time::rfc3339_now();
+        // Old token invalid.
+        assert!(store.take_pending_signup(&a.token_hash, &now).is_none());
+        // New token good.
+        assert!(store.take_pending_signup(&b.token_hash, &now).is_some());
+    }
+
+    #[test]
+    fn in_memory_gc_removes_expired_rows() {
+        let store = InMemoryBillingStore::default();
+        let expired = PendingSignup {
+            token_hash: "expiredhash".into(),
+            email: "expired@example.com".into(),
+            org_name: "X".into(),
+            created_at: "2020-01-01T00:00:00.000Z".into(),
+            expires_at: "2020-01-01T00:00:01.000Z".into(),
+        };
+        let fresh = PendingSignup {
+            token_hash: "freshhash".into(),
+            email: "fresh@example.com".into(),
+            org_name: "Y".into(),
+            created_at: crate::time::rfc3339_now(),
+            expires_at: crate::time::rfc3339_offset(60),
+        };
+        store.record_pending_signup(&expired).unwrap();
+        store.record_pending_signup(&fresh).unwrap();
+        let now = crate::time::rfc3339_now();
+        assert_eq!(store.gc_expired_signups(&now).unwrap(), 1);
+        // Fresh survived.
+        assert!(store.take_pending_signup(&fresh.token_hash, &now).is_some());
+    }
+
+    #[tokio::test]
+    async fn signup_request_returns_opaque_ok_for_malformed_email() {
+        let store = InMemoryBillingStore::default();
+        let email = LogEmailSender;
+        let resp = signup_request(
+            &store,
+            &email,
+            "https://ex.co/verify",
+            60,
+            SignupRequestRequest {
+                email: "not-an-email".into(),
+                org: "Acme".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(resp.message.contains("If that address is eligible"));
+        // No pending row was persisted for the malformed input.
+        assert_eq!(
+            store
+                .gc_expired_signups(&crate::time::rfc3339_offset(3600))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn signup_request_persists_pending_and_sends_email() {
+        let store = InMemoryBillingStore::default();
+        let email = LogEmailSender;
+        signup_request(
+            &store,
+            &email,
+            "https://ex.co/verify",
+            60,
+            SignupRequestRequest {
+                email: "founder@example.com".into(),
+                org: "Acme Inc".into(),
+            },
+        )
+        .await
+        .unwrap();
+        // A pending signup landed — GC-with-past-expiry-cutoff removes 0
+        // (because the row's expiry is in the future).
+        let now_past = "2020-01-01T00:00:00.000Z";
+        assert_eq!(store.gc_expired_signups(now_past).unwrap(), 0);
+        // GC-with-future-cutoff removes it.
+        assert_eq!(
+            store
+                .gc_expired_signups(&crate::time::rfc3339_offset(3600))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn signup_verify_rejects_unknown_token() {
+        let store = InMemoryBillingStore::default();
+        let stripe = StripeClient::new("sk_test_x");
+        let tokens = ApiTokens::from_csv("");
+        let err = signup_verify(
+            &tokens,
+            &store,
+            &stripe,
+            SignupVerifyRequest {
+                token: "never-issued".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, BillingError::InvalidSignupToken));
     }
 }

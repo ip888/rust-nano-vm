@@ -42,6 +42,18 @@
 //!   (HMAC-SHA256 of `timestamp.payload`, within a 300 s replay
 //!   window). Unset → the webhook endpoint returns 501
 //!   `webhook_disabled`.
+//! - `RESEND_API_KEY` + `NANOVM_SIGNUP_FROM` — enable real email
+//!   delivery via Resend for the self-serve signup magic link.
+//!   `NANOVM_SIGNUP_FROM` must be a verified sender on that Resend
+//!   workspace (e.g. `"nanovm <verify@your-domain.com>"`). Unset →
+//!   the magic link is logged at `info` (dev/self-hosted only —
+//!   NEVER expose that build to real customers).
+//! - `NANOVM_SIGNUP_VERIFY_URL` — where the magic-link email points
+//!   the recipient. The handler appends `?token=<raw>` at send time.
+//!   Typically `https://app.your-saas.com/signup/verify`. Defaults to
+//!   `http://localhost:8080/v1/signup/verify` (dev only).
+//! - `NANOVM_SIGNUP_TOKEN_TTL_SECS` — magic-link lifetime. Default
+//!   `900` (15 min).
 //! - `NANOVM_DEFAULT_KERNEL_PATH` — absolute path to the kernel image
 //!   used as the fallback when `POST /v1/vms` omits `kernel`. Set to
 //!   `/usr/local/share/nanovm/vmlinux` by `Dockerfile.kvm` so
@@ -426,10 +438,38 @@ fn build_billing_ctx() -> Option<control_plane::billing::BillingCtx> {
         tier_count = tiers.len(),
         "billing: plan tiers configured (NANOVM_PLAN_TIERS)"
     );
+    // Email delivery: Resend if `RESEND_API_KEY` + `NANOVM_SIGNUP_FROM`
+    // are both set; otherwise fall through to LogEmailSender (dev /
+    // self-hosted). The latter logs magic links at info — DO NOT wire
+    // in prod without a real provider.
+    let email: std::sync::Arc<dyn control_plane::billing::EmailSender> = match (
+        std::env::var("RESEND_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        std::env::var("NANOVM_SIGNUP_FROM")
+            .ok()
+            .filter(|s| !s.is_empty()),
+    ) {
+        (Some(key), Some(from)) => {
+            tracing::info!(
+                from = %from,
+                "billing: signup emails via Resend (RESEND_API_KEY + NANOVM_SIGNUP_FROM set)"
+            );
+            std::sync::Arc::new(control_plane::billing::ResendEmailSender::new(key, from))
+        }
+        _ => {
+            tracing::warn!(
+                "billing: signup emails will be logged, not sent \
+                 (set RESEND_API_KEY + NANOVM_SIGNUP_FROM to enable delivery)"
+            );
+            std::sync::Arc::new(control_plane::billing::LogEmailSender)
+        }
+    };
     Some(control_plane::billing::BillingCtx {
         config: cfg,
         store,
         stripe,
         tiers,
+        email,
     })
 }
