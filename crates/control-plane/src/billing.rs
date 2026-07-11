@@ -442,6 +442,13 @@ pub struct SubscriptionState {
     /// Maps to your product catalogue (free / pro / enterprise) by
     /// application config (`NANOVM_PLAN_TIERS`).
     pub price_id: Option<String>,
+    /// Stripe **subscription item** id (`si_…`) of the primary
+    /// subscription item. Needed by the metered-usage reporter to
+    /// POST `usage_records` for the customer. `None` when we've never
+    /// seen a `customer.subscription.*` event carrying the item id
+    /// (rows migrated in from schema v3 stay `None` until Stripe
+    /// re-sends the next event, which is typically ≤ 24 h).
+    pub subscription_item_id: Option<String>,
     /// RFC 3339 timestamp of the last update — for observability +
     /// operator triage. Set by the webhook handler when a subscription
     /// event is parsed (see `parse_subscription_object`) and passed
@@ -568,6 +575,9 @@ impl BillingStore for InMemoryBillingStore {
 mod sqlite_billing_backend;
 pub use sqlite_billing_backend::SqliteBillingStore;
 
+pub mod usage_reporter;
+pub use usage_reporter::{UsageReporterConfig, UsageReporterHandle};
+
 // -------- Stripe client ------------------------------------------------
 
 /// Thin reqwest wrapper for the two Stripe endpoints this crate needs.
@@ -657,6 +667,58 @@ impl StripeClient {
             .map_err(|e| BillingError::StripeTransport(e.to_string()))?;
         parse_stripe_response(resp).await
     }
+
+    /// Report metered usage for a subscription item.
+    ///
+    /// `subscription_item_id` is the `si_…` id captured from the
+    /// primary item of the customer's subscription (see
+    /// `parse_subscription_object`). `quantity` is the delta since
+    /// the last report — Stripe adds it to the current billing
+    /// period's meter with `action=increment`. `timestamp` is the
+    /// caller's Unix epoch seconds; using a monotonic sequence
+    /// prevents Stripe from silently coalescing reports.
+    ///
+    /// `idempotency_key` prevents a retry after a transient failure
+    /// from being double-counted. The reporter derives the key from
+    /// `(subscription_item_id, timestamp)` so a re-run with the same
+    /// inputs is a no-op on Stripe.
+    pub async fn report_usage_record(
+        &self,
+        subscription_item_id: &str,
+        quantity: u64,
+        timestamp: i64,
+        idempotency_key: &str,
+    ) -> Result<UsageRecord, BillingError> {
+        let quantity_s = quantity.to_string();
+        let ts_s = timestamp.to_string();
+        let form = [
+            ("quantity", quantity_s.as_str()),
+            ("timestamp", ts_s.as_str()),
+            ("action", "increment"),
+        ];
+        let resp = self
+            .http
+            .post(format!(
+                "{}/v1/subscription_items/{subscription_item_id}/usage_records",
+                self.base_url
+            ))
+            .basic_auth(&self.secret_key, Some(""))
+            .header("Idempotency-Key", idempotency_key)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| BillingError::StripeTransport(e.to_string()))?;
+        parse_stripe_response(resp).await
+    }
+}
+
+/// Stripe usage-record response. Only `id` is used today (for the
+/// tracing log line); the rest of the fields Stripe returns are
+/// ignored via serde's default behavior.
+#[derive(Debug, Deserialize)]
+pub struct UsageRecord {
+    /// Stripe usage-record id (`mbur_…`).
+    pub id: String,
 }
 
 /// Stripe customer object subset — just the fields we care about
@@ -1571,17 +1633,28 @@ fn parse_subscription_object(
         .and_then(|v| v.as_str())
         .ok_or("data.object.status missing")?
         .to_string();
-    // Primary subscription item's price id. Stripe multi-item
-    // subscriptions do exist; we pick the first one which matches the
-    // common single-item shape most SaaS deploys use. A follow-up can
-    // extend this to enumerate multi-item subscriptions.
-    let price_id = object
+    // Primary subscription item. Stripe multi-item subscriptions do
+    // exist; we pick the first one which matches the common
+    // single-item shape most SaaS deploys use. A follow-up can extend
+    // this to enumerate multi-item subscriptions.
+    //
+    // We capture both:
+    //   `items.data[0].price.id` — used to map to the named tier
+    //     configured in `NANOVM_PLAN_TIERS`.
+    //   `items.data[0].id` — the SUBSCRIPTION_ITEM id (`si_…`), needed
+    //     by the metered reporter to POST usage_records.
+    let primary_item = object
         .get("items")
         .and_then(|v| v.get("data"))
         .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
+        .and_then(|arr| arr.first());
+    let price_id = primary_item
         .and_then(|item| item.get("price"))
         .and_then(|price| price.get("id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let subscription_item_id = primary_item
+        .and_then(|item| item.get("id"))
         .and_then(|v| v.as_str())
         .map(str::to_string);
     Ok((
@@ -1590,6 +1663,7 @@ fn parse_subscription_object(
             subscription_id,
             status,
             price_id,
+            subscription_item_id,
             updated_at: crate::time::rfc3339_now(),
         },
     ))
@@ -1963,6 +2037,7 @@ mod tests {
                     subscription_id: "sub_A".into(),
                     status: "past_due".into(),
                     price_id: Some("price_pro".into()),
+                    subscription_item_id: None,
                     updated_at: "2026-07-10T00:00:00Z".into(),
                 },
             )
@@ -2076,6 +2151,7 @@ mod tests {
                     subscription_id: "sub_1".into(),
                     status: "active".into(),
                     price_id: Some("price_pro".into()),
+                    subscription_item_id: None,
                     updated_at: "2026-07-10T00:00:00Z".into(),
                 },
             )
@@ -2103,6 +2179,7 @@ mod tests {
                     subscription_id: "sub_1".into(),
                     status: "active".into(),
                     price_id: Some("price_UNMAPPED".into()),
+                    subscription_item_id: None,
                     updated_at: "2026-07-10T00:00:00Z".into(),
                 },
             )

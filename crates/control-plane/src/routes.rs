@@ -185,6 +185,14 @@ impl AppState {
         self.billing.as_ref()
     }
 
+    /// External accessor for the billing context — used by the binary
+    /// to spawn the metered-usage reporter. Guarded by the same
+    /// `billing` feature flag as the field itself.
+    #[cfg(feature = "billing")]
+    pub fn billing_ctx_pub(&self) -> Option<&crate::billing::BillingCtx> {
+        self.billing.as_ref()
+    }
+
     /// Borrow the per-org ownership map. Used by sibling modules
     /// (`sandbox`, `snapshot_export`, `exec_stream`) that need to
     /// record/check resource ownership outside the main handlers in
