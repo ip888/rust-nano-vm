@@ -100,9 +100,10 @@ pub struct PlanTier {
 ///
 /// Each triple is `stripe_price_id=name:rps`; separators between
 /// triples are commas; the parser is intentionally permissive on
-/// whitespace + trailing commas. A default fallback (when the caller
-/// has no subscription) uses `default_rps`, which comes from the
-/// existing `NANOVM_FORK_RPS` env var (already read by [`crate::ForkQuota`]).
+/// whitespace + trailing commas. Callers with no mapped tier fall
+/// through to the env default configured on
+/// [`crate::ForkQuota`] (`NANOVM_FORK_RPS` / `NANOVM_FORK_BURST`) —
+/// that fallback is applied in `try_acquire_org`, not here.
 #[derive(Debug, Clone, Default)]
 pub struct PlanTiers {
     /// `price_id → tier`
@@ -139,10 +140,19 @@ impl PlanTiers {
                 tracing::warn!(entry, "NANOVM_PLAN_TIERS: rps not a u32; skipping");
                 continue;
             };
+            let price_id = price_id.trim();
+            let name = name.trim();
+            if price_id.is_empty() || name.is_empty() {
+                tracing::warn!(
+                    entry,
+                    "NANOVM_PLAN_TIERS: empty price_id or tier name; skipping"
+                );
+                continue;
+            }
             by_price_id.insert(
-                price_id.trim().to_string(),
+                price_id.to_string(),
                 PlanTier {
-                    name: name.trim().to_string(),
+                    name: name.to_string(),
                     rps,
                 },
             );
@@ -246,7 +256,8 @@ pub struct BillingConfig {
     /// `STRIPE_WEBHOOK_SIGNING_SECRET`. Used to verify the
     /// `Stripe-Signature` header on `POST /v1/stripe/webhook`.
     /// `None` when unset, in which case the webhook endpoint returns
-    /// 503 `billing_disabled`. Never appears in Debug output.
+    /// 501 `webhook_disabled` (via [`crate::error::ApiError::Unsupported`]).
+    /// Never appears in Debug output.
     pub webhook_signing_secret: Option<String>,
 }
 
@@ -355,7 +366,10 @@ pub struct SubscriptionState {
     /// application config (`NANOVM_PLAN_TIERS`).
     pub price_id: Option<String>,
     /// RFC 3339 timestamp of the last update — for observability +
-    /// operator triage. Set by the store on write.
+    /// operator triage. Set by the webhook handler when a subscription
+    /// event is parsed (see `parse_subscription_object`) and passed
+    /// through by the store verbatim, so tests can pin a deterministic
+    /// value.
     pub updated_at: String,
 }
 
@@ -391,6 +405,17 @@ impl BillingStore for InMemoryBillingStore {
         customer_id: &str,
         state: &SubscriptionState,
     ) -> Result<(), BillingStoreError> {
+        // Match SqliteBillingStore's precondition: the customer must
+        // exist (via `record_customer`) before its subscription can be
+        // recorded. Otherwise tests that pass against InMemory would
+        // silently drop state against SQLite in prod.
+        let map = self.map.lock().expect("billing map poisoned");
+        if !map.values().any(|cid| cid == customer_id) {
+            return Err(BillingStoreError::Backend(format!(
+                "record_subscription: no customer recorded for customer_id={customer_id:?}"
+            )));
+        }
+        drop(map);
         let mut guard = self.subs.lock().expect("billing subs poisoned");
         guard.insert(customer_id.to_string(), state.clone());
         Ok(())
@@ -739,7 +764,12 @@ pub fn verify_webhook_signature(
     use sha2::Sha256;
 
     let (ts, v1s) = parse_stripe_signature(header)?;
-    if (now - ts).abs() > tolerance_secs {
+    // Use `abs_diff` so an attacker-controlled `t=` value near `i64::MIN`
+    // can't overflow the subtraction and panic in overflow-checked builds.
+    // `tolerance_secs` is bounded to a small positive number by the caller,
+    // and any legitimate Stripe payload lands within seconds of `now`.
+    let skew = now.abs_diff(ts);
+    if skew > u64::try_from(tolerance_secs.max(0)).unwrap_or(u64::MAX) {
         return Err(WebhookError::StaleTimestamp {
             ts,
             now,

@@ -151,9 +151,9 @@ By default the KVM backend requires each `POST /v1/vms` request to specify `kern
 | `NANOVM_DEFAULT_ROOTFS_PATH` | Absolute path to a rootfs image | `/usr/local/share/nanovm/rootfs.ext4` |
 | `NANOVM_DEFAULT_KERNEL_CMDLINE` | Kernel cmdline for the default boot | `console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw` |
 
-Server-side defaults **only apply when the request field is unset** — request-supplied values always win. Unset any of the three and callers must supply that field on every request.
+Server-side defaults **only apply when the request field is unset**. For `kernel` / `rootfs` an explicit request value wins over the default. `cmdline` is a special case — the wire type can't distinguish an omitted field from an explicit empty string, so an empty cmdline is treated as "unset" and falls through to the default; deliberately-empty cmdlines are a rare backend-specific need (`flat_binary` VMs) that doesn't pass through this code path. Unset any of the three env vars and callers must supply that field on every request.
 
-Baking the kernel + rootfs into `Dockerfile.kvm` (so `docker run ghcr.io/ip888/nanovm-control-plane-kvm` works out of the box) is a follow-up PR (Stream C1b in the plan). Today an operator provides them via `docker run -v /host/img:/img -e NANOVM_DEFAULT_KERNEL_PATH=/img/vmlinux …` or Helm `extraVolumes` + `env`.
+Since #148, `Dockerfile.kvm` bakes a Firecracker sample kernel + rootfs at `/usr/local/share/nanovm/` and sets `NANOVM_DEFAULT_KERNEL_PATH` / `NANOVM_DEFAULT_ROOTFS_PATH` so `docker run ghcr.io/ip888/nanovm-control-plane-kvm` boots a demo VM against `POST /v1/vms {}` out of the box. Override at runtime with `-v /host/img:/img -e NANOVM_DEFAULT_KERNEL_PATH=/img/vmlinux …` or Helm `extraVolumes` + `env`.
 
 ## Honest non-features
 

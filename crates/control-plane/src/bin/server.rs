@@ -34,8 +34,8 @@
 //! - `NANOVM_PLAN_TIERS` — map Stripe price ids to named tiers +
 //!   fork RPS. Format:
 //!   `price_ABC=free:5,price_XYZ=pro:100,price_ENT=enterprise:1000`.
-//!   Read at startup; drives `GET /v1/billing/plan`. Unwiring into
-//!   fork quota lands in the follow-up "tier-based fork quota" PR.
+//!   Read at startup; drives `GET /v1/billing/plan` and, since #153,
+//!   the per-org fork-quota bucket capacity.
 //! - `STRIPE_WEBHOOK_SIGNING_SECRET` — the `whsec_…` value from your
 //!   Stripe webhook endpoint. When set, `POST /v1/stripe/webhook`
 //!   accepts events with a valid `Stripe-Signature` header
@@ -49,7 +49,7 @@
 //! - `NANOVM_DEFAULT_ROOTFS_PATH` — same for rootfs. Set to
 //!   `/usr/local/share/nanovm/rootfs.ext4` by `Dockerfile.kvm`.
 //! - `NANOVM_DEFAULT_KERNEL_CMDLINE` — cmdline used when the request's
-//!   is empty. Recommended default (Firecracker kernel): `console=ttyS0
+//!   cmdline is empty. Recommended default (Firecracker kernel): `console=ttyS0
 //!   reboot=k panic=1 pci=off root=/dev/vda rw`. Unset → no cmdline.
 //! - `NANOVM_OWNERSHIP_STORE` — path to a SQLite file that records
 //!   which org owns which VM / snapshot. Unset → in-memory only, and
@@ -180,12 +180,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // backend. Unset → the existing "request must supply kernel/rootfs"
     // shape is preserved.
     let vm_defaults = control_plane::VmConfigDefaults::from_env();
+    let cmdline_present = vm_defaults.cmdline.is_some();
     match (&vm_defaults.kernel, &vm_defaults.rootfs) {
         (Some(k), Some(r)) => {
-            info!(kernel = %k.display(), rootfs = %r.display(), "VmConfig defaults: kernel + rootfs present, empty POST /v1/vms will boot")
+            info!(kernel = %k.display(), rootfs = %r.display(), cmdline = cmdline_present, "VmConfig defaults: kernel + rootfs present, empty POST /v1/vms will boot")
         }
-        (Some(k), None) => info!(kernel = %k.display(), "VmConfig defaults: kernel-only"),
-        (None, Some(r)) => info!(rootfs = %r.display(), "VmConfig defaults: rootfs-only"),
+        (Some(k), None) => {
+            info!(kernel = %k.display(), cmdline = cmdline_present, "VmConfig defaults: kernel-only")
+        }
+        (None, Some(r)) => {
+            info!(rootfs = %r.display(), cmdline = cmdline_present, "VmConfig defaults: rootfs-only")
+        }
+        (None, None) if cmdline_present => info!(
+            "VmConfig defaults: cmdline-only (set NANOVM_DEFAULT_KERNEL_PATH + NANOVM_DEFAULT_ROOTFS_PATH to enable empty-body POST /v1/vms)"
+        ),
         (None, None) => info!(
             "VmConfig defaults unset (set NANOVM_DEFAULT_KERNEL_PATH + NANOVM_DEFAULT_ROOTFS_PATH to enable empty-body POST /v1/vms)"
         ),

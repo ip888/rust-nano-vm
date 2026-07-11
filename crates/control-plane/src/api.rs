@@ -64,7 +64,15 @@ impl From<CreateVmRequest> for VmConfig {
 /// `NANOVM_DEFAULT_KERNEL_PATH` / `NANOVM_DEFAULT_ROOTFS_PATH` /
 /// `NANOVM_DEFAULT_KERNEL_CMDLINE` env vars. Lives on
 /// [`crate::AppState`]; the `create_vm` handler applies them before
-/// dispatch. Request-supplied fields always win.
+/// dispatch.
+///
+/// Semantic: for `kernel` / `rootfs`, request-supplied fields win over
+/// the defaults. `cmdline` is a special case — because the wire type
+/// deserializes an omitted field to `""` (indistinguishable from an
+/// explicit empty string), an empty cmdline is treated as "unset" and
+/// falls through to the default. Setting an explicitly empty cmdline
+/// on a VM is a rare backend-specific need (raw `flat_binary` VMs)
+/// that doesn't pass through this handler.
 #[derive(Debug, Clone, Default)]
 pub struct VmConfigDefaults {
     /// Fallback kernel path.
@@ -94,8 +102,11 @@ impl VmConfigDefaults {
         }
     }
 
-    /// Apply defaults to `cfg` — request fields win, defaults fill any
-    /// gap. Called from the `create_vm` handler.
+    /// Apply defaults to `cfg`. A set `kernel` / `rootfs` on the
+    /// request wins over the default; an empty `cmdline` is treated as
+    /// "unset" (the wire type can't distinguish omitted from explicit
+    /// empty) and falls through to the default. Called from the
+    /// `create_vm` handler.
     pub fn apply_to(&self, cfg: &mut VmConfig) {
         if cfg.kernel.is_none() {
             cfg.kernel = self.kernel.clone();

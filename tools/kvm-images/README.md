@@ -33,8 +33,12 @@ stack requires a beefier rootfs, either by:
 ./fetch.sh /some/target/dir
 ```
 
-Writes `/some/target/dir/{vmlinux,rootfs.ext4}`. Fails loudly if a
-download errors or the SHA-256 doesn't match.
+Writes `/some/target/dir/{vmlinux,rootfs.ext4}`. Fails loudly on a
+network error. SHA-256 verification is enforced when
+`KERNEL_SHA`/`ROOTFS_SHA` are pinned; today they're `SKIP` (bootstrap
+posture) and the script warns + continues. Pin real digests before
+treating the resulting image as production-hardened — see "Refreshing
+the pins" below.
 
 `Dockerfile.kvm` runs it during the builder stage; nothing needs to
 be done on the host manually.
