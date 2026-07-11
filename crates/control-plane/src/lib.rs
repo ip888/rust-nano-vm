@@ -69,5 +69,5 @@ pub use fork_quota::ForkQuota;
 pub use metrics::Metrics;
 pub use ownership::{OwnershipMap, OwnershipStoreError};
 pub use request_id::RequestId;
-pub use routes::{router, AppState};
+pub use routes::{cors_layer_from, router, AppState};
 pub use warm_pool::WarmPool;
