@@ -21,6 +21,34 @@ Or, from a working checkout (development install):
 pip install ./clients/python
 ```
 
+## `nanovm` command-line client
+
+`pip install nanovm` also puts a `nanovm` command on your PATH.
+Shares its config file with the SDK — one identity per host.
+
+```sh
+nanovm login --api-url https://api.your-saas.com
+# API key (input hidden): ***                    # or --key on CLI / NANOVM_API_KEY env
+
+nanovm status
+#  Org           acme
+#  API           https://api.your-saas.com
+#  Forks         42
+#  Total ms      523
+#  Avg ms/fork   12
+
+nanovm python 'print(sum(range(100)))'
+#  4950
+nanovm shell 'uname -a'
+#  Linux …
+
+nanovm logout                                    # forget the saved key
+```
+
+Config lives at `$XDG_CONFIG_HOME/nanovm/config.json` on Linux and
+`~/.nanovm/config.json` on macOS/Windows; override with the
+`NANOVM_CONFIG` env var. File perms are 0600 on Unix.
+
 ## Give your AI agent a real sandbox in three lines
 
 LangChain / LangGraph:
