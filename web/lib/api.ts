@@ -13,9 +13,20 @@
 /**
  * Base URL of the control-plane API. Falls back to localhost so a
  * fresh clone can `npm run dev` without an env file.
+ *
+ * We accept the env var only when it's non-empty after trimming.
+ * `?? "..."` alone would treat an explicit empty string as valid
+ * — every fetch would then go to the dashboard's own origin and
+ * silently 404.
  */
-export const API_BASE: string =
-  process.env.NEXT_PUBLIC_NANOVM_API_URL ?? "http://localhost:8080";
+export const API_BASE: string = pickApiBase(
+  process.env.NEXT_PUBLIC_NANOVM_API_URL,
+);
+
+function pickApiBase(raw: string | undefined): string {
+  const trimmed = raw?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : "http://localhost:8080";
+}
 
 // -------- Types (mirror the Rust DTOs) ---------------------------
 
@@ -43,12 +54,6 @@ export interface PlanResponse {
   plan: PlanTier | null;
   subscription_status: string | null;
   price_id: string | null;
-}
-
-export interface UsageByOrg {
-  org: string;
-  fork_count: number;
-  fork_total_ms: number;
 }
 
 export interface UsageResponseDto {

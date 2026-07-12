@@ -34,6 +34,26 @@
 //! `warn` and don't block other customers; the next tick retries.
 //! A total Stripe outage translates to at most one billing-period's
 //! worth of delayed reports.
+//!
+//! ## Stripe API surface — legacy vs Meter Events
+//!
+//! This module posts to `/v1/subscription_items/:id/usage_records`,
+//! which is the **legacy** metered-billing API. It requires the
+//! subscription's price to use `recurring.usage_type=metered` (the
+//! pre-2024 shape).
+//!
+//! Stripe accounts created after mid-2024 (and any account that opts
+//! into the new billing model) must use the **Meter Events** API at
+//! `/v1/billing/meter_events` with `event_name`, `payload[stripe_customer_id]`,
+//! `payload[value]`, and an `identifier` for idempotency. That
+//! requires knowing the meter's event_name (a per-workspace string
+//! configured in the Stripe dashboard).
+//!
+//! **Before going live**, verify which model your account is on:
+//!  - Legacy metered price → this module works as-is.
+//!  - Meter Events → migrate `report_usage_record` on `StripeClient`
+//!    to POST `/v1/billing/meter_events` and thread the event name
+//!    through `NANOVM_STRIPE_METER_EVENT_NAME`.
 
 #![cfg(feature = "billing")]
 
@@ -95,9 +115,12 @@ impl UsageReporterConfig {
     }
 }
 
-/// Handle to a running reporter task. Drop it to keep the task
-/// running for the process lifetime; call [`shutdown`] before drop
-/// if you want the loop to exit cleanly.
+/// Handle to a running reporter task. **Hold this to keep the task
+/// running** — dropping the handle drops the oneshot sender, which
+/// completes the receiver and stops the loop at the next tick.
+/// [`shutdown`](Self::shutdown) is the explicit-intent form of the
+/// same behaviour, useful when you want the reporter to exit even
+/// though the handle is going into a longer-lived container.
 #[derive(Debug)]
 pub struct UsageReporterHandle {
     _stop: tokio::sync::oneshot::Sender<()>,
@@ -106,7 +129,7 @@ pub struct UsageReporterHandle {
 
 impl UsageReporterHandle {
     /// Signal the reporter task to stop after the current tick
-    /// completes. The handle drops after this; the task detaches.
+    /// completes. The handle is consumed; the join handle detaches.
     pub fn shutdown(self) {
         let _ = self._stop.send(());
     }
@@ -127,11 +150,17 @@ pub fn spawn(
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(config.interval);
-        // First tick fires immediately; discard so the initial state
-        // becomes the baseline instead of getting reported as one
-        // huge delta.
+        // First tick fires immediately; discard it AND seed the
+        // baseline from the counter's value at startup. Without this
+        // seeding, the second tick's `now - prior` would report the
+        // whole counter as if it had accumulated in one interval —
+        // potentially over-billing on a restart of a warm process.
         interval.tick().await;
-        let mut prior_snapshot: HashMap<String, u64> = HashMap::new();
+        let mut prior_snapshot: HashMap<String, u64> = metrics
+            .forks_by_org_snapshot()
+            .into_iter()
+            .map(|(org, count, _sum_ms)| (org, count))
+            .collect();
         loop {
             tokio::select! {
                 _ = &mut stop_rx => {

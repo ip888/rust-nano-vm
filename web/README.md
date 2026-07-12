@@ -16,7 +16,7 @@ Fully client-side. Every page is either a static route or a client component; th
 
 ## Requirements
 
-- Node **20** or newer (Next.js 15 dropped 18).
+- Node **18.18** or newer (Next.js 15's minimum). Any current LTS (20 or 22) is fine.
 - A running `nanovm-control-plane` reachable from the browser.
 - The control plane MUST have `NANOVM_CORS_ORIGIN` set to the dashboard's origin, e.g.:
 
@@ -24,7 +24,7 @@ Fully client-side. Every page is either a static route or a client component; th
 NANOVM_CORS_ORIGIN=http://localhost:3000 nanovm-control-plane
 ```
 
-Otherwise the browser drops every `POST /v1/*` response.
+Otherwise the browser drops every cross-origin response — GETs like `/v1/billing/plan` too, not just mutating calls.
 
 ## Local dev
 

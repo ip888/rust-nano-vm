@@ -330,10 +330,16 @@ impl BillingConfig {
             webhook_signing_secret: std::env::var("STRIPE_WEBHOOK_SIGNING_SECRET")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            // Default points at the DASHBOARD's client-side verify
+            // page, NOT the server's POST endpoint. A magic-link click
+            // is a `GET` from the user's browser; landing on
+            // `POST /v1/signup/verify` would 405. The dashboard page
+            // handles the click, reads the `?token=` query, and POSTs
+            // to the server endpoint on the user's behalf.
             signup_verify_url: std::env::var("NANOVM_SIGNUP_VERIFY_URL")
                 .ok()
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "http://localhost:8080/v1/signup/verify".into()),
+                .unwrap_or_else(|| "http://localhost:3000/signup/verify".into()),
             signup_token_ttl_secs: std::env::var("NANOVM_SIGNUP_TOKEN_TTL_SECS")
                 .ok()
                 .and_then(|s| s.parse::<i64>().ok())
@@ -419,7 +425,24 @@ pub trait BillingStore: Send + Sync + std::fmt::Debug {
     /// future relative to `now` (RFC 3339). Expired rows are treated as
     /// absent (and should be swept by `gc_expired_signups`). This is
     /// the atomic point that prevents a token being redeemed twice.
+    ///
+    /// **Prefer [`peek_pending_signup`](Self::peek_pending_signup) +
+    /// [`delete_pending_signup`](Self::delete_pending_signup) for
+    /// verify flows** so a Stripe failure mid-verify doesn't leave the
+    /// user with a consumed token AND no customer.
     fn take_pending_signup(&self, token_hash: &str, now: &str) -> Option<PendingSignup>;
+
+    /// Non-destructive lookup — same expiry semantics as
+    /// [`take_pending_signup`](Self::take_pending_signup) but leaves
+    /// the row in place. The caller is expected to follow up with
+    /// [`delete_pending_signup`](Self::delete_pending_signup) once the
+    /// downstream side effects (Stripe customer create, etc.) have
+    /// succeeded.
+    fn peek_pending_signup(&self, token_hash: &str, now: &str) -> Option<PendingSignup>;
+
+    /// Finalize a signup by removing the pending row. Returns Ok even
+    /// if the row was already gone (concurrent verify / GC).
+    fn delete_pending_signup(&self, token_hash: &str) -> Result<(), BillingStoreError>;
 
     /// Delete pending-signup rows whose `expires_at` is < `now`. Called
     /// periodically by the control-plane. Returns the count removed.
@@ -564,6 +587,19 @@ impl BillingStore for InMemoryBillingStore {
         }
         Some(entry)
     }
+    fn peek_pending_signup(&self, token_hash: &str, now: &str) -> Option<PendingSignup> {
+        let guard = self.pending.lock().expect("pending signups poisoned");
+        let entry = guard.get(token_hash)?;
+        if entry.expires_at.as_str() < now {
+            return None;
+        }
+        Some(entry.clone())
+    }
+    fn delete_pending_signup(&self, token_hash: &str) -> Result<(), BillingStoreError> {
+        let mut guard = self.pending.lock().expect("pending signups poisoned");
+        guard.remove(token_hash);
+        Ok(())
+    }
     fn gc_expired_signups(&self, now: &str) -> Result<u64, BillingStoreError> {
         let mut guard = self.pending.lock().expect("pending signups poisoned");
         let before = guard.len();
@@ -628,11 +664,21 @@ impl StripeClient {
     /// dashboard. `org_slug` is the stable internal id used both as the
     /// nanovm `OrgId` and as `metadata[org_id]` so Stripe → nanovm
     /// reconciliation stays deterministic across `name` renames.
+    ///
+    /// `idempotency_key` is the value Stripe uses to deduplicate this
+    /// request for 24 h. A network retry after Stripe already accepted
+    /// the request (but our response was dropped) hits the cache and
+    /// returns the existing customer instead of minting a duplicate.
+    /// Callers must pick a key that's stable across retries but unique
+    /// per logical signup — the magic-link `token_hash` is the natural
+    /// choice for self-serve; the admin `signup` path can use the
+    /// org_slug.
     pub async fn create_customer(
         &self,
         email: &str,
         name: &str,
         org_slug: &str,
+        idempotency_key: &str,
     ) -> Result<StripeCustomer, BillingError> {
         let params = [
             ("email", email),
@@ -643,6 +689,7 @@ impl StripeClient {
             .http
             .post(format!("{}/v1/customers", self.base_url))
             .basic_auth(&self.secret_key, Some(""))
+            .header("Idempotency-Key", idempotency_key)
             .form(&params)
             .send()
             .await
@@ -1028,6 +1075,17 @@ pub async fn signup_request(
 /// Self-serve signup step 2: activate a pending signup using the token
 /// from the magic link. Reuses the same "Stripe customer → persist →
 /// mint API key" sequence as the admin `signup` path.
+///
+/// Ordering (audit-driven):
+///   1. **Peek** the pending row — read-only lookup so a Stripe failure
+///      doesn't leave the user with a consumed token AND no customer.
+///   2. Call Stripe `create_customer` with `Idempotency-Key = token_hash`.
+///      A network retry after Stripe accepted the request (but our
+///      response dropped) hits the Stripe cache instead of creating a
+///      duplicate `cus_…`.
+///   3. Persist the org → customer_id mapping locally.
+///   4. **Now** delete the pending row — the signup is committed.
+///   5. Mint the API key (pure local op).
 pub async fn signup_verify(
     tokens: &ApiTokens,
     store: &dyn BillingStore,
@@ -1037,7 +1095,7 @@ pub async fn signup_verify(
     let token_hash = hash_signup_token(&req.token);
     let now = crate::time::rfc3339_now();
     let pending = store
-        .take_pending_signup(&token_hash, &now)
+        .peek_pending_signup(&token_hash, &now)
         .ok_or(BillingError::InvalidSignupToken)?;
     let org_slug = slugify(&pending.org_name);
     if org_slug.is_empty() {
@@ -1045,9 +1103,21 @@ pub async fn signup_verify(
     }
     let org_id = OrgId(org_slug.clone());
     let customer = stripe
-        .create_customer(&pending.email, &pending.org_name, &org_slug)
+        .create_customer(&pending.email, &pending.org_name, &org_slug, &token_hash)
         .await?;
     store.record_customer(&org_id, &customer.id)?;
+    // Stripe accepted + local persistence succeeded — now consume the
+    // pending row. If this delete fails the user has an activated
+    // signup with a still-live token; next verify hits Stripe's
+    // idempotency cache and returns the same customer, then re-runs
+    // record_customer (an UPSERT), so it's idempotent end-to-end.
+    if let Err(e) = store.delete_pending_signup(&token_hash) {
+        tracing::warn!(
+            error = %e,
+            token_hash,
+            "signup_verify: delete_pending_signup failed post-commit"
+        );
+    }
     let issued: IssuedToken = tokens.issue(org_id);
     Ok(SignupResponse {
         org: org_slug,
@@ -1076,7 +1146,14 @@ pub async fn signup(
     bearer: Option<&str>,
     req: SignupRequest,
 ) -> Result<SignupResponse, BillingError> {
-    if bearer != Some(cfg.signup_token.as_str()) {
+    // Constant-time compare so the admin bearer isn't timing-side-channel
+    // recoverable byte-by-byte. `==`/`!=` on `&str` short-circuits at
+    // the first differing byte; over enough retries an attacker can
+    // reconstruct the token. `subtle`-style compare avoids that.
+    let bearer_ok = bearer
+        .map(|b| constant_time_eq_bytes(b.as_bytes(), cfg.signup_token.as_bytes()))
+        .unwrap_or(false);
+    if !bearer_ok {
         return Err(BillingError::BadSignupToken);
     }
 
@@ -1089,9 +1166,11 @@ pub async fn signup(
     // 1) External call first — the only step that can fail with side
     //    effects landing outside our control (a customer object on
     //    Stripe). If it fails, we return before any local state
-    //    mutation, so a retry is safe.
+    //    mutation, so a retry is safe. Idempotency-Key = `org_slug` so
+    //    a network-level retry doesn't create a duplicate cus_… on
+    //    Stripe's side.
     let customer = stripe
-        .create_customer(&req.email, &req.org, &org_slug)
+        .create_customer(&req.email, &req.org, &org_slug, &org_slug)
         .await?;
     // 2) Persist the mapping BEFORE minting the token so a signup that
     //    crashes between these two steps loses the token, not the
@@ -1204,11 +1283,21 @@ fn parse_stripe_signature(header: &str) -> Result<(i64, Vec<String>), WebhookErr
 
 /// Constant-time comparison of two hex-encoded byte strings.
 fn constant_time_eq_hex(a: &str, b: &str) -> bool {
+    constant_time_eq_bytes(a.as_bytes(), b.as_bytes())
+}
+
+/// Byte-wise constant-time equality — length mismatch → false, otherwise
+/// XORs every byte-pair and returns the OR-fold. Used for both webhook
+/// signatures and admin-bearer comparison. Not "constant time" against
+/// a length-based side channel; the length check IS a fast exit for
+/// mismatched lengths, which is fine because a valid caller always
+/// passes matching-length inputs.
+fn constant_time_eq_bytes(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
     let mut diff = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
+    for (x, y) in a.iter().zip(b.iter()) {
         diff |= x ^ y;
     }
     diff == 0
@@ -1239,7 +1328,12 @@ pub fn verify_webhook_signature(
     // `tolerance_secs` is bounded to a small positive number by the caller,
     // and any legitimate Stripe payload lands within seconds of `now`.
     let skew = now.abs_diff(ts);
-    if skew > u64::try_from(tolerance_secs.max(0)).unwrap_or(u64::MAX) {
+    // Callers pass a small positive number (typically 300). Clamp
+    // negatives to 0 so the comparison rejects everything, and use
+    // a direct `as` cast — the `try_from` fallback the earlier code
+    // carried was dead once the max(0) was in place.
+    let tolerance = tolerance_secs.max(0) as u64;
+    if skew > tolerance {
         return Err(WebhookError::StaleTimestamp {
             ts,
             now,
@@ -1342,9 +1436,10 @@ pub(crate) async fn signup_handler(
 }
 
 /// `POST /v1/signup/request` axum handler. Self-serve — no bearer.
-/// Rate-limited at the route layer (see routes.rs). Returns the same
-/// opaque body regardless of outcome so callers can't enumerate live
-/// email addresses; the operator sees the real story in tracing.
+/// Rate-limiting is expected UPSTREAM (reverse proxy / LB per-IP)
+/// today; there is no in-process limiter on this route. Returns the
+/// same opaque body regardless of outcome so callers can't enumerate
+/// live email addresses; the operator sees the real story in tracing.
 pub(crate) async fn signup_request_handler(
     State(state): State<crate::AppState>,
     body: Result<Json<SignupRequestRequest>, axum::extract::rejection::JsonRejection>,
@@ -1703,10 +1798,35 @@ fn billing_to_api_error(e: BillingError) -> ApiError {
             message: format!("no Stripe customer recorded for org {org:?}; did you signup?"),
         },
         BillingError::StripeApi { status, message } => {
-            ApiError::Bad(format!("stripe api error ({status}): {message}"))
+            // Never echo Stripe's raw message to the caller — it can
+            // name internal Stripe object IDs, the caller's email,
+            // "no such price price_XXX", etc. Log at `warn` so ops
+            // sees the real story; return a generic body.
+            tracing::warn!(
+                stripe_status = status,
+                stripe_message = %message,
+                "billing: upstream Stripe error"
+            );
+            match status {
+                429 => ApiError::TooManyRequests {
+                    code: "billing_upstream_throttled",
+                    message: "Stripe rate-limited the request; retry shortly.".into(),
+                    // Stripe's own Retry-After header (which we don't parse
+                    // yet) would be more accurate. 60s is a safe conservative
+                    // default that matches Stripe's typical guidance.
+                    retry_after_secs: 60,
+                },
+                500..=599 => ApiError::InternalDyn(
+                    "upstream billing provider is unavailable; try again shortly.".into(),
+                ),
+                _ => ApiError::Bad(
+                    "billing request was rejected by the upstream provider.".into(),
+                ),
+            }
         }
         BillingError::StripeTransport(msg) => {
-            ApiError::InternalDyn(format!("stripe transport error: {msg}"))
+            tracing::warn!(error = %msg, "billing: Stripe transport error");
+            ApiError::InternalDyn("upstream billing provider is unreachable.".into())
         }
         BillingError::Store(inner) => ApiError::InternalDyn(inner.to_string()),
         BillingError::InvalidSignupToken => ApiError::Bad(

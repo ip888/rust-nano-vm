@@ -2,10 +2,12 @@
 
 import Link from "next/link";
 import { useSearchParams, useRouter } from "next/navigation";
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 
 import { ApiError, verifySignup } from "@/lib/api";
 import { setSession } from "@/lib/session";
+
+type CopyState = "idle" | "copied" | "failed";
 
 /**
  * Signup step 2: user clicked the magic link. The token is in
@@ -31,9 +33,19 @@ function VerifyInner() {
     | { kind: "success"; org: string; apiKey: string }
     | { kind: "error"; message: string }
   >(() => (token ? { kind: "loading" } : { kind: "error", message: "Missing token — the magic link didn't include one." }));
+  const [copyState, setCopyState] = useState<CopyState>("idle");
+  // React 18 StrictMode double-invokes effects in dev; without this
+  // latch we'd POST /v1/signup/verify twice, and the second call
+  // returns InvalidSignupToken (token already consumed) which
+  // clobbers the success state that setSession just wrote. Ref (not
+  // state) so the latch survives the second effect run without
+  // triggering another render.
+  const fired = useRef(false);
 
   useEffect(() => {
     if (state.kind !== "loading") return;
+    if (fired.current) return;
+    fired.current = true;
     (async () => {
       try {
         const resp = await verifySignup(token);
@@ -90,11 +102,28 @@ function VerifyInner() {
       </div>
       <button
         onClick={() => {
-          void navigator.clipboard.writeText(state.apiKey);
+          // `navigator.clipboard` is undefined on insecure origins
+          // (http://…, unless it's localhost) and writeText can
+          // reject if the tab lacks focus / permission. Handle both
+          // so the console stays clean and the user gets a visible
+          // failure state.
+          const clip = navigator.clipboard;
+          if (!clip) {
+            setCopyState("failed");
+            return;
+          }
+          clip.writeText(state.apiKey).then(
+            () => setCopyState("copied"),
+            () => setCopyState("failed"),
+          );
         }}
         className="mb-6 rounded-md border border-gray-300 px-4 py-2 text-sm hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-800"
       >
-        Copy to clipboard
+        {copyState === "copied"
+          ? "Copied ✓"
+          : copyState === "failed"
+            ? "Couldn't copy — select and copy manually"
+            : "Copy to clipboard"}
       </button>
       <button
         onClick={() => router.push("/dashboard")}

@@ -353,10 +353,15 @@ pub fn router() -> Router<AppState> {
     #[cfg(feature = "billing")]
     let v1 = v1.route("/signup", post(crate::billing::signup_handler));
     // Self-serve signup: request → email magic link → verify → API key.
-    // Also outside tenant auth (the caller has no tenant token yet); the
-    // security posture is (a) rate-limit the request endpoint per-IP,
-    // (b) hash the token before storing, (c) expire in 15 min, (d) never
-    // leak whether an address is already registered.
+    // Also outside tenant auth (the caller has no tenant token yet).
+    // Security posture:
+    //   (a) hash the token with SHA-256 before storing,
+    //   (b) 15-min expiry enforced both at take-time and by the GC pass,
+    //   (c) opaque response body on request → no address enumeration,
+    //   (d) rate-limiting is expected UPSTREAM (reverse proxy / load
+    //       balancer per-IP) today. An in-process limiter is a scoped
+    //       follow-up; today's shape assumes the deploy env caps
+    //       abusive callers before they reach this router.
     #[cfg(feature = "billing")]
     let v1 = v1
         .route(
@@ -419,8 +424,12 @@ pub fn router() -> Router<AppState> {
 ///   fully-public read APIs; `Authorization: Bearer …` requests will
 ///   still work because credentials are NOT sent under `*`.
 ///
-/// Rejects an origin with a malformed URL by logging and skipping —
-/// the whole config isn't torn down because one entry is bad.
+/// Entries that aren't valid HTTP header values (control chars, etc.)
+/// are logged at `warn` and skipped so one bad entry doesn't tear
+/// down the whole config. We do NOT validate URL shape — CORS just
+/// needs the string to match the browser's `Origin` header byte-for-byte,
+/// so a syntactically-off "URL" that a browser will nonetheless send
+/// still works.
 fn cors_layer_from_env() -> tower_http::cors::CorsLayer {
     let raw = std::env::var("NANOVM_CORS_ORIGIN").unwrap_or_default();
     cors_layer_from(&raw)
