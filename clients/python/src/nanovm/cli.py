@@ -37,7 +37,7 @@ from getpass import getpass
 from pathlib import Path
 from typing import Optional
 
-from . import Client, __version__
+from . import AuthError, Client, NanovmError, __version__
 
 # Exit codes — grep-able for shell scripts calling this CLI.
 EXIT_OK = 0
@@ -141,7 +141,7 @@ def _require_session() -> Session:
 
 def cmd_login(args: argparse.Namespace) -> int:
     """`nanovm login` — prompt for API key + save."""
-    api_url = args.api_url.rstrip("/")
+    api_url = args.api_url
     api_key = args.key or os.environ.get("NANOVM_API_KEY")
     if not api_key:
         try:
@@ -159,18 +159,27 @@ def cmd_login(args: argparse.Namespace) -> int:
     try:
         # /v1/usage is auth'd and cheap; a 401 tells us the key's dead.
         usage = client.usage()
-    except Exception as e:  # noqa: BLE001 — bubbled up as CLI text
-        msg = str(e)
-        if "401" in msg or "unauthorized" in msg.lower():
-            print(f"API key rejected: {msg}", file=sys.stderr)
+    except AuthError as e:
+        print(f"API key rejected: {e}", file=sys.stderr)
+        return EXIT_AUTH_FAILED
+    except NanovmError as e:
+        if e.status == 401:
+            print(f"API key rejected: {e}", file=sys.stderr)
             return EXIT_AUTH_FAILED
-        print(f"Couldn't reach the API at {api_url}: {msg}", file=sys.stderr)
+        print(f"Couldn't reach the API at {api_url}: {e}", file=sys.stderr)
+        return EXIT_API_ERROR
+    except Exception as e:  # noqa: BLE001 — bubbled up as CLI text
+        print(f"Couldn't reach the API at {api_url}: {e}", file=sys.stderr)
         return EXIT_API_ERROR
 
     # Derive org from the token shape (`org:secret`); fall back to
     # `?` for tokens the CLI doesn't recognise.
     org = api_key.split(":", 1)[0] if ":" in api_key else "?"
-    _save_session(Session(api_url=api_url, api_key=api_key, org=org))
+    try:
+        _save_session(Session(api_url=api_url, api_key=api_key, org=org))
+    except OSError as e:
+        print(f"Couldn't save session to {_config_path()}: {e}", file=sys.stderr)
+        return EXIT_API_ERROR
     print(f"Logged in as {org} at {api_url}.")
     print(f"  fork_count: {usage.fork_count}")
     print(f"  saved to:   {_config_path()}")
@@ -179,7 +188,11 @@ def cmd_login(args: argparse.Namespace) -> int:
 
 def cmd_logout(_args: argparse.Namespace) -> int:
     """`nanovm logout` — delete config."""
-    _clear_session()
+    try:
+        _clear_session()
+    except OSError as e:
+        print(f"Couldn't remove {_config_path()}: {e}", file=sys.stderr)
+        return EXIT_API_ERROR
     print(f"Removed {_config_path()}.")
     return EXIT_OK
 
@@ -235,7 +248,7 @@ def cmd_python(args: argparse.Namespace) -> int:
             sys.stdout.write("\n")
     if result.stderr:
         sys.stderr.write(result.stderr)
-    return result.exit_code if result.exit_code is not None else EXIT_OK
+    return result.exit_code
 
 
 def cmd_shell(args: argparse.Namespace) -> int:
@@ -257,7 +270,7 @@ def cmd_shell(args: argparse.Namespace) -> int:
             sys.stdout.write("\n")
     if result.stderr:
         sys.stderr.write(result.stderr)
-    return result.exit_code if result.exit_code is not None else EXIT_OK
+    return result.exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +316,7 @@ def _build_parser() -> argparse.ArgumentParser:
     py.add_argument("code", help="Python source to execute.")
     py.add_argument(
         "--snapshot",
+        type=int,
         default=None,
         help="Snapshot id to fork. Default = server-side default.",
     )
@@ -316,7 +330,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sh = sub.add_parser("shell", help="Run a shell command in a sandbox.")
     sh.add_argument("command", help="Shell command to execute.")
-    sh.add_argument("--snapshot", default=None)
+    sh.add_argument("--snapshot", type=int, default=None)
     sh.add_argument("--timeout", type=int, default=None)
     sh.set_defaults(func=cmd_shell)
 

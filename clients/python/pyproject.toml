@@ -40,8 +40,8 @@ Issues        = "https://github.com/ip888/Rust-nano-vm/issues"
 
 [project.scripts]
 # `pip install nanovm` puts a `nanovm` command on the user's PATH.
-# Same auth + config file the Python SDK writes when it caches a
-# token, so the CLI and library share one identity per host.
+# CLI stores login state in the user config directory so `nanovm` can
+# reuse one saved identity per host.
 nanovm = "nanovm.cli:main"
 
 [project.optional-dependencies]

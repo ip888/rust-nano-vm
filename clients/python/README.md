@@ -24,7 +24,7 @@ pip install ./clients/python
 ## `nanovm` command-line client
 
 `pip install nanovm` also puts a `nanovm` command on your PATH.
-Shares its config file with the SDK — one identity per host.
+Stores login state in a local config file — one identity per host for the CLI.
 
 ```sh
 nanovm login --api-url https://api.your-saas.com
