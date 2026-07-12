@@ -34,6 +34,26 @@
 //! `warn` and don't block other customers; the next tick retries.
 //! A total Stripe outage translates to at most one billing-period's
 //! worth of delayed reports.
+//!
+//! ## Stripe API surface — legacy vs Meter Events
+//!
+//! This module posts to `/v1/subscription_items/:id/usage_records`,
+//! which is the **legacy** metered-billing API. It requires the
+//! subscription's price to use `recurring.usage_type=metered` (the
+//! pre-2024 shape).
+//!
+//! Stripe accounts created after mid-2024 (and any account that opts
+//! into the new billing model) must use the **Meter Events** API at
+//! `/v1/billing/meter_events` with `event_name`, `payload[stripe_customer_id]`,
+//! `payload[value]`, and an `identifier` for idempotency. That
+//! requires knowing the meter's event_name (a per-workspace string
+//! configured in the Stripe dashboard).
+//!
+//! **Before going live**, verify which model your account is on:
+//!  - Legacy metered price → this module works as-is.
+//!  - Meter Events → migrate `report_usage_record` on `StripeClient`
+//!    to POST `/v1/billing/meter_events` and thread the event name
+//!    through `NANOVM_STRIPE_METER_EVENT_NAME`.
 
 #![cfg(feature = "billing")]
 

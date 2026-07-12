@@ -469,9 +469,29 @@ fn build_billing_ctx() -> Option<control_plane::billing::BillingCtx> {
                 }
             }
             None => {
+                // In-memory billing store + real Stripe credentials is
+                // a live-money footgun: every restart loses the
+                // org→customer_id map, so already-live subscriptions
+                // become orphans that can't be looked up on the next
+                // /v1/billing/portal. Opt-out via
+                // `NANOVM_ALLOW_INMEMORY_BILLING=1` for tests / demos.
+                let allow_inmemory = std::env::var("NANOVM_ALLOW_INMEMORY_BILLING")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .is_some();
+                if !allow_inmemory {
+                    tracing::error!(
+                        "billing: NANOVM_OWNERSHIP_STORE is required when billing is enabled. \
+                         An in-memory store would drop every Stripe customer mapping on restart, \
+                         orphaning live subscriptions. Set a SQLite path, or opt into the unsafe \
+                         in-memory mode with NANOVM_ALLOW_INMEMORY_BILLING=1 (tests only)."
+                    );
+                    std::process::exit(1);
+                }
                 tracing::warn!(
-                    "billing: NANOVM_OWNERSHIP_STORE unset; using InMemoryBillingStore. \
-                 Stripe customer ids will be lost on restart — DO NOT use in prod."
+                    "billing: running with InMemoryBillingStore because \
+                     NANOVM_ALLOW_INMEMORY_BILLING=1 was set. Restart LOSES all \
+                     Stripe customer mappings — DO NOT use with a live Stripe key."
                 );
                 std::sync::Arc::new(control_plane::billing::InMemoryBillingStore::default())
             }

@@ -371,6 +371,39 @@ impl BillingStore for SqliteBillingStore {
         })?;
         Ok(deleted as u64)
     }
+
+    fn peek_pending_signup(&self, token_hash: &str, now: &str) -> Option<PendingSignup> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT email, org_name, created_at, expires_at
+                   FROM pending_signups
+                  WHERE token_hash = ?1 AND expires_at >= ?2",
+                params![token_hash, now],
+                |r| {
+                    Ok(PendingSignup {
+                        token_hash: token_hash.to_owned(),
+                        email: r.get::<_, String>(0)?,
+                        org_name: r.get::<_, String>(1)?,
+                        created_at: r.get::<_, String>(2)?,
+                        expires_at: r.get::<_, String>(3)?,
+                    })
+                },
+            )
+            .optional()
+        })
+        .ok()
+        .flatten()
+    }
+
+    fn delete_pending_signup(&self, token_hash: &str) -> Result<(), BillingStoreError> {
+        self.with_conn(|c| {
+            c.execute(
+                "DELETE FROM pending_signups WHERE token_hash = ?1",
+                params![token_hash],
+            )?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]

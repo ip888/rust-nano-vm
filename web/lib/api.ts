@@ -56,12 +56,6 @@ export interface PlanResponse {
   price_id: string | null;
 }
 
-export interface UsageByOrg {
-  org: string;
-  fork_count: number;
-  fork_total_ms: number;
-}
-
 export interface UsageResponseDto {
   token: string;
   fork_count: number;

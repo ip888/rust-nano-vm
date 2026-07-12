@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useSearchParams, useRouter } from "next/navigation";
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 
 import { ApiError, verifySignup } from "@/lib/api";
 import { setSession } from "@/lib/session";
@@ -34,9 +34,18 @@ function VerifyInner() {
     | { kind: "error"; message: string }
   >(() => (token ? { kind: "loading" } : { kind: "error", message: "Missing token — the magic link didn't include one." }));
   const [copyState, setCopyState] = useState<CopyState>("idle");
+  // React 18 StrictMode double-invokes effects in dev; without this
+  // latch we'd POST /v1/signup/verify twice, and the second call
+  // returns InvalidSignupToken (token already consumed) which
+  // clobbers the success state that setSession just wrote. Ref (not
+  // state) so the latch survives the second effect run without
+  // triggering another render.
+  const fired = useRef(false);
 
   useEffect(() => {
     if (state.kind !== "loading") return;
+    if (fired.current) return;
+    fired.current = true;
     (async () => {
       try {
         const resp = await verifySignup(token);
