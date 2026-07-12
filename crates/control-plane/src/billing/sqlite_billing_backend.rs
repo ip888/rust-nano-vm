@@ -282,10 +282,7 @@ impl BillingStore for SqliteBillingStore {
     }
 
     fn record_pending_signup(&self, signup: &PendingSignup) -> Result<(), BillingStoreError> {
-        // Two conflict paths, both need explicit UPSERT clauses because
-        // SQLite requires the target of `ON CONFLICT` to be a UNIQUE /
-        // PRIMARY KEY column:
-        //
+        // Two conflict paths must both replace the prior row:
         //   * `email` (UNIQUE) — re-requesting a signup for the same
         //     address replaces the prior row so we never leave two
         //     live tokens for one email.
@@ -293,31 +290,36 @@ impl BillingStore for SqliteBillingStore {
         //     with a still-live row from a different email (extremely
         //     unlikely for a 24-byte random token, but the trait
         //     contract promises the fresh row wins).
-        self.with_conn(|c| {
-            c.execute(
-                "INSERT INTO pending_signups
+        //
+        // A single `INSERT` can only carry ONE `ON CONFLICT` clause in
+        // SQLite, and chaining them would fail to parse. Instead we
+        // DELETE any pre-existing row that matches either constraint
+        // and then INSERT — both statements in one transaction so
+        // there's no window where either row is missing. Cheap in
+        // practice because both columns are indexed.
+        let mut guard = self
+            .conn
+            .lock()
+            .map_err(|e| BillingStoreError::Backend(format!("mutex poisoned: {e}")))?;
+        let tx = guard.transaction()?;
+        tx.execute(
+            "DELETE FROM pending_signups WHERE email = ?1 OR token_hash = ?2",
+            params![signup.email, signup.token_hash],
+        )?;
+        tx.execute(
+            "INSERT INTO pending_signups
                     (token_hash, email, org_name, created_at, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(email) DO UPDATE SET
-                    token_hash = excluded.token_hash,
-                    org_name   = excluded.org_name,
-                    created_at = excluded.created_at,
-                    expires_at = excluded.expires_at
-                 ON CONFLICT(token_hash) DO UPDATE SET
-                    email      = excluded.email,
-                    org_name   = excluded.org_name,
-                    created_at = excluded.created_at,
-                    expires_at = excluded.expires_at",
-                params![
-                    signup.token_hash,
-                    signup.email,
-                    signup.org_name,
-                    signup.created_at,
-                    signup.expires_at,
-                ],
-            )?;
-            Ok(())
-        })
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                signup.token_hash,
+                signup.email,
+                signup.org_name,
+                signup.created_at,
+                signup.expires_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn take_pending_signup(&self, token_hash: &str, now: &str) -> Option<PendingSignup> {
@@ -564,6 +566,42 @@ mod tests {
         assert!(store
             .take_pending_signup("hash-b", "2026-07-11T00:00:00.000Z")
             .is_some());
+    }
+
+    #[test]
+    fn token_hash_collision_across_emails_replaces_prior_row() {
+        // Extremely unlikely for a 24-byte random token, but the trait
+        // contract says a fresh mint that hashes to a still-live row's
+        // token_hash MUST replace the prior row rather than returning
+        // an error. The prior implementation used chained ON CONFLICT
+        // clauses which failed to parse — this test locks the DELETE+
+        // INSERT shape down.
+        let dir = tempdir().unwrap();
+        let store = SqliteBillingStore::open(dir.path().join("b.sqlite")).unwrap();
+        let first = PendingSignup {
+            token_hash: "collision-hash".into(),
+            email: "alice@example.com".into(),
+            org_name: "Acme".into(),
+            created_at: "2026-07-10T00:00:00.000Z".into(),
+            expires_at: "2999-01-01T00:00:00.000Z".into(),
+        };
+        let second = PendingSignup {
+            token_hash: "collision-hash".into(),
+            email: "bob@example.com".into(),
+            org_name: "Globex".into(),
+            created_at: "2026-07-10T00:00:01.000Z".into(),
+            expires_at: "2999-01-01T00:00:00.000Z".into(),
+        };
+        store.record_pending_signup(&first).unwrap();
+        store
+            .record_pending_signup(&second)
+            .expect("token_hash collision must be a valid overwrite, not an error");
+        // Only bob's row survives; taking it round-trips the new email.
+        let taken = store
+            .take_pending_signup("collision-hash", "2026-07-11T00:00:00.000Z")
+            .expect("bob's row should be present after the overwrite");
+        assert_eq!(taken.email, "bob@example.com");
+        assert_eq!(taken.org_name, "Globex");
     }
 
     #[test]
