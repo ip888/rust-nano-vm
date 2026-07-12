@@ -38,6 +38,12 @@ Repository    = "https://github.com/ip888/Rust-nano-vm"
 Documentation = "https://github.com/ip888/Rust-nano-vm/tree/main/clients/python#readme"
 Issues        = "https://github.com/ip888/Rust-nano-vm/issues"
 
+[project.scripts]
+# `pip install nanovm` puts a `nanovm` command on the user's PATH.
+# CLI stores login state in the user config directory so `nanovm` can
+# reuse one saved identity per host.
+nanovm = "nanovm.cli:main"
+
 [project.optional-dependencies]
 # Async client — non-agent users who want `AsyncClient` on their own
 # asyncio loop. Small dep footprint.
