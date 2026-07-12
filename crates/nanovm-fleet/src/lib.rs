@@ -339,9 +339,29 @@ impl ProcessFleet {
         if let Some(parent) = &self.config.cgroup_parent {
             cmd.arg("--cgroup-parent").arg(parent);
         }
-        let child = cmd
-            .spawn()
-            .map_err(|e| VmError::Backend(format!("spawn jailer: {e}")))?;
+        // CI occasionally races an in-flight relink of the jailer/worker
+        // binary and returns ETXTBSY from execve(). Treat that as transient.
+        let mut child = None;
+        let mut spawn_err = None;
+        for attempt in 0..3 {
+            match cmd.spawn() {
+                Ok(c) => {
+                    child = Some(c);
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 2 => {
+                    spawn_err = Some(e);
+                    std::thread::sleep(Duration::from_millis(25 * (attempt as u64 + 1)));
+                }
+                Err(e) => {
+                    return Err(VmError::Backend(format!("spawn jailer: {e}")));
+                }
+            }
+        }
+        let child = child.ok_or_else(|| {
+            let e = spawn_err.expect("ETXTBSY retry captured spawn error");
+            VmError::Backend(format!("spawn jailer: {e}"))
+        })?;
 
         // Block on the runtime so the sync Hypervisor caller
         // doesn't have to know we're driving an async transport.
