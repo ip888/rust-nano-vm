@@ -23,10 +23,18 @@ pub(crate) fn rfc3339_offset(offset_secs: i64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let millis = now.subsec_millis();
     // i64 + u64 → do arithmetic in i64 with saturating, then clamp
-    // to 0. Underflow past epoch → 0 (we never emit negative years).
-    let secs = (now.as_secs() as i64).saturating_add(offset_secs).max(0) as u64;
+    // to 0. Underflow past epoch → the exact `1970-01-01T00:00:00.000Z`
+    // string documented above. We deliberately drop the current
+    // `subsec_millis` in the clamp branch — leaving them in would emit
+    // `1970-01-01T00:00:00.<nonzero>Z`, which contradicts the doc and
+    // makes the value depend on wall-clock at the moment of clamp.
+    let signed_secs = (now.as_secs() as i64).saturating_add(offset_secs);
+    let (secs, millis) = if signed_secs < 0 {
+        (0u64, 0u32)
+    } else {
+        (signed_secs as u64, now.subsec_millis())
+    };
     let (year, month, day) = civil_from_days((secs / 86_400) as i64);
     let s_of_day = (secs % 86_400) as u32;
     let h = s_of_day / 3600;

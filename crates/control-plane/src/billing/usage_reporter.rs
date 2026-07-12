@@ -95,9 +95,12 @@ impl UsageReporterConfig {
     }
 }
 
-/// Handle to a running reporter task. Drop it to keep the task
-/// running for the process lifetime; call [`shutdown`] before drop
-/// if you want the loop to exit cleanly.
+/// Handle to a running reporter task. **Hold this to keep the task
+/// running** — dropping the handle drops the oneshot sender, which
+/// completes the receiver and stops the loop at the next tick.
+/// [`shutdown`](Self::shutdown) is the explicit-intent form of the
+/// same behaviour, useful when you want the reporter to exit even
+/// though the handle is going into a longer-lived container.
 #[derive(Debug)]
 pub struct UsageReporterHandle {
     _stop: tokio::sync::oneshot::Sender<()>,
@@ -106,7 +109,7 @@ pub struct UsageReporterHandle {
 
 impl UsageReporterHandle {
     /// Signal the reporter task to stop after the current tick
-    /// completes. The handle drops after this; the task detaches.
+    /// completes. The handle is consumed; the join handle detaches.
     pub fn shutdown(self) {
         let _ = self._stop.send(());
     }
@@ -127,11 +130,17 @@ pub fn spawn(
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(config.interval);
-        // First tick fires immediately; discard so the initial state
-        // becomes the baseline instead of getting reported as one
-        // huge delta.
+        // First tick fires immediately; discard it AND seed the
+        // baseline from the counter's value at startup. Without this
+        // seeding, the second tick's `now - prior` would report the
+        // whole counter as if it had accumulated in one interval —
+        // potentially over-billing on a restart of a warm process.
         interval.tick().await;
-        let mut prior_snapshot: HashMap<String, u64> = HashMap::new();
+        let mut prior_snapshot: HashMap<String, u64> = metrics
+            .forks_by_org_snapshot()
+            .into_iter()
+            .map(|(org, count, _sum_ms)| (org, count))
+            .collect();
         loop {
             tokio::select! {
                 _ = &mut stop_rx => {

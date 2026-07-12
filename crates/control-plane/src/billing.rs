@@ -1239,7 +1239,12 @@ pub fn verify_webhook_signature(
     // `tolerance_secs` is bounded to a small positive number by the caller,
     // and any legitimate Stripe payload lands within seconds of `now`.
     let skew = now.abs_diff(ts);
-    if skew > u64::try_from(tolerance_secs.max(0)).unwrap_or(u64::MAX) {
+    // Callers pass a small positive number (typically 300). Clamp
+    // negatives to 0 so the comparison rejects everything, and use
+    // a direct `as` cast — the `try_from` fallback the earlier code
+    // carried was dead once the max(0) was in place.
+    let tolerance = tolerance_secs.max(0) as u64;
+    if skew > tolerance {
         return Err(WebhookError::StaleTimestamp {
             ts,
             now,
@@ -1342,9 +1347,10 @@ pub(crate) async fn signup_handler(
 }
 
 /// `POST /v1/signup/request` axum handler. Self-serve — no bearer.
-/// Rate-limited at the route layer (see routes.rs). Returns the same
-/// opaque body regardless of outcome so callers can't enumerate live
-/// email addresses; the operator sees the real story in tracing.
+/// Rate-limiting is expected UPSTREAM (reverse proxy / LB per-IP)
+/// today; there is no in-process limiter on this route. Returns the
+/// same opaque body regardless of outcome so callers can't enumerate
+/// live email addresses; the operator sees the real story in tracing.
 pub(crate) async fn signup_request_handler(
     State(state): State<crate::AppState>,
     body: Result<Json<SignupRequestRequest>, axum::extract::rejection::JsonRejection>,

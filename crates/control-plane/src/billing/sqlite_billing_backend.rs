@@ -282,10 +282,17 @@ impl BillingStore for SqliteBillingStore {
     }
 
     fn record_pending_signup(&self, signup: &PendingSignup) -> Result<(), BillingStoreError> {
-        // ON CONFLICT on `email` UPSERTs, so re-requesting a signup for
-        // the same email replaces the prior token_hash rather than
-        // leaving both live. ON CONFLICT on `token_hash` (the PK) covers
-        // the extremely unlikely collision case.
+        // Two conflict paths, both need explicit UPSERT clauses because
+        // SQLite requires the target of `ON CONFLICT` to be a UNIQUE /
+        // PRIMARY KEY column:
+        //
+        //   * `email` (UNIQUE) — re-requesting a signup for the same
+        //     address replaces the prior row so we never leave two
+        //     live tokens for one email.
+        //   * `token_hash` (PRIMARY KEY) — a fresh mint that collides
+        //     with a still-live row from a different email (extremely
+        //     unlikely for a 24-byte random token, but the trait
+        //     contract promises the fresh row wins).
         self.with_conn(|c| {
             c.execute(
                 "INSERT INTO pending_signups
@@ -293,6 +300,11 @@ impl BillingStore for SqliteBillingStore {
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(email) DO UPDATE SET
                     token_hash = excluded.token_hash,
+                    org_name   = excluded.org_name,
+                    created_at = excluded.created_at,
+                    expires_at = excluded.expires_at
+                 ON CONFLICT(token_hash) DO UPDATE SET
+                    email      = excluded.email,
                     org_name   = excluded.org_name,
                     created_at = excluded.created_at,
                     expires_at = excluded.expires_at",
@@ -311,12 +323,17 @@ impl BillingStore for SqliteBillingStore {
     fn take_pending_signup(&self, token_hash: &str, now: &str) -> Option<PendingSignup> {
         let mut guard = self.conn.lock().ok()?;
         let tx = guard.transaction().ok()?;
-        // SELECT then DELETE inside the same transaction — SQLite's
-        // WAL mode + BEGIN IMMEDIATE (default here) means a concurrent
-        // verify against the same token blocks until we commit, so the
-        // token can be redeemed at most once. WHERE guards on
-        // expires_at so an expired row is treated as absent even if
-        // GC hasn't run yet.
+        // The single-redeem guarantee comes from the `Mutex<Connection>`
+        // we hold across the whole SELECT + DELETE, NOT from SQLite's
+        // transaction isolation — `rusqlite::Connection::transaction()`
+        // starts a DEFERRED transaction by default, which does not
+        // acquire a write lock until the DELETE. If a future refactor
+        // moved this to a connection pool (multiple connections) the
+        // race would reopen; either use `transaction_with_behavior`
+        // (Immediate) or keep the single-connection-with-mutex shape.
+        //
+        // WHERE guards on `expires_at` so an expired row is treated as
+        // absent even if GC hasn't run yet.
         let row = tx
             .query_row(
                 "SELECT email, org_name, created_at, expires_at

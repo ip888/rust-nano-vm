@@ -2980,10 +2980,23 @@ async fn exec_stream_rejects_cross_org_vm() {
 
 #[tokio::test]
 async fn cors_default_is_off_no_allow_origin_header() {
-    // NANOVM_CORS_ORIGIN is unset in the test env, so the CORS layer
-    // is a no-op — a browser-style preflight must not receive an
-    // Access-Control-Allow-Origin header. This locks the "opt-in"
-    // posture: an operator who does nothing gets no CORS behavior.
+    // This test asserts the "opt-in" posture: an operator who does
+    // nothing gets no CORS behavior. That claim only holds when
+    // NANOVM_CORS_ORIGIN is unset in the process env — which is
+    // normal for CI + `cargo test` but NOT guaranteed on a
+    // contributor's shell (or a CI matrix that injects it). Skip
+    // rather than false-fail when the env is polluted.
+    if std::env::var("NANOVM_CORS_ORIGIN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .is_some()
+    {
+        eprintln!(
+            "skipping cors_default_is_off_no_allow_origin_header: \
+             NANOVM_CORS_ORIGIN is set in this shell"
+        );
+        return;
+    }
     let app = app();
     let req = Request::builder()
         .method(Method::OPTIONS)
