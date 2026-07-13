@@ -1,0 +1,78 @@
+# syntax=docker/dockerfile:1.7
+#
+# Container image for the nanovm dashboard (`web/`).
+#
+# Two stages:
+#   1) `deps` — install npm deps against package-lock.json.
+#   2) `builder` — copy source + run `next build` with `output:
+#      standalone` (see web/next.config.ts) so the final image only
+#      needs the standalone tree, not full node_modules.
+#   3) runtime — distroless-node so the image ships without a shell,
+#      package manager, or unrelated userland. ~200 MB total vs the
+#      ~1 GB you'd get from FROM node:20.
+#
+# Build (from the repo root):
+#   docker build -f Dockerfile.web -t nanovm-web:local .
+#
+# Run:
+#   docker run --rm -p 3000:3000 \
+#     -e NEXT_PUBLIC_NANOVM_API_URL=https://api.your-saas.com \
+#     nanovm-web:local
+#
+# The API host MUST be baked at build time — Next.js inlines
+# `NEXT_PUBLIC_*` values into the client bundle. Rebuild the image
+# when the API host changes, or pass `--build-arg
+# NANOVM_API_URL=…` (wired below) so the same source builds different
+# per-environment images.
+
+ARG NANOVM_API_URL=http://localhost:8080
+ARG NODE_VERSION=20
+
+# -----------------------------------------------------------------------
+# Stage 1: install deps
+# -----------------------------------------------------------------------
+FROM node:${NODE_VERSION}-alpine AS deps
+WORKDIR /app
+COPY web/package.json web/package-lock.json ./
+# `npm ci` is deterministic — fails loudly if lockfile is out of
+# sync, which is what we want in CI + prod builds.
+RUN npm ci --no-audit --no-fund
+
+# -----------------------------------------------------------------------
+# Stage 2: build
+# -----------------------------------------------------------------------
+FROM node:${NODE_VERSION}-alpine AS builder
+WORKDIR /app
+ARG NANOVM_API_URL
+ENV NEXT_PUBLIC_NANOVM_API_URL=${NANOVM_API_URL}
+ENV NEXT_TELEMETRY_DISABLED=1
+COPY --from=deps /app/node_modules ./node_modules
+COPY web/ ./
+RUN npm run build
+
+# -----------------------------------------------------------------------
+# Stage 3: runtime
+# -----------------------------------------------------------------------
+# distroless-node hands us a Node runtime + libc + CA certs and
+# nothing else. No shell, no apt, no package manager — dramatically
+# smaller attack surface than node:alpine.
+FROM gcr.io/distroless/nodejs${NODE_VERSION}-debian12:nonroot AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
+
+# The standalone output pattern — see web/next.config.ts. The
+# `nonroot` variant of the base image runs as uid 65532, so ownership
+# has to be right on the copied trees.
+COPY --from=builder --chown=nonroot:nonroot /app/public                ./public
+COPY --from=builder --chown=nonroot:nonroot /app/.next/standalone      ./
+COPY --from=builder --chown=nonroot:nonroot /app/.next/static          ./.next/static
+
+EXPOSE 3000
+USER nonroot
+# `server.js` is emitted by the standalone build; it's a plain Node
+# entrypoint (not `next start`), which is why we don't need the CLI
+# in this image.
+CMD ["server.js"]

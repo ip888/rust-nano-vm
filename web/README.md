@@ -61,7 +61,18 @@ Set `NEXT_PUBLIC_NANOVM_API_URL` in the platform's env config.
 
 **2. Container.**
 
-The build output is standalone; a minimal Dockerfile would be `FROM node:22-alpine`, `COPY web/`, `npm run build`, `CMD ["npm", "start"]`. Kept as a follow-up so this MVP PR stays surgical.
+Multi-stage `Dockerfile.web` at the repo root builds a distroless-node image (~200 MB).
+
+```bash
+# From the repo root, NOT from web/.
+docker build -f Dockerfile.web \
+  --build-arg NANOVM_API_URL=https://api.your-saas.com \
+  -t nanovm-web:local .
+
+docker run --rm -p 3000:3000 nanovm-web:local
+```
+
+The API host is baked at build time (Next.js inlines `NEXT_PUBLIC_*` into the client bundle). Rebuild the image when you change deploy targets, or pass a different `--build-arg NANOVM_API_URL=…` per environment.
 
 ## Wiring against a real Stripe subscription
 
