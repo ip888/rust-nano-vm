@@ -62,6 +62,26 @@ export interface UsageResponseDto {
   fork_total_ms: number;
 }
 
+/** A row in `GET /v1/keys`. `token` is NEVER returned by list — only mint. */
+export interface KeyEntry {
+  id: string;
+  org: string;
+  created_at: string;
+}
+
+export interface ListKeysResponse {
+  keys: KeyEntry[];
+}
+
+/** `POST /v1/keys` returns the new bearer once. Never fetched again. */
+export interface IssueKeyResponse {
+  /** Bearer token in the standard `org:secret` form. Shown once. */
+  token: string;
+  id: string;
+  org: string;
+  created_at: string;
+}
+
 // -------- Fetch wrappers -----------------------------------------
 
 /**
@@ -144,6 +164,27 @@ export function getPlan(apiKey: string): Promise<PlanResponse> {
 
 export function getUsage(apiKey: string): Promise<UsageResponseDto> {
   return request<UsageResponseDto>("/v1/usage", { apiKey });
+}
+
+export function listKeys(apiKey: string): Promise<ListKeysResponse> {
+  return request<ListKeysResponse>("/v1/keys", { apiKey });
+}
+
+export function issueKey(apiKey: string): Promise<IssueKeyResponse> {
+  return request<IssueKeyResponse>("/v1/keys", {
+    apiKey,
+    method: "POST",
+    // Server-side generates the secret; body is empty JSON so
+    // Content-Type gets set correctly.
+    body: JSON.stringify({}),
+  });
+}
+
+export function revokeKey(apiKey: string, id: string): Promise<void> {
+  return request<void>(`/v1/keys/${encodeURIComponent(id)}`, {
+    apiKey,
+    method: "DELETE",
+  });
 }
 
 export function getBillingPortalUrl(
