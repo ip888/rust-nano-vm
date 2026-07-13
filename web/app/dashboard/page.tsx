@@ -90,12 +90,20 @@ export default function DashboardPage() {
             <span className="font-mono">{session.org}</span>
           </p>
         </div>
-        <button
-          onClick={signOut}
-          className="rounded-md border border-gray-300 px-4 py-2 text-sm hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-800"
-        >
-          Sign out
-        </button>
+        <div className="flex items-center gap-3">
+          <Link
+            href="/dashboard/keys"
+            className="rounded-md border border-gray-300 px-4 py-2 text-sm hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-800"
+          >
+            API keys
+          </Link>
+          <button
+            onClick={signOut}
+            className="rounded-md border border-gray-300 px-4 py-2 text-sm hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-800"
+          >
+            Sign out
+          </button>
+        </div>
       </header>
 
       {error && (
