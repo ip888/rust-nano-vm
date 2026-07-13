@@ -22,9 +22,9 @@ import { clearSession, getSession, type Session } from "@/lib/session";
  * discards it — the server never returns it again. If the user
  * misses the copy window they mint another.
  *
- * Revoke is destructive; guarded by a confirm() dialog. The current
- * session's key is filterable from revoke so the user can't sign
- * themselves out of the dashboard by accident.
+ * Revoke is destructive; guarded by a confirm() dialog. After revocation
+ * the key list is re-fetched; a 401 means the current bearer was just
+ * revoked, so the session is cleared and the user is redirected to login.
  */
 export default function KeysPage() {
   const router = useRouter();
@@ -59,7 +59,7 @@ export default function KeysPage() {
     })();
   }, [router]);
 
-  const currentKeyId = deriveCurrentKeyId(session?.apiKey ?? null, keys);
+  const currentKeyId: string | null = null;
 
   async function mint() {
     if (!session || minting) return;
@@ -68,7 +68,8 @@ export default function KeysPage() {
     try {
       const resp = await issueKey(session.apiKey);
       setNewlyIssued(resp);
-      setKeys((prev) => (prev ? [...prev, { id: resp.id, org: resp.org, created_at: resp.created_at }] : prev));
+      const updated = await listKeys(session.apiKey);
+      setKeys(updated.keys);
     } catch (err) {
       setError(
         err instanceof ApiError ? err.message : "Couldn't mint a new key.",
@@ -80,17 +81,7 @@ export default function KeysPage() {
 
   async function revoke(id: string) {
     if (!session || revokingId) return;
-    if (id === currentKeyId) {
-      // The dashboard is authenticating with this key. Revoking it
-      // signs the user out — insist on an explicit confirmation.
-      if (
-        !window.confirm(
-          "This is the key you're currently signed in with. Revoking it will sign you out. Continue?",
-        )
-      ) {
-        return;
-      }
-    } else if (
+    if (
       !window.confirm(`Revoke key ${id}? Anything using it will break.`)
     ) {
       return;
@@ -99,15 +90,16 @@ export default function KeysPage() {
     setError(null);
     try {
       await revokeKey(session.apiKey, id);
-      // If we just revoked our own bearer, bounce to login rather
-      // than showing a broken dashboard.
-      if (id === currentKeyId) {
+      // Re-fetch the key list. A 401 here means the key we just revoked
+      // was our own bearer — clear the session and bounce to login.
+      const resp = await listKeys(session.apiKey);
+      setKeys(resp.keys);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
         clearSession();
         router.replace("/login");
         return;
       }
-      setKeys((prev) => (prev ? prev.filter((k) => k.id !== id) : prev));
-    } catch (err) {
       setError(
         err instanceof ApiError ? err.message : "Couldn't revoke that key.",
       );
@@ -263,28 +255,3 @@ function NewKeyCallout({
   );
 }
 
-/**
- * Try to identify which of the listed keys is the one the browser is
- * currently signing in with, so we can badge it "current" and gate
- * self-revoke. The runtime tokens follow the shape `<org>:<secret>`
- * where secret's first segment is the id — but that's an
- * implementation detail; a stricter server-side "which key am I"
- * endpoint would be better. For MVP we match by prefix on the token
- * itself when the id shows up in the list.
- */
-function deriveCurrentKeyId(
-  apiKey: string | null,
-  keys: KeyEntry[] | null,
-): string | null {
-  if (!apiKey || !keys) return null;
-  // The runtime-key format used by /v1/keys is `<org>:<id>-<secret>`
-  // in practice, so the first `-`-delimited chunk after the `:` IS
-  // the id — match that. Falls back to a substring check if the
-  // format ever changes.
-  const afterOrg = apiKey.split(":")[1] ?? "";
-  const idGuess = afterOrg.split("-")[0] ?? "";
-  const exact = keys.find((k) => k.id === idGuess);
-  if (exact) return exact.id;
-  const contains = keys.find((k) => apiKey.includes(k.id));
-  return contains?.id ?? null;
-}

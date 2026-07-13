@@ -75,7 +75,7 @@ export interface ListKeysResponse {
 
 /** `POST /v1/keys` returns the new bearer once. Never fetched again. */
 export interface IssueKeyResponse {
-  /** Bearer token in the standard `org:secret` form. Shown once. */
+  /** Opaque bearer token. Shown once; the server never returns it again. */
   token: string;
   id: string;
   org: string;
