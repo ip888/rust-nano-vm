@@ -1,0 +1,53 @@
+# Homebrew formula for the `nanovm` CLI + Python SDK.
+#
+# Installs the `nanovm` PyPI package into a dedicated virtualenv
+# under `libexec/`, then symlinks the `nanovm` entry point onto
+# the user's PATH. This avoids polluting `pip install --user` state
+# and keeps the CLI's Python deps (`requests`) out of the user's
+# global site-packages.
+#
+# Local install (from a working checkout):
+#
+#   brew install --formula ./install/brew/nanovm.rb
+#
+# Once the project has its own Homebrew tap (`ip888/tap`), this file
+# will be published there and users can `brew install ip888/tap/nanovm`.
+# The formula body doesn't change — only where it lives.
+#
+# Formula-audit is expected to pass; we deliberately don't set
+# `head` because the source of truth for CLI behaviour is the PyPI
+# release, not a github tag.
+
+class Nanovm < Formula
+  include Language::Python::Virtualenv
+
+  desc "Sub-second microVMs for AI agents (CLI + Python SDK)"
+  homepage "https://github.com/ip888/rust-nano-vm"
+  # Pinned to a specific PyPI release. Bump `url` + `sha256` when the
+  # SDK ships a new version — the CI publish workflow updates PyPI,
+  # not this formula.
+  url "https://files.pythonhosted.org/packages/source/n/nanovm/nanovm-0.1.0.tar.gz"
+  sha256 "REPLACE_WITH_SHA256_OF_PUBLISHED_TARBALL"
+  license "Apache-2.0"
+
+  # Follow whatever Homebrew's `python` label points at today. `pip
+  # install nanovm` supports 3.9+; brew currently ships 3.13.
+  depends_on "python@3.13"
+
+  # Runtime dep of the SDK. Homebrew's virtualenv builder resolves
+  # this from PyPI at install time via `Language::Python::Virtualenv`.
+  resource "requests" do
+    url "https://files.pythonhosted.org/packages/source/r/requests/requests-2.32.3.tar.gz"
+    sha256 "REPLACE_WITH_SHA256_OF_REQUESTS_TARBALL"
+  end
+
+  def install
+    virtualenv_install_with_resources
+  end
+
+  test do
+    # Smoke test — `--version` prints the pinned SDK version. Doesn't
+    # touch the network so it's safe on the Homebrew CI runners.
+    assert_match "nanovm", shell_output("#{bin}/nanovm --version")
+  end
+end
