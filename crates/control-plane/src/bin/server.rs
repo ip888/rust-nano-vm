@@ -31,6 +31,10 @@
 //!   three are set (and the binary is built `--features billing`),
 //!   `POST /v1/signup` and `GET /v1/billing/portal` go live. Never
 //!   commit; wire via `flyctl secrets set` / Helm value / K8s Secret.
+//! - `NANOVM_MARKETPLACE_CONFIG` — path to a JSON file defining the
+//!   curated snapshot marketplace (see `deploy/marketplace/example.json`).
+//!   Unset → the public `GET /v1/marketplace/snapshots` endpoint
+//!   returns `{"snapshots": []}`. Read once at startup.
 //! - `NANOVM_PLAN_TIERS` — map Stripe price ids to named tiers +
 //!   fork RPS. Format:
 //!   `price_ABC=free:5,price_XYZ=pro:100,price_ENT=enterprise:1000`.
@@ -232,7 +236,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_snapshot_store(snapshot_store)
         .with_backend_label(backend_label)
         .with_ownership_map(Arc::new(ownership))
-        .with_vm_defaults(vm_defaults);
+        .with_vm_defaults(vm_defaults)
+        .with_marketplace(Arc::new(control_plane::Marketplace::from_env()));
     #[cfg(feature = "billing")]
     let state = state.with_billing(billing_ctx);
 
