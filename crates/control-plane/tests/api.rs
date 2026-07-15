@@ -2976,6 +2976,73 @@ async fn exec_stream_rejects_cross_org_vm() {
     assert_eq!(body["error"]["code"], "cross_org");
 }
 
+// -------- Marketplace ----------------------------------------------
+
+#[tokio::test]
+async fn marketplace_snapshots_empty_when_unconfigured() {
+    // Default `AppState::new` builds an empty `Marketplace`. Endpoint
+    // is unauthenticated so we can hit it without a bearer.
+    let app = app();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/marketplace/snapshots")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body, json!({"snapshots": []}));
+}
+
+#[tokio::test]
+async fn marketplace_snapshots_returns_configured_catalogue() {
+    use control_plane::Marketplace;
+    let raw = r#"
+    {"snapshots":[
+      {"name":"python-3.12-minimal","description":"tiny","size_bytes":1,
+       "kernel_url":"https://k","rootfs_url":"https://r","cmdline":"c",
+       "labels":["python"],"maintainer":"nanovm-marketplace"}
+    ]}
+    "#;
+    let m = std::sync::Arc::new(Marketplace::parse(raw));
+    let hv: Arc<dyn vm_core::Hypervisor> = Arc::new(MockHypervisor::new());
+    let app = router()
+        .layer(Extension(Arc::new(ApiTokens::default())))
+        .with_state(AppState::new(hv).with_marketplace(m));
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/marketplace/snapshots")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["snapshots"].as_array().unwrap().len(), 1);
+    assert_eq!(body["snapshots"][0]["name"], "python-3.12-minimal");
+    assert_eq!(body["snapshots"][0]["labels"], json!(["python"]));
+}
+
+#[tokio::test]
+async fn marketplace_snapshots_endpoint_is_public_no_auth_required() {
+    // Router configured with auth-required tokens. The marketplace
+    // list endpoint must NOT require a bearer — it's the discovery
+    // surface a landing page hits.
+    let app = app_with_tokens(ApiTokens::from_csv("secret"));
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/marketplace/snapshots")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "marketplace listing must not require a bearer"
+    );
+}
+
 // -------- CORS -----------------------------------------------------
 
 #[tokio::test]

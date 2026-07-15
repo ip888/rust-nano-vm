@@ -113,6 +113,10 @@ pub struct AppState {
     /// Read once at startup from `NANOVM_DEFAULT_*` env vars. Empty by
     /// default so existing tests + mock deploys keep working.
     vm_defaults: crate::api::VmConfigDefaults,
+    /// Curated snapshot marketplace loaded from
+    /// `NANOVM_MARKETPLACE_CONFIG`. Empty when unset — the endpoint
+    /// then returns `{"snapshots": []}`.
+    marketplace: Arc<crate::Marketplace>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -156,7 +160,16 @@ impl AppState {
             #[cfg(feature = "billing")]
             billing: None,
             vm_defaults: crate::api::VmConfigDefaults::default(),
+            marketplace: Arc::new(crate::Marketplace::default()),
         }
+    }
+
+    /// Install a snapshot marketplace catalogue. Loaded from
+    /// `NANOVM_MARKETPLACE_CONFIG` by the binary; tests pass a
+    /// hand-built [`crate::Marketplace`].
+    pub fn with_marketplace(mut self, marketplace: Arc<crate::Marketplace>) -> Self {
+        self.marketplace = marketplace;
+        self
     }
 
     /// Install `NANOVM_DEFAULT_*` server-side fallbacks. The
@@ -390,6 +403,13 @@ pub fn router() -> Router<AppState> {
         post(crate::billing::stripe_webhook_handler)
             .layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
     );
+    // Snapshot marketplace listing — unauthenticated by design.
+    // Discovery of curated pre-built snapshots (see
+    // `crate::marketplace`). Registered AFTER the tenant-auth layer
+    // above so the middleware doesn't gate it. The (future) fork
+    // endpoint WILL sit behind tenant-auth because it mutates the
+    // caller's warm pool.
+    let v1 = v1.route("/marketplace/snapshots", get(list_marketplace_snapshots));
 
     Router::new()
         .route("/healthz", get(healthz))
@@ -1026,4 +1046,21 @@ async fn read_file(
     let Query(q) = query.map_err(|e| ApiError::Bad(e.to_string()))?;
     let content = state.hypervisor.read_file(vm_id, q.path)?;
     Ok(Json(FileReadResponse { content }))
+}
+
+/// `GET /v1/marketplace/snapshots` — public discovery. Returns the
+/// curated marketplace catalogue loaded from
+/// `NANOVM_MARKETPLACE_CONFIG` (empty list when unset). No auth
+/// intentionally — this is a browse endpoint the dashboard and CLI
+/// can hit before the user even signs up.
+///
+/// A per-IP rate-limit sits UPSTREAM (LB / reverse proxy) — same
+/// posture as the signup endpoints. The (future) fork endpoint that
+/// actually mutates state WILL sit behind tenant-auth.
+async fn list_marketplace_snapshots(
+    State(state): State<AppState>,
+) -> Json<crate::MarketplaceListResponse> {
+    Json(crate::MarketplaceListResponse {
+        snapshots: state.marketplace.all(),
+    })
 }

@@ -1,0 +1,45 @@
+{
+  "_comment": "Sample marketplace config. Copy to your prod host and point NANOVM_MARKETPLACE_CONFIG at it. Real first-party entries will be published on the nanovm CDN; the URLs below are illustrative placeholders — a control plane pointed at them will list the entries but the (future) fork flow won't be able to pull the tarballs. Swap in real URLs before shipping to customers.",
+  "snapshots": [
+    {
+      "name": "python-3.12-ds",
+      "description": "Python 3.12 + pandas 2.2 + numpy 2 + scikit-learn 1.5 + matplotlib. ~48 MB compressed. For agent tool calls that need to slice DataFrames + do quick modeling without paying pip install cold-start.",
+      "size_bytes": 52428800,
+      "kernel_url": "https://cdn.nanovm.io/marketplace/python-3.12-ds/vmlinux",
+      "rootfs_url": "https://cdn.nanovm.io/marketplace/python-3.12-ds/rootfs.ext4",
+      "cmdline": "console=ttyS0 root=/dev/vda rw quiet",
+      "labels": ["python", "data-science", "pandas", "sklearn"],
+      "maintainer": "nanovm-marketplace"
+    },
+    {
+      "name": "python-3.12-minimal",
+      "description": "Python 3.12 + stdlib only. ~12 MB. Fastest cold-start for pure-Python agent tool calls with no external deps.",
+      "size_bytes": 12582912,
+      "kernel_url": "https://cdn.nanovm.io/marketplace/python-3.12-minimal/vmlinux",
+      "rootfs_url": "https://cdn.nanovm.io/marketplace/python-3.12-minimal/rootfs.ext4",
+      "cmdline": "console=ttyS0 root=/dev/vda rw quiet",
+      "labels": ["python", "minimal"],
+      "maintainer": "nanovm-marketplace"
+    },
+    {
+      "name": "node-20-playwright",
+      "description": "Node 20 LTS + Playwright + Chromium headless. ~180 MB. For agent tool calls that scrape / test / screenshot web pages.",
+      "size_bytes": 188743680,
+      "kernel_url": "https://cdn.nanovm.io/marketplace/node-20-playwright/vmlinux",
+      "rootfs_url": "https://cdn.nanovm.io/marketplace/node-20-playwright/rootfs.ext4",
+      "cmdline": "console=ttyS0 root=/dev/vda rw quiet",
+      "labels": ["node", "playwright", "browser", "scraping"],
+      "maintainer": "nanovm-marketplace"
+    },
+    {
+      "name": "alpine-3.20-shell",
+      "description": "Alpine 3.20 with busybox + coreutils + bash + curl + jq. ~6 MB. For agent tool calls that just need a POSIX shell without a language runtime.",
+      "size_bytes": 6291456,
+      "kernel_url": "https://cdn.nanovm.io/marketplace/alpine-3.20-shell/vmlinux",
+      "rootfs_url": "https://cdn.nanovm.io/marketplace/alpine-3.20-shell/rootfs.ext4",
+      "cmdline": "console=ttyS0 root=/dev/vda rw quiet",
+      "labels": ["shell", "alpine", "minimal"],
+      "maintainer": "nanovm-marketplace"
+    }
+  ]
+}
