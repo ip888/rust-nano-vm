@@ -13,9 +13,10 @@
 # What this script does:
 #   1. Creates a Lima config that requests nested virt.
 #   2. `limactl start` the VM (first run downloads an Ubuntu image).
-#   3. Installs Docker inside the VM.
-#   4. Pulls the nanovm-control-plane container.
-#   5. Prints the docker-run command with /dev/kvm mapped in.
+#   3. Provisions Docker inside the VM via cloud-init.
+#   4. Prints the follow-up commands (docker pull + docker run with
+#      /dev/kvm mapped in) — the container itself is NOT pulled here
+#      so a first run doesn't block on a ~200 MB download.
 #
 # The Lima VM lives at ~/.lima/nanovm. `limactl stop nanovm` puts
 # it on ice; `limactl delete nanovm` throws it away.
@@ -31,9 +32,11 @@ if ! command -v limactl >/dev/null 2>&1; then
     exit 1
 fi
 
-# Write a Lima config with nested virt on. Apple Silicon exposes
-# `vz` type + `vmType: "vz"` for the Apple Virtualization.framework;
-# `x86_64` Macs fall back to qemu but Rosetta will translate.
+# Write a Lima config with nested virt on. `vmType: "vz"` uses Apple's
+# Virtualization.framework on Apple Silicon; on Intel Macs Lima falls
+# back to qemu (Rosetta is explicitly OFF below — we don't want x86_64
+# binary translation, we want the guest's own kernel to run KVM
+# natively for its architecture).
 CONFIG_FILE="$LIMA_CONFIG_DIR/${VM_NAME}.yaml"
 cat > "$CONFIG_FILE" <<'YAML'
 # Lima VM tuned for running nanovm-control-plane against real KVM.
@@ -92,12 +95,12 @@ else
     echo "! You can still run the mock backend inside the VM, but not real KVM." >&2
 fi
 
-cat <<'NEXT'
+cat <<NEXT
 
 Next steps (run these inside the Lima VM):
 
-  limactl shell nanovm
-  docker run --rm --device=/dev/kvm -p 8080:8080 \
+  limactl shell ${VM_NAME}
+  docker run --rm --device=/dev/kvm -p 8080:8080 \\
     ghcr.io/ip888/nanovm-control-plane-kvm:main
 
 Then, back on your Mac (in another terminal):
@@ -105,5 +108,5 @@ Then, back on your Mac (in another terminal):
   nanovm status
 
 Lima forwards ports from the guest to the Mac by default, so
-`localhost:8080` on your Mac hits the control-plane inside the VM.
+\`localhost:8080\` on your Mac hits the control-plane inside the VM.
 NEXT

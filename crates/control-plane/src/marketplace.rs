@@ -138,19 +138,46 @@ impl Marketplace {
     }
 
     /// Parse the JSON payload directly. Malformed top-level shape
-    /// yields an empty catalogue (logged); malformed individual entries
-    /// are skipped with a per-entry warn so a typo doesn't take down
-    /// the whole registry.
+    /// (not a JSON object with a `snapshots` array) yields an empty
+    /// catalogue (logged). Malformed *individual* entries — missing
+    /// required fields, wrong types, invalid names, empty URLs — are
+    /// skipped with a per-entry warn so a typo doesn't take down the
+    /// whole registry.
+    ///
+    /// We deserialize the outer envelope as `Value` and each entry
+    /// individually rather than the whole `MarketplaceListResponse`
+    /// at once — serde's default all-or-nothing behavior on a
+    /// `Vec<MarketplaceSnapshot>` would fail the whole parse on one
+    /// bad entry, defeating the graceful-degradation goal.
     pub fn parse(raw: &str) -> Self {
-        let mut out = Vec::new();
-        let Ok(root) = serde_json::from_str::<MarketplaceListResponse>(raw) else {
+        let Ok(root) = serde_json::from_str::<serde_json::Value>(raw) else {
+            tracing::warn!("marketplace: config is not valid JSON; treating as empty");
+            return Self::default();
+        };
+        let Some(arr) = root.get("snapshots").and_then(|v| v.as_array()) else {
             tracing::warn!(
-                "marketplace: config is not a valid \
-                 `{{ \"snapshots\": [...] }}` document; treating as empty"
+                "marketplace: config is missing the top-level `snapshots` array; treating as empty"
             );
             return Self::default();
         };
-        for entry in root.snapshots {
+        let mut out = Vec::new();
+        for (idx, raw_entry) in arr.iter().enumerate() {
+            let entry: MarketplaceSnapshot = match serde_json::from_value(raw_entry.clone()) {
+                Ok(e) => e,
+                Err(e) => {
+                    let name_hint = raw_entry
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    tracing::warn!(
+                        index = idx,
+                        name = name_hint,
+                        error = %e,
+                        "marketplace: skipping malformed entry"
+                    );
+                    continue;
+                }
+            };
             if !is_valid_name(&entry.name) {
                 tracing::warn!(
                     name = %entry.name,
@@ -308,6 +335,27 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert!(m.get("good-one").is_some());
         assert!(m.get("Bad_Name/../etc").is_none());
+    }
+
+    #[test]
+    fn parse_skips_individual_malformed_entries_without_killing_the_catalogue() {
+        // One entry is missing `cmdline` (required, no serde default) —
+        // the whole-document deserialize used to fail on this and drop
+        // every entry. New parser skips the bad entry and keeps the
+        // rest.
+        let raw = r#"
+        {"snapshots": [
+          {"name":"good-one","description":"x","size_bytes":1,
+           "kernel_url":"https://k","rootfs_url":"https://r",
+           "cmdline":"","labels":[],"maintainer":"m"},
+          {"name":"missing-cmdline","description":"x","size_bytes":1,
+           "kernel_url":"https://k","rootfs_url":"https://r",
+           "labels":[],"maintainer":"m"}
+        ]}
+        "#;
+        let m = Marketplace::parse(raw);
+        assert_eq!(m.len(), 1, "the well-formed entry must survive");
+        assert!(m.get("good-one").is_some());
     }
 
     #[test]

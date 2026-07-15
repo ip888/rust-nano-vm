@@ -7,8 +7,8 @@ developer's laptop. Pick the row that matches your setup.
 |---|---|---|---|
 | **Linux with `/dev/kvm`** | `pip install nanovm` | ✅ | ✅ |
 | **Linux without KVM** (CI, generic VPS) | `pip install nanovm` | ❌ (mock backend only) | ✅ |
-| **macOS (Intel or Apple Silicon)** | `brew install --formula ./install/brew/nanovm.rb` | ❌ natively — use SaaS OR `install/mac/lima-setup.sh` for local Linux VM w/ nested KVM | ✅ |
-| **Windows** | `install/wsl2/install.sh` (run inside WSL2 shell) | ✅ (WSL2 kernel ≥ 5.10 exposes nested KVM) | ✅ |
+| **macOS (Intel or Apple Silicon)** | Fill in the sha256s in `install/brew/nanovm.rb.template`, then `brew install --formula ./install/brew/nanovm.rb` (or wait for the published tap) | ❌ natively — use SaaS OR `bash install/mac/lima-setup.sh` for local Linux VM w/ nested KVM | ✅ |
+| **Windows** | `bash install/wsl2/install.sh` (run inside WSL2 shell) | ✅ (WSL2 kernel ≥ 5.10 exposes nested KVM) | ✅ |
 
 ## The honest matrix
 

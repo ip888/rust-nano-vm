@@ -10,13 +10,6 @@ const nextConfig: NextConfig = {
   //
   // Zero effect on `next dev` and `next start`; standalone only
   // changes what `next build` writes under `.next/`.
-  //
-  // For a CDN-only deploy (no Node runtime), set `output: "export"`
-  // here instead and re-run `npm run build`. That path currently
-  // requires dropping the `useSearchParams` client hook wrapping in
-  // `web/app/signup/verify/page.tsx` (already Suspense-wrapped, so
-  // the export will work) — verify the built `out/` renders before
-  // uploading.
   output: "standalone",
   reactStrictMode: true,
 };

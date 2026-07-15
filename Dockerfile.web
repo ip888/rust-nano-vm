@@ -2,28 +2,30 @@
 #
 # Container image for the nanovm dashboard (`web/`).
 #
-# Two stages:
+# Three stages:
 #   1) `deps` — install npm deps against package-lock.json.
 #   2) `builder` — copy source + run `next build` with `output:
 #      standalone` (see web/next.config.ts) so the final image only
 #      needs the standalone tree, not full node_modules.
-#   3) runtime — distroless-node so the image ships without a shell,
+#   3) `runtime` — distroless-node so the image ships without a shell,
 #      package manager, or unrelated userland. ~200 MB total vs the
 #      ~1 GB you'd get from FROM node:20.
 #
-# Build (from the repo root):
-#   docker build -f Dockerfile.web -t nanovm-web:local .
+# Build (from the repo root) — the API host is BAKED IN at build time
+# because Next.js inlines `NEXT_PUBLIC_*` into the client bundle.
+# There is no runtime override; a `docker run -e NEXT_PUBLIC_...` will
+# be silently ignored. To point a built image at a different API,
+# rebuild:
 #
-# Run:
-#   docker run --rm -p 3000:3000 \
-#     -e NEXT_PUBLIC_NANOVM_API_URL=https://api.your-saas.com \
-#     nanovm-web:local
+#   docker build -f Dockerfile.web \
+#     --build-arg NANOVM_API_URL=https://api.your-saas.com \
+#     -t nanovm-web:prod .
 #
-# The API host MUST be baked at build time — Next.js inlines
-# `NEXT_PUBLIC_*` values into the client bundle. Rebuild the image
-# when the API host changes, or pass `--build-arg
-# NANOVM_API_URL=…` (wired below) so the same source builds different
-# per-environment images.
+# The default build-arg is http://localhost:8080 — good for local dev,
+# not what you want in prod.
+#
+# Run (host is already baked, just publish the port):
+#   docker run --rm -p 3000:3000 nanovm-web:prod
 
 ARG NANOVM_API_URL=http://localhost:8080
 ARG NODE_VERSION=20

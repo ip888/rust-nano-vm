@@ -789,6 +789,20 @@ pub fn openapi_spec() -> Value {
                     }
                 }
             },
+            "/v1/marketplace/snapshots": {
+                "get": {
+                    "summary": "Public curated snapshot registry",
+                    "description": "Returns the marketplace catalogue loaded from NANOVM_MARKETPLACE_CONFIG. UNAUTHENTICATED so a dashboard or CLI can browse entries pre-signup. When the env var is unset the array is empty.",
+                    "responses": {
+                        "200": {
+                            "description": "Marketplace snapshot entries",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/MarketplaceListResponse" } }
+                            }
+                        }
+                    }
+                }
+            },
             "/v1/health": {
                 "get": {
                     "summary": "Structured health detail (backend, version, uptime)",
@@ -1078,6 +1092,41 @@ pub fn openapi_spec() -> Value {
                         "id": { "type": "string" },
                         "org": { "type": "string" },
                         "created_at": { "type": "string" }
+                    }
+                },
+                "MarketplaceSnapshot": {
+                    "type": "object",
+                    "required": ["name", "description", "size_bytes", "kernel_url", "rootfs_url", "cmdline", "labels", "maintainer"],
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "URL-safe id matching `[a-z0-9][a-z0-9.-]*` with no trailing `-` or `.`.",
+                            "example": "python-3.12-ds"
+                        },
+                        "description": { "type": "string" },
+                        "size_bytes": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Approximate uncompressed rootfs size for UI display."
+                        },
+                        "kernel_url": { "type": "string", "description": "Public HTTPS URL of the vmlinux blob." },
+                        "rootfs_url": { "type": "string", "description": "Public HTTPS URL of the rootfs.ext4 blob." },
+                        "cmdline": { "type": "string" },
+                        "labels": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "maintainer": { "type": "string", "example": "nanovm-marketplace" }
+                    }
+                },
+                "MarketplaceListResponse": {
+                    "type": "object",
+                    "required": ["snapshots"],
+                    "properties": {
+                        "snapshots": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/MarketplaceSnapshot" }
+                        }
                     }
                 },
                 "HealthResponse": {
