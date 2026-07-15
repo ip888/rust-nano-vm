@@ -268,6 +268,16 @@ curl -L https://github.com/ip888/Rust-nano-vm/releases/latest/download/rust-nano
 Replace `VERSION` with the release tag (e.g. `0.0.2`). Each tarball
 ships a sidecar `.sha256` for integrity verification.
 
+## Install — CLI + SDK (any platform)
+
+For the `nanovm` shell command + Python SDK on Mac / Linux / WSL2, see
+[`install/README.md`](install/README.md). Quick recipes:
+
+- **Any platform with Python 3.9+:** `pip install nanovm`
+- **macOS (Homebrew):** `brew install --formula ./install/brew/nanovm.rb`
+- **Windows (inside WSL2):** `bash install/wsl2/install.sh`
+- **macOS + real local microVMs (advanced):** `bash install/mac/lima-setup.sh`
+
 ## Install — Docker (no toolchain needed)
 
 A container image of `nanovm-control-plane` is published to GHCR on
