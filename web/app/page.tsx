@@ -13,6 +13,9 @@ export default function LandingPage() {
           <span className="text-lg font-semibold">nanovm</span>
         </div>
         <nav className="flex items-center gap-6 text-sm">
+          <Link href="/marketplace" className="hover:text-brand-600">
+            Marketplace
+          </Link>
           <Link href="/login" className="hover:text-brand-600">
             Log in
           </Link>
