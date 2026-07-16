@@ -82,6 +82,23 @@ export interface IssueKeyResponse {
   created_at: string;
 }
 
+/** One entry in `GET /v1/marketplace/snapshots`. Mirrors the Rust
+ *  `MarketplaceSnapshot` DTO. */
+export interface MarketplaceSnapshot {
+  name: string;
+  description: string;
+  size_bytes: number;
+  kernel_url: string;
+  rootfs_url: string;
+  cmdline: string;
+  labels: string[];
+  maintainer: string;
+}
+
+export interface MarketplaceListResponse {
+  snapshots: MarketplaceSnapshot[];
+}
+
 // -------- Fetch wrappers -----------------------------------------
 
 /**
@@ -191,4 +208,10 @@ export function getBillingPortalUrl(
   apiKey: string,
 ): Promise<{ url: string }> {
   return request<{ url: string }>("/v1/billing/portal", { apiKey });
+}
+
+/** Public — no bearer required. The marketplace catalogue is meant
+ *  for browse-before-signup. */
+export function listMarketplaceSnapshots(): Promise<MarketplaceListResponse> {
+  return request<MarketplaceListResponse>("/v1/marketplace/snapshots");
 }
