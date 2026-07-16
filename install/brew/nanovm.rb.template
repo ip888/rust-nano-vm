@@ -1,18 +1,23 @@
-# Homebrew formula for the `nanovm` CLI + Python SDK.
+# Homebrew formula TEMPLATE for the `nanovm` CLI + Python SDK.
 #
-# Installs the `nanovm` PyPI package into a dedicated virtualenv
-# under `libexec/`, then symlinks the `nanovm` entry point onto
-# the user's PATH. This avoids polluting `pip install --user` state
-# and keeps the CLI's Python deps (`requests`) out of the user's
-# global site-packages.
+# This file is a template — the two `REPLACE_WITH_SHA256_...`
+# placeholders below MUST be filled in with real sha256sums before
+# the formula can install. The publish workflow (release-time) is
+# what stamps them in and copies the result to the Homebrew tap.
 #
-# Local install (from a working checkout):
+# To install locally from a working checkout you have two options:
 #
-#   brew install --formula ./install/brew/nanovm.rb
+#   1. Copy the template, fill in both sha256sums by hand:
+#        curl -sL <tarball-url> | shasum -a 256
+#      then `brew install --formula ./install/brew/nanovm.rb`.
 #
-# Once the project has its own Homebrew tap (`ip888/tap`), this file
-# will be published there and users can `brew install ip888/tap/nanovm`.
-# The formula body doesn't change — only where it lives.
+#   2. Once the project has its own Homebrew tap (`ip888/tap`), the
+#      published formula lives there with real sums baked in and
+#      users just run `brew install ip888/tap/nanovm` — no template
+#      juggling.
+#
+# The formula body itself doesn't change between locations, only the
+# two sums do.
 #
 # Formula-audit is expected to pass; we deliberately don't set
 # `head` because the source of truth for CLI behaviour is the PyPI

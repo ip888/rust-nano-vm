@@ -42,9 +42,17 @@ fi
 
 # ---- 2. Python + pip -----------------------------------------------------
 
+# Two-step check: only probe `python3 -m pip` if python3 itself exists.
+# Otherwise `set -euo pipefail` on some shells (and `command not found`
+# handlers on others) would blow up before we can print the friendly
+# install hint. `pip` is useless without python3 anyway — asking for both
+# at once when python3 is missing is the correct message.
 need_install=()
-command -v python3 >/dev/null 2>&1 || need_install+=("python3")
-python3 -m pip --version >/dev/null 2>&1 || need_install+=("python3-pip")
+if ! command -v python3 >/dev/null 2>&1; then
+    need_install+=("python3" "python3-pip")
+elif ! python3 -m pip --version >/dev/null 2>&1; then
+    need_install+=("python3-pip")
+fi
 
 if [ "${#need_install[@]}" -gt 0 ]; then
     warn "Missing: ${need_install[*]}"

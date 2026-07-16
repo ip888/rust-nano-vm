@@ -32,7 +32,7 @@ See [`example.json`](./example.json). Every entry:
 }
 ```
 
-- `name` — URL-safe id (`[a-z0-9][a-z0-9-]*`). Becomes the path segment on the (future) fork endpoint. Invalid names log a `warn` and get skipped — a typo can't take the whole registry offline.
+- `name` — URL-safe id matching `[a-z0-9][a-z0-9.-]*` **with no trailing `-` or `.`**. Allows natural versioned ids like `python-3.12-ds`; rejects `Uppercase`, `under_score`, `has/slash`. Becomes the path segment on the (future) fork endpoint. Invalid names log a `warn` and get skipped — a typo can't take the whole registry offline.
 - `size_bytes` — approximate uncompressed rootfs size. Lets the dashboard render "~50 MB" without HEAD-ing the URL.
 - `kernel_url` / `rootfs_url` — public HTTPS URLs. Empty either → entry skipped (logged).
 - `cmdline` — passed verbatim to VMs forked from this snapshot.
