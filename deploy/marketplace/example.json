@@ -7,6 +7,7 @@
       "size_bytes": 52428800,
       "kernel_url": "https://cdn.nanovm.io/marketplace/python-3.12-ds/vmlinux",
       "rootfs_url": "https://cdn.nanovm.io/marketplace/python-3.12-ds/rootfs.ext4",
+      "snapshot_url": "https://cdn.nanovm.io/marketplace/python-3.12-ds/snapshot.tar.gz",
       "cmdline": "console=ttyS0 root=/dev/vda rw quiet",
       "labels": ["python", "data-science", "pandas", "sklearn"],
       "maintainer": "nanovm-marketplace"

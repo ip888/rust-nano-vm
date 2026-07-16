@@ -28,6 +28,7 @@
 //!       "size_bytes": 52428800,
 //!       "kernel_url": "https://cdn.example/marketplace/python-3.12-ds/vmlinux",
 //!       "rootfs_url": "https://cdn.example/marketplace/python-3.12-ds/rootfs.ext4",
+//!       "snapshot_url": "https://cdn.example/marketplace/python-3.12-ds/snapshot.tar.gz",
 //!       "cmdline": "console=ttyS0 root=/dev/vda rw",
 //!       "labels": ["python", "data-science"],
 //!       "maintainer": "nanovm-marketplace"
@@ -35,6 +36,11 @@
 //!   ]
 //! }
 //! ```
+//!
+//! `snapshot_url` is the tarball the marketplace-fork endpoint pulls
+//! into the tenant's snapshot store. Optional at parse time so listing
+//! works even for entries that only publish `kernel_url` / `rootfs_url`;
+//! the fork endpoint 501s for those entries.
 //!
 //! Malformed entries are logged at `warn` and skipped — same
 //! don't-crash-on-typo posture as `NANOVM_PLAN_TIERS`.
@@ -62,10 +68,25 @@ pub struct MarketplaceSnapshot {
     /// Approximate uncompressed size of `rootfs_url`, in bytes. Lets
     /// the dashboard render "~50 MB" without HEAD-ing the URL.
     pub size_bytes: u64,
-    /// Public URL to the kernel binary (vmlinux or bzImage).
+    /// Public URL to the kernel binary (vmlinux or bzImage). Kept for
+    /// display / provenance; the fork endpoint itself does not download
+    /// this — see `snapshot_url`.
     pub kernel_url: String,
-    /// Public URL to the rootfs image (ext4, squashfs, etc.).
+    /// Public URL to the rootfs image (ext4, squashfs, etc.). Kept for
+    /// display / provenance; the fork endpoint itself does not download
+    /// this — see `snapshot_url`.
     pub rootfs_url: String,
+    /// Optional public URL to a `.tar.gz` containing the pre-captured
+    /// snapshot's `manifest.json` + backing file (`memory.cow`). The
+    /// marketplace-fork endpoint downloads this on first fork per tenant
+    /// and adopts it into the tenant's [`snapshot::SnapshotStore`];
+    /// subsequent forks are served from the local snapshot (~12 ms warm-pool
+    /// pops). When `None`, the fork endpoint responds `501
+    /// snapshot_not_forkable` — the entry can be listed but not forked
+    /// yet (useful while a marketplace publisher is still writing their
+    /// snapshot pipeline).
+    #[serde(default)]
+    pub snapshot_url: Option<String>,
     /// Kernel cmdline the snapshot was captured with. Consumers
     /// forking a marketplace snapshot should pass this through
     /// verbatim unless they know what they're doing.
@@ -270,6 +291,7 @@ mod tests {
               "size_bytes": 52428800,
               "kernel_url": "https://cdn.example/py/vmlinux",
               "rootfs_url": "https://cdn.example/py/rootfs.ext4",
+              "snapshot_url": "https://cdn.example/py/snapshot.tar.gz",
               "cmdline": "console=ttyS0 root=/dev/vda rw",
               "labels": ["python", "ml"],
               "maintainer": "nanovm-marketplace"
