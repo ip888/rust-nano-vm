@@ -85,7 +85,12 @@ pub struct MarketplaceSnapshot {
     /// snapshot_not_forkable` — the entry can be listed but not forked
     /// yet (useful while a marketplace publisher is still writing their
     /// snapshot pipeline).
-    #[serde(default)]
+    ///
+    /// `skip_serializing_if` matches the OpenAPI schema: the field is
+    /// declared as an optional non-null string, so we omit it entirely
+    /// on the wire when the operator hasn't set it (rather than emitting
+    /// `"snapshot_url": null`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_url: Option<String>,
     /// Kernel cmdline the snapshot was captured with. Consumers
     /// forking a marketplace snapshot should pass this through
