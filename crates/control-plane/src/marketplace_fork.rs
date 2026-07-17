@@ -11,15 +11,21 @@
 //! 1. Auth (tenant bearer → [`OrgId`] in extensions).
 //! 2. Look up the entry by URL segment `:name`. 404 if unknown; 501 if
 //!    the entry has no `snapshot_url` (listing-only entry).
-//! 3. Cache lookup: `(org, name, url) → local SnapshotId`. On hit, skip
-//!    to step 6.
-//! 4. On miss, download the tarball to a scratch dir with a size cap
-//!    (default 2 GiB), extract with path-traversal + entry-count safety,
-//!    then [`Hypervisor::snapshot_adopt`](vm_core::Hypervisor::snapshot_adopt)
-//!    it into the backend under a fresh local id.
-//! 5. Record ownership (so subsequent `/v1/snapshots`, `/v1/snapshots/:id/*`
-//!    see it) and cache the mapping.
-//! 6. Apply per-token + per-org fork quota. On 429, return `retry-after`.
+//! 3. Apply per-token + per-org fork quota. On 429, return `retry-after`.
+//!    Enforced BEFORE the cold path so an exhausted-bucket caller can't
+//!    trigger a full tarball download by hammering this endpoint.
+//! 4. Cache lookup: `(org, name, url) → local SnapshotId`. On hit, skip
+//!    to step 7.
+//! 5. On miss, STREAM the tarball (no full in-memory buffer) through a
+//!    capping reader (default 2 GiB, `NANOVM_MARKETPLACE_MAX_BYTES`
+//!    override) into a fresh scratch dir. Extraction rejects
+//!    path-traversal, tar-bomb entry counts, gzip-bomb size, symlinks
+//!    / hardlinks / device entries, and duplicate paths under
+//!    normalization. Then [`Hypervisor::snapshot_adopt`](vm_core::Hypervisor::snapshot_adopt)
+//!    into the backend under a fresh local id.
+//! 6. Reconcile with the cache under lock; on race-loss delete the
+//!    freshly-adopted snapshot + forget its ownership so we don't
+//!    accumulate duplicate-tenant rows.
 //! 7. Restore the local snapshot (warm-pool if hot, cold otherwise);
 //!    record fork metrics + usage counters exactly like `/v1/snapshots/:id/fork`.
 //! 8. Return [`ForkResponseDto`](crate::api::ForkResponseDto).
@@ -28,12 +34,21 @@
 //!
 //! - `Content-Length > MAX_TARBALL_BYTES` → reject before streaming a
 //!   byte. Callers can override via `NANOVM_MARKETPLACE_MAX_BYTES`.
-//! - No `Content-Length` header → still stream, but abort the moment
-//!   bytes-read passes the cap (guards against chunked-encoding truncation
-//!   attacks).
+//! - No `Content-Length` header → still stream, but the [`CappedRead`]
+//!   adapter aborts the moment bytes-read passes the cap (guards
+//!   against chunked-encoding truncation attacks).
+//! - **No full in-memory buffer**: the HTTP body flows straight through
+//!   gz decode → tar reader → per-file unpack. Peak memory is bounded
+//!   to a couple of chunk-size buffers regardless of tarball size —
+//!   concurrent cold forks don't OOM the box.
+//! - Extract dir created with `create_dir` (NOT `create_dir_all`) so a
+//!   pre-placed symlink at the scratch path cannot redirect writes.
 //! - Extraction rejects any entry whose relative path escapes the target
 //!   dir (`..` components or absolute paths) — standard tar-slip
 //!   protection.
+//! - Duplicate detection is on the NORMALIZED path (`.` components
+//!   collapsed), so `manifest.json` and `./manifest.json` collide
+//!   rather than silently overwriting each other.
 //! - Extraction caps entry count at [`MAX_TARBALL_ENTRIES`] and
 //!   uncompressed-total at the same byte limit so a gzip bomb can't fill
 //!   the disk.
@@ -115,7 +130,44 @@ pub(crate) async fn fork_marketplace_snapshot(
             ),
         })?;
 
-    // 2. Cache lookup — skip download on hit.
+    // 2. Enforce fork quota BEFORE the (potentially expensive) cold-path
+    //    pull. Doing quota-after-pull meant a quota-exhausted token could
+    //    still trigger a full tarball download + extract + adopt (seconds
+    //    + up to the byte cap) before getting 429 — turning quota from a
+    //    cost-control mechanism into a decorative rejection. Ordered
+    //    per-token first, then per-org (matches /v1/snapshots/:id/fork).
+    let bearer = extract_bearer(&headers);
+    if let Err(retry_after_secs) = state.fork_quota().try_acquire(bearer.as_deref()) {
+        let fp = bearer
+            .as_deref()
+            .map(token_fingerprint)
+            .unwrap_or_else(|| "anonymous".to_owned());
+        state.metrics().record_throttled(&fp, org.as_str());
+        return Err(ApiError::TooManyRequests {
+            code: "fork_quota_exceeded",
+            message: format!("fork quota exceeded; retry after {retry_after_secs} second(s)"),
+            retry_after_secs,
+        });
+    }
+    let (tier_rps, tier_burst) = resolve_tier_limits(&state, &org);
+    if let Err(retry_after_secs) =
+        state
+            .fork_quota()
+            .try_acquire_org(org.as_str(), tier_rps, tier_burst)
+    {
+        let fp = bearer
+            .as_deref()
+            .map(token_fingerprint)
+            .unwrap_or_else(|| "anonymous".to_owned());
+        state.metrics().record_throttled(&fp, org.as_str());
+        return Err(ApiError::TooManyRequests {
+            code: "fork_quota_exceeded",
+            message: format!("org fork quota exceeded; retry after {retry_after_secs} second(s)"),
+            retry_after_secs,
+        });
+    }
+
+    // 3. Cache lookup — skip download on hit.
     let cache_key = (org.clone(), name.clone(), snapshot_url.clone());
     let cached_id = {
         let cache = state
@@ -150,49 +202,37 @@ pub(crate) async fn fork_marketplace_snapshot(
         .await
         .map_err(|e| ApiError::InternalDyn(format!("marketplace pull task panicked: {e}")))??;
 
-        // Insert under the lock; race-loser drops its snapshot below.
-        // (Rare — two concurrent first-forks for the same (org, name, url)
-        // — but leaving the loser's snapshot in the hypervisor is a small
-        // leak, not a correctness issue. A follow-up can wire a
-        // per-key async lock to fully serialize.)
-        let mut cache = state
-            .marketplace_fork_cache
-            .lock()
-            .map_err(|_| ApiError::Internal("marketplace_fork_cache mutex poisoned"))?;
-        *cache.entry(cache_key).or_insert(adopted)
+        // Reconcile with the cache: another request may have won the race
+        // and already installed a different id for this (org, name, url).
+        // If so, our freshly-adopted snapshot is dead weight — delete it
+        // from the hypervisor and forget its ownership record so the
+        // tenant's `/v1/snapshots` listing and quota don't accumulate
+        // race-loser rows on every concurrent first fork.
+        let winner_id = {
+            let mut cache = state
+                .marketplace_fork_cache
+                .lock()
+                .map_err(|_| ApiError::Internal("marketplace_fork_cache mutex poisoned"))?;
+            *cache.entry(cache_key).or_insert(adopted)
+        };
+        if winner_id != adopted {
+            let hv = state.hypervisor().clone();
+            let ownership = state.ownership().clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = hv.delete_snapshot(adopted) {
+                    tracing::warn!(
+                        snapshot = adopted.0,
+                        error = %e,
+                        "marketplace: race-loser snapshot delete failed"
+                    );
+                }
+                ownership.forget_snapshot(adopted);
+            })
+            .await
+            .map_err(|e| ApiError::InternalDyn(format!("race-loser cleanup task panicked: {e}")))?;
+        }
+        winner_id
     };
-
-    // 3. Enforce fork quota (same shape as /v1/snapshots/:id/fork).
-    let bearer = extract_bearer(&headers);
-    if let Err(retry_after_secs) = state.fork_quota().try_acquire(bearer.as_deref()) {
-        let fp = bearer
-            .as_deref()
-            .map(token_fingerprint)
-            .unwrap_or_else(|| "anonymous".to_owned());
-        state.metrics().record_throttled(&fp, org.as_str());
-        return Err(ApiError::TooManyRequests {
-            code: "fork_quota_exceeded",
-            message: format!("fork quota exceeded; retry after {retry_after_secs} second(s)"),
-            retry_after_secs,
-        });
-    }
-    let (tier_rps, tier_burst) = resolve_tier_limits(&state, &org);
-    if let Err(retry_after_secs) =
-        state
-            .fork_quota()
-            .try_acquire_org(org.as_str(), tier_rps, tier_burst)
-    {
-        let fp = bearer
-            .as_deref()
-            .map(token_fingerprint)
-            .unwrap_or_else(|| "anonymous".to_owned());
-        state.metrics().record_throttled(&fp, org.as_str());
-        return Err(ApiError::TooManyRequests {
-            code: "fork_quota_exceeded",
-            message: format!("org fork quota exceeded; retry after {retry_after_secs} second(s)"),
-            retry_after_secs,
-        });
-    }
 
     // 4. Restore — warm-pool first, cold restore fallback.
     let started = Instant::now();
@@ -253,11 +293,16 @@ fn pull_and_adopt(
         max_bytes,
         "marketplace: pulling snapshot tarball"
     );
-    let bytes = http_get_capped(&url, max_bytes)?;
     let scratch = scratch_dir(&entry_name);
+    // Stream the response directly through the gzip + tar readers.
+    // Bounded at every stage: the HTTP body is wrapped in a capping
+    // reader (byte cap), gz decode uses its own bounded output check via
+    // extract_tar_gz, and the scratch dir is created fresh (not with
+    // create_dir_all, which would follow a pre-placed symlink).
+    let resp = http_get_streaming(&url, max_bytes)?;
     // Extract into a fresh dir. On any error, do our best to clean up so
     // we don't leave partial data behind.
-    if let Err(e) = extract_tar_gz(&bytes, &scratch, max_bytes) {
+    if let Err(e) = extract_tar_gz(resp, &scratch, max_bytes) {
         let _ = std::fs::remove_dir_all(&scratch);
         return Err(e);
     }
@@ -278,11 +323,16 @@ fn pull_and_adopt(
     Ok(snap_id)
 }
 
-/// HTTP GET with a byte cap enforced streaming-side. Uses a fresh
-/// `reqwest::Client` per call — control-plane doesn't have a shared
-/// HTTP client abstraction and marketplace pulls are rare (first fork
-/// per tenant per entry), so the per-call overhead is negligible.
-fn http_get_capped(url: &str, max_bytes: u64) -> Result<Vec<u8>, ApiError> {
+/// Open the tarball URL and return the response body as a `Read` that
+/// enforces the byte cap streaming-side. NO full buffering — the
+/// caller (gzip decoder → tar reader → per-file unpack) consumes bytes
+/// as they arrive so peak memory is bounded to a couple of chunk-size
+/// buffers regardless of the tarball's compressed size.
+///
+/// Uses a fresh `reqwest::blocking::Client` per call — marketplace pulls
+/// are rare (first fork per tenant per entry) so the per-call setup cost
+/// is negligible next to the network round-trip.
+fn http_get_streaming(url: &str, max_bytes: u64) -> Result<CappedRead, ApiError> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(5))
@@ -301,7 +351,7 @@ fn http_get_capped(url: &str, max_bytes: u64) -> Result<Vec<u8>, ApiError> {
         );
     }
 
-    let mut resp = client
+    let resp = client
         .get(url)
         .send()
         .map_err(|e| ApiError::InternalDyn(format!("marketplace GET {url}: {e}")))?;
@@ -320,27 +370,46 @@ fn http_get_capped(url: &str, max_bytes: u64) -> Result<Vec<u8>, ApiError> {
             )));
         }
     }
+    Ok(CappedRead::new(resp, max_bytes, url.to_string()))
+}
 
-    // Streaming read with a running byte cap — chunked responses can
-    // omit Content-Length; we need to enforce the cap regardless.
-    let mut buf: Vec<u8> = Vec::with_capacity(resp.content_length().unwrap_or(0) as usize);
-    let mut chunk = [0u8; 64 * 1024];
-    loop {
-        let n = resp
-            .read(&mut chunk)
-            .map_err(|e| ApiError::InternalDyn(format!("marketplace read {url}: {e}")))?;
-        if n == 0 {
-            break;
+/// `Read` adapter that enforces a running byte cap on the underlying
+/// stream. Returns [`io::ErrorKind::InvalidData`] the moment total-read
+/// crosses `max_bytes` — the gz + tar readers translate that into an
+/// extraction error, which the handler surfaces as a client-safe 400.
+pub(crate) struct CappedRead {
+    inner: reqwest::blocking::Response,
+    max_bytes: u64,
+    seen: u64,
+    url: String,
+}
+
+impl CappedRead {
+    fn new(inner: reqwest::blocking::Response, max_bytes: u64, url: String) -> Self {
+        Self {
+            inner,
+            max_bytes,
+            seen: 0,
+            url,
         }
-        if (buf.len() as u64).saturating_add(n as u64) > max_bytes {
-            return Err(ApiError::Bad(format!(
-                "marketplace tarball {url}: body exceeded cap {max_bytes} mid-stream \
-                 (set NANOVM_MARKETPLACE_MAX_BYTES to raise)"
-            )));
-        }
-        buf.extend_from_slice(&chunk[..n]);
     }
-    Ok(buf)
+}
+
+impl Read for CappedRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.seen = self.seen.saturating_add(n as u64);
+        if self.seen > self.max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "marketplace tarball {}: body exceeded cap {} mid-stream",
+                    self.url, self.max_bytes
+                ),
+            ));
+        }
+        Ok(n)
+    }
 }
 
 /// Safely extract a gzipped tarball into `dst`. Rejects entries whose
@@ -352,15 +421,22 @@ fn http_get_capped(url: &str, max_bytes: u64) -> Result<Vec<u8>, ApiError> {
 /// tarballs are a well-defined format (a couple of files at the archive
 /// root) and any weird shape is a security signal, not a novel layout
 /// we should accommodate.
-fn extract_tar_gz(bytes: &[u8], dst: &Path, max_bytes: u64) -> Result<(), ApiError> {
-    std::fs::create_dir_all(dst).map_err(|e| {
+fn extract_tar_gz<R: Read>(source: R, dst: &Path, max_bytes: u64) -> Result<(), ApiError> {
+    // `create_dir` (not `create_dir_all`) — the scratch path is
+    // per-process nonce-tagged, so it MUST NOT already exist. If it
+    // does, treat that as an attempt to pre-place a symlink and refuse
+    // rather than following into whatever the attacker prepared. The
+    // process-local `pid + atomic counter` naming makes a real
+    // collision essentially impossible; a pre-existing path means
+    // tampering.
+    std::fs::create_dir(dst).map_err(|e| {
         ApiError::InternalDyn(format!(
-            "marketplace: mkdir extract dir {}: {e}",
+            "marketplace: mkdir extract dir {} (must not pre-exist): {e}",
             dst.display()
         ))
     })?;
 
-    let gz = flate2::read::GzDecoder::new(bytes);
+    let gz = flate2::read::GzDecoder::new(source);
     let mut archive = tar::Archive::new(gz);
     let mut count = 0usize;
     let mut total_bytes: u64 = 0;
@@ -389,9 +465,16 @@ fn extract_tar_gz(bytes: &[u8], dst: &Path, max_bytes: u64) -> Result<(), ApiErr
                 "marketplace tarball: unsafe entry path {raw_path:?} — refusing to extract"
             )));
         }
-        if !seen_paths.insert(raw_path.clone()) {
+        // Normalize before the dedup check: `manifest.json` and
+        // `./manifest.json` (and `a/b` vs `a/./b`) unpack to the same
+        // filesystem target, so they must collide in `seen_paths` too.
+        // Without this, an archive could smuggle in two entries whose
+        // second silently overwrote the first's extracted file.
+        let normalized = normalize_relative(&raw_path);
+        if !seen_paths.insert(normalized.clone()) {
             return Err(ApiError::Bad(format!(
-                "marketplace tarball: duplicate entry {raw_path:?}"
+                "marketplace tarball: duplicate entry {raw_path:?} \
+                 (normalizes to {normalized:?})"
             )));
         }
 
@@ -412,7 +495,7 @@ fn extract_tar_gz(bytes: &[u8], dst: &Path, max_bytes: u64) -> Result<(), ApiErr
             )));
         }
 
-        let target = dst.join(&raw_path);
+        let target = dst.join(&normalized);
         // Belt-and-braces: canonicalize check under dst. `is_safe_relative`
         // already rejects `..` and absolute paths so this is redundant on
         // sound inputs, but cheap.
@@ -428,6 +511,23 @@ fn extract_tar_gz(bytes: &[u8], dst: &Path, max_bytes: u64) -> Result<(), ApiErr
         })?;
     }
     Ok(())
+}
+
+/// Strip `.` components from a relative path. Callers guarantee it's
+/// already `is_safe_relative` (no absolute, no `..`), so nothing else
+/// needs collapsing. Empty output (all `.` components) maps to an empty
+/// path, which the caller's `dst.join()` then treats as `dst` itself —
+/// the archive is malformed and gets rejected as a duplicate on the
+/// second empty-normalized entry, or by unpack on the first.
+fn normalize_relative(p: &Path) -> PathBuf {
+    p.components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s),
+            Component::CurDir => None,
+            // is_safe_relative caller-side rules these out; be defensive.
+            _ => None,
+        })
+        .collect()
 }
 
 /// True iff `p` is safe to `dst.join(p)` — no absolute, no `..`
@@ -533,6 +633,24 @@ mod tests {
         gz.finish().unwrap()
     }
 
+    /// Per-test tmp path with a real monotonic counter so two calls in
+    /// the same process (or two `#[test]` in the same binary) never
+    /// collide. Callers `remove_dir_all` up front to ensure a clean
+    /// slate for `create_dir` (which errors on pre-existing dirs, by
+    /// design).
+    fn fresh_tmp(label: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "nanovm-mkt-{}-{}-{}",
+            label,
+            std::process::id(),
+            id,
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
     #[test]
     fn is_safe_relative_accepts_normal() {
         assert!(is_safe_relative(Path::new("manifest.json")));
@@ -550,13 +668,8 @@ mod tests {
     #[test]
     fn extract_tar_gz_happy_path() {
         let tarball = sample_snapshot_tarball();
-        let tmp = std::env::temp_dir().join(format!(
-            "nanovm-mkt-extract-{}-{}",
-            std::process::id(),
-            std::sync::atomic::AtomicUsize::new(0)
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        ));
-        extract_tar_gz(&tarball, &tmp, DEFAULT_MAX_TARBALL_BYTES).expect("extract");
+        let tmp = fresh_tmp("extract");
+        extract_tar_gz(tarball.as_slice(), &tmp, DEFAULT_MAX_TARBALL_BYTES).expect("extract");
         assert!(
             tmp.join("manifest.json").exists(),
             "manifest.json extracted"
@@ -616,8 +729,8 @@ mod tests {
         gz.write_all(&tarbytes).unwrap();
         let bytes = gz.finish().unwrap();
 
-        let tmp = std::env::temp_dir().join(format!("nanovm-mkt-traverse-{}", std::process::id()));
-        let err = extract_tar_gz(&bytes, &tmp, DEFAULT_MAX_TARBALL_BYTES).unwrap_err();
+        let tmp = fresh_tmp("traverse");
+        let err = extract_tar_gz(bytes.as_slice(), &tmp, DEFAULT_MAX_TARBALL_BYTES).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("unsafe entry path") || msg.contains("escapes extract dir"),
@@ -634,11 +747,84 @@ mod tests {
     fn extract_tar_gz_enforces_byte_cap() {
         let tarball = sample_snapshot_tarball();
         // Cap tiny — 100 bytes — so the ~4 KiB payload trips it.
-        let tmp = std::env::temp_dir().join(format!("nanovm-mkt-cap-{}", std::process::id()));
-        let err = extract_tar_gz(&tarball, &tmp, 100).unwrap_err();
+        let tmp = fresh_tmp("cap");
+        let err = extract_tar_gz(tarball.as_slice(), &tmp, 100).unwrap_err();
         assert!(
             format!("{err:?}").contains("uncompressed total exceeds cap"),
             "expected cap error, got: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extract_tar_gz_refuses_preexisting_dst() {
+        // Simulates the symlink pre-placement attack: attacker gets
+        // `dst` to already exist (as a symlink or real dir) before we
+        // extract. `create_dir` must fail rather than reuse.
+        let tarball = sample_snapshot_tarball();
+        let tmp = fresh_tmp("preexist");
+        std::fs::create_dir(&tmp).unwrap();
+        let err = extract_tar_gz(tarball.as_slice(), &tmp, DEFAULT_MAX_TARBALL_BYTES).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("must not pre-exist"),
+            "expected pre-exist refusal, got: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn normalize_relative_strips_dot_components() {
+        assert_eq!(
+            normalize_relative(Path::new("./manifest.json")),
+            PathBuf::from("manifest.json")
+        );
+        assert_eq!(
+            normalize_relative(Path::new("a/./b/./c")),
+            PathBuf::from("a/b/c")
+        );
+        assert_eq!(
+            normalize_relative(Path::new("manifest.json")),
+            PathBuf::from("manifest.json")
+        );
+    }
+
+    #[test]
+    fn extract_tar_gz_dedup_collapses_dot_prefix() {
+        // Craft a tarball with `manifest.json` and `./manifest.json` —
+        // both entries extract to the same target. Without normalize
+        // the dedup check on `raw_path` would let the second silently
+        // overwrite the first; with normalize it must reject.
+        let payload = b"x";
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut tarw = tar::Builder::new(&mut gz);
+            let mut h = Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tarw.append_data(&mut h, "manifest.json", payload.as_slice())
+                .unwrap();
+            // Second entry with a `./` prefix. tar-rs's append_data
+            // canonicalizes the input path, but the CurDir component
+            // gets preserved because it's a leading `./`. If tar-rs
+            // strips it on its side, this test degenerates into "two
+            // identical entries" which the raw-path check would also
+            // reject — either way, the collision is caught. We just
+            // want to prove the extract-time normalize does its job.
+            let mut h2 = Header::new_gnu();
+            h2.set_size(payload.len() as u64);
+            h2.set_mode(0o644);
+            h2.set_cksum();
+            tarw.append_data(&mut h2, "./manifest.json", payload.as_slice())
+                .unwrap();
+            tarw.finish().unwrap();
+        }
+        let bytes = gz.finish().unwrap();
+        let tmp = fresh_tmp("dedup");
+        let err = extract_tar_gz(bytes.as_slice(), &tmp, DEFAULT_MAX_TARBALL_BYTES).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("duplicate entry"),
+            "expected duplicate rejection, got: {err:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
