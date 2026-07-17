@@ -5,17 +5,23 @@ import { useEffect, useMemo, useState } from "react";
 
 import {
   ApiError,
+  forkMarketplaceSnapshot,
   listMarketplaceSnapshots,
+  type ForkResponse,
   type MarketplaceSnapshot,
 } from "@/lib/api";
+import { getSession, type Session } from "@/lib/session";
 
 /**
- * `/marketplace` — public browse of the snapshot catalogue.
+ * `/marketplace` — public browse of the snapshot catalogue with a
+ * per-card "Fork this" button.
  *
- * Deliberately mounted OUTSIDE `/dashboard` so a landing-page visitor
- * can hit it before they've signed up (matches the server-side posture:
- * `GET /v1/marketplace/snapshots` is unauthenticated). A follow-up wires
- * the "fork this" button once the server-side fork flow ships.
+ * The list itself is unauthenticated (matches the server-side posture:
+ * `GET /v1/marketplace/snapshots` needs no bearer). The fork button
+ * needs an API key — signed-out visitors see a `Sign in to fork` link
+ * on each card instead. This keeps the browse-before-signup path fast
+ * while still surfacing the real value prop the moment a visitor has
+ * a key.
  */
 export default function MarketplacePage() {
   const [state, setState] = useState<
@@ -24,8 +30,10 @@ export default function MarketplacePage() {
     | { kind: "error"; message: string }
   >({ kind: "loading" });
   const [query, setQuery] = useState("");
+  const [session, setSessionState] = useState<Session | null>(null);
 
   useEffect(() => {
+    setSessionState(getSession());
     (async () => {
       try {
         const resp = await listMarketplaceSnapshots();
@@ -73,18 +81,29 @@ export default function MarketplacePage() {
           </p>
         </div>
         <div className="flex gap-3">
-          <Link
-            href="/signup"
-            className="rounded-md bg-brand-500 px-4 py-2 text-sm text-white hover:bg-brand-600"
-          >
-            Sign up to fork
-          </Link>
-          <Link
-            href="/login"
-            className="rounded-md border border-gray-300 px-4 py-2 text-sm hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-800"
-          >
-            Log in
-          </Link>
+          {session ? (
+            <Link
+              href="/dashboard"
+              className="rounded-md bg-brand-500 px-4 py-2 text-sm text-white hover:bg-brand-600"
+            >
+              Dashboard
+            </Link>
+          ) : (
+            <>
+              <Link
+                href="/signup"
+                className="rounded-md bg-brand-500 px-4 py-2 text-sm text-white hover:bg-brand-600"
+              >
+                Sign up to fork
+              </Link>
+              <Link
+                href="/login"
+                className="rounded-md border border-gray-300 px-4 py-2 text-sm hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-800"
+              >
+                Log in
+              </Link>
+            </>
+          )}
         </div>
       </header>
 
@@ -117,7 +136,11 @@ export default function MarketplacePage() {
       {state.kind === "ok" && state.snapshots.length > 0 && (
         <ul className="grid gap-4 md:grid-cols-2">
           {filtered.map((s) => (
-            <SnapshotCard key={s.name} snapshot={s} />
+            <SnapshotCard
+              key={s.name}
+              snapshot={s}
+              session={session}
+            />
           ))}
           {filtered.length === 0 && (
             <li className="col-span-full rounded-lg border border-gray-200 p-6 text-sm text-gray-500 dark:border-gray-800">
@@ -152,7 +175,46 @@ function EmptyState() {
   );
 }
 
-function SnapshotCard({ snapshot }: { snapshot: MarketplaceSnapshot }) {
+/**
+ * Per-card fork state. Kept card-local so a failure on one entry
+ * doesn't taint the others, and so an "in-flight" spinner only
+ * disables the button the user clicked.
+ */
+type ForkState =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "success"; result: ForkResponse }
+  | { kind: "error"; code: string; message: string };
+
+function SnapshotCard({
+  snapshot,
+  session,
+}: {
+  snapshot: MarketplaceSnapshot;
+  session: Session | null;
+}) {
+  const [fork, setFork] = useState<ForkState>({ kind: "idle" });
+  const notForkable = !snapshot.snapshot_url;
+
+  async function onFork() {
+    if (!session) return;
+    setFork({ kind: "loading" });
+    try {
+      const result = await forkMarketplaceSnapshot(session.apiKey, snapshot.name);
+      setFork({ kind: "success", result });
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setFork({ kind: "error", code: err.code, message: err.message });
+      } else {
+        setFork({
+          kind: "error",
+          code: "network",
+          message: "Couldn't reach the API.",
+        });
+      }
+    }
+  }
+
   return (
     <li className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm transition-shadow hover:shadow-md dark:border-gray-800 dark:bg-gray-900">
       <div className="mb-2 flex items-start justify-between gap-2">
@@ -176,10 +238,88 @@ function SnapshotCard({ snapshot }: { snapshot: MarketplaceSnapshot }) {
           ))}
         </div>
       )}
-      <div className="flex items-center justify-between text-xs text-gray-500">
+
+      {/* Fork result surface */}
+      {fork.kind === "success" && (
+        <div className="mb-4 rounded-md border border-green-200 bg-green-50 p-3 text-xs text-green-800 dark:border-green-900 dark:bg-green-950 dark:text-green-200">
+          <p className="font-semibold">
+            Forked in {fork.result.fork_ms} ms
+          </p>
+          <p className="mt-1 font-mono">
+            VM #{fork.result.vm.id} ({fork.result.vm.state})
+          </p>
+          <p className="mt-1 text-green-700 dark:text-green-300">
+            You&apos;ve forked {fork.result.fork_count} time
+            {fork.result.fork_count === 1 ? "" : "s"} this month.
+          </p>
+        </div>
+      )}
+      {fork.kind === "error" && (
+        <div className="mb-4 rounded-md border border-red-200 bg-red-50 p-3 text-xs text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
+          <p className="font-semibold">Fork failed ({fork.code})</p>
+          <p className="mt-1">{fork.message}</p>
+        </div>
+      )}
+
+      <div className="flex items-center justify-between gap-3 text-xs text-gray-500">
         <span>by {snapshot.maintainer}</span>
+        {renderForkButton({ session, notForkable, fork, onFork })}
       </div>
     </li>
+  );
+}
+
+/**
+ * Extracted so the card's JSX stays flat. Four states drive the label
+ * and the click behavior:
+ *   - no session       → link to /login (browse-before-signup path)
+ *   - no snapshot_url  → disabled, tooltip explains 501 up front
+ *   - loading          → disabled spinner
+ *   - idle / done      → primary button, re-fork allowed
+ */
+function renderForkButton({
+  session,
+  notForkable,
+  fork,
+  onFork,
+}: {
+  session: Session | null;
+  notForkable: boolean;
+  fork: ForkState;
+  onFork: () => void;
+}) {
+  if (!session) {
+    return (
+      <Link
+        href="/login"
+        className="rounded-md border border-gray-300 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-800"
+      >
+        Sign in to fork
+      </Link>
+    );
+  }
+  if (notForkable) {
+    return (
+      <button
+        type="button"
+        disabled
+        title="This entry has no snapshot_url yet — publisher listed for discovery only."
+        className="cursor-not-allowed rounded-md bg-gray-200 px-3 py-1.5 text-xs font-medium text-gray-500 dark:bg-gray-800 dark:text-gray-500"
+      >
+        Not forkable
+      </button>
+    );
+  }
+  const loading = fork.kind === "loading";
+  return (
+    <button
+      type="button"
+      onClick={onFork}
+      disabled={loading}
+      className="rounded-md bg-brand-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-brand-600 disabled:cursor-not-allowed disabled:bg-brand-300"
+    >
+      {loading ? "Forking…" : fork.kind === "success" ? "Fork again" : "Fork this"}
+    </button>
   );
 }
 
