@@ -117,7 +117,21 @@ pub struct AppState {
     /// `NANOVM_MARKETPLACE_CONFIG`. Empty when unset — the endpoint
     /// then returns `{"snapshots": []}`.
     marketplace: Arc<crate::Marketplace>,
+    /// Per-org cache of adopted marketplace snapshots. Key: `(org,
+    /// entry_name, snapshot_url)`; value: local `SnapshotId` after
+    /// download + adopt. Process-local — cross-restart re-download is
+    /// accepted for MVP. The URL is part of the key so that a
+    /// republished tarball (same name, new URL) invalidates the cache
+    /// without a manual op. Only present when the `marketplace-fork`
+    /// feature is compiled in.
+    #[cfg(feature = "marketplace-fork")]
+    pub(crate) marketplace_fork_cache: Arc<Mutex<MarketplaceForkCache>>,
 }
+
+/// Type alias for the marketplace-fork cache map — extracted so
+/// clippy's `type_complexity` lint stops firing on the field.
+#[cfg(feature = "marketplace-fork")]
+pub(crate) type MarketplaceForkCache = HashMap<(OrgId, String, String), vm_core::SnapshotId>;
 
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -161,7 +175,18 @@ impl AppState {
             billing: None,
             vm_defaults: crate::api::VmConfigDefaults::default(),
             marketplace: Arc::new(crate::Marketplace::default()),
+            #[cfg(feature = "marketplace-fork")]
+            marketplace_fork_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Borrow the marketplace catalogue. Only used by the fork handler
+    /// today (the list handler reaches the field directly); gated
+    /// behind the same feature so `#[deny(dead_code)]` stays happy on
+    /// the default build.
+    #[cfg(feature = "marketplace-fork")]
+    pub(crate) fn marketplace(&self) -> &Arc<crate::Marketplace> {
+        &self.marketplace
     }
 
     /// Install a snapshot marketplace catalogue. Loaded from
@@ -283,6 +308,27 @@ impl AppState {
     pub(crate) fn hypervisor(&self) -> &Arc<dyn Hypervisor> {
         &self.hypervisor
     }
+
+    /// Lock the per-token fork-usage map. Exposed for sibling handlers
+    /// (marketplace-fork) that need to increment the same counters as
+    /// the primary fork route so the caller's `/v1/usage` view stays
+    /// consistent regardless of which fork endpoint they hit.
+    #[cfg(feature = "marketplace-fork")]
+    pub(crate) fn fork_usage_lock(
+        &self,
+    ) -> std::sync::LockResult<std::sync::MutexGuard<'_, HashMap<String, ForkUsage>>> {
+        self.fork_usage.lock()
+    }
+
+    /// Borrow the shared fork-quota bucket. Exposed for sibling
+    /// handlers (marketplace-fork) that need to gate their own fork
+    /// paths against the same per-token + per-org buckets as
+    /// `/v1/snapshots/:id/fork`. Only compiled when the marketplace-fork
+    /// feature is on — the primary route reaches the field directly.
+    #[cfg(feature = "marketplace-fork")]
+    pub(crate) fn fork_quota(&self) -> &Arc<crate::ForkQuota> {
+        &self.fork_quota
+    }
 }
 
 /// Build the REST router. The returned [`Router`] is parameterised over
@@ -403,12 +449,29 @@ pub fn router() -> Router<AppState> {
         post(crate::billing::stripe_webhook_handler)
             .layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
     );
+    // Marketplace fork endpoint — sits INSIDE the tenant-auth layer
+    // because it (a) mutates the caller's snapshot store and (b) counts
+    // against the caller's fork quota + usage. Feature-gated because it
+    // pulls in reqwest + tar + flate2 for the tarball download path.
+    // Chained inside the auth block by re-splitting the auth chain
+    // isn't possible after `.route_layer` has already been applied;
+    // instead we register the fork route on its own tenant-authed
+    // subrouter and merge below.
+    #[cfg(feature = "marketplace-fork")]
+    let v1 = v1.merge(
+        Router::new()
+            .route(
+                "/marketplace/snapshots/:name/fork",
+                post(crate::marketplace_fork::fork_marketplace_snapshot),
+            )
+            .route_layer(middleware::from_fn(audit::require_audit))
+            .route_layer(middleware::from_fn(auth::require_token)),
+    );
     // Snapshot marketplace listing — unauthenticated by design.
     // Discovery of curated pre-built snapshots (see
     // `crate::marketplace`). Registered AFTER the tenant-auth layer
-    // above so the middleware doesn't gate it. The (future) fork
-    // endpoint WILL sit behind tenant-auth because it mutates the
-    // caller's warm pool.
+    // above so the middleware doesn't gate it. The fork endpoint (above,
+    // feature-gated) IS tenant-authed because it mutates state.
     let v1 = v1.route("/marketplace/snapshots", get(list_marketplace_snapshots));
 
     Router::new()
@@ -906,7 +969,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 /// cached: subscription state changes flow through the webhook
 /// handler and land in the store, and re-reading here means a tier
 /// upgrade is enforced on the next fork without a restart.
-fn resolve_tier_limits(state: &AppState, org: &OrgId) -> (Option<f64>, Option<u32>) {
+pub(crate) fn resolve_tier_limits(state: &AppState, org: &OrgId) -> (Option<f64>, Option<u32>) {
     #[cfg(feature = "billing")]
     {
         if let Some(ctx) = state.billing_ctx() {
@@ -925,7 +988,7 @@ fn resolve_tier_limits(state: &AppState, org: &OrgId) -> (Option<f64>, Option<u3
 /// Pull the bearer token out of the `Authorization: Bearer …` header, if
 /// present. Returns `None` for missing / malformed headers (auth-off mode
 /// or unauthenticated probes).
-fn extract_bearer(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     headers
         .get("authorization")?
         .to_str()

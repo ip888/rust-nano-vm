@@ -53,6 +53,8 @@ mod exec_stream;
 pub mod fork_quota;
 mod keys;
 pub mod marketplace;
+#[cfg(feature = "marketplace-fork")]
+pub mod marketplace_fork;
 pub mod metrics;
 mod ownership;
 mod request_id;

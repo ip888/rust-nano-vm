@@ -59,6 +59,13 @@ sha2 = { version = "0.10", optional = true }
 # the tree via reqwest/rustls; declaring 0.2 explicitly keeps the API
 # stable across upstream churn (0.3+ renamed the entry point).
 getrandom = { version = "0.2", optional = true }
+# Marketplace fork endpoint pulls a snapshot tarball into the tenant's
+# SnapshotStore on first fork. Both crates are optional so the fork
+# endpoint stays behind its own feature gate — deployments that only
+# want to list the marketplace catalogue (or don't want it at all)
+# skip the download machinery entirely.
+tar = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -77,6 +84,13 @@ sqlite = ["dep:rusqlite"]
 # restart). Wire STRIPE_SECRET_KEY, STRIPE_BILLING_PORTAL_RETURN_URL,
 # NANOVM_SIGNUP_TOKEN at deploy time.
 billing = ["dep:reqwest", "dep:hmac", "dep:sha2", "dep:getrandom", "sqlite"]
+# Adds POST /v1/marketplace/snapshots/:name/fork — pulls the tarball
+# named by each entry's `snapshot_url` into the tenant's SnapshotStore
+# on first fork per tenant, then forks the local copy. Requires an S3
+# or filesystem snapshot store to be configured
+# (NANOVM_SNAPSHOT_STORE). Cached process-locally: a restart re-pulls
+# on first fork (a persisted cache is a follow-up).
+marketplace-fork = ["dep:reqwest", "dep:tar", "dep:flate2"]
 
 [dev-dependencies]
 base64.workspace = true

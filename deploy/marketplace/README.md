@@ -26,22 +26,31 @@ See [`example.json`](./example.json). Every entry:
   "size_bytes": 52428800,
   "kernel_url": "https://cdn.example/marketplace/…/vmlinux",
   "rootfs_url": "https://cdn.example/marketplace/…/rootfs.ext4",
+  "snapshot_url": "https://cdn.example/marketplace/…/snapshot.tar.gz",
   "cmdline": "console=ttyS0 root=/dev/vda rw quiet",
   "labels": ["python", "data-science"],
   "maintainer": "nanovm-marketplace"
 }
 ```
 
-- `name` — URL-safe id matching `[a-z0-9][a-z0-9.-]*` **with no trailing `-` or `.`**. Allows natural versioned ids like `python-3.12-ds`; rejects `Uppercase`, `under_score`, `has/slash`. Becomes the path segment on the (future) fork endpoint. Invalid names log a `warn` and get skipped — a typo can't take the whole registry offline.
+- `name` — URL-safe id matching `[a-z0-9][a-z0-9.-]*` **with no trailing `-` or `.`**. Allows natural versioned ids like `python-3.12-ds`; rejects `Uppercase`, `under_score`, `has/slash`. Becomes the path segment on the fork endpoint. Invalid names log a `warn` and get skipped — a typo can't take the whole registry offline.
 - `size_bytes` — approximate uncompressed rootfs size. Lets the dashboard render "~50 MB" without HEAD-ing the URL.
-- `kernel_url` / `rootfs_url` — public HTTPS URLs. Empty either → entry skipped (logged).
+- `kernel_url` / `rootfs_url` — public HTTPS URLs for display / provenance. Empty either → entry skipped (logged).
+- `snapshot_url` — **optional** public HTTPS URL to a `.tar.gz` of the pre-captured snapshot (`manifest.json` + `memory.cow` at the archive root). This is what the fork endpoint actually downloads. When absent, the entry is discoverable but the fork endpoint returns `501 snapshot_not_forkable` (a publisher may list first, add the tarball later).
 - `cmdline` — passed verbatim to VMs forked from this snapshot.
 - `labels` — free-form tags for filtering in a UI.
 - `maintainer` — who publishes this entry. `"nanovm-marketplace"` for first-party.
 
-## Roadmap
+## Forking a marketplace snapshot
 
-**v2 (next PR):** `POST /v1/marketplace/snapshots/:name/fork` — tenant-authed. Pulls the marketplace tarball into the tenant's snapshot store (via the existing `SnapshotStore` trait — filesystem or S3), then forks from it. Cached on first fetch; subsequent forks are ~12 ms warm-pool pops.
+`POST /v1/marketplace/snapshots/:name/fork` (tenant-authed, requires the control-plane binary to be built with `--features marketplace-fork`):
+
+- **First call per (tenant, name, snapshot_url)** pulls the tarball, extracts it (with tar-slip + entry-count + size-cap protection), and adopts it as a local snapshot in the tenant's backend. Takes seconds. Response body is the same [`ForkResponse`](../../crates/control-plane/src/api.rs) shape as `/v1/snapshots/:id/fork`.
+- **Subsequent calls** hit an in-process cache keyed by `(org, name, snapshot_url)` and fork the local snapshot directly (~12 ms with a warm pool). The URL is part of the key so a republished tarball invalidates the cache without a manual op.
+- **Cache is process-local**: a control-plane restart re-pulls on first fork per tenant. Persisting the mapping in the ownership store is a follow-up.
+- **Byte cap**: default 2 GiB per download and per extracted total. Override with `NANOVM_MARKETPLACE_MAX_BYTES=<bytes>` if a publisher needs a larger snapshot.
+
+## Roadmap
 
 **v3:** Publish-side. `POST /v1/marketplace/snapshots` (admin-authed) — publish an org's own snapshot as a marketplace entry, either public (visible to all callers) or private (visible only to a specific org list).
 

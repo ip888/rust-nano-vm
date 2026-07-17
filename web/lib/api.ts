@@ -90,6 +90,9 @@ export interface MarketplaceSnapshot {
   size_bytes: number;
   kernel_url: string;
   rootfs_url: string;
+  /** Optional `.tar.gz` URL of the pre-captured snapshot. When absent,
+   *  the entry is browse-only — `POST .../fork` returns 501. */
+  snapshot_url?: string | null;
   cmdline: string;
   labels: string[];
   maintainer: string;
@@ -97,6 +100,15 @@ export interface MarketplaceSnapshot {
 
 export interface MarketplaceListResponse {
   snapshots: MarketplaceSnapshot[];
+}
+
+/** Response body of `POST /v1/marketplace/snapshots/:name/fork` and
+ *  `POST /v1/snapshots/:id/fork` — the same DTO. */
+export interface ForkResponse {
+  vm: { id: number; display: string; state: "created" | "running" | "stopped" };
+  fork_ms: number;
+  fork_count: number;
+  fork_total_ms: number;
 }
 
 // -------- Fetch wrappers -----------------------------------------
@@ -214,4 +226,21 @@ export function getBillingPortalUrl(
  *  for browse-before-signup. */
 export function listMarketplaceSnapshots(): Promise<MarketplaceListResponse> {
   return request<MarketplaceListResponse>("/v1/marketplace/snapshots");
+}
+
+/** Fork a marketplace entry into the caller's tenant. First call per
+ *  `(tenant, name, snapshot_url)` downloads the tarball (seconds);
+ *  subsequent calls are ~12 ms warm-pool pops. Requires bearer auth. */
+export function forkMarketplaceSnapshot(
+  apiKey: string,
+  name: string,
+): Promise<ForkResponse> {
+  return request<ForkResponse>(
+    `/v1/marketplace/snapshots/${encodeURIComponent(name)}/fork`,
+    {
+      apiKey,
+      method: "POST",
+      body: JSON.stringify({}),
+    },
+  );
 }
