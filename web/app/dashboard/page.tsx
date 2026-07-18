@@ -9,6 +9,7 @@ import {
   getBillingPortalUrl,
   getPlan,
   getUsage,
+  getUsageByOrg,
   type PlanResponse,
   type UsageResponseDto,
 } from "@/lib/api";
@@ -123,6 +124,10 @@ export default function DashboardPage() {
           {usage ? <UsageBody usage={usage} /> : <Skeleton />}
         </Tile>
 
+        <Tile title="Fork activity (last 5 min)" className="md:col-span-2">
+          <ForkActivity apiKey={session.apiKey} orgId={session.org} plan={plan} />
+        </Tile>
+
         <Tile title="Quick start" className="md:col-span-2">
           <QuickStart apiKey={session.apiKey} />
         </Tile>
@@ -220,6 +225,221 @@ function UsageBody({ usage }: { usage: UsageResponseDto }) {
         </div>
       </dl>
     </div>
+  );
+}
+
+/**
+ * Rolling-window fork-rate view. Polls `/v1/usage/by-org` every
+ * `POLL_MS`, keeps the last `WINDOW` samples, and renders a sparkline
+ * of the derived per-interval rate alongside a `current rate / plan
+ * cap` readout.
+ *
+ * MVP is intentionally poll-based: the existing `nanovm_forks_total_by_org`
+ * counter surfaces cheaply and the extra round trip is trivial next to
+ * the wall-clock latency of a fork itself. A follow-up (PR-D1v2) swaps
+ * to `GET /v1/events` SSE so the browser gets pushed deltas instead of
+ * pulling snapshots.
+ */
+const POLL_MS = 5_000;
+const WINDOW = 60; // 60 × 5 s = 5 min of history.
+
+interface Sample {
+  /** ms since epoch when the sample landed on the client. */
+  t: number;
+  /** Cumulative fork count reported by the server at that moment. */
+  total: number;
+}
+
+function ForkActivity({
+  apiKey,
+  orgId,
+  plan,
+}: {
+  apiKey: string;
+  orgId: string;
+  plan: PlanResponse | null;
+}) {
+  const [samples, setSamples] = useState<Sample[]>([]);
+  const [pollError, setPollError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function tick() {
+      try {
+        const resp = await getUsageByOrg(apiKey);
+        const row = resp.orgs.find((o) => o.org_id === orgId);
+        if (cancelled) return;
+        if (!row) {
+          // No forks recorded yet — the counter is lazy and only
+          // appears on first fork. Render an empty sparkline; not an
+          // error.
+          setSamples((prev) => appendSample(prev, { t: Date.now(), total: 0 }));
+          return;
+        }
+        setSamples((prev) => appendSample(prev, { t: Date.now(), total: row.fork_count }));
+        setPollError(null);
+      } catch (err) {
+        if (cancelled) return;
+        // A transient 401 during rotation shouldn't tear the tile
+        // apart. Surface as an inline message and keep polling.
+        setPollError(
+          err instanceof ApiError
+            ? `${err.code}: ${err.message}`
+            : "poll failed",
+        );
+      }
+    }
+
+    tick(); // eager first sample so the UI populates immediately
+    const handle = setInterval(tick, POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(handle);
+    };
+  }, [apiKey, orgId]);
+
+  const rates = deriveRates(samples);
+  const currentRate = rates.length > 0 ? rates[rates.length - 1] : 0;
+  const capRps = plan?.plan?.rps ?? null;
+  const utilization = capRps ? Math.min(1, currentRate / capRps) : null;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-baseline justify-between gap-4">
+        <div>
+          <div className="text-3xl font-semibold">
+            {currentRate.toFixed(2)}
+            <span className="ml-1 text-base font-normal text-gray-500">
+              forks/s
+            </span>
+          </div>
+          <div className="text-sm text-gray-500">
+            {capRps
+              ? `${(utilization! * 100).toFixed(0)}% of ${capRps.toLocaleString()} forks/s plan cap`
+              : "no active plan — showing rate only"}
+          </div>
+        </div>
+        <div className="text-xs text-gray-400">
+          Updates every {POLL_MS / 1000} s · window {WINDOW * POLL_MS / 60_000} min
+        </div>
+      </div>
+
+      <Sparkline rates={rates} capRps={capRps} />
+
+      {utilization !== null && (
+        <div className="h-2 w-full overflow-hidden rounded bg-gray-200 dark:bg-gray-800">
+          <div
+            className={`h-full transition-all ${
+              utilization > 0.9
+                ? "bg-red-500"
+                : utilization > 0.75
+                  ? "bg-amber-500"
+                  : "bg-brand-500"
+            }`}
+            style={{ width: `${utilization * 100}%` }}
+          />
+        </div>
+      )}
+
+      {pollError && (
+        <p className="text-xs text-amber-600 dark:text-amber-400">
+          Live rate paused — {pollError}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** Append `next` to the rolling window, capping length at `WINDOW`. */
+function appendSample(prev: Sample[], next: Sample): Sample[] {
+  const merged = [...prev, next];
+  return merged.length <= WINDOW ? merged : merged.slice(merged.length - WINDOW);
+}
+
+/** Diff consecutive cumulative counts into per-interval forks/second.
+ *  Never negative (a restart can zero the counter) and never emits the
+ *  final undefined-partner sample. */
+function deriveRates(samples: Sample[]): number[] {
+  const out: number[] = [];
+  for (let i = 1; i < samples.length; i++) {
+    const a = samples[i - 1]!;
+    const b = samples[i]!;
+    const dt = (b.t - a.t) / 1000;
+    if (dt <= 0) continue;
+    const dv = Math.max(0, b.total - a.total);
+    out.push(dv / dt);
+  }
+  return out;
+}
+
+/**
+ * Renders the rate series as an inline SVG polyline. Uses a fixed
+ * viewBox so the parent controls sizing (Tailwind width). Empty /
+ * flat series still draws a baseline so the tile doesn't visually
+ * collapse.
+ */
+function Sparkline({
+  rates,
+  capRps,
+}: {
+  rates: number[];
+  capRps: number | null;
+}) {
+  const width = 600;
+  const height = 80;
+  // Baseline scale: max of (observed max, plan cap) so the cap line
+  // stays inside the frame even during idle periods.
+  const dataMax = rates.length > 0 ? Math.max(...rates) : 0;
+  const scaleMax = Math.max(dataMax, capRps ?? 0, 1);
+  const stepX = rates.length > 1 ? width / (rates.length - 1) : 0;
+  const points = rates
+    .map((r, i) => {
+      const x = i * stepX;
+      const y = height - (r / scaleMax) * height;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+  const capY = capRps ? height - (capRps / scaleMax) * height : null;
+
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      className="h-20 w-full"
+      preserveAspectRatio="none"
+      role="img"
+      aria-label={`Fork rate sparkline, ${rates.length} samples`}
+    >
+      {capY !== null && (
+        <line
+          x1={0}
+          y1={capY}
+          x2={width}
+          y2={capY}
+          stroke="currentColor"
+          strokeDasharray="4 4"
+          strokeWidth={1}
+          className="text-amber-500"
+        />
+      )}
+      {rates.length > 1 ? (
+        <polyline
+          points={points}
+          fill="none"
+          strokeWidth={2}
+          className="stroke-brand-500"
+        />
+      ) : (
+        <line
+          x1={0}
+          y1={height - 1}
+          x2={width}
+          y2={height - 1}
+          strokeWidth={1}
+          className="stroke-gray-300 dark:stroke-gray-700"
+        />
+      )}
+    </svg>
   );
 }
 
