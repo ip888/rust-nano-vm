@@ -299,15 +299,22 @@ function renderForkButton({
     );
   }
   if (notForkable) {
+    // A `<button disabled title=…>` doesn't reliably surface its
+    // tooltip: browsers gate `title` on hover of *focusable* elements
+    // and disabled controls aren't focusable. Use a non-disabled
+    // `<span>` styled like a chip so the reason is actually
+    // discoverable (mouse hover fires; keyboard users get the
+    // aria-label read by screen readers).
     return (
-      <button
-        type="button"
-        disabled
+      <span
+        role="note"
+        tabIndex={0}
         title="This entry has no snapshot_url yet — publisher listed for discovery only."
-        className="cursor-not-allowed rounded-md bg-gray-200 px-3 py-1.5 text-xs font-medium text-gray-500 dark:bg-gray-800 dark:text-gray-500"
+        aria-label="Not forkable: this entry has no snapshot_url yet — publisher listed for discovery only."
+        className="cursor-help rounded-md bg-gray-200 px-3 py-1.5 text-xs font-medium text-gray-500 dark:bg-gray-800 dark:text-gray-500"
       >
         Not forkable
-      </button>
+      </span>
     );
   }
   const loading = fork.kind === "loading";
