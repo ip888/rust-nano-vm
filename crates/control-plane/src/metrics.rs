@@ -85,10 +85,13 @@ pub struct Metrics {
     /// is safe to label-by-value.
     stripe_events_total: Mutex<HashMap<String, u64>>,
     /// Fork attempts denied by dunning enforcement (402), keyed by
-    /// `"{org}|{status}"`. Cardinality is bounded — Stripe's status
-    /// enum is small and orgs are bounded by tenant count. Useful for
-    /// the "how many customers am I actually gating?" dashboard tile.
-    dunning_blocked_total: Mutex<HashMap<String, u64>>,
+    /// `(org, status)`. Tuple key rather than a joined `"{org}|{status}"`
+    /// string because [`crate::auth::OrgId`] accepts arbitrary bytes —
+    /// a `|` in the org id would corrupt the label split. Cardinality
+    /// is bounded — Stripe's status enum is small and orgs are bounded
+    /// by tenant count. Useful for the "how many customers am I
+    /// actually gating?" dashboard tile.
+    dunning_blocked_total: Mutex<HashMap<(String, String), u64>>,
 }
 
 impl Metrics {
@@ -120,13 +123,13 @@ impl Metrics {
     }
 
     /// Record a fork attempt that was denied by dunning enforcement.
-    /// Keyed by `"{org}|{status}"` so a Prometheus scrape can pivot on
-    /// either dimension. Called from `check_dunning_or_402` before the
-    /// 402 response is built.
+    /// Keyed by `(org, status)` — tuple key preserves both dimensions
+    /// verbatim so a `|` in an org id can't corrupt the exposition.
+    /// Called from `check_dunning_or_402` before the 402 response is
+    /// built.
     pub fn record_dunning_block(&self, org: &str, status: &str) {
         if let Ok(mut map) = self.dunning_blocked_total.lock() {
-            let key = format!("{org}|{status}");
-            *map.entry(key).or_insert(0) += 1;
+            *map.entry((org.to_owned(), status.to_owned())).or_insert(0) += 1;
         }
     }
 
@@ -309,11 +312,14 @@ impl Metrics {
         );
         out.push_str("# TYPE nanovm_dunning_blocked_total counter\n");
         if let Ok(map) = self.dunning_blocked_total.lock() {
-            for (key, n) in sorted_pairs(&map) {
-                // Key is `"{org}|{status}"` — split for the two labels.
-                let (org, status) = key.split_once('|').unwrap_or((key.as_str(), ""));
-                let org = escape_label(org);
-                let status = escape_label(status);
+            // Deterministic exposition order: sort by (org, status)
+            // so scrapes diff cleanly across runs.
+            let mut rows: Vec<(&(String, String), u64)> =
+                map.iter().map(|(k, n)| (k, *n)).collect();
+            rows.sort_by(|a, b| a.0.cmp(b.0));
+            for ((org, status), n) in rows {
+                let org = escape_label(org.as_str());
+                let status = escape_label(status.as_str());
                 let _ = writeln!(
                     out,
                     "nanovm_dunning_blocked_total{{org=\"{org}\",status=\"{status}\"}} {n}"
