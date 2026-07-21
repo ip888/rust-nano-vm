@@ -84,6 +84,11 @@ pub struct Metrics {
     /// Cardinality is bounded by Stripe's own event-type enum, so this
     /// is safe to label-by-value.
     stripe_events_total: Mutex<HashMap<String, u64>>,
+    /// Fork attempts denied by dunning enforcement (402), keyed by
+    /// `"{org}|{status}"`. Cardinality is bounded — Stripe's status
+    /// enum is small and orgs are bounded by tenant count. Useful for
+    /// the "how many customers am I actually gating?" dashboard tile.
+    dunning_blocked_total: Mutex<HashMap<String, u64>>,
 }
 
 impl Metrics {
@@ -112,6 +117,17 @@ impl Metrics {
         self.fork_latency_ms_sum
             .fetch_add(latency_ms, Ordering::Relaxed);
         self.fork_latency_ms_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a fork attempt that was denied by dunning enforcement.
+    /// Keyed by `"{org}|{status}"` so a Prometheus scrape can pivot on
+    /// either dimension. Called from `check_dunning_or_402` before the
+    /// 402 response is built.
+    pub fn record_dunning_block(&self, org: &str, status: &str) {
+        if let Ok(mut map) = self.dunning_blocked_total.lock() {
+            let key = format!("{org}|{status}");
+            *map.entry(key).or_insert(0) += 1;
+        }
     }
 
     /// Record a fork attempt that was rejected by the quota. Splits
@@ -284,6 +300,23 @@ impl Metrics {
                 let _ = writeln!(
                     out,
                     "nanovm_stripe_webhook_events_total{{event_type=\"{event_type}\"}} {n}"
+                );
+            }
+        }
+
+        out.push_str(
+            "# HELP nanovm_dunning_blocked_total Fork attempts denied by dunning enforcement (402).\n",
+        );
+        out.push_str("# TYPE nanovm_dunning_blocked_total counter\n");
+        if let Ok(map) = self.dunning_blocked_total.lock() {
+            for (key, n) in sorted_pairs(&map) {
+                // Key is `"{org}|{status}"` — split for the two labels.
+                let (org, status) = key.split_once('|').unwrap_or((key.as_str(), ""));
+                let org = escape_label(org);
+                let status = escape_label(status);
+                let _ = writeln!(
+                    out,
+                    "nanovm_dunning_blocked_total{{org=\"{org}\",status=\"{status}\"}} {n}"
                 );
             }
         }

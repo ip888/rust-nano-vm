@@ -83,7 +83,9 @@ use vm_core::{Hypervisor, SnapshotId};
 use crate::api::ForkResponseDto;
 use crate::auth::OrgId;
 use crate::error::ApiError;
-use crate::routes::{extract_bearer, resolve_tier_limits, token_fingerprint, AppState};
+use crate::routes::{
+    check_dunning_or_402, extract_bearer, resolve_tier_limits, token_fingerprint, AppState,
+};
 
 /// Default cap on both the compressed download size AND the sum of
 /// extracted-entry sizes. Chosen so a rootfs the size of the largest
@@ -130,7 +132,13 @@ pub(crate) async fn fork_marketplace_snapshot(
             ),
         })?;
 
-    // 2. Enforce fork quota BEFORE the (potentially expensive) cold-path
+    // 2. Enforce dunning BEFORE the (potentially expensive) cold-path
+    //    pull. Same rationale as the quota check below — a delinquent
+    //    tenant hammering the endpoint mustn't burn tarball-download
+    //    bytes on our dime waiting for a 402.
+    check_dunning_or_402(&state, &org)?;
+
+    // 3. Enforce fork quota BEFORE the (potentially expensive) cold-path
     //    pull. Doing quota-after-pull meant a quota-exhausted token could
     //    still trigger a full tarball download + extract + adopt (seconds
     //    + up to the byte cap) before getting 429 — turning quota from a

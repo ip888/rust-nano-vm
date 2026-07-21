@@ -131,15 +131,27 @@ export interface ForkResponse {
  * status; `.code` and `.message` come from the control-plane's
  * `{"error": {"code": "...", "message": "..."}}` envelope when
  * present, otherwise a synthetic value.
+ *
+ * `.upgradeEndpoint` is set on 402 Payment Required responses (dunning
+ * blocks): the server points the client at the API path that returns
+ * a live Stripe billing-portal URL, so the UI can render an actionable
+ * "Open billing" link rather than a plain error.
  */
 export class ApiError extends Error {
   status: number;
   code: string;
+  upgradeEndpoint?: string;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    upgradeEndpoint?: string,
+  ) {
     super(message);
     this.status = status;
     this.code = code;
+    this.upgradeEndpoint = upgradeEndpoint;
     this.name = "ApiError";
   }
 }
@@ -166,12 +178,17 @@ async function request<T>(
   const text = await resp.text();
   const parsed = text ? safeJson(text) : null;
   if (!resp.ok) {
-    const errObj = parsed as { error?: { code?: string; message?: string } };
+    const errObj = parsed as {
+      error?: { code?: string; message?: string; upgrade_endpoint?: string };
+    };
     const code = errObj?.error?.code ?? String(resp.status);
     const message =
       errObj?.error?.message ??
       (typeof parsed === "string" ? parsed : text || resp.statusText);
-    throw new ApiError(resp.status, code, message);
+    // 402 dunning responses extend the envelope with `upgrade_endpoint`
+    // pointing at `/v1/billing/portal`. Preserve it on the ApiError so
+    // UIs can render a "Manage billing" link instead of a dead error.
+    throw new ApiError(resp.status, code, message, errObj?.error?.upgrade_endpoint);
   }
   return parsed as T;
 }
