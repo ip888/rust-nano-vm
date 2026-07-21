@@ -1,6 +1,20 @@
 # Default values for the nanovm-control-plane chart. Override via
 # `helm install ... --set` or your own values.yaml.
 
+# Enterprise / on-prem toggle. When true:
+# - The chart doesn't render env vars that would trigger outbound
+#   network calls the operator can't audit (Stripe reporter tick,
+#   Resend email delivery). Values you set explicitly still take
+#   effect; airgap only suppresses defaults.
+# - Documented posture: see `deploy/enterprise/README.md`. This is a
+#   flag for chart behavior, not a compile-time cargo feature — the
+#   binary still supports every SaaS surface if the operator wires
+#   the corresponding env vars.
+# - The SIEM audit sink (`NANOVM_AUDIT_SINK_URL`) still ships to
+#   whatever URL the operator provides, including in-cluster
+#   collectors — airgap-compatible by construction.
+airgap: false
+
 image:
   # Default to the KVM-enabled production image. Operators that want
   # mock-backend dev deployments should override to the plain
