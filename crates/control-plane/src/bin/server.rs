@@ -166,6 +166,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              Configure tokens before relying on the audit log."
         );
     }
+    // SIEM sink: an optional HTTP webhook that receives one JSON POST
+    // per audit record (Datadog / Splunk HEC / custom collector). Only
+    // pulled in when the binary is built with --features audit-sink.
+    // File appender + sink are independent; either or both can be
+    // configured. Task handle is dropped intentionally — the sender
+    // held by the (Clone) AuditLog keeps the channel alive for the
+    // whole process lifetime.
+    #[cfg(feature = "audit-sink")]
+    let audit = match std::env::var(control_plane::audit_sink::SINK_URL_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(url) => {
+            let header = match std::env::var(control_plane::audit_sink::SINK_HEADER_ENV) {
+                Ok(raw) if !raw.trim().is_empty() => {
+                    match control_plane::audit_sink::parse_header(&raw) {
+                        Ok((name, value)) => {
+                            info!(
+                                header_name = name.as_str(),
+                                "audit sink: extra header configured"
+                            );
+                            Some((name, value))
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "audit sink: NANOVM_AUDIT_SINK_HEADER malformed; skipping");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let sink = control_plane::audit_sink::spawn(url.clone(), header);
+            info!(url, "audit sink enabled");
+            // Detach the task — its lifetime is tied to the mpsc
+            // sender that AuditLog holds; server shutdown drops that.
+            std::mem::forget(sink.task);
+            audit.with_sink(sink.sender)
+        }
+        None => audit,
+    };
 
     let (hypervisor, backend_label) = build_hypervisor()?;
     let warm_pool = WarmPool::from_env(Arc::clone(&hypervisor));

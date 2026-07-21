@@ -45,6 +45,8 @@
 
 mod api;
 mod audit;
+#[cfg(feature = "audit-sink")]
+pub mod audit_sink;
 mod auth;
 #[cfg(feature = "billing")]
 pub mod billing;
