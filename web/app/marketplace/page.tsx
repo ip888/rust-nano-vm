@@ -13,6 +13,12 @@ import {
 } from "@/lib/api";
 import { getSession, type Session } from "@/lib/session";
 
+/** The one server-relative path our `openBillingPortal` helper knows
+ *  how to call today. We only fire the "Manage billing" button when
+ *  the server's `upgrade_endpoint` matches this exactly — see the
+ *  card's error surface for the rationale. */
+const BILLING_PORTAL_ENDPOINT = "/v1/billing/portal";
+
 /**
  * `/marketplace` — public browse of the snapshot catalogue with a
  * per-card "Fork this" button.
@@ -291,7 +297,13 @@ function SnapshotCard({
         <div className="mb-4 rounded-md border border-red-200 bg-red-50 p-3 text-xs text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
           <p className="font-semibold">Fork failed ({fork.code})</p>
           <p className="mt-1">{fork.message}</p>
-          {fork.upgradeEndpoint && (
+          {/* Only render the "Manage billing" button when the server's
+              `upgrade_endpoint` matches the exact path our helper knows
+              how to call. If a future control-plane sends something
+              else (a different portal path, a hosted URL, etc.) we
+              deliberately don't fire the button — better a missing CTA
+              than a button that calls the wrong endpoint. */}
+          {fork.upgradeEndpoint === BILLING_PORTAL_ENDPOINT && (
             <button
               type="button"
               onClick={openBillingPortal}
@@ -344,11 +356,11 @@ function renderForkButton({
     // `aria-disabled` (not `disabled`) so the button stays focusable
     // and the `title` tooltip actually fires — browsers gate `title`
     // on hover of *focusable* elements. Keeps button semantics
-    // (screen reader announces "button, not forkable") while blocking
-    // the click via `onClick=undefined`. Adding `tabIndex={0}` to a
-    // non-interactive element (an earlier iteration used
-    // `<span role="note">`) would put decorative chips in the tab
-    // order — an a11y-audit anti-pattern.
+    // (screen reader announces "button, not forkable"). The click is
+    // a no-op simply because no `onClick` handler is attached below.
+    // Adding `tabIndex={0}` to a non-interactive element (an earlier
+    // iteration used `<span role="note">`) would put decorative chips
+    // in the tab order — an a11y-audit anti-pattern.
     return (
       <button
         type="button"
