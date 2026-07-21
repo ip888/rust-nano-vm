@@ -62,9 +62,10 @@ export interface UsageResponseDto {
   fork_total_ms: number;
 }
 
-/** One row in `GET /v1/usage/by-org`. Same shape as `UsageResponseDto`
- *  but org-scoped. Caller sees their own row; operator-scoped tokens
- *  can request every row via `?all=1`. */
+/** One row in `GET /v1/usage/by-org`. Shape: `org_id` + cumulative
+ *  counters (no per-token field — unlike `UsageResponseDto`). The
+ *  caller sees only their own row unless they hold an operator-scoped
+ *  token and pass `?all=true` (server accepts `all=1` too). */
 export interface UsageByOrgEntry {
   org_id: string;
   fork_count: number;
@@ -209,10 +210,15 @@ export function getUsage(apiKey: string): Promise<UsageResponseDto> {
 }
 
 /** Per-org fork counters. Returns only the caller's own org row unless
- *  the caller has operator scope AND passes `all=true`. Cheap: reads
- *  from Prometheus counters in-process. */
-export function getUsageByOrg(apiKey: string): Promise<UsageByOrgResponse> {
-  return request<UsageByOrgResponse>("/v1/usage/by-org", { apiKey });
+ *  the caller has operator scope AND passes `all: true` (which forwards
+ *  as `?all=true`; the server also accepts `all=1`). Cheap: reads from
+ *  Prometheus counters in-process. */
+export function getUsageByOrg(
+  apiKey: string,
+  opts: { all?: boolean } = {},
+): Promise<UsageByOrgResponse> {
+  const suffix = opts.all ? "?all=true" : "";
+  return request<UsageByOrgResponse>(`/v1/usage/by-org${suffix}`, { apiKey });
 }
 
 export function listKeys(apiKey: string): Promise<ListKeysResponse> {
