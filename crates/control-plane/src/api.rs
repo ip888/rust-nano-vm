@@ -728,6 +728,9 @@ pub fn openapi_spec() -> Value {
                                 "application/json": { "schema": { "$ref": "#/components/schemas/ForkResponse" } }
                             }
                         },
+                        "402": {
+                            "description": "Subscription is dunning-blocked (past_due / unpaid / canceled past the grace window). Body includes an `upgrade_endpoint` hint pointing at `/v1/billing/portal`."
+                        },
                         "429": {
                             "description": "Rate-limited by per-token fork quota"
                         }
@@ -822,6 +825,7 @@ pub fn openapi_spec() -> Value {
                             }
                         },
                         "404": { "description": "No marketplace entry with that name" },
+                        "402": { "description": "Subscription is dunning-blocked past the grace window; body includes `upgrade_endpoint`" },
                         "429": { "description": "Rate-limited by per-token or per-org fork quota" },
                         "501": { "description": "The entry has no `snapshot_url` and cannot yet be forked" }
                     }

@@ -226,6 +226,103 @@ pub struct PlanResponse {
     pub price_id: Option<String>,
 }
 
+/// Env var: hours of grace after a subscription enters a delinquent
+/// state before fork routes start returning 402. Default 72 h — long
+/// enough that a weekend outage on the customer's payment method
+/// doesn't lock them out, short enough that we're not shipping compute
+/// on unpaid subscriptions indefinitely.
+pub const DUNNING_GRACE_ENV: &str = "NANOVM_DUNNING_GRACE_HOURS";
+
+/// Default value of [`DUNNING_GRACE_ENV`] when unset or malformed.
+pub const DEFAULT_DUNNING_GRACE_HOURS: u64 = 72;
+
+/// Subscription statuses that trigger dunning enforcement past the
+/// grace window. Stripe emits these on `customer.subscription.updated`
+/// / `customer.subscription.deleted`; we compare verbatim.
+const DELINQUENT_STATUSES: &[&str] = &["past_due", "unpaid", "canceled"];
+
+/// Reason a fork was denied by dunning enforcement. Split from
+/// [`ApiError`] so tests can assert on the classification without
+/// depending on axum's response types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DunningVerdict {
+    /// Stripe's verbatim status string that triggered the block.
+    pub status: String,
+    /// RFC 3339 timestamp of when the subscription entered this state
+    /// (or last had its status observed at this value). Set by
+    /// [`SubscriptionState::updated_at`].
+    pub updated_at: String,
+    /// Grace-window ceiling that had already elapsed, in hours. Used
+    /// for the client-facing message.
+    pub grace_hours: u64,
+}
+
+/// Check whether the caller's subscription is dunning-blocked. Returns
+/// `Ok(())` when the caller may proceed — free tier, active/trialing
+/// subscription, or delinquent-but-inside-grace-window. Returns
+/// `Err(DunningVerdict)` for a real block.
+///
+/// The grace window compares `SubscriptionState.updated_at` (RFC 3339
+/// UTC) against `now - grace_hours` lexicographically. Both strings
+/// share the same fixed shape from [`crate::time::rfc3339_now`], so a
+/// string compare is well-defined and cheap — no chrono dependency.
+pub fn check_dunning(
+    store: &dyn BillingStore,
+    org: &OrgId,
+    grace_hours: u64,
+) -> Result<(), DunningVerdict> {
+    let Some(customer_id) = store.get_customer(org) else {
+        // Free tier / never provisioned: no subscription to gate on.
+        return Ok(());
+    };
+    let Some(sub) = store.get_subscription(&customer_id) else {
+        return Ok(());
+    };
+    if !DELINQUENT_STATUSES.contains(&sub.status.as_str()) {
+        return Ok(());
+    }
+    let grace_secs: i64 = (grace_hours as i64).saturating_mul(3600);
+    let grace_boundary = crate::time::rfc3339_offset(-grace_secs);
+    // Inside grace: sub.updated_at is MORE recent than boundary, so
+    // string-compare of the fixed-width RFC 3339 form returns
+    // `updated_at > grace_boundary`.
+    if sub.updated_at.as_str() > grace_boundary.as_str() {
+        return Ok(());
+    }
+    Err(DunningVerdict {
+        status: sub.status,
+        updated_at: sub.updated_at,
+        grace_hours,
+    })
+}
+
+/// Read [`DUNNING_GRACE_ENV`] from the process environment, falling
+/// back to [`DEFAULT_DUNNING_GRACE_HOURS`] when unset or unparseable
+/// (a typo can't accidentally disable enforcement — default 72 h is
+/// the safe posture).
+pub fn dunning_grace_hours() -> u64 {
+    parse_dunning_grace_hours(std::env::var(DUNNING_GRACE_ENV).ok().as_deref())
+}
+
+/// Split from [`dunning_grace_hours`] so unit tests can exercise the
+/// parser without mutating process env (workspace forbids `unsafe`
+/// which `std::env::set_var` needs).
+pub fn parse_dunning_grace_hours(raw: Option<&str>) -> u64 {
+    match raw {
+        Some(v) => match v.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    "{DUNNING_GRACE_ENV}={v:?} is not a non-negative integer; \
+                     falling back to default {DEFAULT_DUNNING_GRACE_HOURS} h"
+                );
+                DEFAULT_DUNNING_GRACE_HOURS
+            }
+        },
+        None => DEFAULT_DUNNING_GRACE_HOURS,
+    }
+}
+
 /// Resolve the current plan for an org: look up its Stripe customer
 /// id, fetch its subscription state, map the price_id via
 /// [`PlanTiers`]. All three lookups are cheap and stateless.
@@ -2628,5 +2725,111 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, BillingError::InvalidSignupToken));
+    }
+
+    // ---- Dunning enforcement ---------------------------------------
+
+    /// Build a subscription state with `updated_at` set to `hours_ago`
+    /// hours before now (via `rfc3339_offset`), so tests exercise the
+    /// grace-window comparison without touching env or wall clock.
+    fn seed_delinquent_subscription(
+        store: &InMemoryBillingStore,
+        org: &str,
+        status: &str,
+        hours_ago: i64,
+    ) {
+        store
+            .record_customer(&OrgId::new(org), &format!("cus_{org}"))
+            .unwrap();
+        let sub = SubscriptionState {
+            subscription_id: format!("sub_{org}"),
+            status: status.into(),
+            price_id: Some("price_pro".into()),
+            subscription_item_id: None,
+            updated_at: crate::time::rfc3339_offset(-(hours_ago * 3600)),
+        };
+        store
+            .record_subscription(&format!("cus_{org}"), &sub)
+            .unwrap();
+    }
+
+    #[test]
+    fn dunning_ok_when_no_customer_row() {
+        let store = InMemoryBillingStore::default();
+        assert!(check_dunning(&store, &OrgId::new("acme"), 72).is_ok());
+    }
+
+    #[test]
+    fn dunning_ok_when_active_subscription() {
+        let store = InMemoryBillingStore::default();
+        seed_delinquent_subscription(&store, "acme", "active", 200);
+        assert!(check_dunning(&store, &OrgId::new("acme"), 72).is_ok());
+    }
+
+    #[test]
+    fn dunning_ok_when_delinquent_but_inside_grace_window() {
+        let store = InMemoryBillingStore::default();
+        // past_due for 24 h, grace 72 h → still inside grace.
+        seed_delinquent_subscription(&store, "acme", "past_due", 24);
+        assert!(check_dunning(&store, &OrgId::new("acme"), 72).is_ok());
+    }
+
+    #[test]
+    fn dunning_blocks_past_due_past_grace() {
+        let store = InMemoryBillingStore::default();
+        seed_delinquent_subscription(&store, "acme", "past_due", 200);
+        let verdict = check_dunning(&store, &OrgId::new("acme"), 72).unwrap_err();
+        assert_eq!(verdict.status, "past_due");
+        assert_eq!(verdict.grace_hours, 72);
+    }
+
+    #[test]
+    fn dunning_blocks_canceled_past_grace() {
+        let store = InMemoryBillingStore::default();
+        seed_delinquent_subscription(&store, "acme", "canceled", 200);
+        assert!(check_dunning(&store, &OrgId::new("acme"), 72).is_err());
+    }
+
+    #[test]
+    fn dunning_blocks_unpaid_past_grace() {
+        let store = InMemoryBillingStore::default();
+        seed_delinquent_subscription(&store, "acme", "unpaid", 200);
+        assert!(check_dunning(&store, &OrgId::new("acme"), 72).is_err());
+    }
+
+    #[test]
+    fn dunning_ignores_incomplete_and_incomplete_expired() {
+        // `incomplete` / `incomplete_expired` come from a signup where
+        // the initial payment never completed; the customer never had
+        // service. Not our concern — Stripe would never send us
+        // metered usage under those statuses either.
+        let store = InMemoryBillingStore::default();
+        seed_delinquent_subscription(&store, "acme", "incomplete", 200);
+        assert!(check_dunning(&store, &OrgId::new("acme"), 72).is_ok());
+    }
+
+    #[test]
+    fn dunning_grace_zero_blocks_immediately() {
+        let store = InMemoryBillingStore::default();
+        // updated_at is 1 s in the past, but grace = 0 h means any
+        // delinquent state blocks right away.
+        seed_delinquent_subscription(&store, "acme", "past_due", 0);
+        assert!(check_dunning(&store, &OrgId::new("acme"), 0).is_err());
+    }
+
+    #[test]
+    fn parse_dunning_grace_hours_defaults_and_recovers() {
+        assert_eq!(parse_dunning_grace_hours(None), DEFAULT_DUNNING_GRACE_HOURS);
+        assert_eq!(parse_dunning_grace_hours(Some("48")), 48);
+        assert_eq!(parse_dunning_grace_hours(Some("  0  ")), 0);
+        // Malformed → fall back to default, don't disable enforcement.
+        assert_eq!(
+            parse_dunning_grace_hours(Some("not-a-number")),
+            DEFAULT_DUNNING_GRACE_HOURS
+        );
+        assert_eq!(
+            parse_dunning_grace_hours(Some("-5")),
+            DEFAULT_DUNNING_GRACE_HOURS
+        );
     }
 }

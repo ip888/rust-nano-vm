@@ -783,6 +783,11 @@ async fn fork_snapshot(
     let Path(id) = id?;
     let snap_id = SnapshotId(id);
     state.ownership.require_snapshot_access(snap_id, &org)?;
+    // Dunning enforcement: past_due / unpaid / canceled past the
+    // grace window returns 402 with an upgrade_endpoint hint. Runs
+    // before the fork itself so we don't burn a warm-pool slot on an
+    // account that can't be billed.
+    check_dunning_or_402(&state, &org)?;
     let bearer = extract_bearer(&headers);
     // Gate before doing any work — quota exhaustion is the common bad-day
     // signal, so it should be cheap to surface.
@@ -969,6 +974,40 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 /// cached: subscription state changes flow through the webhook
 /// handler and land in the store, and re-reading here means a tier
 /// upgrade is enforced on the next fork without a restart.
+/// Enforce dunning on fork routes. Returns `Ok(())` when the caller
+/// may fork (billing feature off, no subscription, active/trialing,
+/// or delinquent-but-inside-grace). Returns `Err(ApiError::PaymentRequired)`
+/// with a client-safe message + `upgrade_endpoint` when a real block
+/// applies.
+///
+/// The billing store lookup is two cheap probe reads; grace-window
+/// comparison is a string compare. Runs before quota to keep 402s
+/// cheaper than 429s (the more common bad-day signal is quota).
+pub(crate) fn check_dunning_or_402(state: &AppState, org: &OrgId) -> Result<(), ApiError> {
+    #[cfg(feature = "billing")]
+    {
+        if let Some(ctx) = state.billing_ctx() {
+            let grace = crate::billing::dunning_grace_hours();
+            if let Err(v) = crate::billing::check_dunning(ctx.store.as_ref(), org, grace) {
+                state
+                    .metrics()
+                    .record_dunning_block(org.as_str(), &v.status);
+                return Err(ApiError::PaymentRequired {
+                    code: "subscription_delinquent",
+                    message: format!(
+                        "subscription is {} (since {}, past the {}-hour grace window); \
+                         resolve via the billing portal",
+                        v.status, v.updated_at, v.grace_hours
+                    ),
+                    upgrade_endpoint: "/v1/billing/portal",
+                });
+            }
+        }
+    }
+    let _ = (state, org); // silence unused warnings on non-billing builds
+    Ok(())
+}
+
 pub(crate) fn resolve_tier_limits(state: &AppState, org: &OrgId) -> (Option<f64>, Option<u32>) {
     #[cfg(feature = "billing")]
     {

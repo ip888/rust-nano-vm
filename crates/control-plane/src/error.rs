@@ -64,6 +64,27 @@ pub(crate) enum ApiError {
         /// Seconds the client should wait before retrying.
         retry_after_secs: u64,
     },
+    /// Subscription is dunning-blocked (past_due / unpaid / canceled
+    /// past the grace window). Renders as 402 Payment Required with an
+    /// extended envelope:
+    /// `{ error: { code, message, upgrade_endpoint } }`. Clients redirect
+    /// the user to `upgrade_endpoint` (relative API path — call it with
+    /// the caller's bearer to receive a live Stripe portal URL).
+    ///
+    /// Feature-gated because the `check_dunning_or_402` construction
+    /// site is itself billing-only; without the gate the variant is
+    /// dead on default builds.
+    #[cfg(feature = "billing")]
+    PaymentRequired {
+        /// Stable machine-readable code (e.g. `"subscription_past_due"`).
+        code: &'static str,
+        /// Human-readable detail surfaced to the client.
+        message: String,
+        /// Relative API path the client should hit to obtain a live
+        /// billing-portal URL (`/v1/billing/portal`). Server-relative so
+        /// the client already knows how to authenticate against it.
+        upgrade_endpoint: &'static str,
+    },
     /// Endpoint or feature isn't supported on this deployment (no
     /// snapshot store configured, backend doesn't know how to do X,
     /// etc.). Renders as 501 with a caller-supplied stable code.
@@ -118,6 +139,23 @@ struct ErrorBody<'a> {
     message: String,
 }
 
+#[cfg(feature = "billing")]
+#[derive(Serialize)]
+struct PaymentRequiredBody<'a> {
+    code: &'a str,
+    message: String,
+    /// Relative API path the client should hit to obtain a live
+    /// billing-portal URL. Serialised alongside the standard `code` +
+    /// `message` — extending the envelope for the dunning case only.
+    upgrade_endpoint: &'a str,
+}
+
+#[cfg(feature = "billing")]
+#[derive(Serialize)]
+struct PaymentRequiredEnvelope<'a> {
+    error: PaymentRequiredBody<'a>,
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         // 429 needs a Retry-After header in addition to the JSON envelope, so
@@ -136,6 +174,23 @@ impl IntoResponse for ApiError {
                 resp.headers_mut().insert("retry-after", v);
             }
             return resp;
+        }
+        // 402 uses an extended body carrying `upgrade_endpoint`.
+        #[cfg(feature = "billing")]
+        if let ApiError::PaymentRequired {
+            code,
+            message,
+            upgrade_endpoint,
+        } = self
+        {
+            let body = Json(PaymentRequiredEnvelope {
+                error: PaymentRequiredBody {
+                    code,
+                    message,
+                    upgrade_endpoint,
+                },
+            });
+            return (StatusCode::PAYMENT_REQUIRED, body).into_response();
         }
         let (status, code, message) = match self {
             ApiError::Vm(e) => {
@@ -165,6 +220,10 @@ impl IntoResponse for ApiError {
             ApiError::NotFound { code, message } => (StatusCode::NOT_FOUND, code, message),
             ApiError::TooManyRequests { .. } => {
                 unreachable!("TooManyRequests handled above with Retry-After header")
+            }
+            #[cfg(feature = "billing")]
+            ApiError::PaymentRequired { .. } => {
+                unreachable!("PaymentRequired handled above with extended envelope")
             }
         };
         let body = Json(ErrorEnvelope {

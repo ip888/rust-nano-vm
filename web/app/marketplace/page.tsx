@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   ApiError,
   forkMarketplaceSnapshot,
+  getBillingPortalUrl,
   listMarketplaceSnapshots,
   type ForkResponse,
   type MarketplaceSnapshot,
@@ -184,7 +185,15 @@ type ForkState =
   | { kind: "idle" }
   | { kind: "loading" }
   | { kind: "success"; result: ForkResponse }
-  | { kind: "error"; code: string; message: string };
+  | {
+      kind: "error";
+      code: string;
+      message: string;
+      /** Populated on 402 dunning responses so the card can render an
+       *  actionable "Manage billing" link. Present when the server
+       *  included `upgrade_endpoint` in the error envelope. */
+      upgradeEndpoint?: string;
+    };
 
 function SnapshotCard({
   snapshot,
@@ -204,7 +213,12 @@ function SnapshotCard({
       setFork({ kind: "success", result });
     } catch (err) {
       if (err instanceof ApiError) {
-        setFork({ kind: "error", code: err.code, message: err.message });
+        setFork({
+          kind: "error",
+          code: err.code,
+          message: err.message,
+          upgradeEndpoint: err.upgradeEndpoint,
+        });
       } else {
         setFork({
           kind: "error",
@@ -212,6 +226,25 @@ function SnapshotCard({
           message: "Couldn't reach the API.",
         });
       }
+    }
+  }
+
+  /**
+   * Trade the caller's bearer for a live Stripe billing-portal URL,
+   * then redirect. Used only when a 402 dunning response carries an
+   * `upgrade_endpoint` — for MVP we assume it's `/v1/billing/portal`
+   * (there is no other server-side path today) and drive the existing
+   * `getBillingPortalUrl` helper.
+   */
+  async function openBillingPortal() {
+    if (!session) return;
+    try {
+      const { url } = await getBillingPortalUrl(session.apiKey);
+      window.location.href = url;
+    } catch {
+      // Fall through — surfacing yet another error would obscure the
+      // dunning message that put us here. The user can navigate to
+      // /dashboard manually if the portal handshake fails.
     }
   }
 
@@ -258,6 +291,15 @@ function SnapshotCard({
         <div className="mb-4 rounded-md border border-red-200 bg-red-50 p-3 text-xs text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
           <p className="font-semibold">Fork failed ({fork.code})</p>
           <p className="mt-1">{fork.message}</p>
+          {fork.upgradeEndpoint && (
+            <button
+              type="button"
+              onClick={openBillingPortal}
+              className="mt-2 rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700"
+            >
+              Manage billing →
+            </button>
+          )}
         </div>
       )}
 
