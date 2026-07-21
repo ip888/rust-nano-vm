@@ -86,11 +86,12 @@ pub struct Metrics {
     stripe_events_total: Mutex<HashMap<String, u64>>,
     /// Fork attempts denied by dunning enforcement (402), keyed by
     /// `(org, status)`. Tuple key rather than a joined `"{org}|{status}"`
-    /// string because [`crate::auth::OrgId`] accepts arbitrary bytes —
-    /// a `|` in the org id would corrupt the label split. Cardinality
-    /// is bounded — Stripe's status enum is small and orgs are bounded
-    /// by tenant count. Useful for the "how many customers am I
-    /// actually gating?" dashboard tile.
+    /// string because [`crate::auth::OrgId`] is a plain UTF-8 `String`
+    /// wrapper that accepts arbitrary characters — a `|` in the org id
+    /// would corrupt the label split. Cardinality is bounded — Stripe's
+    /// status enum is small and orgs are bounded by tenant count.
+    /// Useful for the "how many customers am I actually gating?"
+    /// dashboard tile.
     dunning_blocked_total: Mutex<HashMap<(String, String), u64>>,
 }
 

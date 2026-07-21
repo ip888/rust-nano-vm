@@ -284,9 +284,10 @@ pub fn check_dunning(
     // Saturate the u64→i64 conversion AND the ×3600 so an operator
     // typo like `NANOVM_DUNNING_GRACE_HOURS=99999999999999999999` can
     // never wrap negative (which would flip the boundary comparison
-    // and start blocking immediately). Anything past ~292 billion
-    // hours becomes "effectively never blocks" — the sane behaviour
-    // for a nonsensical value.
+    // and start blocking immediately). Anything past i64::MAX seconds
+    // (~2.5 quadrillion hours ≈ 292 billion years) becomes
+    // "effectively never blocks" — the sane behaviour for a
+    // nonsensical value.
     let grace_secs: i64 = i64::try_from(grace_hours)
         .unwrap_or(i64::MAX)
         .saturating_mul(3600);
