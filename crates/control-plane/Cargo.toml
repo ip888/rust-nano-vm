@@ -91,6 +91,12 @@ billing = ["dep:reqwest", "dep:hmac", "dep:sha2", "dep:getrandom", "sqlite"]
 # (NANOVM_SNAPSHOT_STORE). Cached process-locally: a restart re-pulls
 # on first fork (a persisted cache is a follow-up).
 marketplace-fork = ["dep:reqwest", "dep:tar", "dep:flate2"]
+# Enterprise SIEM sink for the JSONL audit log. When set,
+# NANOVM_AUDIT_SINK_URL receives an HTTP POST per audit line (Datadog,
+# Splunk HEC, custom collector). Bounded background queue so a slow
+# sink can't stall request threads. Filesystem NANOVM_AUDIT_LOG is
+# independent — either or both may be configured.
+audit-sink = ["dep:reqwest"]
 
 [dev-dependencies]
 base64.workspace = true
