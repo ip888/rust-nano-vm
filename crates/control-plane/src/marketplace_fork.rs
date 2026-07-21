@@ -224,15 +224,17 @@ pub(crate) async fn fork_marketplace_snapshot(
             *cache.entry(cache_key).or_insert(adopted)
         };
         if winner_id != adopted {
-            // Best-effort cleanup: the caller has a perfectly good
-            // `winner_id` in hand, so a failure here (task panic, cancel,
-            // delete_snapshot error) MUST NOT poison the response. The
-            // worst case is a stale snapshot lingering in the backend
-            // that a periodic reconciler could later reap — much better
-            // than intermittent 500s for concurrent first-forks.
+            // Truly detached: DROP the JoinHandle so the request path
+            // never waits on `delete_snapshot`. The caller already has
+            // `winner_id` in hand — a slow hypervisor delete or a
+            // panicking cleanup task must not couple to response
+            // latency or leak a 500 to the client. Worst case is a
+            // stale snapshot lingering in the backend that a periodic
+            // reconciler can reap later; that trade is well worth
+            // shaving the extra deletion time off first-fork p99.
             let hv = state.hypervisor().clone();
             let ownership = state.ownership().clone();
-            let join = tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 if let Err(e) = hv.delete_snapshot(adopted) {
                     tracing::warn!(
                         snapshot = adopted.0,
@@ -241,16 +243,7 @@ pub(crate) async fn fork_marketplace_snapshot(
                     );
                 }
                 ownership.forget_snapshot(adopted);
-            })
-            .await;
-            if let Err(e) = join {
-                tracing::warn!(
-                    snapshot = adopted.0,
-                    error = %e,
-                    "marketplace: race-loser cleanup task panicked; snapshot may leak until \
-                     a reconciler sweeps it"
-                );
-            }
+            });
         }
         winner_id
     };

@@ -341,22 +341,24 @@ function renderForkButton({
     );
   }
   if (notForkable) {
-    // A `<button disabled title=…>` doesn't reliably surface its
-    // tooltip: browsers gate `title` on hover of *focusable* elements
-    // and disabled controls aren't focusable. Use a non-disabled
-    // `<span>` styled like a chip so the reason is actually
-    // discoverable (mouse hover fires; keyboard users get the
-    // aria-label read by screen readers).
+    // `aria-disabled` (not `disabled`) so the button stays focusable
+    // and the `title` tooltip actually fires — browsers gate `title`
+    // on hover of *focusable* elements. Keeps button semantics
+    // (screen reader announces "button, not forkable") while blocking
+    // the click via `onClick=undefined`. Adding `tabIndex={0}` to a
+    // non-interactive element (an earlier iteration used
+    // `<span role="note">`) would put decorative chips in the tab
+    // order — an a11y-audit anti-pattern.
     return (
-      <span
-        role="note"
-        tabIndex={0}
+      <button
+        type="button"
+        aria-disabled="true"
         title="This entry has no snapshot_url yet — publisher listed for discovery only."
         aria-label="Not forkable: this entry has no snapshot_url yet — publisher listed for discovery only."
         className="cursor-help rounded-md bg-gray-200 px-3 py-1.5 text-xs font-medium text-gray-500 dark:bg-gray-800 dark:text-gray-500"
       >
         Not forkable
-      </span>
+      </button>
     );
   }
   const loading = fork.kind === "loading";

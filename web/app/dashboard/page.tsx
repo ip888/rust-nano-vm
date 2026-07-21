@@ -264,6 +264,7 @@ function ForkActivity({
 
   useEffect(() => {
     let cancelled = false;
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
 
     async function tick() {
       try {
@@ -275,27 +276,34 @@ function ForkActivity({
           // appears on first fork. Render an empty sparkline; not an
           // error.
           setSamples((prev) => appendSample(prev, { t: Date.now(), total: 0 }));
-          return;
+        } else {
+          setSamples((prev) => appendSample(prev, { t: Date.now(), total: row.fork_count }));
+          setPollError(null);
         }
-        setSamples((prev) => appendSample(prev, { t: Date.now(), total: row.fork_count }));
-        setPollError(null);
       } catch (err) {
         if (cancelled) return;
-        // A transient 401 during rotation shouldn't tear the tile
-        // apart. Surface as an inline message and keep polling.
-        setPollError(
-          err instanceof ApiError
-            ? `${err.code}: ${err.message}`
-            : "poll failed",
-        );
+        // Show a stable status/code only. `ApiError.message` can carry
+        // raw response text (proxy HTML, upstream 5xx bodies) that we
+        // shouldn't paint straight into the UI.
+        setPollError(describePollError(err));
+      } finally {
+        // Self-schedule the next tick so a slow response never
+        // overlaps with the next one — `setInterval` fires on wall
+        // clock regardless of in-flight work and can queue calls under
+        // tab-throttling / slow network. `setTimeout` chained in
+        // `finally` bounds concurrency to at most one poll at a time.
+        if (!cancelled) {
+          timeoutHandle = setTimeout(tick, POLL_MS);
+        }
       }
     }
 
     tick(); // eager first sample so the UI populates immediately
-    const handle = setInterval(tick, POLL_MS);
     return () => {
       cancelled = true;
-      clearInterval(handle);
+      if (timeoutHandle !== null) {
+        clearTimeout(timeoutHandle);
+      }
     };
   }, [apiKey, orgId]);
 
@@ -349,6 +357,21 @@ function ForkActivity({
       )}
     </div>
   );
+}
+
+/** Render a poll failure as a small, stable string. Deliberately does
+ *  NOT interpolate `ApiError.message`, which can carry arbitrary body
+ *  text (proxy HTML, upstream 5xx dumps) via the `request()` fallback.
+ *  Special-cases 401 as the common key-rotation signal so the user
+ *  gets an actionable hint. */
+function describePollError(err: unknown): string {
+  if (err instanceof ApiError) {
+    if (err.status === 401) {
+      return "session expired — sign in again";
+    }
+    return `HTTP ${err.status} (${err.code})`;
+  }
+  return "network error";
 }
 
 /** Append `next` to the rolling window, capping length at `WINDOW`. */
