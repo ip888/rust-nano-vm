@@ -62,6 +62,19 @@ export interface UsageResponseDto {
   fork_total_ms: number;
 }
 
+/** One row in `GET /v1/usage/by-org`. Same shape as `UsageResponseDto`
+ *  but org-scoped. Caller sees their own row; operator-scoped tokens
+ *  can request every row via `?all=1`. */
+export interface UsageByOrgEntry {
+  org_id: string;
+  fork_count: number;
+  fork_total_ms: number;
+}
+
+export interface UsageByOrgResponse {
+  orgs: UsageByOrgEntry[];
+}
+
 /** A row in `GET /v1/keys`. `token` is NEVER returned by list — only mint. */
 export interface KeyEntry {
   id: string;
@@ -193,6 +206,13 @@ export function getPlan(apiKey: string): Promise<PlanResponse> {
 
 export function getUsage(apiKey: string): Promise<UsageResponseDto> {
   return request<UsageResponseDto>("/v1/usage", { apiKey });
+}
+
+/** Per-org fork counters. Returns only the caller's own org row unless
+ *  the caller has operator scope AND passes `all=true`. Cheap: reads
+ *  from Prometheus counters in-process. */
+export function getUsageByOrg(apiKey: string): Promise<UsageByOrgResponse> {
+  return request<UsageByOrgResponse>("/v1/usage/by-org", { apiKey });
 }
 
 export function listKeys(apiKey: string): Promise<ListKeysResponse> {
