@@ -281,12 +281,24 @@ pub fn check_dunning(
     if !DELINQUENT_STATUSES.contains(&sub.status.as_str()) {
         return Ok(());
     }
-    let grace_secs: i64 = (grace_hours as i64).saturating_mul(3600);
+    // Saturate the u64→i64 conversion AND the ×3600 so an operator
+    // typo like `NANOVM_DUNNING_GRACE_HOURS=99999999999999999999` can
+    // never wrap negative (which would flip the boundary comparison
+    // and start blocking immediately). Anything past i64::MAX seconds
+    // (~2.5 quadrillion hours ≈ 292 billion years) becomes
+    // "effectively never blocks" — the sane behaviour for a
+    // nonsensical value.
+    let grace_secs: i64 = i64::try_from(grace_hours)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(3600);
     let grace_boundary = crate::time::rfc3339_offset(-grace_secs);
-    // Inside grace: sub.updated_at is MORE recent than boundary, so
-    // string-compare of the fixed-width RFC 3339 form returns
-    // `updated_at > grace_boundary`.
-    if sub.updated_at.as_str() > grace_boundary.as_str() {
+    // Inside grace: sub.updated_at is at or MORE recent than boundary,
+    // so string-compare of the fixed-width RFC 3339 form returns
+    // `updated_at >= grace_boundary`. We allow at exactly the boundary
+    // so the doc "past the grace window" reads without off-by-one:
+    // block only when `now - updated_at > grace`, i.e. `updated_at <
+    // grace_boundary`.
+    if sub.updated_at.as_str() >= grace_boundary.as_str() {
         return Ok(());
     }
     Err(DunningVerdict {
@@ -2811,9 +2823,14 @@ mod tests {
     #[test]
     fn dunning_grace_zero_blocks_immediately() {
         let store = InMemoryBillingStore::default();
-        // updated_at is 1 s in the past, but grace = 0 h means any
-        // delinquent state blocks right away.
-        seed_delinquent_subscription(&store, "acme", "past_due", 0);
+        // updated_at is 1 h in the past; grace = 0 h means block as
+        // soon as we're STRICTLY past the boundary. Using hours_ago=1
+        // instead of 0 keeps the assertion free of the millisecond
+        // race between seed's rfc3339_offset(0) and check_dunning's
+        // computation of the grace boundary — both would round to the
+        // same string in ~1 ms and (correctly) allow, per the
+        // "strictly past" boundary semantics.
+        seed_delinquent_subscription(&store, "acme", "past_due", 1);
         assert!(check_dunning(&store, &OrgId::new("acme"), 0).is_err());
     }
 

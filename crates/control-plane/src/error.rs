@@ -76,7 +76,12 @@ pub(crate) enum ApiError {
     /// dead on default builds.
     #[cfg(feature = "billing")]
     PaymentRequired {
-        /// Stable machine-readable code (e.g. `"subscription_past_due"`).
+        /// Stable machine-readable code. Currently only one value is
+        /// emitted: `"subscription_delinquent"` (see
+        /// `check_dunning_or_402`). Kept as a `&'static str` so a future
+        /// finer-grained mapping (e.g. `"subscription_past_due"` vs
+        /// `"..._canceled"`) can add variants without changing the
+        /// wire shape.
         code: &'static str,
         /// Human-readable detail surfaced to the client.
         message: String,
