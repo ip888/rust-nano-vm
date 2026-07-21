@@ -216,9 +216,15 @@ pub(crate) async fn fork_marketplace_snapshot(
             *cache.entry(cache_key).or_insert(adopted)
         };
         if winner_id != adopted {
+            // Best-effort cleanup: the caller has a perfectly good
+            // `winner_id` in hand, so a failure here (task panic, cancel,
+            // delete_snapshot error) MUST NOT poison the response. The
+            // worst case is a stale snapshot lingering in the backend
+            // that a periodic reconciler could later reap — much better
+            // than intermittent 500s for concurrent first-forks.
             let hv = state.hypervisor().clone();
             let ownership = state.ownership().clone();
-            tokio::task::spawn_blocking(move || {
+            let join = tokio::task::spawn_blocking(move || {
                 if let Err(e) = hv.delete_snapshot(adopted) {
                     tracing::warn!(
                         snapshot = adopted.0,
@@ -228,8 +234,15 @@ pub(crate) async fn fork_marketplace_snapshot(
                 }
                 ownership.forget_snapshot(adopted);
             })
-            .await
-            .map_err(|e| ApiError::InternalDyn(format!("race-loser cleanup task panicked: {e}")))?;
+            .await;
+            if let Err(e) = join {
+                tracing::warn!(
+                    snapshot = adopted.0,
+                    error = %e,
+                    "marketplace: race-loser cleanup task panicked; snapshot may leak until \
+                     a reconciler sweeps it"
+                );
+            }
         }
         winner_id
     };
@@ -471,6 +484,17 @@ fn extract_tar_gz<R: Read>(source: R, dst: &Path, max_bytes: u64) -> Result<(), 
         // Without this, an archive could smuggle in two entries whose
         // second silently overwrote the first's extracted file.
         let normalized = normalize_relative(&raw_path);
+        // Entries like `.` or `./` normalize to an empty path — that
+        // would make the extract target `dst.join("")` == `dst` and
+        // `tar::Entry::unpack` errors out with an opaque I/O failure
+        // that renders as a 500. Reject up-front as a client-facing 400
+        // with a clear reason.
+        if normalized.as_os_str().is_empty() {
+            return Err(ApiError::Bad(format!(
+                "marketplace tarball: entry {raw_path:?} normalizes to an empty path \
+                 (only `.` / `./` components) — refusing to extract"
+            )));
+        }
         if !seen_paths.insert(normalized.clone()) {
             return Err(ApiError::Bad(format!(
                 "marketplace tarball: duplicate entry {raw_path:?} \
@@ -515,10 +539,10 @@ fn extract_tar_gz<R: Read>(source: R, dst: &Path, max_bytes: u64) -> Result<(), 
 
 /// Strip `.` components from a relative path. Callers guarantee it's
 /// already `is_safe_relative` (no absolute, no `..`), so nothing else
-/// needs collapsing. Empty output (all `.` components) maps to an empty
-/// path, which the caller's `dst.join()` then treats as `dst` itself —
-/// the archive is malformed and gets rejected as a duplicate on the
-/// second empty-normalized entry, or by unpack on the first.
+/// needs collapsing. May return an empty PathBuf when the input is
+/// entirely `.` components (e.g. `.` or `./`) — the caller in
+/// [`extract_tar_gz`] checks for that and rejects with a 400 rather
+/// than trying to `dst.join("")` and confusing `tar::Entry::unpack`.
 fn normalize_relative(p: &Path) -> PathBuf {
     p.components()
         .filter_map(|c| match c {
@@ -786,6 +810,48 @@ mod tests {
             normalize_relative(Path::new("manifest.json")),
             PathBuf::from("manifest.json")
         );
+    }
+
+    #[test]
+    fn normalize_relative_yields_empty_for_all_dot_components() {
+        assert!(normalize_relative(Path::new("./")).as_os_str().is_empty());
+        assert!(normalize_relative(Path::new(".")).as_os_str().is_empty());
+        assert!(normalize_relative(Path::new("./././"))
+            .as_os_str()
+            .is_empty());
+    }
+
+    #[test]
+    fn extract_tar_gz_rejects_all_dot_entry_with_client_error() {
+        // Craft a tarball with a single `.` entry (all-CurDir path).
+        // This normalizes to an empty path — before the fix, extract
+        // fell through to `entry.unpack(dst)` which errored out as a
+        // 500. After the fix, we return a client-safe 400.
+        let payload: &[u8] = b"x";
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut tarw = tar::Builder::new(&mut gz);
+            let mut h = Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            // `.` — a single CurDir component.
+            tarw.append_data(&mut h, ".", payload).unwrap();
+            tarw.finish().unwrap();
+        }
+        let bytes = gz.finish().unwrap();
+        let tmp = fresh_tmp("empty-normalize");
+        let err = extract_tar_gz(bytes.as_slice(), &tmp, DEFAULT_MAX_TARBALL_BYTES).unwrap_err();
+        // Must be a Bad (400) with a clear reason, not an InternalDyn (500).
+        assert!(
+            matches!(err, ApiError::Bad(_)),
+            "expected ApiError::Bad, got: {err:?}"
+        );
+        assert!(
+            format!("{err:?}").contains("normalizes to an empty path"),
+            "expected empty-path message, got: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
