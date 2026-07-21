@@ -50,10 +50,19 @@ use crate::routes::token_fingerprint;
 use crate::time::rfc3339_now;
 
 /// JSONL audit appender. Cheap to clone — wraps an `Arc<Mutex<File>>`.
+///
+/// When the `audit-sink` feature is compiled in AND the server binary
+/// calls [`AuditLog::with_sink`], each appended record is *also* pushed
+/// into a bounded mpsc channel drained by
+/// [`crate::audit_sink`], which POSTs it to the configured SIEM URL.
+/// Filesystem + sink are independent: either or both may be
+/// configured; both are best-effort.
 #[derive(Clone, Debug, Default)]
 pub struct AuditLog {
     inner: Option<Arc<Mutex<File>>>,
     path: Option<PathBuf>,
+    #[cfg(feature = "audit-sink")]
+    sink_tx: Option<tokio::sync::mpsc::Sender<Value>>,
 }
 
 impl AuditLog {
@@ -70,7 +79,23 @@ impl AuditLog {
         Ok(Self {
             inner: Some(Arc::new(Mutex::new(file))),
             path: Some(path),
+            #[cfg(feature = "audit-sink")]
+            sink_tx: None,
         })
+    }
+
+    /// Attach a SIEM sink to an existing appender. The sender end of an
+    /// mpsc channel drained by [`crate::audit_sink::spawn`]; every
+    /// subsequent [`append`](Self::append) call ALSO pushes the record
+    /// into that channel via `try_send` (non-blocking, drop-on-full).
+    ///
+    /// A sink can be attached to a disabled (no-file) appender — the
+    /// pattern for a customer who wants SIEM shipping without a local
+    /// JSONL trail.
+    #[cfg(feature = "audit-sink")]
+    pub fn with_sink(mut self, sender: tokio::sync::mpsc::Sender<Value>) -> Self {
+        self.sink_tx = Some(sender);
+        self
     }
 
     /// Build from the `NANOVM_AUDIT_LOG` environment variable. When unset
@@ -108,26 +133,35 @@ impl AuditLog {
         self.path.as_deref()
     }
 
-    /// Append a record. Write failures are logged once and dropped — the
-    /// caller's request still completes.
+    /// Append a record. Both sinks (filesystem + SIEM webhook) are
+    /// best-effort: a failure on either logs and drops, the caller's
+    /// request still completes.
+    ///
+    /// Filesystem write happens synchronously under the file mutex.
+    /// SIEM push is a non-blocking `try_send` into the audit-sink
+    /// channel — full channel → drop with warn, so request threads
+    /// never wait on a slow HTTP collector.
     pub fn append(&self, record: &Value) {
-        let Some(file) = &self.inner else {
-            return;
-        };
-        let mut line = match serde_json::to_vec(record) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                tracing::error!(%err, "audit record failed to serialize");
-                return;
+        if let Some(file) = &self.inner {
+            let mut line = match serde_json::to_vec(record) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::error!(%err, "audit record failed to serialize");
+                    return;
+                }
+            };
+            line.push(b'\n');
+            let mut guard = match file.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Err(err) = guard.write_all(&line) {
+                tracing::error!(%err, "audit log append failed");
             }
-        };
-        line.push(b'\n');
-        let mut guard = match file.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Err(err) = guard.write_all(&line) {
-            tracing::error!(%err, "audit log append failed");
+        }
+        #[cfg(feature = "audit-sink")]
+        if let Some(sender) = &self.sink_tx {
+            crate::audit_sink::push(sender, record.clone());
         }
     }
 }
