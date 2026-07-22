@@ -1,5 +1,7 @@
 import Link from "next/link";
 
+import LiveForkBenchmark from "@/components/LiveForkBenchmark";
+
 /**
  * Landing page. Structure:
  *   1. Hero + big number + primary CTA.
@@ -24,6 +26,7 @@ export default function LandingPage() {
 
       <Hero />
       <QuickStart />
+      <LiveForkBenchmark />
       <WhyPanels />
       <ComparisonStrip />
       <MadeForAgents />
