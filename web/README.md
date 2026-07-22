@@ -74,6 +74,31 @@ docker run --rm -p 3000:3000 nanovm-web:local
 
 The API host is baked at build time (Next.js inlines `NEXT_PUBLIC_*` into the client bundle). Rebuild the image when you change deploy targets, or pass a different `--build-arg NANOVM_API_URL=…` per environment.
 
+## Live fork-latency demo on the landing page
+
+The `<LiveForkBenchmark />` component on `/` runs 20 real fork
+requests against a public demo tenant and renders a bar chart with
+p50 / p95 / min / max. When the env vars below are unset (the
+default), the component runs in **seeded mode** — the button shows a
+plausible pre-baked dataset with a clear "Seeded — not live" pill so
+visitors don't mistake it for real numbers.
+
+To turn on live mode, set these at build time:
+
+```bash
+NEXT_PUBLIC_NANOVM_DEMO_URL=https://demo-api.your-saas.com   # public control plane
+NEXT_PUBLIC_NANOVM_DEMO_TOKEN=demo-tenant-throwaway-token     # bearer for the demo tenant
+
+# Pick ONE of these to name what to fork:
+NEXT_PUBLIC_NANOVM_DEMO_SNAPSHOT_ID=42                        # a snapshot id, OR
+NEXT_PUBLIC_NANOVM_DEMO_MARKETPLACE_NAME=python-3.12-minimal  # marketplace entry name (default)
+```
+
+**Security note:** the demo tenant's token IS baked into the client
+bundle — it's public. Provision the demo tenant with a tight
+`NANOVM_FORK_RPS` cap + a dedicated org id you can revoke, and never
+reuse a paying-customer token there.
+
 ## Wiring against a real Stripe subscription
 
 For the "Manage billing" button on the dashboard to work, the control plane needs:
