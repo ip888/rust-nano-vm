@@ -69,7 +69,7 @@ pub mod warm_pool;
 
 pub use api::{openapi_spec, VmConfigDefaults};
 pub use audit::AuditLog;
-pub use auth::{ApiTokens, IssuedToken, OrgId, RuntimeTokenInfo, TokenId};
+pub use auth::{ApiTokens, IssuedToken, OrgId, Role, RuntimeTokenInfo, TokenId};
 pub use fork_quota::ForkQuota;
 pub use marketplace::{Marketplace, MarketplaceListResponse, MarketplaceSnapshot};
 pub use metrics::Metrics;
