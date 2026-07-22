@@ -43,6 +43,7 @@ __all__ = [
     "Client",
     "Vm",
     "Snapshot",
+    "Sandbox",
     "ExecResult",
     "ExecChunk",
     "ExecExit",
@@ -55,6 +56,7 @@ __all__ = [
     "NotFoundError",
     "ConflictError",
     "RateLimited",
+    "PaymentRequiredError",
     "__version__",
 ]
 
@@ -118,6 +120,27 @@ class RateLimited(NanovmError):
     def __init__(self, message: str, retry_after: int):
         super().__init__(message, code="too_many_requests", status=429)
         self.retry_after = retry_after
+
+
+class PaymentRequiredError(NanovmError):
+    """Raised on 402: subscription is dunning-blocked (past_due /
+    unpaid / canceled past the grace window).
+
+    The server's error envelope extends the standard shape with
+    ``upgrade_endpoint`` — the relative API path (typically
+    ``/v1/billing/portal``) the client should hit with the caller's
+    bearer to obtain a live Stripe billing-portal URL. Dashboards
+    render a ``Manage billing`` CTA that fires on this exception.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        code: str,
+        upgrade_endpoint: Optional[str] = None,
+    ):
+        super().__init__(message, code=code, status=402)
+        self.upgrade_endpoint = upgrade_endpoint
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +457,138 @@ class Snapshot:
         self._client._request("DELETE", f"/v1/snapshots/{self.id}")
 
 
+class Sandbox:
+    """A reusable sandbox VM opened via context-manager.
+
+    The one-shot ``Client.execute_python`` / ``execute_shell`` methods
+    fork a fresh VM per call — great for single tool-invocations, but
+    an agent that runs ~10 Python snippets against the same
+    ``python-3.12-ds`` snapshot re-pays the cold-fork every time.
+    ``Sandbox`` forks ONCE on ``__enter__`` and holds the VM open for
+    the duration of the ``with`` block — subsequent
+    ``sandbox.execute_python(...)`` calls reuse it (~sub-ms exec RTT
+    once the VM is warm), then ``__exit__`` destroys the VM even on
+    exception.
+
+    Usage::
+
+        with client.sandbox(snapshot="python-3.12-ds") as sb:
+            sb.execute_python("import pandas as pd")            # ~12 ms fork
+            sb.execute_python("df = pd.DataFrame({'x':[1,2,3]})")  # same VM
+            print(sb.execute_python("print(df.sum().to_dict())").stdout)
+
+    The ``snapshot`` argument is either an integer snapshot id (a
+    local snapshot the caller previously created) or a string
+    marketplace-entry name (invokes the fork-marketplace endpoint
+    first, then re-uses that local snapshot).
+    """
+
+    def __init__(
+        self,
+        client: "Client",
+        snapshot: Union[int, str],
+    ):
+        self._client = client
+        self._snapshot: Union[int, str] = snapshot
+        self._vm: Optional[Vm] = None
+
+    @property
+    def vm(self) -> Vm:
+        """Access the underlying VM — mainly for
+        ``vm.exec_stream`` and other calls the Sandbox convenience
+        surface doesn't wrap. Only valid inside the ``with`` block."""
+        if self._vm is None:
+            raise NanovmError(
+                "Sandbox not entered — use `with client.sandbox(...) as sb:` "
+                "or call .open() manually",
+                code="sandbox_not_open",
+            )
+        return self._vm
+
+    def open(self) -> Vm:
+        """Explicit lifecycle for callers that can't use ``with``."""
+        if self._vm is not None:
+            return self._vm
+        if isinstance(self._snapshot, int):
+            resp = self._client._request(
+                "POST", f"/v1/snapshots/{self._snapshot}/fork"
+            )
+        elif isinstance(self._snapshot, str):
+            # Marketplace entry name — first-fork per (org, name, url)
+            # pulls the tarball; subsequent forks are ~12 ms warm-pool
+            # pops. See `crates/control-plane/src/marketplace_fork.rs`.
+            import urllib.parse
+
+            name = urllib.parse.quote(self._snapshot, safe="")
+            resp = self._client._request(
+                "POST", f"/v1/marketplace/snapshots/{name}/fork"
+            )
+        else:
+            raise TypeError(
+                f"snapshot must be int (snapshot id) or str (marketplace name), "
+                f"got {type(self._snapshot).__name__}"
+            )
+        vm_dto = resp["vm"]
+        self._vm = Vm(
+            id=vm_dto["id"],
+            display=vm_dto["display"],
+            state=vm_dto["state"],
+            _client=self._client,
+        )
+        return self._vm
+
+    def close(self) -> None:
+        """Explicit close for non-``with`` callers. Best-effort — a
+        destroy failure logs a warn and swallows so the caller isn't
+        blocked cleaning up."""
+        if self._vm is None:
+            return
+        try:
+            self._vm.destroy()
+        except NanovmError:
+            # Best-effort: destroy on a VM that's already gone (or
+            # unreachable) shouldn't propagate a second error into
+            # the caller's cleanup path.
+            pass
+        self._vm = None
+
+    def __enter__(self) -> "Sandbox":
+        self.open()
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+    # ---- convenience shortcuts ------------------------------------
+
+    def execute_python(
+        self,
+        code: str,
+        timeout_ms: Optional[int] = None,
+    ) -> ExecResult:
+        """Run ``python3 -c <code>`` inside the held VM."""
+        args = ["-c", code]
+        return self.vm.exec("python3", args=args, timeout_ms=timeout_ms)
+
+    def execute_shell(
+        self,
+        command: str,
+        timeout_ms: Optional[int] = None,
+    ) -> ExecResult:
+        """Run ``sh -c <command>`` inside the held VM."""
+        return self.vm.exec("sh", args=["-c", command], timeout_ms=timeout_ms)
+
+    def exec(
+        self,
+        program: str,
+        args: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> ExecResult:
+        """Direct passthrough to ``Vm.exec`` for anything the two
+        convenience methods above don't cover."""
+        return self.vm.exec(program, args=args, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
@@ -511,15 +666,21 @@ class Client:
         """
         code = "unknown"
         message = resp.text or f"HTTP {resp.status_code}"
+        upgrade_endpoint: Optional[str] = None
         try:
             envelope = resp.json()
             err = envelope.get("error", {})
             code = err.get("code", code)
             message = err.get("message", message)
+            upgrade_endpoint = err.get("upgrade_endpoint")
         except ValueError:
             pass
         if resp.status_code == 401:
             raise AuthError(message, code=code, status=401)
+        if resp.status_code == 402:
+            raise PaymentRequiredError(
+                message, code=code, upgrade_endpoint=upgrade_endpoint
+            )
         if resp.status_code == 404:
             raise NotFoundError(message, code=code, status=404)
         if resp.status_code == 409:
@@ -527,8 +688,13 @@ class Client:
         if resp.status_code == 429:
             retry_after = int(resp.headers.get("retry-after", "1") or "1")
             raise RateLimited(message, retry_after=retry_after)
+        # Fall-through: attach the request-id header when present so
+        # operators can correlate a client-side traceback with the
+        # server's audit log without the user having to fish it out.
+        request_id = resp.headers.get("x-request-id")
+        rid_suffix = f" [request_id={request_id}]" if request_id else ""
         raise NanovmError(
-            f"HTTP {resp.status_code} [{code}]: {message}",
+            f"HTTP {resp.status_code} [{code}]: {message}{rid_suffix}",
             code=code,
             status=resp.status_code,
         )
@@ -794,6 +960,49 @@ class Client:
         sandbox VM. One entry per line in ``result.stdout``.
         """
         return self.sandbox_invoke("list_files", snapshot=snapshot, path=path)
+
+    def sandbox(self, snapshot: Union[int, str]) -> "Sandbox":
+        """Open a reusable sandbox VM as a context manager.
+
+        Forks ONCE from ``snapshot`` on ``__enter__``, holds the VM
+        open for the ``with`` block, destroys it on ``__exit__``. See
+        :class:`Sandbox` for the full doc.
+
+        ``snapshot`` is either:
+
+        - an ``int`` — the id of a snapshot the caller previously
+          captured via ``vm.snapshot()`` or imported;
+        - a ``str`` — the URL-safe ``name`` of a marketplace entry
+          (``"python-3.12-ds"``, ``"node-20-playwright"``). Requires
+          the control plane to be built with ``--features
+          marketplace-fork``.
+
+        Example::
+
+            with client.sandbox(snapshot="python-3.12-ds") as sb:
+                sb.execute_python("import pandas; print(pandas.__version__)")
+                sb.execute_python("df = pandas.DataFrame({'x': [1,2,3]})")
+        """
+        return Sandbox(self, snapshot)
+
+    def fork_marketplace(self, name: str) -> Vm:
+        """One-shot fork from a marketplace entry — returns the raw
+        :class:`Vm`. Prefer :meth:`sandbox` for the reusable pattern;
+        this method is for callers that want the VM handle directly.
+
+        Wraps ``POST /v1/marketplace/snapshots/:name/fork``.
+        """
+        import urllib.parse
+
+        quoted = urllib.parse.quote(name, safe="")
+        resp = self._request("POST", f"/v1/marketplace/snapshots/{quoted}/fork")
+        vm_dto = resp["vm"]
+        return Vm(
+            id=vm_dto["id"],
+            display=vm_dto["display"],
+            state=vm_dto["state"],
+            _client=self,
+        )
 
     def close(self) -> None:
         """Release the underlying connection pool."""
