@@ -11,10 +11,15 @@
 //!
 //! - `token`                  → default org, `admin` role (legacy shape).
 //! - `org_id:token`           → given org, `admin` role.
-//! - `org_id:token:role`      → given org + explicit role. Roles are
-//!   `admin` / `developer` / `viewer` (case-insensitive). Unknown role
-//!   strings fold BACK into the token — a secret that happens to
-//!   contain a `:` isn't mangled.
+//! - `org_id:token@role`      → given org + explicit role. Roles are
+//!   `admin` / `developer` / `viewer` (case-insensitive).
+//!
+//! **Why `@role` and not `:role`?** A `:` inside the token secret
+//! (like `sk-live:abc123`) used to collide with a `:role` suffix if
+//! the tail happened to match a role name — silently truncating the
+//! token and breaking auth. `@` is not a valid role-name character,
+//! so `sk-live:abc123` unambiguously parses as the full token while
+//! `sk-live:abc123@admin` unambiguously means "with admin role".
 //!
 //! The legacy comma-only shape (`tok1,tok2`) keeps working: every legacy
 //! token lands in the `default` org as `admin`. That preserves
@@ -648,44 +653,80 @@ impl ApiTokens {
 ///
 /// - `tok`                    → `(default, tok, admin)` — legacy.
 /// - `org:tok`                → `(org,     tok, admin)` — multi-tenant.
-/// - `org:tok:role`           → `(org,     tok, role)`  — RBAC stub.
+/// - `org:tok@role`           → `(org,     tok, role)`  — RBAC stub.
 ///
-/// The role suffix is optional. When present it must be one of
-/// `admin`/`developer`/`viewer` (case-insensitive) or the whole third
-/// component is treated as still-part-of-the-token — this way an
-/// operator whose token secret genuinely contains a `:` doesn't get
-/// silently split. Empty org (`:tok`) still folds to `default`.
+/// The `@role` suffix is **only recognised on the LAST field of the
+/// entry** (i.e. on the token). We use `@` rather than a third `:`
+/// specifically to prevent the ambiguity Copilot flagged on #180 —
+/// a token secret that legitimately contains `:` (e.g. `sk-live:abc`)
+/// used to be silently truncated when the tail happened to match a
+/// role name. `@` is not a legal role-name character AND is highly
+/// unusual inside opaque bearer tokens, so `tok@admin` is
+/// unambiguously "token `tok` with role `admin`" while `sk-live:abc`
+/// keeps parsing as the full token.
+///
+/// If a token legitimately contains `@` followed by a known role
+/// name (e.g. `hunter2@admin`), the split still fires — same trade
+/// as any prefix-scheme parser. Operators that hit that edge case
+/// should base64url-encode the secret or rotate the token; the
+/// alternative would be requiring `@role` at a specific position that
+/// can never appear inside the token, which no token generator
+/// guarantees.
+///
+/// Empty org (`:tok`) still folds to `default`.
 ///
 /// Split out from [`ApiTokens::from_csv`] so unit tests can exercise
 /// the parser without HashMap ceremony.
 fn parse_env_entry(entry: &str) -> (OrgId, String, Role) {
     let entry = entry.trim();
-    // splitn(3) so a token containing a `:` isn't mangled — everything
-    // past the 2nd colon is considered "role-or-token-tail".
-    let parts: Vec<&str> = entry.splitn(3, ':').collect();
-    match parts.as_slice() {
-        [tok] => (
-            OrgId::default_org(),
-            tok.trim().to_owned(),
-            Role::default_for_legacy(),
-        ),
-        [org, tok] => {
-            let org = normalize_org(org);
-            (org, tok.trim().to_owned(), Role::default_for_legacy())
-        }
-        [org, tok, maybe_role] => {
-            let org = normalize_org(org);
-            if let Some(role) = Role::parse(maybe_role) {
-                (org, tok.trim().to_owned(), role)
-            } else {
-                // Third component isn't a known role — treat as
-                // token-tail. Reassemble to preserve any `:` inside
-                // the secret.
-                let token = format!("{}:{}", tok.trim(), maybe_role.trim());
-                (org, token, Role::default_for_legacy())
-            }
-        }
-        _ => unreachable!("splitn(3) yields at most 3 parts"),
+    // First split off the optional role suffix from the RIGHT so the
+    // token side keeps every `:` intact.
+    let (body, role) = split_role_suffix(entry);
+    // Then split org:token from the body.
+    let (org, token) = match body.split_once(':') {
+        Some((org, tok)) => (normalize_org(org), tok.trim().to_owned()),
+        None => (OrgId::default_org(), body.trim().to_owned()),
+    };
+    (org, token, role)
+}
+
+/// Split an entry on a trailing `@<role>` marker. Returns
+/// `(body_without_role, role)` — `body` == input if no suffix is
+/// found or the tail isn't a known role name. Deliberately splits
+/// from the RIGHT so an org id containing `@` (unusual but legal)
+/// isn't affected.
+fn split_role_suffix(entry: &str) -> (&str, Role) {
+    match entry.rsplit_once('@') {
+        Some((body, tail)) => match Role::parse(tail) {
+            Some(role) => (body, role),
+            None => (entry, Role::default_for_legacy()),
+        },
+        None => (entry, Role::default_for_legacy()),
+    }
+}
+
+/// Parse an `Authorization` header value into the bearer token. RFC
+/// 7235 § 5.1: auth-scheme names are **case-insensitive** and the
+/// scheme may be separated from the credentials by 1+ SP or HTAB.
+/// Previously we used `strip_prefix("Bearer ")`, which rejected
+/// `bearer <tok>` / `BEARER  <tok>` / `Bearer\t<tok>` — all valid per
+/// the spec. Now: split off the first whitespace-delimited word,
+/// case-fold, verify `bearer`, then trim any additional leading
+/// whitespace off the credential.
+///
+/// Returns `None` when the header isn't a bearer challenge — the
+/// middleware turns that into a 401.
+fn parse_bearer_scheme(header: &str) -> Option<&str> {
+    let header = header.trim_start();
+    let (scheme, rest) = header.split_once(|c: char| c.is_ascii_whitespace())?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = rest.trim_start();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
     }
 }
 
@@ -759,7 +800,7 @@ pub async fn require_token(
         .headers()
         .get("authorization")
         .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
+        .and_then(parse_bearer_scheme)
         .ok_or_else(|| {
             ApiError::Unauthorized("missing or malformed authorization header".into())
         })?;
@@ -929,41 +970,89 @@ mod tests {
             parse_env_entry("acme:tok"),
             (OrgId::new("acme"), "tok".to_string(), Role::Admin)
         );
-        // Three-part: org:token:role.
+        // Three-part with @role suffix.
         assert_eq!(
-            parse_env_entry("acme:tok:developer"),
+            parse_env_entry("acme:tok@developer"),
             (OrgId::new("acme"), "tok".to_string(), Role::Developer)
         );
         assert_eq!(
-            parse_env_entry("acme:tok:viewer"),
+            parse_env_entry("acme:tok@viewer"),
             (OrgId::new("acme"), "tok".to_string(), Role::Viewer)
         );
         // Empty org folds to default.
         assert_eq!(
-            parse_env_entry(":tok:admin"),
+            parse_env_entry(":tok@admin"),
             (OrgId::default_org(), "tok".to_string(), Role::Admin)
+        );
+        // Legacy shape with @role (no org prefix).
+        assert_eq!(
+            parse_env_entry("legacy-tok@viewer"),
+            (OrgId::default_org(), "legacy-tok".to_string(), Role::Viewer)
         );
     }
 
     #[test]
-    fn parse_env_entry_preserves_colons_inside_token_when_third_part_isnt_a_role() {
-        // Guard against silently mangling a token that happens to
-        // contain `:`. `acme:sk-live:xyz` is (org=acme,
-        // token="sk-live:xyz", default role) — because `xyz` isn't a
-        // known role name.
-        let (org, tok, role) = parse_env_entry("acme:sk-live:xyz");
+    fn parse_env_entry_preserves_colons_inside_token_secret() {
+        // A token secret with `:` inside it (e.g. `sk-live:abc`) MUST
+        // parse as-is. The old `:role` split silently mangled this.
+        let (org, tok, role) = parse_env_entry("acme:sk-live:abc");
         assert_eq!(org, OrgId::new("acme"));
-        assert_eq!(tok, "sk-live:xyz");
+        assert_eq!(tok, "sk-live:abc");
+        assert_eq!(role, Role::Admin);
+
+        // Even the pathological case from the review comment now works:
+        // a token whose plaintext ends with `:admin`.
+        let (org, tok, role) = parse_env_entry("acme:sk-live:admin");
+        assert_eq!(org, OrgId::new("acme"));
+        assert_eq!(tok, "sk-live:admin");
+        assert_eq!(role, Role::Admin);
+
+        // Same token WITH explicit @role suffix — unambiguous.
+        let (org, tok, role) = parse_env_entry("acme:sk-live:admin@developer");
+        assert_eq!(org, OrgId::new("acme"));
+        assert_eq!(tok, "sk-live:admin");
+        assert_eq!(role, Role::Developer);
+    }
+
+    #[test]
+    fn parse_env_entry_unknown_role_suffix_falls_back() {
+        // `@` present but tail isn't a known role → treat as part of
+        // the token, not a role marker.
+        let (org, tok, role) = parse_env_entry("acme:tok@notarole");
+        assert_eq!(org, OrgId::new("acme"));
+        assert_eq!(tok, "tok@notarole");
         assert_eq!(role, Role::Admin);
     }
 
     #[test]
     fn from_csv_admits_role_suffix() {
-        let t = ApiTokens::from_csv("acme:tok-a:admin,acme:tok-b:developer,acme:tok-c:viewer");
+        let t = ApiTokens::from_csv("acme:tok-a@admin,acme:tok-b@developer,acme:tok-c@viewer");
         assert_eq!(t.len(), 3);
         assert_eq!(t.resolve("tok-a").map(|(_, r)| r), Some(Role::Admin));
         assert_eq!(t.resolve("tok-b").map(|(_, r)| r), Some(Role::Developer));
         assert_eq!(t.resolve("tok-c").map(|(_, r)| r), Some(Role::Viewer));
+    }
+
+    #[test]
+    fn parse_bearer_scheme_is_case_insensitive_and_tolerates_whitespace() {
+        // Canonical form.
+        assert_eq!(parse_bearer_scheme("Bearer tok"), Some("tok"));
+        // Lowercase scheme (RFC 7235 § 5.1 allows).
+        assert_eq!(parse_bearer_scheme("bearer tok"), Some("tok"));
+        // All-caps scheme.
+        assert_eq!(parse_bearer_scheme("BEARER tok"), Some("tok"));
+        // MixedCase.
+        assert_eq!(parse_bearer_scheme("BeArEr tok"), Some("tok"));
+        // Multiple spaces + tab between scheme and credential.
+        assert_eq!(parse_bearer_scheme("Bearer   tok"), Some("tok"));
+        assert_eq!(parse_bearer_scheme("Bearer\ttok"), Some("tok"));
+        // Leading whitespace on the header value.
+        assert_eq!(parse_bearer_scheme("  Bearer tok"), Some("tok"));
+        // Wrong scheme.
+        assert_eq!(parse_bearer_scheme("Basic dXNlcjpwYXNz"), None);
+        // Missing credential.
+        assert_eq!(parse_bearer_scheme("Bearer "), None);
+        assert_eq!(parse_bearer_scheme("Bearer"), None);
     }
 
     #[test]
