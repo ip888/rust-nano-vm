@@ -3,6 +3,8 @@
 Three production paths, ordered by setup cost.
 
 > **Already deployed?** See [ONBOARDING.md](ONBOARDING.md) for the operator playbook on turning a signed customer into a billable tenant in ~10 minutes (token issuance → ingress → per-org telemetry → billing query).
+>
+> **Enterprise / on-prem / air-gap install?** See [enterprise/README.md](enterprise/README.md) for the network-isolated deploy path, support-boundary matrix, feature-flag guidance, and SBOM / cosign verification.
 
 ## Path 1 — Fly.io (~5 minutes)
 
