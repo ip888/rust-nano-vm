@@ -172,7 +172,7 @@ export default function LiveForkBenchmark() {
         )}
       </div>
 
-      {(result.kind === "loading" || result.kind === "done") && (
+      {"latencies" in result && result.latencies.length > 0 && (
         <LatencyChart
           latencies={result.latencies}
           inFlight={result.kind === "loading" ? result.done : -1}
