@@ -169,6 +169,37 @@ with nanovm.Client("http://localhost:8080", token="dev-token") as client:
         vm.destroy()
 ```
 
+## Reusable sandbox — fork once, run N times
+
+An agent that runs several tool calls in a row against the *same*
+snapshot shouldn't pay the fork cold-start on every call. `Client.sandbox`
+opens ONE VM as a context manager, holds it open for the `with`
+block, and destroys it on exit (even on exception):
+
+```python
+import nanovm
+
+with nanovm.Client("http://localhost:8080", token="dev-token") as client:
+    # Fork ONCE from a marketplace snapshot — pandas already loaded
+    # in memory. ~12 ms on real KVM.
+    with client.sandbox(snapshot="python-3.12-ds") as sb:
+        sb.execute_python("import pandas as pd")                # ~12 ms fork
+        sb.execute_python("df = pd.DataFrame({'x': [1,2,3]})")  # same VM, sub-ms exec RTT
+        result = sb.execute_python("print(df.sum().to_dict())")
+        print(result.stdout)  # "{'x': 6}\n"
+```
+
+The `snapshot` argument is either an `int` (a snapshot you previously
+captured) or a `str` (marketplace-entry name like `"python-3.12-ds"`
+or `"node-20-playwright"`). Marketplace names invoke the
+[fork-marketplace endpoint](../../deploy/marketplace/README.md)
+automatically — the first fork per tenant pulls the tarball, every
+subsequent one is a warm-pool pop.
+
+If you need the raw VM handle for a one-shot fork without the context
+manager, use `client.fork_marketplace("python-3.12-ds")` — same
+underlying endpoint, no context management.
+
 ## Sandbox-action API (one-shot fork-exec-destroy)
 
 For AI-agent tool use, you usually don't want to manage VM lifecycles
