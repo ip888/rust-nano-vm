@@ -539,8 +539,8 @@ class Sandbox:
 
     def close(self) -> None:
         """Explicit close for non-``with`` callers. Best-effort — a
-        destroy failure logs a warn and swallows so the caller isn't
-        blocked cleaning up."""
+        destroy failure is swallowed so the caller isn't blocked
+        cleaning up."""
         if self._vm is None:
             return
         try:
