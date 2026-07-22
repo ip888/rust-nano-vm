@@ -510,9 +510,8 @@ class Sandbox:
         if self._vm is not None:
             return self._vm
         if isinstance(self._snapshot, int) and not isinstance(self._snapshot, bool):
-            snapshot_id = int(self._snapshot)
             resp = self._client._request(
-                "POST", f"/v1/snapshots/{snapshot_id}/fork"
+                "POST", f"/v1/snapshots/{int(self._snapshot)}/fork"
             )
         elif isinstance(self._snapshot, str):
             # Marketplace entry name — first-fork per (org, name, url)
@@ -540,8 +539,8 @@ class Sandbox:
 
     def close(self) -> None:
         """Explicit close for non-``with`` callers. Best-effort — a
-        destroy failure is swallowed so the caller isn't blocked
-        cleaning up."""
+        destroy failure logs a warn and swallows so the caller isn't
+        blocked cleaning up."""
         if self._vm is None:
             return
         try:

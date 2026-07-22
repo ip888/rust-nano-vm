@@ -140,7 +140,7 @@ def test_sandbox_marketplace_string_forks_marketplace_endpoint() -> None:
 
 
 def test_sandbox_marketplace_name_is_url_encoded() -> None:
-    """A name with reserved path characters should be
+    """A name that needs URL-encoding (`weird/name?with&chars`) should be
     passed through `quote(safe="")` so no reserved chars leak into
     the path."""
     captured_url: Dict[str, str] = {}
