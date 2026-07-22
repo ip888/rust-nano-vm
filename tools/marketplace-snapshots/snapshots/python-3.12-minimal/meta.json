@@ -1,0 +1,7 @@
+{
+  "description": "Python 3.12 + stdlib only. ~12 MB. Fastest cold-start for pure-Python agent tool calls with no external deps. Common stdlib modules (json, re, itertools, dataclasses, typing) are pre-imported into the snapshot's memory image.",
+  "kernel_url": "https://cdn.nanovm.io/marketplace/python-3.12-minimal/vmlinux",
+  "rootfs_url": "https://cdn.nanovm.io/marketplace/python-3.12-minimal/rootfs.ext4",
+  "cmdline": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw quiet",
+  "labels": ["python", "minimal"]
+}
