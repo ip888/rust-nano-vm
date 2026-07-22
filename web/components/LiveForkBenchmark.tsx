@@ -58,7 +58,7 @@ function demoConfig(): DemoConfig | null {
 
 type Result =
   | { kind: "idle" }
-  | { kind: "loading"; done: number }
+  | { kind: "loading"; done: number; latencies: number[] }
   | { kind: "done"; latencies: number[]; live: boolean }
   | { kind: "error"; message: string };
 
@@ -71,11 +71,11 @@ export default function LiveForkBenchmark() {
     if (!config) {
       // Seeded mode: play back the fixed dataset with a short
       // per-sample delay so the "running…" state is visible.
-      setResult({ kind: "loading", done: 0 });
       const latencies: number[] = [];
+      setResult({ kind: "loading", done: 0, latencies: [] });
       for (let i = 0; i < SEEDED_LATENCIES_MS.length; i++) {
         latencies.push(SEEDED_LATENCIES_MS[i]!);
-        setResult({ kind: "loading", done: i + 1 });
+        setResult({ kind: "loading", done: i + 1, latencies: [...latencies] });
         await new Promise((r) => setTimeout(r, 40));
       }
       setResult({ kind: "done", latencies, live: false });
@@ -83,8 +83,8 @@ export default function LiveForkBenchmark() {
     }
 
     // Live mode: hit the demo tenant's fork endpoint N_FORKS times.
-    setResult({ kind: "loading", done: 0 });
     const latencies: number[] = [];
+    setResult({ kind: "loading", done: 0, latencies: [] });
     const path = config.snapshotId
       ? `/v1/snapshots/${encodeURIComponent(config.snapshotId)}/fork`
       : `/v1/marketplace/snapshots/${encodeURIComponent(config.marketplaceName)}/fork`;
@@ -101,7 +101,7 @@ export default function LiveForkBenchmark() {
           body: "{}",
         });
         if (!resp.ok) {
-          throw new Error(`HTTP ${resp.status}`);
+          throw new Error(await formatHttpError(resp));
         }
         const body = await resp.json();
         // Prefer server-reported fork_ms (accurate, excludes network
@@ -114,7 +114,7 @@ export default function LiveForkBenchmark() {
             ? Math.round(body.fork_ms)
             : Math.round(t1 - t0);
         latencies.push(ms);
-        setResult({ kind: "loading", done: i + 1 });
+        setResult({ kind: "loading", done: i + 1, latencies: [...latencies] });
       }
       setResult({ kind: "done", latencies, live: true });
     } catch (err) {
@@ -174,15 +174,38 @@ export default function LiveForkBenchmark() {
 
       {(result.kind === "loading" || result.kind === "done") && (
         <LatencyChart
-          latencies={
-            result.kind === "loading" ? [] : result.latencies
-          }
-          inFlight={result.kind === "loading" ? result.done : 0}
+          latencies={result.latencies}
+          inFlight={result.kind === "loading" ? result.done : -1}
           total={N_FORKS}
         />
       )}
     </section>
   );
+}
+
+/**
+ * Turn a non-2xx response into an actionable message. Prefers the
+ * server's structured error envelope (`{error: {message, code}}`)
+ * over a bare status code so "402 dunning", "401 bad token", "404
+ * unknown snapshot" surface on-page rather than "HTTP 402".
+ */
+async function formatHttpError(resp: Response): Promise<string> {
+  try {
+    const body = await resp.json();
+    const message =
+      typeof body?.error?.message === "string"
+        ? body.error.message
+        : typeof body?.message === "string"
+          ? body.message
+          : null;
+    const code =
+      typeof body?.error?.code === "string" ? body.error.code : null;
+    if (message && code) return `HTTP ${resp.status} [${code}]: ${message}`;
+    if (message) return `HTTP ${resp.status}: ${message}`;
+  } catch {
+    // fall through — response wasn't JSON, use the status alone.
+  }
+  return `HTTP ${resp.status}`;
 }
 
 function ModePill({ live }: { live: boolean }) {
@@ -232,7 +255,10 @@ function LatencyChart({
       <div className="space-y-1">
         {Array.from({ length: total }).map((_, i) => {
           const v = latencies[i];
-          const running = i < inFlight;
+          // `inFlight` is the count of completed rows; the currently
+          // running row is the NEXT index. `-1` (terminal states)
+          // pulses nothing.
+          const running = i === inFlight;
           return (
             <div key={i} className="flex items-center gap-2 text-xs">
               <span className="w-6 text-right text-gray-400 tabular-nums">
