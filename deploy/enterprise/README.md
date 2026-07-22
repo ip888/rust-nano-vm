@@ -46,29 +46,33 @@ contact is negotiated separately — email support@nanovm.io.
 
 ## Airgap knob
 
-The `airgap` value flips a set of defaults that make sense for a
-network-isolated deployment. When `--set airgap=true`:
+The `airgap: false` value in `values.yaml` is a **placeholder** for
+chart-level network-isolation behavior. The chart does not currently
+reference this flag in its templates, so toggling it has no runtime
+effect on its own.
 
-- Stripe billing is disabled (`--features billing` build still works,
-  but `STRIPE_*` env vars are unset → `/v1/signup` + `/v1/billing/*`
-  return `503 billing_disabled`).
-- Marketplace fork tarball URLs must be file-scheme or resolvable
-  inside the private network — the chart doesn't warn on `https://cdn.nanovm.io`
-  because that's a valid choice for connected deployments; airgapped
-  operators simply publish their own `NANOVM_MARKETPLACE_CONFIG` with
-  in-cluster URLs.
-- The metered-billing reporter (`NANOVM_BILLING_REPORT_SECS`) is
-  disabled at chart level.
-- Magic-link signup is silent-drop (the binary logs the URL to
-  stdout — fine for on-prem where the ops team runs the initial
-  provisioning by hand).
-- The SIEM sink can still ship audit records — it targets whatever URL
-  you set, including an in-cluster collector. `NANOVM_AUDIT_SINK_URL`
-  is honored even in airgap mode.
+The Rust binary already defaults to a safe airgap posture without any
+chart wiring:
+
+- The metered-billing reporter is **off by default** — it only activates
+  when `NANOVM_BILLING_REPORT_SECS` is explicitly set by the operator.
+- Magic-link delivery defaults to logging the verify URL to stdout — no
+  outbound email unless `RESEND_API_KEY` and `NANOVM_SIGNUP_FROM` are
+  both configured.
+- Stripe billing endpoints return `503 billing_disabled` until `STRIPE_*`
+  env vars are wired in.
+
+Airgapped operators: simply omit those env vars. The SIEM sink
+(`NANOVM_AUDIT_SINK_URL`) is still honored when configured — it targets
+whatever URL you provide, including an in-cluster collector.
+
+Marketplace fork tarball URLs must be reachable from inside the private
+network — supply your own `NANOVM_MARKETPLACE_CONFIG` with in-cluster
+URLs rather than `https://cdn.nanovm.io` paths.
 
 Non-airgap connected deployments (customer running on AWS with public
-outbound) can leave `airgap=false` and enable the SaaS-facing bits as
-needed.
+outbound) can leave `airgap=false` and enable the SaaS-facing bits by
+setting the corresponding env vars as needed.
 
 ## Pre-pinned images
 
@@ -99,15 +103,17 @@ helm install nanovm ./deploy/helm/nanovm \
   --set image.repository=registry.internal.example.com/nanovm-control-plane-kvm \
   --set image.tag=0.0.3 \
   --set config.apiTokens='acme:tok-INITIAL-DO-NOT-COMMIT' \
-  --set persistence.enabled=true \
-  --set persistence.storageClass=your-storage-class \
   --set config.tokenStorePath=/var/lib/nanovm/tokens.json \
   --set config.auditPath=/var/log/nanovm/audit.jsonl
 ```
 
-`persistence.enabled=true` swaps the default `emptyDir` volumes for a
-PVC on your storage class — required for the token store, the
-ownership SQLite, and the JSONL audit log to survive pod restarts.
+The chart uses `emptyDir` for the token-store and audit-log volumes by
+default — data is lost on pod restart. For production, replace those
+with a PVC by adding custom `volumes` / `volumeMounts` overrides in your
+values file (the chart does not currently provide a built-in
+`persistence.enabled` toggle). Mount a CSI-backed volume at
+`/var/lib/nanovm` and `/var/log/nanovm` to make the token store, the
+ownership SQLite, and the JSONL audit log survive pod restarts.
 
 ## Feature-flag matrix
 
@@ -127,10 +133,13 @@ Recommended enterprise builds:
 - **Full SaaS**: `--features billing,marketplace-fork,audit-sink,s3`
 - **Bare on-prem lab**: `--features sqlite` (everything else default)
 
-`docker build --build-arg CARGO_FEATURES=sqlite,audit-sink` is wired
-in `Dockerfile.kvm` for custom builds; the published images ship the
-full SaaS feature set so operators can opt in via env vars alone
-without a rebuild.
+To enable feature-gated endpoints, rebuild from source with
+`--features <list>` (e.g., `cargo build --release --features billing,audit-sink`).
+`Dockerfile.kvm` does not accept a `CARGO_FEATURES` build argument, and
+the published images do not enable optional features — the `cargo build`
+invocations in both `Dockerfile` and `Dockerfile.kvm` run without
+`--features`. Operators who need `billing`, `audit-sink`, or other
+feature-gated surfaces must build and publish their own image.
 
 ## Audit + observability
 
@@ -144,8 +153,10 @@ Both are covered in dedicated docs:
 
 ## Security posture (what auditors ask for)
 
-- **Rust `#![forbid(unsafe_code)]`** on every crate the control plane
-  compiles. Verifiable in-tree.
+- **Rust `#![forbid(unsafe_code)]`** on all control-plane crates
+  (`control-plane`, `nanovm-jailer`, and shared libraries). The
+  `vm-kvm` crate is explicitly exempt — it requires `unsafe` for the
+  KVM ioctl ABI. Verifiable in-tree.
 - **Seccomp deny-list** on the vmm-child, cgroups on the jailer.
 - **Bearer tokens fingerprinted in logs** (never the raw secret).
 - **RFC 3339 timestamps** on every audit record; SIEM sink preserves
