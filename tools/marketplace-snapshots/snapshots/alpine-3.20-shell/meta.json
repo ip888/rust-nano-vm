@@ -1,0 +1,7 @@
+{
+  "description": "Alpine 3.20 with busybox + coreutils + bash + curl + jq. ~6 MB. For agent tool calls that just need a POSIX shell without a language runtime.",
+  "kernel_url": "https://cdn.nanovm.io/marketplace/alpine-3.20-shell/vmlinux",
+  "rootfs_url": "https://cdn.nanovm.io/marketplace/alpine-3.20-shell/rootfs.ext4",
+  "cmdline": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw quiet",
+  "labels": ["shell", "alpine", "minimal"]
+}
