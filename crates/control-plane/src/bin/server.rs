@@ -198,10 +198,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => None,
             };
             let sink = control_plane::audit_sink::spawn(url.clone(), header);
-            info!(url, "audit sink enabled");
-            // Detach the task — its lifetime is tied to the mpsc
-            // sender that AuditLog holds; server shutdown drops that.
-            std::mem::forget(sink.task);
+            // Log the scheme + host only. A misconfigured URL like
+            // `https://user:secret@collector/…?token=abc` would leak
+            // credentials into stdout if we printed it verbatim.
+            info!(
+                sink_host = %sink_host_only(&url),
+                "audit sink enabled"
+            );
+            // Detach the task by dropping the JoinHandle. Tokio tasks
+            // keep running after their handle drops; there's no need
+            // for `std::mem::forget` (which would leak the handle
+            // allocation for the process lifetime).
+            drop(sink.task);
             audit.with_sink(sink.sender)
         }
         None => audit,
@@ -583,4 +591,23 @@ fn build_billing_ctx() -> Option<control_plane::billing::BillingCtx> {
         tiers,
         email,
     })
+}
+
+/// Redact a sink URL to `scheme://host` — drop userinfo, path, and
+/// query. Startup-log context only; the real sink URL still reaches
+/// reqwest verbatim inside the drain task. Best-effort: on
+/// unparseable input, returns `<redacted>` so operators still see a
+/// signal that the sink was configured.
+#[cfg(feature = "audit-sink")]
+fn sink_host_only(raw: &str) -> String {
+    let (scheme, rest) = match raw.split_once("://") {
+        Some(sr) => sr,
+        None => return "<redacted>".to_string(),
+    };
+    let host_start = rest.find('@').map(|i| i + 1).unwrap_or(0);
+    let host_end = rest[host_start..]
+        .find(['/', '?'])
+        .map(|i| host_start + i)
+        .unwrap_or(rest.len());
+    format!("{scheme}://{}", &rest[host_start..host_end])
 }
