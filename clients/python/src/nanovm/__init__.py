@@ -509,9 +509,10 @@ class Sandbox:
         """Explicit lifecycle for callers that can't use ``with``."""
         if self._vm is not None:
             return self._vm
-        if isinstance(self._snapshot, int):
+        if isinstance(self._snapshot, int) and not isinstance(self._snapshot, bool):
+            snapshot_id = int(self._snapshot)
             resp = self._client._request(
-                "POST", f"/v1/snapshots/{self._snapshot}/fork"
+                "POST", f"/v1/snapshots/{snapshot_id}/fork"
             )
         elif isinstance(self._snapshot, str):
             # Marketplace entry name — first-fork per (org, name, url)
@@ -539,8 +540,8 @@ class Sandbox:
 
     def close(self) -> None:
         """Explicit close for non-``with`` callers. Best-effort — a
-        destroy failure logs a warn and swallows so the caller isn't
-        blocked cleaning up."""
+        destroy failure is swallowed so the caller isn't blocked
+        cleaning up."""
         if self._vm is None:
             return
         try:

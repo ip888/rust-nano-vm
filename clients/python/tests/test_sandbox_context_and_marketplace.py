@@ -140,7 +140,7 @@ def test_sandbox_marketplace_string_forks_marketplace_endpoint() -> None:
 
 
 def test_sandbox_marketplace_name_is_url_encoded() -> None:
-    """A name that needs URL-encoding (`python-3.12-ds`) should be
+    """A name with reserved path characters should be
     passed through `quote(safe="")` so no reserved chars leak into
     the path."""
     captured_url: Dict[str, str] = {}
@@ -167,6 +167,13 @@ def test_sandbox_marketplace_name_is_url_encoded() -> None:
     # `/`, `?`, `&` all get percent-encoded — the whole name is one
     # path segment, not sub-paths.
     assert captured_url["url"].endswith("weird%2Fname%3Fwith%26chars/fork")
+
+
+def test_sandbox_bool_snapshot_is_rejected() -> None:
+    c = nanovm.Client("http://stub", token="t")
+
+    with pytest.raises(TypeError, match="snapshot must be int"):
+        c.sandbox(snapshot=True).open()
 
 
 def test_sandbox_destroys_vm_on_exception() -> None:
