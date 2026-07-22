@@ -51,9 +51,11 @@ pub const SINK_HEADER_ENV: &str = "NANOVM_AUDIT_SINK_HEADER";
 const SINK_CHANNEL_CAP: usize = 1024;
 
 /// Per-request timeout on the HTTP POST to the collector. Keep tight —
-/// a slow sink shouldn't back up the channel drain loop. Dropped
-/// records will get retried on the NEXT audit event (there's no
-/// per-record retry).
+/// a slow sink shouldn't back up the channel drain loop. There is NO
+/// per-record retry: a failed POST logs a warn and the record is
+/// dropped. The next audit event triggers a fresh POST — if the
+/// collector has recovered, shipping resumes; the dropped one stays
+/// lost. Best-effort by design.
 const SINK_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Successfully-parsed sink config. `sender` is what [`AuditLog::append`]
@@ -99,28 +101,64 @@ pub fn parse_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
 /// cleanly.
 pub fn spawn(url: String, extra_header: Option<(HeaderName, HeaderValue)>) -> SinkHandle {
     let (tx, mut rx) = mpsc::channel::<Value>(SINK_CHANNEL_CAP);
-    let client = build_client(extra_header.clone());
+    let client = build_client(extra_header);
     let task = tokio::spawn(async move {
         if url.starts_with("http://") {
             tracing::warn!(
-                url = %url,
+                url = %redact_url(&url),
                 "NANOVM_AUDIT_SINK_URL uses http:// — audit records will be sent unencrypted"
             );
         }
-        while let Some(record) = rx.recv().await {
-            match &client {
-                Ok(client) => post_one(client, &url, &record).await,
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "audit sink: HTTP client init failed; dropping record"
-                    );
-                }
+        // Client-build failure is a single-shot startup error: log it
+        // ONCE and drain the channel until it closes, dropping every
+        // record. Previously the log fired per-record, producing a
+        // log storm indistinguishable from a live-but-failing sink.
+        let client = match client {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "audit sink: HTTP client init failed at startup; all records will be dropped for the process lifetime"
+                );
+                // Drain the channel so the sender-side try_send
+                // doesn't accumulate a full backlog either.
+                while rx.recv().await.is_some() {}
+                tracing::info!("audit sink: channel closed, drain task exiting");
+                return;
             }
+        };
+        while let Some(record) = rx.recv().await {
+            post_one(&client, &url, &record).await;
         }
         tracing::info!("audit sink: channel closed, drain task exiting");
     });
     SinkHandle { sender: tx, task }
+}
+
+/// Strip userinfo + query-string from a URL for safe logging. A
+/// misconfigured `NANOVM_AUDIT_SINK_URL` like
+/// `https://user:secret@collector.example.com/ingest?token=xyz` would
+/// otherwise leak credentials into stdout the moment the http:// warn
+/// fires. Best-effort: on unparseable URLs, log the scheme + `<redacted>`
+/// so the operator still gets a signal without the secret.
+fn redact_url(raw: &str) -> String {
+    // We don't have `url` in deps; do a lightweight parse: keep the
+    // scheme+host+path, drop userinfo and query.
+    let (scheme, rest) = match raw.split_once("://") {
+        Some(sr) => sr,
+        None => return "<redacted>".to_string(),
+    };
+    // Split off the query first.
+    let path = rest.split('?').next().unwrap_or("");
+    // Strip userinfo if present: everything before an `@` that appears
+    // before the first `/` is auth material.
+    let host_and_path = match path.split_once('@') {
+        Some((_userinfo, rest)) if !rest.contains('/') || _userinfo.chars().all(|c| c != '/') => {
+            rest
+        }
+        _ => path,
+    };
+    format!("{scheme}://{host_and_path}")
 }
 
 /// Build the shared reqwest client. Broken out so a client-build
@@ -155,17 +193,19 @@ async fn post_one(client: &Client, url: &str, record: &Value) {
 
 /// Non-blocking push. Called from the request-hot-path in
 /// [`AuditLog::append`]; must return immediately regardless of sink
-/// backpressure. Full channel → drop the record with a rate-limited
-/// warn.
+/// backpressure. Full channel → drop the record and log a warn per
+/// drop.
+///
+/// The warn is **not rate-limited** today — a truly-down sink at a
+/// high mutating-request rate will produce warn-per-request until the
+/// sink recovers or the operator drops the log level for this target.
+/// If that turns out to be a problem in the wild, wire a token-bucket
+/// or a "first + every 100th drop" filter here. Left honest for now.
 ///
 /// Split out so the AuditLog side stays a plain sync `Sender::try_send`
 /// call without importing the mpsc type directly.
 pub fn push(sender: &mpsc::Sender<Value>, record: Value) {
     if let Err(err) = sender.try_send(record) {
-        // Rate-limiting the warn: at 1024 slots and default enterprise
-        // audit rates, a full channel means the sink is truly down.
-        // One warn per drop is fine — it's what makes the "why isn't
-        // my SIEM getting events?" question answerable.
         match err {
             mpsc::error::TrySendError::Full(_) => {
                 tracing::warn!(
@@ -215,6 +255,34 @@ mod tests {
         // rejects it.
         let err = parse_header("X-Test: bad\nvalue").unwrap_err();
         assert!(err.contains("invalid header value"), "got: {err}");
+    }
+
+    #[test]
+    fn redact_url_strips_userinfo_and_query() {
+        // Plain HTTPS host: unchanged (scheme+host+path preserved,
+        // query dropped).
+        assert_eq!(
+            redact_url("https://collector.example.com/ingest"),
+            "https://collector.example.com/ingest"
+        );
+        // Userinfo present: dropped.
+        assert_eq!(
+            redact_url("https://user:secret@collector.example.com/ingest"),
+            "https://collector.example.com/ingest"
+        );
+        // Query with token: dropped so it doesn't hit stdout.
+        assert_eq!(
+            redact_url("https://collector.example.com/ingest?token=abc"),
+            "https://collector.example.com/ingest"
+        );
+        // Both userinfo AND query: both dropped.
+        assert_eq!(
+            redact_url("https://x:y@collector.example.com/ingest?t=abc"),
+            "https://collector.example.com/ingest"
+        );
+        // Malformed input: returns the redacted sentinel so operators
+        // still get a startup signal without the raw value.
+        assert_eq!(redact_url("not a url"), "<redacted>");
     }
 
     // ---- end-to-end drain into a local test server -------------------
@@ -276,7 +344,13 @@ mod tests {
         drop(sink.sender);
         // The task exits on channel close; joining it makes sure we
         // haven't leaked a lingering worker.
-        let _ = tokio::time::timeout(Duration::from_secs(1), sink.task).await;
+        // Assert the drain task exits cleanly. A `Err` (timeout) or
+        // an `Ok(Err(_))` (task panicked) would silently pass without
+        // this — precisely the failure mode Copilot flagged.
+        let join = tokio::time::timeout(Duration::from_secs(1), sink.task)
+            .await
+            .expect("drain task should exit within 1s after sender drop");
+        join.expect("drain task must not panic");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -309,6 +383,12 @@ mod tests {
         // Sender should still be usable (task is alive).
         assert!(!sink.sender.is_closed());
         drop(sink.sender);
-        let _ = tokio::time::timeout(Duration::from_secs(1), sink.task).await;
+        // Assert the drain task exits cleanly. A `Err` (timeout) or
+        // an `Ok(Err(_))` (task panicked) would silently pass without
+        // this — precisely the failure mode Copilot flagged.
+        let join = tokio::time::timeout(Duration::from_secs(1), sink.task)
+            .await
+            .expect("drain task should exit within 1s after sender drop");
+        join.expect("drain task must not panic");
     }
 }

@@ -84,18 +84,33 @@ if a collector needs a multi-header handshake (rare).
   collector.
 - **Not guaranteed**: durability across process crash. Records
   in-flight in the sink channel are lost on `kill -9`. The file
-  appender uses libc-buffered `write`, so up to one line may be lost
-  on a crash between `write()` and the OS flush.
+  appender uses `std::fs::File::write_all` (no user-space buffer) but
+  does NOT `fsync` after each line, so the last record can be lost
+  in the OS page cache if the kernel dies before it flushes to disk.
+  Pair the append with a `NANOVM_AUDIT_LOG` path on a filesystem that
+  auto-flushes on close (most journalled FSes on a normal shutdown)
+  or add a supervisor that `fsync`s on rotation.
 - **Not guaranteed**: retry on sink failure. A single POST attempt per
   record, no back-off. If the collector is down, the operator sees
   `tracing::warn!` lines and the record is dropped. The next
   successful POST resumes normal shipping.
 
-## Prometheus signals
+## Observability signals
 
-- `nanovm_audit_sink_channel_full` — WARN-level tracing counter (not
-  yet exposed to Prometheus); a follow-up may promote it. For now the
-  operator's log-aggregator answers "is the sink getting behind?"
+Today the audit sink surfaces its state through `tracing` only — no
+Prometheus counter. The three warn lines an operator watches for:
+
+- `audit sink: channel full, dropping record (sink may be down)` —
+  the mpsc channel between `AuditLog::append` and the drain task is
+  saturated. Either the collector is slow / down, OR mutating traffic
+  spiked past 1024 records in one drain-tick window.
+- `audit sink: POST returned non-2xx; dropping record` — the
+  collector answered but rejected the record. Check its ingest logs.
+- `audit sink: POST failed; dropping record` — network-layer error.
+  Check DNS / TLS / reachability.
+
+Promoting these to a Prometheus counter (`nanovm_audit_sink_dropped_total{reason=…}`)
+is a scoped follow-up if the log-aggregator answer ever falls short.
 
 ## Compliance posture
 
