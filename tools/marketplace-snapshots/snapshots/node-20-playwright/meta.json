@@ -1,0 +1,7 @@
+{
+  "description": "Node 20 LTS + Playwright 1.48 + Chromium headless. ~220 MB. The Chromium browser + Playwright's browser handshake are pre-warmed into the snapshot's memory image — second fork skips the ~1s browser spin-up.",
+  "kernel_url": "https://cdn.nanovm.io/marketplace/node-20-playwright/vmlinux",
+  "rootfs_url": "https://cdn.nanovm.io/marketplace/node-20-playwright/rootfs.ext4",
+  "cmdline": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw quiet",
+  "labels": ["node", "playwright", "browser", "scraping"]
+}

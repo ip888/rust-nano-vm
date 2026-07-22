@@ -1,0 +1,7 @@
+{
+  "description": "Python 3.12 + pandas 2.2 + numpy 2 + scikit-learn 1.5 + matplotlib. ~180 MB. pandas / numpy / sklearn are pre-imported into the snapshot's memory image, so first fork skips the ~2s cold import.",
+  "kernel_url": "https://cdn.nanovm.io/marketplace/python-3.12-ds/vmlinux",
+  "rootfs_url": "https://cdn.nanovm.io/marketplace/python-3.12-ds/rootfs.ext4",
+  "cmdline": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw quiet",
+  "labels": ["python", "data-science", "pandas", "sklearn"]
+}
