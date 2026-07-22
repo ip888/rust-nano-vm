@@ -7,15 +7,22 @@
 //!
 //! ## Env format
 //!
-//! `NANOVM_API_TOKENS` is a comma-separated list. Each entry is either:
+//! `NANOVM_API_TOKENS` is a comma-separated list. Each entry is one of:
 //!
-//! - `org_id:token`  → the token belongs to that org
-//! - `token`         → the token belongs to the special org `"default"`
+//! - `token`                  → default org, `admin` role (legacy shape).
+//! - `org_id:token`           → given org, `admin` role.
+//! - `org_id:token:role`      → given org + explicit role. Roles are
+//!   `admin` / `developer` / `viewer` (case-insensitive). Unknown role
+//!   strings fold BACK into the token — a secret that happens to
+//!   contain a `:` isn't mangled.
 //!
 //! The legacy comma-only shape (`tok1,tok2`) keeps working: every legacy
-//! token lands in the `default` org. That preserves single-tenant
-//! deployments byte-for-byte; multi-tenant rollouts re-encode the env to
-//! `tenantA:tok1,tenantB:tok2`.
+//! token lands in the `default` org as `admin`. That preserves
+//! single-tenant deployments byte-for-byte.
+//!
+//! The role is a **shovel-ready stub** — see [`Role`] and
+//! [`require_role`]. No handler enforces it today; the plumbing lands
+//! now so SSO integration doesn't need a schema migration.
 //!
 //! ## Token sources
 //!
@@ -112,11 +119,81 @@ impl std::fmt::Display for TokenId {
     }
 }
 
+/// Coarse authorization role attached to every token. Not enforced by
+/// any handler yet — this is a **shovel-ready stub** that lets the
+/// schema, wire format, and extension-injection surface land now, so
+/// that when SSO / group-attribute mapping arrives the plumbing is
+/// already in place.
+///
+/// Ordering matters: `require_role(min)` uses `>=` on the ordinal so
+/// a stricter role always satisfies a looser requirement. The order is
+/// `Viewer < Developer < Admin`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, Ord, PartialOrd)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// Read-only. Can list VMs / snapshots / usage but not mutate.
+    Viewer,
+    /// Everyday developer scope: create/destroy VMs, fork snapshots,
+    /// run exec. Cannot mint or revoke API keys, cannot touch billing.
+    Developer,
+    /// Everything: manage keys, billing portal, org-level settings.
+    /// Every legacy env-loaded token defaults to `Admin` — the
+    /// backward-compat posture.
+    Admin,
+}
+
+impl Role {
+    /// Default role for tokens whose source doesn't specify one
+    /// (legacy env format, runtime-issued keys, mock/dev deploys).
+    /// Chosen as `Admin` so existing single-tenant deployments keep
+    /// working without config changes. A follow-up PR flips the
+    /// default once SSO ships and roles start coming from group
+    /// attributes.
+    pub fn default_for_legacy() -> Self {
+        Self::Admin
+    }
+
+    /// Parse from the wire / env format. Case-insensitive. Returns
+    /// `None` on unknown strings — the env parser treats "unknown
+    /// role suffix" as "no role suffix present" so a typo can't
+    /// silently privilege-escalate.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "admin" => Some(Self::Admin),
+            "developer" | "dev" => Some(Self::Developer),
+            "viewer" | "readonly" | "read-only" => Some(Self::Viewer),
+            _ => None,
+        }
+    }
+
+    /// Stable machine-readable name — matches the `#[serde(rename_all)]`
+    /// output so JSON, env, and audit-log formats round-trip.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Developer => "developer",
+            Self::Viewer => "viewer",
+        }
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Metadata for one accepted token. We never store the plaintext on this
 /// struct (it lives only as the HashMap key for the auth lookup path).
 #[derive(Clone, Debug)]
 struct TokenEntry {
     org: OrgId,
+    /// Coarse authorization role. Injected into request extensions
+    /// alongside [`OrgId`] on every authenticated request. Defaults
+    /// to [`Role::default_for_legacy`] (`Admin`) for env-loaded and
+    /// runtime-issued tokens; SSO-provisioned tokens will populate
+    /// this from IdP group membership when that ships.
+    role: Role,
     source: TokenSource,
 }
 
@@ -225,6 +302,7 @@ impl ApiTokens {
                 s,
                 TokenEntry {
                     org: default.clone(),
+                    role: Role::default_for_legacy(),
                     source: TokenSource::Env,
                 },
             );
@@ -252,6 +330,7 @@ impl ApiTokens {
                 t,
                 TokenEntry {
                     org,
+                    role: Role::default_for_legacy(),
                     source: TokenSource::Env,
                 },
             );
@@ -324,6 +403,10 @@ impl ApiTokens {
                 p.token.clone(),
                 TokenEntry {
                     org: OrgId(p.org),
+                    // Persisted-runtime tokens predate the role field;
+                    // treat them as Admin (matches env-loaded default)
+                    // until the persistence format gains a role column.
+                    role: Role::default_for_legacy(),
                     source: TokenSource::Runtime {
                         id: id.clone(),
                         created_at: p.created_at,
@@ -402,18 +485,7 @@ impl ApiTokens {
             if trimmed.is_empty() {
                 continue;
             }
-            let (org, token) = match trimmed.split_once(':') {
-                Some((o, t)) => {
-                    let org_str = o.trim();
-                    let org = if org_str.is_empty() {
-                        OrgId::default_org()
-                    } else {
-                        OrgId::new(org_str)
-                    };
-                    (org, t.trim().to_owned())
-                }
-                None => (OrgId::default_org(), trimmed.to_owned()),
-            };
+            let (org, token, role) = parse_env_entry(trimmed);
             if token.is_empty() {
                 continue;
             }
@@ -423,6 +495,7 @@ impl ApiTokens {
                 token,
                 TokenEntry {
                     org,
+                    role,
                     source: TokenSource::Env,
                 },
             );
@@ -470,6 +543,20 @@ impl ApiTokens {
             .map(|e| e.org.clone())
     }
 
+    /// Returns the `(org, role)` pair the presented token maps to, or
+    /// `None` if the token isn't in the set. Used by [`require_token`]
+    /// to inject both extensions in one lookup. Handlers that only
+    /// need the org can keep using [`org_for`](Self::org_for); anything
+    /// that will grow role checks eventually should switch to this.
+    pub fn resolve(&self, presented: &str) -> Option<(OrgId, Role)> {
+        self.store
+            .read()
+            .expect("api tokens lock")
+            .by_token
+            .get(presented)
+            .map(|e| (e.org.clone(), e.role))
+    }
+
     /// Issue a new runtime token for `org`. Returns the plaintext token
     /// (the only time it's ever exposed) plus its public id for later
     /// listing / revocation. The token is added to the in-memory accept
@@ -483,6 +570,11 @@ impl ApiTokens {
             token.clone(),
             TokenEntry {
                 org: org.clone(),
+                // Runtime-issued keys default to Admin. `POST /v1/keys`
+                // gains an optional `role` body field in the follow-up
+                // that ships SSO — until then, self-serve dashboards
+                // that mint keys assume full org privilege.
+                role: Role::default_for_legacy(),
                 source: TokenSource::Runtime {
                     id: id.clone(),
                     created_at: created_at.clone(),
@@ -551,6 +643,61 @@ impl ApiTokens {
     }
 }
 
+/// Parse one comma-separated entry from `NANOVM_API_TOKENS` into
+/// `(org, token, role)`. Accepted shapes:
+///
+/// - `tok`                    → `(default, tok, admin)` — legacy.
+/// - `org:tok`                → `(org,     tok, admin)` — multi-tenant.
+/// - `org:tok:role`           → `(org,     tok, role)`  — RBAC stub.
+///
+/// The role suffix is optional. When present it must be one of
+/// `admin`/`developer`/`viewer` (case-insensitive) or the whole third
+/// component is treated as still-part-of-the-token — this way an
+/// operator whose token secret genuinely contains a `:` doesn't get
+/// silently split. Empty org (`:tok`) still folds to `default`.
+///
+/// Split out from [`ApiTokens::from_csv`] so unit tests can exercise
+/// the parser without HashMap ceremony.
+fn parse_env_entry(entry: &str) -> (OrgId, String, Role) {
+    let entry = entry.trim();
+    // splitn(3) so a token containing a `:` isn't mangled — everything
+    // past the 2nd colon is considered "role-or-token-tail".
+    let parts: Vec<&str> = entry.splitn(3, ':').collect();
+    match parts.as_slice() {
+        [tok] => (
+            OrgId::default_org(),
+            tok.trim().to_owned(),
+            Role::default_for_legacy(),
+        ),
+        [org, tok] => {
+            let org = normalize_org(org);
+            (org, tok.trim().to_owned(), Role::default_for_legacy())
+        }
+        [org, tok, maybe_role] => {
+            let org = normalize_org(org);
+            if let Some(role) = Role::parse(maybe_role) {
+                (org, tok.trim().to_owned(), role)
+            } else {
+                // Third component isn't a known role — treat as
+                // token-tail. Reassemble to preserve any `:` inside
+                // the secret.
+                let token = format!("{}:{}", tok.trim(), maybe_role.trim());
+                (org, token, Role::default_for_legacy())
+            }
+        }
+        _ => unreachable!("splitn(3) yields at most 3 parts"),
+    }
+}
+
+fn normalize_org(org_str: &str) -> OrgId {
+    let s = org_str.trim();
+    if s.is_empty() {
+        OrgId::default_org()
+    } else {
+        OrgId::new(s)
+    }
+}
+
 /// Read 32 bytes from `/dev/urandom` and base64url-encode (no padding).
 /// Yields a 43-char string prefixed with `nv_` so operators can grep for
 /// nanovm bearer tokens at a glance. Total length: 46 chars.
@@ -602,7 +749,10 @@ pub async fn require_token(
         // Auth disabled: anonymous traffic is treated as the default
         // org. Useful for local dev; production deployments must set
         // NANOVM_API_TOKENS so the middleware actually checks anything.
+        // Role is Admin (least-restrictive) so auth-off mode keeps
+        // every handler reachable.
         req.extensions_mut().insert(OrgId::default_org());
+        req.extensions_mut().insert(Role::default_for_legacy());
         return Ok(next.run(req).await);
     }
     let bearer = req
@@ -613,11 +763,49 @@ pub async fn require_token(
         .ok_or_else(|| {
             ApiError::Unauthorized("missing or malformed authorization header".into())
         })?;
-    let Some(org) = tokens.org_for(bearer) else {
+    let Some((org, role)) = tokens.resolve(bearer) else {
         return Err(ApiError::Unauthorized("invalid api token".into()));
     };
     req.extensions_mut().insert(org);
+    req.extensions_mut().insert(role);
     Ok(next.run(req).await)
+}
+
+/// Handler-side helper: verify the caller's [`Role`] extension is at
+/// least `min`. Returns `Err(ApiError::Forbidden)` with a
+/// `role_required` code on insufficient scope, `Ok(())` otherwise.
+///
+/// **Not called by any handler today** — this is the shovel-ready
+/// hook for when SSO ships and role assignments arrive from group
+/// mapping. Kept next to the [`Role`] type so the enforcement API
+/// lives with the schema.
+///
+/// Typical use once SSO lands:
+///
+/// ```ignore
+/// async fn revoke_key(
+///     Extension(role): Extension<Role>,
+///     // ...
+/// ) -> Result<(), ApiError> {
+///     require_role(role, Role::Admin)?;
+///     // ...
+/// }
+/// ```
+// Intentionally unused today — see the doc comment above. The stub
+// exists so handlers can start calling it the moment SSO ships without
+// a follow-up refactor. Kept `pub(crate)` so it survives dead-code
+// analysis in the whole crate; when the first handler calls it the
+// allow can come off.
+#[allow(dead_code)]
+pub(crate) fn require_role(caller: Role, min: Role) -> Result<(), ApiError> {
+    if caller >= min {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden {
+            code: "role_required",
+            message: format!("this endpoint requires role >= {min}; caller has {caller}"),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -682,6 +870,118 @@ mod tests {
         let t = ApiTokens::from_csv("acme:tok1");
         assert!(t.org_for("tok2").is_none());
         assert!(t.org_for("").is_none());
+    }
+
+    // ---- RBAC stub -----------------------------------------------------
+
+    #[test]
+    fn role_parse_case_insensitive() {
+        assert_eq!(Role::parse("admin"), Some(Role::Admin));
+        assert_eq!(Role::parse("ADMIN"), Some(Role::Admin));
+        assert_eq!(Role::parse("Developer"), Some(Role::Developer));
+        assert_eq!(Role::parse("dev"), Some(Role::Developer));
+        assert_eq!(Role::parse("viewer"), Some(Role::Viewer));
+        assert_eq!(Role::parse("readonly"), Some(Role::Viewer));
+        assert_eq!(Role::parse("read-only"), Some(Role::Viewer));
+        assert_eq!(Role::parse("  viewer  "), Some(Role::Viewer));
+        assert_eq!(Role::parse("root"), None);
+        assert_eq!(Role::parse(""), None);
+    }
+
+    #[test]
+    fn role_ordering_admin_is_strictest() {
+        // Ordering matters for require_role's `caller >= min` check.
+        assert!(Role::Admin >= Role::Developer);
+        assert!(Role::Admin >= Role::Viewer);
+        assert!(Role::Developer >= Role::Viewer);
+        assert!(Role::Developer < Role::Admin);
+        assert!(Role::Viewer < Role::Developer);
+    }
+
+    #[test]
+    fn require_role_allows_stricter_and_rejects_looser() {
+        assert!(require_role(Role::Admin, Role::Developer).is_ok());
+        assert!(require_role(Role::Developer, Role::Developer).is_ok());
+        assert!(require_role(Role::Admin, Role::Admin).is_ok());
+        let err = require_role(Role::Viewer, Role::Admin).unwrap_err();
+        assert!(matches!(
+            err,
+            ApiError::Forbidden {
+                code: "role_required",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_env_entry_shapes() {
+        // Legacy: no colons at all.
+        assert_eq!(
+            parse_env_entry("just-a-token"),
+            (
+                OrgId::default_org(),
+                "just-a-token".to_string(),
+                Role::Admin
+            )
+        );
+        // Two-part: org:token, default role.
+        assert_eq!(
+            parse_env_entry("acme:tok"),
+            (OrgId::new("acme"), "tok".to_string(), Role::Admin)
+        );
+        // Three-part: org:token:role.
+        assert_eq!(
+            parse_env_entry("acme:tok:developer"),
+            (OrgId::new("acme"), "tok".to_string(), Role::Developer)
+        );
+        assert_eq!(
+            parse_env_entry("acme:tok:viewer"),
+            (OrgId::new("acme"), "tok".to_string(), Role::Viewer)
+        );
+        // Empty org folds to default.
+        assert_eq!(
+            parse_env_entry(":tok:admin"),
+            (OrgId::default_org(), "tok".to_string(), Role::Admin)
+        );
+    }
+
+    #[test]
+    fn parse_env_entry_preserves_colons_inside_token_when_third_part_isnt_a_role() {
+        // Guard against silently mangling a token that happens to
+        // contain `:`. `acme:sk-live:xyz` is (org=acme,
+        // token="sk-live:xyz", default role) — because `xyz` isn't a
+        // known role name.
+        let (org, tok, role) = parse_env_entry("acme:sk-live:xyz");
+        assert_eq!(org, OrgId::new("acme"));
+        assert_eq!(tok, "sk-live:xyz");
+        assert_eq!(role, Role::Admin);
+    }
+
+    #[test]
+    fn from_csv_admits_role_suffix() {
+        let t = ApiTokens::from_csv("acme:tok-a:admin,acme:tok-b:developer,acme:tok-c:viewer");
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.resolve("tok-a").map(|(_, r)| r), Some(Role::Admin));
+        assert_eq!(t.resolve("tok-b").map(|(_, r)| r), Some(Role::Developer));
+        assert_eq!(t.resolve("tok-c").map(|(_, r)| r), Some(Role::Viewer));
+    }
+
+    #[test]
+    fn resolve_returns_admin_for_legacy_token_shape() {
+        let t = ApiTokens::from_csv("legacy-token,acme:tok");
+        assert_eq!(
+            t.resolve("legacy-token"),
+            Some((OrgId::default_org(), Role::Admin))
+        );
+        assert_eq!(t.resolve("tok"), Some((OrgId::new("acme"), Role::Admin)));
+    }
+
+    #[test]
+    fn role_round_trips_through_serde() {
+        let json = serde_json::to_string(&Role::Developer).unwrap();
+        assert_eq!(json, r#""developer""#);
+        let back: Role = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Role::Developer);
     }
 
     #[test]
