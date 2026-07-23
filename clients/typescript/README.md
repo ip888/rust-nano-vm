@@ -181,6 +181,15 @@ ship in a follow-up once there's demand.
 Pre-1.0, expect churn aligned with the server. The SDK's version
 tracks the server's `major.minor.patch`.
 
+npm releases ship via
+[`.github/workflows/npm-publish.yml`](../../.github/workflows/npm-publish.yml)
+on every `v*.*.*` tag push, using npm Trusted Publishing (GitHub OIDC —
+no `NPM_TOKEN` stored in the repo). Every tarball carries a Sigstore
+provenance attestation you can verify with `npm audit signatures`.
+Until the Trusted Publisher is registered on npmjs (a one-time
+maintainer step; see the workflow header), the publish step fails
+cleanly and no package ships.
+
 ## License
 
 Apache-2.0 OR MIT (same as the rust-nano-vm workspace).

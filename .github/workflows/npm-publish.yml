@@ -1,0 +1,165 @@
+name: npm-publish
+
+# Build and publish the `@nanovm/sdk` TypeScript client to npm on every
+# `v*.*.*` tag push — the same trigger that ships PyPI + GHCR
+# artifacts, so all three stay version-locked.
+#
+# Authentication uses npm Trusted Publishing (GitHub OIDC), so no
+# `NPM_TOKEN` secret is stored in this repo. One-time setup on
+# npmjs.com (a maintainer with publish rights on the `@nanovm` org
+# runs these steps once):
+#
+#   1. Ensure the `@nanovm` scope exists on npm. First publish of the
+#      `@nanovm/sdk` package must be manual with `npm publish
+#      --access public` from a maintainer's machine after `npm login`;
+#      after that the package's Trusted Publishing settings can be
+#      configured to promote this workflow to the sole publisher.
+#   2. https://www.npmjs.com/package/@nanovm/sdk/access →
+#      "Trusted Publishers" → "Add trusted publisher" →
+#        - Publisher:        GitHub Actions
+#        - Organization:     ip888
+#        - Repository:       Rust-nano-vm
+#        - Workflow name:    npm-publish.yml
+#        - Environment:      npm
+#   3. Remove any long-lived `NPM_TOKEN` secret from repo settings so
+#      Trusted Publishing is the only path.
+#
+# Until that npmjs-side setup is done, this workflow will FAIL at the
+# publish step with an OIDC verification error. That's the intended
+# fence — the job runs and shows a clean build, but no package gets
+# published until the human registers the Trusted Publisher on npm.
+#
+# Every publish carries a provenance attestation (`--provenance`) so
+# consumers can verify the tarball's build came from this workflow
+# file at this commit sha.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  # Manual dry-run: build + test + `npm publish --dry-run` against a
+  # branch without actually publishing.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+  build:
+    name: build + test + dry-run pack
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/typescript
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org/
+          cache: npm
+          cache-dependency-path: clients/typescript/package-lock.json
+
+      - name: Install (locked)
+        run: npm ci
+
+      - name: Sync package.json version to tag
+        # On a `v*.*.*` push, refname is `v0.1.0` → `version` becomes
+        # `0.1.0`. On dispatch runs (no tag), skip so we publish
+        # whatever's already committed.
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eux
+          TAG="${GITHUB_REF_NAME#v}"
+          # Update via `npm version` so the shape of the write matches
+          # what `npm publish` will consume. `--no-git-tag-version`
+          # skips the commit + git tag (the tag already exists).
+          # `--allow-same-version` lets a hand-picked-tag == committed-
+          # version release still succeed instead of erroring.
+          npm version "$TAG" --no-git-tag-version --allow-same-version
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm run test
+
+      - name: Verify the tarball contents (dry-run pack)
+        # `npm pack --dry-run` prints exactly what would ship without
+        # writing a tarball. Fails fast if `dist/` is missing (would
+        # publish a broken empty package), or if a file we didn't
+        # intend to ship (say, `test/` or `node_modules`) sneaks in.
+        run: npm pack --dry-run
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-dist
+          path: |
+            clients/typescript/dist/
+            clients/typescript/package.json
+            clients/typescript/package-lock.json
+            clients/typescript/README.md
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish to npm
+    # Only publish on tag pushes; skip on manual dry-run dispatches.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    # Bound the OIDC blast radius to a named environment so npm's
+    # Trusted Publisher binding stays specific to this workflow.
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@nanovm/sdk
+    permissions:
+      # Trusted Publishing: GitHub mints a short-lived OIDC token that
+      # npm verifies — no long-lived secret in repo settings. Also
+      # required for `--provenance`.
+      id-token: write
+      # Provenance attestations are read from the workflow log —
+      # `attestations: write` is what lets `--provenance` upload the
+      # signed attestation to Sigstore's transparency log.
+      attestations: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org/
+          cache: npm
+          cache-dependency-path: clients/typescript/package-lock.json
+
+      - name: Install (locked)
+        working-directory: clients/typescript
+        run: npm ci
+
+      - name: Sync package.json version to tag
+        working-directory: clients/typescript
+        run: |
+          set -eux
+          TAG="${GITHUB_REF_NAME#v}"
+          npm version "$TAG" --no-git-tag-version --allow-same-version
+
+      - name: Build
+        working-directory: clients/typescript
+        run: npm run build
+
+      - name: Publish with provenance
+        working-directory: clients/typescript
+        # `--access public` is required on every publish of a scoped
+        # package (`@nanovm/sdk`); npm defaults scoped packages to
+        # `restricted` even after the first publish. `--provenance`
+        # uploads a Sigstore attestation binding this tarball to this
+        # commit + workflow file; consumers verify with
+        # `npm audit signatures`.
+        run: npm publish --access public --provenance
