@@ -92,6 +92,29 @@ Containers remain the right default for most workloads. For agent code
 execution where cold start matters and an adversarial model is warranted,
 a microVM is the right primitive.
 
+## Reproducing the numbers
+
+Latency numbers in this doc and on the landing page come from
+`nanovm-api-bench` — a small CLI that POSTs sequential fork requests
+to a running control plane, reads the server-reported `fork_ms` out of
+each response body, and prints a markdown table + text histogram.
+
+Anyone can reproduce:
+
+```sh
+export NANOVM_BENCH_URL=https://api.your-saas.com
+export NANOVM_BENCH_TOKEN=nv_<throwaway>
+cargo run -p api-bench --release -- \
+    --marketplace-name python-3.12-minimal \
+    --n 100 --warmup 10
+```
+
+See [`crates/api-bench/README.md`](../crates/api-bench/README.md) for
+setup, output shape, and JSON mode for CI regression tracking. For the
+KVM host-side syscall latency (the number to compare against
+Firecracker benchmarks, not against E2B or Modal), use
+`crates/bench`'s `nanovm-fork-bench` instead.
+
 ## When to choose what
 
 - **Model only writes pure Python, never needs shell / `pip install` / a native package?** LangChain Sandbox (Pyodide + Deno).
