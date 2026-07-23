@@ -333,6 +333,33 @@ See [`clients/python/README.md`](clients/python/README.md) for the
 full surface — snapshot/fork, cursor pagination, error handling,
 and the `iter_vms()` helper that walks the whole result set.
 
+## TypeScript / JavaScript client
+
+For Node.js and browser agents, an ESM-only TypeScript SDK lives at
+[`clients/typescript/`](clients/typescript/). 1:1 mirror of the
+Python SDK's surface — `Client`, `Sandbox`, typed exceptions,
+`await using` for scope-bound sandbox lifecycle. Zero runtime deps
+(uses global `fetch`, Node 18+).
+
+```ts
+import { Client } from "@nanovm/sdk";
+
+const client = new Client("https://api.nanovm.example.com", { token: "nv_..." });
+
+await using sb = client.sandbox("python-3.12-ds");
+console.log((await sb.executePython("print(1 + 1)")).stdout);  // "2\n"
+```
+
+Install:
+
+```sh
+npm install @nanovm/sdk
+```
+
+See [`clients/typescript/README.md`](clients/typescript/README.md)
+for the full surface — streaming exec, cursor pagination, framework
+adapters, `Symbol.asyncDispose` support.
+
 ## Quickstart — demo in 30 seconds (mock backend, no KVM)
 
 One command, identical on Linux, macOS, and Windows. Only prerequisite
