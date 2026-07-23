@@ -25,9 +25,20 @@
 //! token lands in the `default` org as `admin`. That preserves
 //! single-tenant deployments byte-for-byte.
 //!
-//! The role is a **shovel-ready stub** — see [`Role`] and
-//! [`require_role`]. No handler enforces it today; the plumbing lands
-//! now so SSO integration doesn't need a schema migration.
+//! Role enforcement is live on the destructive/admin surface — see
+//! [`Role`] and [`require_role`]. The enforcement matrix:
+//!
+//! - **Admin**: `POST /v1/keys`, `DELETE /v1/keys/:id`,
+//!   `GET /v1/billing/portal`.
+//! - **Developer or higher**: `DELETE /v1/vms/:id`,
+//!   `DELETE /v1/snapshots/:id`.
+//! - **Viewer or higher**: every other authenticated endpoint (list,
+//!   read, exec, fork, sandbox action, health, usage).
+//!
+//! Every legacy env-loaded token defaults to `Admin` (see
+//! [`Role::default_for_legacy`]) so existing single-tenant deployments
+//! keep working byte-for-byte. New env entries opt into a stricter
+//! role with the `@role` suffix.
 //!
 //! ## Token sources
 //!
@@ -816,12 +827,12 @@ pub async fn require_token(
 /// least `min`. Returns `Err(ApiError::Forbidden)` with a
 /// `role_required` code on insufficient scope, `Ok(())` otherwise.
 ///
-/// **Not called by any handler today** — this is the shovel-ready
-/// hook for when SSO ships and role assignments arrive from group
-/// mapping. Kept next to the [`Role`] type so the enforcement API
-/// lives with the schema.
+/// Called by every handler that gates on role — see the enforcement
+/// matrix in the module docs. Uses the [`Role`] ordinal ordering
+/// (`Viewer < Developer < Admin`) so `Role::Admin` satisfies any
+/// requirement.
 ///
-/// Typical use once SSO lands:
+/// Typical use:
 ///
 /// ```ignore
 /// async fn revoke_key(
@@ -832,12 +843,6 @@ pub async fn require_token(
 ///     // ...
 /// }
 /// ```
-// Intentionally unused today — see the doc comment above. The stub
-// exists so handlers can start calling it the moment SSO ships without
-// a follow-up refactor. Kept `pub(crate)` so it survives dead-code
-// analysis in the whole crate; when the first handler calls it the
-// allow can come off.
-#[allow(dead_code)]
 pub(crate) fn require_role(caller: Role, min: Role) -> Result<(), ApiError> {
     if caller >= min {
         Ok(())

@@ -25,7 +25,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{ApiTokens, OrgId, RuntimeTokenInfo, TokenId};
+use crate::auth::{require_role, ApiTokens, OrgId, Role, RuntimeTokenInfo, TokenId};
 use crate::error::ApiError;
 
 /// Response body for `POST /v1/keys`. The `token` field is the only
@@ -68,10 +68,15 @@ impl From<RuntimeTokenInfo> for KeyEntry {
 }
 
 /// `POST /v1/keys` — mint a new bearer token for the caller's org.
+/// Admin-only: minting a token grants a new principal indefinite access
+/// to the org until an admin revokes it, so it's classified as an
+/// admin-scope operation alongside billing.
 pub(crate) async fn issue_key(
     Extension(tokens): Extension<Arc<ApiTokens>>,
     Extension(org): Extension<OrgId>,
+    Extension(role): Extension<Role>,
 ) -> Result<(StatusCode, Json<IssueKeyResponse>), ApiError> {
+    require_role(role, Role::Admin)?;
     let issued = tokens.issue(org);
     Ok((
         StatusCode::CREATED,
@@ -106,8 +111,10 @@ pub(crate) async fn list_keys(
 pub(crate) async fn revoke_key(
     Extension(tokens): Extension<Arc<ApiTokens>>,
     Extension(org): Extension<OrgId>,
+    Extension(role): Extension<Role>,
     id: Result<Path<String>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
+    require_role(role, Role::Admin)?;
     let Path(id) = id?;
     let id = TokenId(id);
     if tokens.revoke(&id, &org) {
