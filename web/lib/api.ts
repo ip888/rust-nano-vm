@@ -88,7 +88,10 @@ export interface VmListEntry {
   vcpus?: number;
   memory_mib?: number;
   kernel_cmdline?: string;
-  snapshot_source?: string;
+  /** Absolute snapshot directory the VM was restored from. Serialised
+   *  from a `PathBuf` — always the server-side path, not the caller's.
+   *  Field name matches the server's `VmListEntry.snapshot_dir`. */
+  snapshot_dir?: string;
 }
 
 /** Cursor-paginated envelope for `GET /v1/vms`. `next` is the last

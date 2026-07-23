@@ -218,10 +218,10 @@ function VmRow({
               {vm.memory_mib} MiB
             </>
           )}
-          {vm.snapshot_source && (
+          {vm.snapshot_dir && (
             <>
-              {" · from snapshot "}
-              <span className="font-mono">{vm.snapshot_source}</span>
+              {" · from "}
+              <span className="font-mono">{vm.snapshot_dir}</span>
             </>
           )}
         </div>
