@@ -100,21 +100,39 @@ struct Args {
     no_destroy: bool,
 }
 
+/// Ceiling on `--warmup + --n`. Everything is buffered in RAM (the
+/// Vec of measured samples + the intermediate per-iteration state),
+/// so an unbounded value would let a typo turn a benchmark run into
+/// an OOM. Chosen high enough to cover every realistic benchmark
+/// (100k forks × 4 bytes/sample ≈ 400 KB) while still catching the
+/// `--n 100000000` fat-finger.
+const MAX_TOTAL_ITERATIONS: usize = 100_000;
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.n == 0 {
         bail!("--n must be >= 1");
     }
-    if args.warmup > 100_000 {
-        bail!("--warmup must be <= 100000; the harness records everything in memory");
+    let total = args
+        .warmup
+        .checked_add(args.n)
+        .ok_or_else(|| anyhow!("--warmup + --n overflowed usize"))?;
+    if total > MAX_TOTAL_ITERATIONS {
+        bail!(
+            "--warmup + --n = {total} exceeds MAX_TOTAL_ITERATIONS ({MAX_TOTAL_ITERATIONS}); \
+             the harness records every measured sample in memory. Split into multiple runs \
+             or raise the cap."
+        );
     }
 
     let client = build_client(&args)?;
     let path = fork_path(&args);
     let url = format!("{}{}", args.api_url.trim_end_matches('/'), path);
 
-    let total = args.warmup + args.n;
-    let mut samples: Vec<u32> = Vec::with_capacity(total);
+    // Reserve for the MEASURED window only — warmup samples are
+    // dropped before landing in `samples`, so `args.n` is the actual
+    // capacity we need.
+    let mut samples: Vec<u32> = Vec::with_capacity(args.n);
 
     for i in 0..total {
         let (ms, vm_id) = one_fork(&client, &url, &args.token, args.timeout_secs)?;
@@ -340,7 +358,15 @@ fn summarise(samples: &[u32]) -> Summary {
     }
 }
 
-/// Nearest-rank percentile over a pre-sorted vector.
+/// Inclusive-index percentile over a pre-sorted vector: `idx =
+/// floor((n - 1) * p / 100)`. This is NOT the classic nearest-rank
+/// definition (`ceil(n * p / 100) - 1`); the difference only matters
+/// at small `n` and at the top end (nearest-rank returns
+/// `sorted[n-1]` for p=99 at n=20; this returns `sorted[18]`).
+/// Chose the inclusive-index form because it stays inside
+/// `[0, n-1]` without a `saturating_sub`, and because it lines up
+/// with what most percentile helpers in the Prometheus /
+/// perf-tools world produce for the same input.
 fn percentile(sorted: &[u32], p: u32) -> u32 {
     if sorted.is_empty() {
         return 0;

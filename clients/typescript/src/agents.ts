@@ -1,7 +1,7 @@
 /**
  * Framework-agnostic agent-tool helpers for `@nanovm/sdk`.
  *
- * Mirrors [`nanovm.agents.openai`](../python/src/nanovm/agents/openai.py)
+ * Mirrors [`nanovm.agents.openai`](../../python/src/nanovm/agents/openai.py)
  * from the Python SDK: a JSON-Schema tool descriptor list plus a
  * dispatcher. The OpenAI function-tool shape is the lingua franca of
  * every current agent framework — it drops straight into:
@@ -58,8 +58,10 @@ import type { Client, SandboxResult } from "./index.js";
  *
  * Adding a new action is a two-step change: append its descriptor
  * here, then handle it in {@link dispatchNanovmToolCall}. Keep the
- * two lists byte-for-byte in sync — the dispatcher throws for names
- * that aren't in the schema list.
+ * two lists byte-for-byte in sync — the dispatcher returns an
+ * `error: unknown tool name '<name>'…` string for names that aren't
+ * in the schema list (the "never throw" contract that keeps the
+ * agent loop alive on a mismatch).
  */
 export interface NanovmToolSchema {
   type: "function";
@@ -163,34 +165,31 @@ export async function dispatchNanovmToolCall(
   argumentsJson: string,
   opts: DispatchOptions = {},
 ): Promise<string> {
-  let args: Record<string, unknown>;
-  try {
-    args = argumentsJson ? (JSON.parse(argumentsJson) as Record<string, unknown>) : {};
-  } catch (e) {
-    return `error: could not parse tool arguments as JSON: ${
-      e instanceof Error ? e.message : String(e)
-    }`;
-  }
+  const parsed = parseArgs(argumentsJson);
+  if (parsed.kind === "error") return parsed.message;
+  const args = parsed.value;
 
   try {
     let result: SandboxResult;
     if (name === "execute_python") {
-      const code = typeof args.code === "string" ? args.code : "";
+      if (typeof args.code !== "string" || args.code === "") {
+        return `error: tool 'execute_python' requires a non-empty string 'code' argument.`;
+      }
       result = await callExecute(
-        client,
         (snapshot) =>
-          client.executePython(code, {
+          client.executePython(args.code as string, {
             snapshot,
             ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
           }),
         opts.snapshot,
       );
     } else if (name === "execute_shell") {
-      const command = typeof args.command === "string" ? args.command : "";
+      if (typeof args.command !== "string" || args.command === "") {
+        return `error: tool 'execute_shell' requires a non-empty string 'command' argument.`;
+      }
       result = await callExecute(
-        client,
         (snapshot) =>
-          client.executeShell(command, {
+          client.executeShell(args.command as string, {
             snapshot,
             ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
           }),
@@ -207,24 +206,63 @@ export async function dispatchNanovmToolCall(
 }
 
 /**
+ * Parse and validate an OpenAI tool-call `arguments` string into an
+ * object we can index into. OpenAI's field is nominally a JSON string
+ * of the schema's `parameters` object, but callers have been seen
+ * emitting `null`, arrays, or plain literals (Anthropic tool use is
+ * looser about this too). Reject anything that isn't a JSON object
+ * with an actionable error string — the alternative is silently
+ * executing an empty program because `args.code` would be `undefined`.
+ */
+function parseArgs(
+  argumentsJson: string,
+): { kind: "ok"; value: Record<string, unknown> } | { kind: "error"; message: string } {
+  const raw = argumentsJson === "" ? "{}" : argumentsJson;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    return {
+      kind: "error",
+      message: `error: could not parse tool arguments as JSON: ${
+        e instanceof Error ? e.message : String(e)
+      }`,
+    };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {
+      kind: "error",
+      message: `error: tool arguments must be a JSON object; got ${describeJsonKind(parsed)}.`,
+    };
+  }
+  return { kind: "ok", value: parsed as Record<string, unknown> };
+}
+
+function describeJsonKind(v: unknown): string {
+  if (v === null) return "null";
+  if (Array.isArray(v)) return "array";
+  return typeof v;
+}
+
+/**
  * Invoke `fn(snapshot)` — pushing `snapshot` in as required by the
- * `Client` action signatures — but treat "no snapshot passed" as the
- * server-side env fallback. The one-shot sandbox actions' `snapshot`
- * is a required parameter on the client, so we bridge through by
- * expecting the caller to have supplied one; if not, we surface a
- * targeted error instead of a `TypeError` deep inside `fetch`.
+ * `Client` action signatures — but treat "no snapshot passed" as a
+ * hard error. The one-shot sandbox actions' `snapshot` is a required
+ * parameter on the client, so if the caller forgot it we surface a
+ * targeted string instead of a `TypeError` deep inside `fetch`.
  */
 async function callExecute(
-  _client: Client,
   fn: (snapshot: number | string) => Promise<SandboxResult>,
   snapshot: number | string | undefined,
 ): Promise<SandboxResult> {
   if (snapshot === undefined) {
     throw new Error(
       "dispatchNanovmToolCall: no snapshot provided. Pass " +
-        "`{ snapshot: <id | marketplace-name> }` in the third argument, " +
-        "or configure `NANOVM_SANDBOX_SNAPSHOT_ID` on the server and " +
-        "call `client.sandboxInvoke(...)` directly.",
+        "`{ snapshot: <id | marketplace-name> }` in the 4th argument " +
+        "(the DispatchOptions object). If you want the server's " +
+        "`NANOVM_SANDBOX_SNAPSHOT_ID` env fallback, call " +
+        "`Client.executePython/executeShell` directly instead of going " +
+        "through this dispatcher.",
     );
   }
   return fn(snapshot);

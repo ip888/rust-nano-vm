@@ -26,7 +26,7 @@ Firecracker-benchmark posts compare against.
 ```sh
 cargo run -p api-bench --release -- \
     --api-url https://api.your-saas.com \
-    --token   nv_<your-key> \
+    --token   nv_YOUR_KEY \
     --marketplace-name python-3.12-minimal \
     --n 100 --warmup 10
 ```
@@ -35,7 +35,7 @@ Or via env vars:
 
 ```sh
 export NANOVM_BENCH_URL=https://api.your-saas.com
-export NANOVM_BENCH_TOKEN=nv_<your-key>
+export NANOVM_BENCH_TOKEN=nv_YOUR_KEY
 cargo run -p api-bench --release -- \
     --marketplace-name python-3.12-minimal
 ```
@@ -55,8 +55,8 @@ cargo run -p api-bench --release -- \
 ## Summary (ms)
 
 | p50 | p90 | p95 | p99 | min | max | mean | stddev |
-|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|
-| 12  | 14  | 25  | 28  | 11  | 30  | 13  | 4   |
+|-----|-----|-----|-----|-----|-----|------|--------|
+| 12  | 14  | 25  | 28  | 11  | 30  | 13   | 4      |
 
 ## Distribution
 
