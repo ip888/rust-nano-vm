@@ -46,7 +46,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{ApiTokens, IssuedToken, OrgId};
+use crate::auth::{require_role, ApiTokens, IssuedToken, OrgId, Role};
 use crate::error::ApiError;
 
 // -------- DTOs ----------------------------------------------------------
@@ -1600,10 +1600,14 @@ pub(crate) async fn signup_verify_handler(
 /// `GET /v1/billing/portal` axum handler. Reaches this handler ONLY
 /// after `auth::require_token` middleware injected the caller's
 /// [`OrgId`], so `Extension<OrgId>` is always present here.
+/// Admin-only: the billing portal lets the caller change payment
+/// method, cancel, or upgrade the subscription — org-level scope.
 pub(crate) async fn billing_portal_handler(
     State(state): State<crate::AppState>,
     Extension(org): Extension<OrgId>,
+    Extension(role): Extension<Role>,
 ) -> Result<Json<PortalResponse>, ApiError> {
+    require_role(role, Role::Admin)?;
     let ctx = state.billing_ctx().ok_or(ApiError::Unsupported {
         code: "billing_disabled",
         message: "billing endpoints require the `billing` feature + Stripe env vars".into(),

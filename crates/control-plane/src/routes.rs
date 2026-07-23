@@ -49,7 +49,7 @@ use crate::api::{
 };
 use crate::audit;
 use crate::auth;
-use crate::auth::OrgId;
+use crate::auth::{require_role, OrgId, Role};
 use crate::error::ApiError;
 use crate::ownership::OwnershipMap;
 use crate::request_id;
@@ -704,8 +704,10 @@ async fn stop_vm(
 async fn destroy_vm(
     State(state): State<AppState>,
     Extension(org): Extension<OrgId>,
+    Extension(role): Extension<Role>,
     id: Result<Path<u64>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
+    require_role(role, Role::Developer)?;
     let Path(id) = id?;
     let vm_id = VmId(id);
     state.ownership.require_vm_access(vm_id, &org)?;
@@ -1092,8 +1094,10 @@ async fn list_snapshots(
 async fn delete_snapshot(
     State(state): State<AppState>,
     Extension(org): Extension<OrgId>,
+    Extension(role): Extension<Role>,
     id: Result<Path<u64>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
+    require_role(role, Role::Developer)?;
     let Path(id) = id?;
     let snap_id = SnapshotId(id);
     state.ownership.require_snapshot_access(snap_id, &org)?;
