@@ -14,6 +14,7 @@ Fully client-side. Every page is either a static route or a client component; th
 | `/signup/verify` | Magic-link landing (`?token=…`). POSTs `/v1/signup/verify`, shows the API key once, persists the session. |
 | `/login` | Paste API key. Verifies against `/v1/billing/plan` before caching. |
 | `/dashboard` | Reads `/v1/billing/plan` + `/v1/usage`. Tiles for plan, usage, quick-start snippet. Sign-out clears the session. |
+| `/dashboard/playground` | In-browser Python/shell playground. Marketplace snapshot picker + code editor; each Run forks a fresh VM, execs, destroys. Shows stdout/stderr/exit_code and wall-clock breakdown. |
 | `/dashboard/keys` | List, mint, revoke runtime API keys against `/v1/keys`. New keys shown once with copy-to-clipboard. |
 | `/dashboard/vms` | List the org's VMs against `/v1/vms` (cursor-paginated). Destroy per row. |
 | `/dashboard/snapshots` | List the org's snapshots against `/v1/snapshots` (cursor-paginated). Destroy per row. |
