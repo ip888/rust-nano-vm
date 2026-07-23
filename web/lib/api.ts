@@ -76,6 +76,44 @@ export interface UsageByOrgResponse {
   orgs: UsageByOrgEntry[];
 }
 
+/** Wire-format VM state — mirrors `VmStateDto` in `crates/control-plane/src/api.rs`. */
+export type VmStateDto = "created" | "running" | "stopped";
+
+/** Row in `GET /v1/vms`. Geometry fields are optional — the mock
+ *  backend surfaces them; a real backend that can't may omit. */
+export interface VmListEntry {
+  id: number;
+  display: string;
+  state: VmStateDto;
+  vcpus?: number;
+  memory_mib?: number;
+  kernel_cmdline?: string;
+  snapshot_source?: string;
+}
+
+/** Cursor-paginated envelope for `GET /v1/vms`. `next` is the last
+ *  returned id — pass as `after=<next>` for the next page. Absent
+ *  when the page fits in one response. */
+export interface VmListResponse {
+  vms: VmListEntry[];
+  next?: number;
+}
+
+/** Row in `GET /v1/snapshots`. Same optional-geometry pattern. */
+export interface SnapshotListEntry {
+  id: number;
+  display: string;
+  vcpu_count?: number;
+  memory_bytes?: number;
+  page_size?: number;
+  kernel_cmdline?: string;
+}
+
+export interface SnapshotListResponse {
+  snapshots: SnapshotListEntry[];
+  next?: number;
+}
+
 /** A row in `GET /v1/keys`. `token` is NEVER returned by list — only mint. */
 export interface KeyEntry {
   id: string;
@@ -236,6 +274,38 @@ export function getUsageByOrg(
 ): Promise<UsageByOrgResponse> {
   const suffix = opts.all ? "?all=true" : "";
   return request<UsageByOrgResponse>(`/v1/usage/by-org${suffix}`, { apiKey });
+}
+
+/** Cursor-paginated `GET /v1/vms`. `after` is the last-seen id; empty
+ *  → first page. `limit` defaults server-side. */
+export function listVms(
+  apiKey: string,
+  opts: { limit?: number; after?: number } = {},
+): Promise<VmListResponse> {
+  const params = new URLSearchParams();
+  if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+  if (opts.after !== undefined) params.set("after", String(opts.after));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request<VmListResponse>(`/v1/vms${suffix}`, { apiKey });
+}
+
+export function destroyVm(apiKey: string, id: number): Promise<void> {
+  return request<void>(`/v1/vms/${id}`, { apiKey, method: "DELETE" });
+}
+
+export function listSnapshots(
+  apiKey: string,
+  opts: { limit?: number; after?: number } = {},
+): Promise<SnapshotListResponse> {
+  const params = new URLSearchParams();
+  if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+  if (opts.after !== undefined) params.set("after", String(opts.after));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request<SnapshotListResponse>(`/v1/snapshots${suffix}`, { apiKey });
+}
+
+export function destroySnapshot(apiKey: string, id: number): Promise<void> {
+  return request<void>(`/v1/snapshots/${id}`, { apiKey, method: "DELETE" });
 }
 
 export function listKeys(apiKey: string): Promise<ListKeysResponse> {
