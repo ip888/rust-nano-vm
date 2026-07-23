@@ -296,6 +296,31 @@ export function destroyVm(apiKey: string, id: number): Promise<void> {
   return request<void>(`/v1/vms/${id}`, { apiKey, method: "DELETE" });
 }
 
+/** Response of `POST /v1/vms/:id/exec`. `exit_code` is null when the
+ *  guest process was killed by a signal (mirror the Rust `Option<i32>`). */
+export interface ExecResponse {
+  exit_code: number | null;
+  signal: number | null;
+  stdout: string;
+  stderr: string;
+  duration_ms: number;
+}
+
+/** Run a program in an existing VM. Blocks until the process exits or
+ *  hits `timeout_ms`. Not streaming — for streaming output use
+ *  `/v1/vms/:id/exec/stream`. */
+export function execVm(
+  apiKey: string,
+  id: number,
+  req: { program: string; args?: string[]; timeout_ms?: number },
+): Promise<ExecResponse> {
+  return request<ExecResponse>(`/v1/vms/${id}/exec`, {
+    apiKey,
+    method: "POST",
+    body: JSON.stringify(req),
+  });
+}
+
 export function listSnapshots(
   apiKey: string,
   opts: { limit?: number; after?: number } = {},
