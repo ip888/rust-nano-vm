@@ -1,0 +1,24 @@
+[package]
+name = "api-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reproducible REST-API fork-latency harness for the rust-nano-vm control plane — the tool behind the ~12 ms number on the landing page."
+keywords = ["microvm", "benchmark", "kvm", "performance", "api"]
+categories = ["virtualization", "development-tools::profiling"]
+
+[[bin]]
+name = "nanovm-api-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+reqwest = { workspace = true, features = ["json", "blocking"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

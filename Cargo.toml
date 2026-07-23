@@ -13,6 +13,7 @@ members = [
     "crates/proto",
     "crates/cli",
     "crates/bench",
+    "crates/api-bench",
     "crates/nanovm-mcp",
     "crates/vmm-ipc",
     "crates/nanovm-vmm-child",
