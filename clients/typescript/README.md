@@ -147,18 +147,133 @@ console.log(await client.usage());
 // { token: "tok-dev--9", fork_count: 42, fork_total_ms: 520 }
 ```
 
-## Framework adapters
+## Agent framework tools — one shape, every framework
 
-**Not shipped in v0.1.** The `Client` + `Sandbox` API is designed to
-drop straight into agent-framework tool definitions without an
-adapter layer:
+`@nanovm/sdk/agents` ships JSON-Schema tool descriptors in the OpenAI
+function-tool shape plus a dispatcher. The OpenAI shape is the lingua
+franca of every current agent framework: LangChain.js, Vercel AI SDK,
+Anthropic tool use, OpenAI Assistants / Responses / Chat Completions
+all consume it directly (with a tiny wrap for Anthropic's `input_schema`
+field name).
 
-- **LangChain.js** — wrap `sb.executePython` in `new DynamicTool({...})`.
-- **Vercel AI SDK** — pass `sb.executePython` inside `tool({ execute: ... })`.
-- **Mastra** — construct a `createTool({...})` with `execute: sb.executePython`.
+Zero peer deps — schemas are plain objects and the dispatcher takes a
+string. Bring your own agent framework.
 
-Purpose-built adapters (`@nanovm/sdk/langchain`, `@nanovm/sdk/vercel-ai`)
-ship in a follow-up once there's demand.
+```ts
+import { Client } from "@nanovm/sdk";
+import {
+  nanovmToolSchemas,
+  dispatchNanovmToolCall,
+} from "@nanovm/sdk/agents";
+
+const sandbox = new Client("http://localhost:8080", { token: "dev-token" });
+const tools = nanovmToolSchemas();  // [{type:"function", function:{...}}, ...]
+```
+
+### OpenAI Chat Completions / Responses / Assistants
+
+```ts
+import OpenAI from "openai";
+
+const llm = new OpenAI();
+const messages: any[] = [{ role: "user", content: "Compute pi to 40 digits" }];
+
+while (true) {
+  const rsp = await llm.chat.completions.create({
+    model: "gpt-4o", messages, tools,
+  });
+  const msg = rsp.choices[0].message;
+  messages.push(msg);
+  if (!msg.tool_calls?.length) { console.log(msg.content); break; }
+  for (const call of msg.tool_calls) {
+    const content = await dispatchNanovmToolCall(
+      sandbox, call.function.name, call.function.arguments,
+      { snapshot: "python-3.12-minimal" },
+    );
+    messages.push({ role: "tool", tool_call_id: call.id, content });
+  }
+}
+```
+
+### LangChain.js
+
+`bindTools()` accepts OpenAI-shape function tools verbatim:
+
+```ts
+import { ChatOpenAI } from "@langchain/openai";
+
+const llm = new ChatOpenAI({ model: "gpt-4o" });
+const llmWithTools = llm.bindTools(tools);
+
+const rsp = await llmWithTools.invoke([
+  { role: "user", content: "Compute pi to 40 digits" },
+]);
+
+for (const call of rsp.tool_calls ?? []) {
+  const output = await dispatchNanovmToolCall(
+    sandbox, call.name, JSON.stringify(call.args),
+    { snapshot: "python-3.12-minimal" },
+  );
+  // …append back as a ToolMessage and re-invoke.
+}
+```
+
+### Vercel AI SDK
+
+Wrap each descriptor's `parameters` with `jsonSchema()` from the `ai`
+package (a two-line convert) and pass into `streamText`/`generateText`:
+
+```ts
+import { streamText, jsonSchema } from "ai";
+import { openai } from "@ai-sdk/openai";
+
+const vercelTools = Object.fromEntries(
+  tools.map((t) => [
+    t.function.name,
+    {
+      description: t.function.description,
+      parameters: jsonSchema(t.function.parameters),
+      execute: async (args: unknown) =>
+        dispatchNanovmToolCall(
+          sandbox, t.function.name, JSON.stringify(args),
+          { snapshot: "python-3.12-minimal" },
+        ),
+    },
+  ]),
+);
+
+const rsp = streamText({
+  model: openai("gpt-4o"),
+  tools: vercelTools,
+  messages: [{ role: "user", content: "Compute pi to 40 digits" }],
+});
+```
+
+### Anthropic tool use
+
+Anthropic uses `input_schema` where OpenAI uses `parameters`:
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+
+const anthropicTools = tools.map((t) => ({
+  name: t.function.name,
+  description: t.function.description,
+  input_schema: t.function.parameters,
+}));
+
+const rsp = await new Anthropic().messages.create({
+  model: "claude-sonnet-4-5",
+  tools: anthropicTools,
+  messages: [{ role: "user", content: "Compute pi to 40 digits" }],
+  max_tokens: 1024,
+});
+```
+
+Every error in `dispatchNanovmToolCall` — bad JSON args, unknown tool
+name, network / auth / quota failure — is caught and returned as an
+`error: …` string. The model sees the error on its next turn and can
+self-correct instead of blowing up the agent loop.
 
 ## What this SDK is and isn't
 
