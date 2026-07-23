@@ -9,6 +9,7 @@ Fully client-side. Every page is either a static route or a client component; th
 | Route | Purpose |
 |---|---|
 | `/` | Landing page + pitch + code snippet. |
+| `/pricing` | Public pricing tiers (Free / Pro / Team / Enterprise), competitor comparison, FAQ. Static route. |
 | `/signup` | Email + org form → POST `/v1/signup/request`. |
 | `/signup/verify` | Magic-link landing (`?token=…`). POSTs `/v1/signup/verify`, shows the API key once, persists the session. |
 | `/login` | Paste API key. Verifies against `/v1/billing/plan` before caching. |

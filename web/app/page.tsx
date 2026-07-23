@@ -48,6 +48,9 @@ function SiteHeader() {
         <Link href="/marketplace" className="hover:text-brand-600">
           Marketplace
         </Link>
+        <Link href="/pricing" className="hover:text-brand-600">
+          Pricing
+        </Link>
         <Link href="/why-nanovm" className="hover:text-brand-600">
           Why nanovm
         </Link>
@@ -355,6 +358,9 @@ function Footer() {
         <div className="flex gap-4">
           <Link href="/marketplace" className="hover:text-brand-600">
             Marketplace
+          </Link>
+          <Link href="/pricing" className="hover:text-brand-600">
+            Pricing
           </Link>
           <Link href="/why-nanovm" className="hover:text-brand-600">
             Why nanovm
