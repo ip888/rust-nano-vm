@@ -1,0 +1,55 @@
+{
+  "name": "@nanovm/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript client for rust-nano-vm — sub-second microVMs for AI-agent code execution.",
+  "keywords": [
+    "microvm",
+    "sandbox",
+    "kvm",
+    "ai-agent",
+    "code-execution",
+    "nanovm"
+  ],
+  "license": "Apache-2.0 OR MIT",
+  "author": "rust-nano-vm contributors",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ip888/rust-nano-vm",
+    "directory": "clients/typescript"
+  },
+  "homepage": "https://github.com/ip888/rust-nano-vm/tree/main/clients/typescript",
+  "bugs": {
+    "url": "https://github.com/ip888/rust-nano-vm/issues"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  }
+}
