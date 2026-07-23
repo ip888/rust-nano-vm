@@ -103,7 +103,7 @@ Anyone can reproduce:
 
 ```sh
 export NANOVM_BENCH_URL=https://api.your-saas.com
-export NANOVM_BENCH_TOKEN=nv_<throwaway>
+export NANOVM_BENCH_TOKEN=nv_YOUR_THROWAWAY_TOKEN
 cargo run -p api-bench --release -- \
     --marketplace-name python-3.12-minimal \
     --n 100 --warmup 10

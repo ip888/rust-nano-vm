@@ -36,7 +36,7 @@ name: npm-publish
 on:
   push:
     tags: ["v*.*.*"]
-  # Manual dry-run: build + test + `npm publish --dry-run` against a
+  # Manual dry-run: build + test + `npm pack --dry-run` against a
   # branch without actually publishing.
   workflow_dispatch:
 
@@ -90,12 +90,33 @@ jobs:
       - name: Test
         run: npm run test
 
-      - name: Verify the tarball contents (dry-run pack)
-        # `npm pack --dry-run` prints exactly what would ship without
-        # writing a tarball. Fails fast if `dist/` is missing (would
-        # publish a broken empty package), or if a file we didn't
-        # intend to ship (say, `test/` or `node_modules`) sneaks in.
-        run: npm pack --dry-run
+      - name: Verify the tarball contents (real pack + assertions)
+        # `npm pack --dry-run` only PRINTS the file list — the job
+        # stays green if `dist/` is missing or `test/` sneaks in.
+        # Produce the real tarball, list its contents with `tar tzf`,
+        # and grep-assert on the invariants:
+        #   - `dist/index.js` present (would publish an empty package
+        #     without it)
+        #   - `dist/agents.js` present (would break the `./agents`
+        #     subpath consumers)
+        #   - `dist/index.d.ts` present (typescript consumers get no
+        #     types otherwise)
+        #   - NO `test/` files (accidental test-suite leak)
+        #   - NO `node_modules/` files (would ship the entire dep tree
+        #     into the tarball)
+        # `set -o pipefail` so a broken pack short-circuits the grep.
+        run: |
+          set -euo pipefail
+          npm pack --pack-destination "$RUNNER_TEMP" > /dev/null
+          TARBALL=$(ls "$RUNNER_TEMP"/nanovm-sdk-*.tgz | head -n1)
+          echo "produced: $TARBALL"
+          CONTENTS=$(tar tzf "$TARBALL")
+          echo "$CONTENTS"
+          echo "$CONTENTS" | grep -qE 'package/dist/index\.js$'    || { echo "::error::missing dist/index.js"; exit 1; }
+          echo "$CONTENTS" | grep -qE 'package/dist/agents\.js$'   || { echo "::error::missing dist/agents.js"; exit 1; }
+          echo "$CONTENTS" | grep -qE 'package/dist/index\.d\.ts$' || { echo "::error::missing dist/index.d.ts"; exit 1; }
+          if echo "$CONTENTS" | grep -qE 'package/test/';         then echo "::error::test/ leaked into tarball";        exit 1; fi
+          if echo "$CONTENTS" | grep -qE 'package/node_modules/'; then echo "::error::node_modules leaked into tarball"; exit 1; fi
 
       - uses: actions/upload-artifact@v4
         with:

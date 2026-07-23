@@ -297,7 +297,7 @@ Pre-1.0, expect churn aligned with the server. The SDK's version
 tracks the server's `major.minor.patch`.
 
 npm releases ship via
-[`.github/workflows/npm-publish.yml`](../../.github/workflows/npm-publish.yml)
+[`npm-publish.yml`](https://github.com/ip888/rust-nano-vm/blob/main/.github/workflows/npm-publish.yml)
 on every `v*.*.*` tag push, using npm Trusted Publishing (GitHub OIDC —
 no `NPM_TOKEN` stored in the repo). Every tarball carries a Sigstore
 provenance attestation you can verify with `npm audit signatures`.

@@ -90,7 +90,13 @@ const TIERS: Tier[] = [
     price: "Custom",
     priceCadence: "annual",
     tagline: "Regulated industries, on-prem, custom controls.",
-    cta: { label: "Talk to us", href: "mailto:sales@nanovm.example.com" },
+    // Enterprise stays outside the self-serve funnel: it's a
+    // real conversation with a human, not a Stripe checkout. Point
+    // at the same /signup as the other tiers so a lead never bounces
+    // to a broken placeholder domain, and let the sales-nurture
+    // sequence take it from there (dashboard → billing portal →
+    // outbound follow-up for Enterprise-flagged orgs).
+    cta: { label: "Start free & upgrade", href: "/signup" },
     bullets: [
       "Unlimited forks/second",
       "SSO (SAML / OIDC) + SCIM",

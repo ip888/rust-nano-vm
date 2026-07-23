@@ -242,6 +242,88 @@ describe("dispatchNanovmToolCall — error paths return strings, never throw", (
     expect(result).toContain("no snapshot provided");
   });
 
+  it("JSON args that parse to null → error string, no HTTP call", async () => {
+    let called = false;
+    const client = new Client("http://stub", {
+      token: "t",
+      fetch: (async (): Promise<Response> => {
+        called = true;
+        throw new Error("should not fetch");
+      }) as unknown as typeof fetch,
+    });
+    const result = await dispatchNanovmToolCall(
+      client,
+      "execute_python",
+      "null",
+      { snapshot: 1 },
+    );
+    expect(called).toBe(false);
+    expect(result.startsWith("error:")).toBe(true);
+    expect(result).toContain("must be a JSON object");
+    expect(result).toContain("null");
+  });
+
+  it("JSON args that parse to an array → error string, no HTTP call", async () => {
+    let called = false;
+    const client = new Client("http://stub", {
+      token: "t",
+      fetch: (async (): Promise<Response> => {
+        called = true;
+        throw new Error("should not fetch");
+      }) as unknown as typeof fetch,
+    });
+    const result = await dispatchNanovmToolCall(
+      client,
+      "execute_shell",
+      "[1, 2, 3]",
+      { snapshot: 1 },
+    );
+    expect(called).toBe(false);
+    expect(result.startsWith("error:")).toBe(true);
+    expect(result).toContain("array");
+  });
+
+  it("missing `code` field on execute_python → error string, no HTTP call", async () => {
+    let called = false;
+    const client = new Client("http://stub", {
+      token: "t",
+      fetch: (async (): Promise<Response> => {
+        called = true;
+        throw new Error("should not fetch");
+      }) as unknown as typeof fetch,
+    });
+    const result = await dispatchNanovmToolCall(
+      client,
+      "execute_python",
+      JSON.stringify({ notCode: "hi" }),
+      { snapshot: 1 },
+    );
+    expect(called).toBe(false);
+    expect(result.startsWith("error:")).toBe(true);
+    expect(result).toContain("'code'");
+    expect(result).toContain("non-empty string");
+  });
+
+  it("empty string `command` on execute_shell → error string, no HTTP call", async () => {
+    let called = false;
+    const client = new Client("http://stub", {
+      token: "t",
+      fetch: (async (): Promise<Response> => {
+        called = true;
+        throw new Error("should not fetch");
+      }) as unknown as typeof fetch,
+    });
+    const result = await dispatchNanovmToolCall(
+      client,
+      "execute_shell",
+      JSON.stringify({ command: "" }),
+      { snapshot: 1 },
+    );
+    expect(called).toBe(false);
+    expect(result.startsWith("error:")).toBe(true);
+    expect(result).toContain("'command'");
+  });
+
   it("network / server error → caught and returned as an error string", async () => {
     const { fetch } = mockFetch(() => ({
       status: 500,
