@@ -13,6 +13,9 @@ Fully client-side. Every page is either a static route or a client component; th
 | `/signup/verify` | Magic-link landing (`?token=…`). POSTs `/v1/signup/verify`, shows the API key once, persists the session. |
 | `/login` | Paste API key. Verifies against `/v1/billing/plan` before caching. |
 | `/dashboard` | Reads `/v1/billing/plan` + `/v1/usage`. Tiles for plan, usage, quick-start snippet. Sign-out clears the session. |
+| `/dashboard/keys` | List, mint, revoke runtime API keys against `/v1/keys`. New keys shown once with copy-to-clipboard. |
+| `/dashboard/vms` | List the org's VMs against `/v1/vms` (cursor-paginated). Destroy per row. |
+| `/dashboard/snapshots` | List the org's snapshots against `/v1/snapshots` (cursor-paginated). Destroy per row. |
 
 ## Requirements
 
@@ -110,8 +113,6 @@ See `docs/saas-billing.md` for the full operator guide.
 
 ## What's NOT here yet
 
-- **API-key management page.** `/v1/keys` exists on the server; the UI to mint / list / revoke is a follow-up.
 - **Live usage graph.** Today's tile shows totals; the "forks over the last 24 h" chart wants an SSE stream from the control plane, which is a separate PR.
-- **Snapshot / VM management pages.** `/v1/snapshots`, `/v1/vms`. Same story: server surface exists, dashboard UI is a follow-up.
 - **Password / SSO / MFA.** Signup is magic-link only.
 - **Framework component library.** Tailwind + hand-rolled components. If the design grows, migrating to shadcn/ui is straightforward.
