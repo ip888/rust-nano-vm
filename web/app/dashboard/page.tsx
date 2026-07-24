@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import {
   ApiError,
@@ -130,6 +130,8 @@ export default function DashboardPage() {
           {error}
         </div>
       )}
+
+      <OnboardingChecklist apiKey={session.apiKey} usage={usage} />
 
       <div className="grid gap-6 md:grid-cols-2">
         <Tile title="Plan">
@@ -506,5 +508,279 @@ print(c.execute_python('print(1+1)'))
         The key above is masked; use your real one in the shell.
       </p>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Onboarding checklist
+// ---------------------------------------------------------------------------
+
+/**
+ * Post-signup "get started" checklist. Shows above the dashboard
+ * tiles until every step is checked OR the user dismisses it.
+ *
+ * State model (all localStorage):
+ * - Per-step `done` bit, keyed by step id — flipped by clicking the
+ *   checkbox OR (for the "run first code" step) auto-detected from
+ *   `usage.fork_count >= 1` on every mount.
+ * - A separate `dismissed` bit that hides the widget outright, in
+ *   case the user knows what they're doing and wants the tiles
+ *   uncluttered.
+ *
+ * The auto-detected steps update whenever fresh usage lands from
+ * `/v1/usage`, so a user who runs a fork via the SDK (not the
+ * playground) still gets credit.
+ */
+const CHECKLIST_STORAGE_KEY = "nanovm.onboarding.v1";
+
+interface ChecklistState {
+  done: Record<string, boolean>;
+  dismissed: boolean;
+}
+
+interface ChecklistStep {
+  id: string;
+  label: string;
+  description: string;
+  action:
+    | { kind: "link"; href: string; cta: string }
+    | { kind: "copy"; cta: string; payload: string };
+  /** When true, this step auto-completes from live signals rather
+   *  than a click. */
+  autoDetected?: boolean;
+}
+
+function loadChecklistState(): ChecklistState {
+  if (typeof window === "undefined") {
+    return { done: {}, dismissed: false };
+  }
+  try {
+    const raw = window.localStorage.getItem(CHECKLIST_STORAGE_KEY);
+    if (!raw) return { done: {}, dismissed: false };
+    const parsed = JSON.parse(raw) as Partial<ChecklistState>;
+    return {
+      done: parsed.done && typeof parsed.done === "object" ? parsed.done : {},
+      dismissed: parsed.dismissed === true,
+    };
+  } catch {
+    return { done: {}, dismissed: false };
+  }
+}
+
+function persistChecklistState(state: ChecklistState) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(CHECKLIST_STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    // localStorage full or blocked (private-window Safari, iframe
+    // sandbox); silent — the state just doesn't persist this
+    // session.
+  }
+}
+
+function OnboardingChecklist({
+  apiKey,
+  usage,
+}: {
+  apiKey: string;
+  usage: UsageResponseDto | null;
+}) {
+  const [state, setState] = useState<ChecklistState>({ done: {}, dismissed: false });
+  const [ready, setReady] = useState(false);
+
+  // Hydrate from localStorage on mount so a returning user sees their
+  // prior progress. `ready` gates the initial render so SSR/CSR
+  // don't clash on the tick marks.
+  useEffect(() => {
+    setState(loadChecklistState());
+    setReady(true);
+  }, []);
+
+  // Auto-detect the "run first code" step from usage.fork_count. This
+  // means a user who ran their first fork via the SDK (not the
+  // playground) still gets credit here — the whole point is
+  // celebrating first-success regardless of surface.
+  useEffect(() => {
+    if (!ready) return;
+    if (usage && usage.fork_count >= 1 && !state.done["run-first"]) {
+      const next = {
+        ...state,
+        done: { ...state.done, "run-first": true },
+      };
+      setState(next);
+      persistChecklistState(next);
+    }
+  }, [ready, usage, state]);
+
+  const steps: ChecklistStep[] = useMemo(
+    () => [
+      {
+        id: "copy-key",
+        label: "Copy your API key",
+        description:
+          "You'll paste it into the SDK or CLI as the `Authorization: Bearer` header.",
+        action: { kind: "copy", cta: "Copy key", payload: apiKey },
+      },
+      {
+        id: "run-first",
+        label: "Run your first Python call",
+        description:
+          "Open the in-browser Playground and hit Run — every call is a real ~12 ms KVM fork.",
+        action: { kind: "link", href: "/dashboard/playground", cta: "Open Playground" },
+        autoDetected: true,
+      },
+      {
+        id: "browse-marketplace",
+        label: "Browse pre-built snapshots",
+        description:
+          "The marketplace ships ready-to-fork Python, Node, and shell images so you don't build one yourself.",
+        action: { kind: "link", href: "/marketplace", cta: "Open Marketplace" },
+      },
+      {
+        id: "review-billing",
+        label: "See your plan and billing",
+        description:
+          "Free tier is 5 forks/sec + 10K forks/month. Upgrade from the billing portal when you outgrow it.",
+        action: { kind: "link", href: "/pricing", cta: "See pricing" },
+      },
+    ],
+    [apiKey],
+  );
+
+  function markDone(id: string) {
+    const next = { ...state, done: { ...state.done, [id]: true } };
+    setState(next);
+    persistChecklistState(next);
+  }
+
+  function dismiss() {
+    const next = { ...state, dismissed: true };
+    setState(next);
+    persistChecklistState(next);
+  }
+
+  if (!ready || state.dismissed) return null;
+  const remaining = steps.filter((s) => !state.done[s.id]).length;
+  const allDone = remaining === 0;
+
+  return (
+    <section className="mb-6 rounded-lg border border-brand-500/40 bg-brand-50/50 p-6 dark:border-brand-500/40 dark:bg-brand-500/10">
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold">
+            {allDone
+              ? "🎉 You're all set."
+              : `Get started — ${steps.length - remaining} of ${steps.length} done`}
+          </h2>
+          <p className="mt-1 text-sm text-gray-700 dark:text-gray-300">
+            {allDone
+              ? "Nice work. Hide this to reclaim the space."
+              : "Take these four one-click steps to hit your first successful sandbox call."}
+          </p>
+        </div>
+        <button
+          onClick={dismiss}
+          className="text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+        >
+          {allDone ? "Hide" : "Hide checklist"}
+        </button>
+      </div>
+
+      <ol className="space-y-3">
+        {steps.map((step, i) => (
+          <ChecklistRow
+            key={step.id}
+            index={i + 1}
+            step={step}
+            done={!!state.done[step.id]}
+            onMarkDone={() => markDone(step.id)}
+          />
+        ))}
+      </ol>
+    </section>
+  );
+}
+
+function ChecklistRow({
+  index,
+  step,
+  done,
+  onMarkDone,
+}: {
+  index: number;
+  step: ChecklistStep;
+  done: boolean;
+  onMarkDone: () => void;
+}) {
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+
+  function handleCopy(payload: string) {
+    const clip = typeof navigator !== "undefined" ? navigator.clipboard : null;
+    if (!clip) {
+      setCopyState("failed");
+      return;
+    }
+    clip.writeText(payload).then(
+      () => {
+        setCopyState("copied");
+        onMarkDone();
+      },
+      () => setCopyState("failed"),
+    );
+  }
+
+  return (
+    <li className="flex items-start gap-3">
+      <span
+        className={`mt-0.5 flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full text-xs font-medium ${
+          done
+            ? "bg-brand-500 text-white"
+            : "border border-gray-300 bg-white text-gray-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-400"
+        }`}
+        aria-hidden
+      >
+        {done ? "✓" : index}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className={`text-sm font-medium ${done ? "line-through opacity-70" : ""}`}>
+          {step.label}
+          {step.autoDetected && !done && (
+            <span
+              className="ml-2 rounded bg-gray-200 px-1.5 py-0.5 text-xs font-normal text-gray-600 dark:bg-gray-800 dark:text-gray-400"
+              title="Auto-detected from your fork count"
+            >
+              auto
+            </span>
+          )}
+        </div>
+        <div className="mt-1 text-xs text-gray-600 dark:text-gray-400">
+          {step.description}
+        </div>
+        {!done && (
+          <div className="mt-2">
+            {step.action.kind === "link" ? (
+              <Link
+                href={step.action.href}
+                onClick={onMarkDone}
+                className="inline-block rounded-md bg-brand-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-brand-600"
+              >
+                {step.action.cta} →
+              </Link>
+            ) : (
+              <button
+                onClick={() => handleCopy((step.action as { payload: string }).payload)}
+                className="rounded-md bg-brand-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-brand-600"
+              >
+                {copyState === "copied"
+                  ? "Copied ✓"
+                  : copyState === "failed"
+                    ? "Couldn't copy — select the key from a code block"
+                    : step.action.cta}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </li>
   );
 }
