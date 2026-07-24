@@ -64,6 +64,15 @@ npm run build && npm start
 
 Set `NEXT_PUBLIC_NANOVM_API_URL` in the platform's env config.
 
+**`NEXT_PUBLIC_NANOVM_WEB_ORIGIN`** — canonical origin for Open Graph
+share previews. Every marketing route ships a
+programmatically-generated 1200×630 OG image
+(`app/**/opengraph-image.tsx`); Next.js resolves relative image URLs
+against `metadataBase`, which we build from this env var. Defaults
+to `https://nanovm.example.com` so a fresh clone renders correctly;
+override with your own origin so Twitter / LinkedIn / HN unfurls
+point at the right host.
+
 **2. Container.**
 
 Multi-stage `Dockerfile.web` at the repo root builds a distroless-node image (~200 MB).

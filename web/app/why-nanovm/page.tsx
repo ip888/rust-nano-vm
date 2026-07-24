@@ -2,7 +2,12 @@ import Link from "next/link";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Why nanovm — comparison vs Lambda MicroVMs, E2B, Modal, Docker",
+  // Root layout's title template turns "Why nanovm" into
+  // "Why nanovm — nanovm". Override the template with `absolute` on
+  // routes whose title already carries the brand.
+  title: {
+    absolute: "Why nanovm — comparison vs Lambda MicroVMs, E2B, Modal, Docker",
+  },
   description:
     "Head-to-head comparison of nanovm against AWS Lambda MicroVMs, E2B, Modal Sandbox, and Docker exec — on cold-fork p50, isolation depth, pricing curve, on-prem story, and vendor lock-in.",
 };

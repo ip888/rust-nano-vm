@@ -17,12 +17,39 @@ import type { Metadata } from "next";
  */
 
 export const metadata: Metadata = {
-  title: "Pricing — nanovm",
+  title: "Pricing",
   description:
     "Simple, usage-based pricing for sub-second microVMs. Free tier for hobby " +
     "projects; Pro from $29/mo; Team from $199/mo; Enterprise with SSO / audit " +
     "sink / on-prem.",
 };
+
+/**
+ * JSON-LD structured data for the pricing page. Feeds Google's rich
+ * snippet parser so a search for "nanovm pricing" can render the
+ * offer prices inline in the SERP instead of just a text snippet.
+ *
+ * `SoftwareApplication` with an `offers` array is the schema.org
+ * shape Google's Product / Offer parsers understand for SaaS.
+ * `priceCurrency: "USD"` matches the /pricing display; operators
+ * that re-brand and price in another currency edit both.
+ */
+const PRICING_STRUCTURED_DATA = {
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  name: "nanovm",
+  applicationCategory: "DeveloperApplication",
+  operatingSystem: "Linux (KVM)",
+  description:
+    "Fork a real KVM microVM in ~12 ms. Give your AI agent a sandbox its tool calls can actually run in.",
+  offers: [
+    { "@type": "Offer", name: "Free", price: "0", priceCurrency: "USD" },
+    { "@type": "Offer", name: "Pro", price: "29", priceCurrency: "USD" },
+    { "@type": "Offer", name: "Team", price: "199", priceCurrency: "USD" },
+    // Enterprise skipped — Google's parser rejects an Offer without
+    // a concrete price. "Talk to us" tier lives in the FAQ instead.
+  ],
+} as const;
 
 interface Tier {
   name: string;
@@ -162,6 +189,15 @@ const COMPETITOR_ROWS: CompetitorRow[] = [
 export default function PricingPage() {
   return (
     <main className="mx-auto max-w-6xl px-6 py-12">
+      <script
+        type="application/ld+json"
+        // JSON-LD in a `<script>` tag; dangerouslySetInnerHTML is the
+        // supported pattern. Content is a compile-time constant, no
+        // user input path, so no XSS surface.
+        dangerouslySetInnerHTML={{
+          __html: JSON.stringify(PRICING_STRUCTURED_DATA),
+        }}
+      />
       <SiteHeader />
 
       <section className="mb-14 text-center">
