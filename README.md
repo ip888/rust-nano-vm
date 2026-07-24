@@ -565,6 +565,15 @@ Pre-1.0. Full roadmap in [`docs/PLAN.md`](docs/PLAN.md).
   residency). See
   [`docs/blog/03-regulated-ai-sandboxes.md`](docs/blog/03-regulated-ai-sandboxes.md)
   for the audit-narrative angle.
+- **A sandbox for coding-agent CLIs.** Claude Code / Cursor Agent /
+  Devin / OpenHands / aider all need to `execute_shell` and
+  `execute_python` somewhere safer than your laptop. See
+  [`docs/blog/05-sandbox-for-claude-code.md`](docs/blog/05-sandbox-for-claude-code.md)
+  for the wire-up in three lines.
+- **execute_python for JS/TS agents.** LangChain.js, Vercel AI SDK,
+  Mastra — same OpenAI-shape tool descriptor works everywhere. See
+  [`docs/blog/06-langchain-js-execute-python.md`](docs/blog/06-langchain-js-execute-python.md)
+  for the LangChain.js + Vercel AI SDK examples.
 - **CI for untrusted PRs.** Stronger isolation than a container, faster
   than a fresh VM, with a REST API your runner can drive.
 - **Per-user sandboxes for AI products.** One snapshot per language
