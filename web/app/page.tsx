@@ -135,6 +135,19 @@ print(client.execute_python("print(sum(range(100)))").stdout)  # "4950\\n"`}
     sb.execute_python("df = pd.DataFrame({'x': [1,2,3]})")  # same VM, sub-ms
     print(sb.execute_python("print(df.sum().to_dict())").stdout)`}
       </pre>
+      <div className="mt-6 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-brand-500/40 bg-brand-50/50 p-4 text-sm dark:border-brand-500/40 dark:bg-brand-500/10">
+        <p className="text-gray-700 dark:text-gray-300">
+          <strong>Rather click than <code>pip install</code>?</strong> Sign up
+          free, open the in-browser playground, paste Python — real KVM
+          fork, real stdout, no SDK required.
+        </p>
+        <Link
+          href="/signup"
+          className="whitespace-nowrap rounded-md bg-brand-500 px-4 py-2 text-xs font-medium text-white hover:bg-brand-600"
+        >
+          Try in your browser →
+        </Link>
+      </div>
     </section>
   );
 }
