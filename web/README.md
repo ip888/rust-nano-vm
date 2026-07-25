@@ -10,6 +10,8 @@ Fully client-side. Every page is either a static route or a client component; th
 |---|---|
 | `/` | Landing page + pitch + code snippet. |
 | `/pricing` | Public pricing tiers (Free / Pro / Team / Enterprise), competitor comparison, FAQ. Static route. |
+| `/sitemap.xml` | Crawler index of the marketing routes. File-convention `app/sitemap.ts`. |
+| `/robots.txt` | Crawler policy — allows marketing routes, disallows dashboard / login / signup. File-convention `app/robots.ts`. |
 | `/signup` | Email + org form → POST `/v1/signup/request`. |
 | `/signup/verify` | Magic-link landing (`?token=…`). POSTs `/v1/signup/verify`, shows the API key once, persists the session. |
 | `/login` | Paste API key. Verifies against `/v1/billing/plan` before caching. |
