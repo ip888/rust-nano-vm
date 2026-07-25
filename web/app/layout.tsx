@@ -12,18 +12,51 @@ import "./globals.css";
  * `NEXT_PUBLIC_NANOVM_API_URL` etc, so operators re-brand this by
  * setting one env var at build time. Fallback to the demo origin so
  * a fresh clone renders correctly without env config.
+ *
+ * We resolve the URL here and swallow parse failures rather than
+ * letting `new URL(...)` throw at module init: a malformed env value
+ * would otherwise crash the whole web app on first request instead
+ * of just breaking OG previews.
  */
-const WEB_ORIGIN = (
-  process.env.NEXT_PUBLIC_NANOVM_WEB_ORIGIN?.trim() ||
-  "https://nanovm.example.com"
-).replace(/\/+$/, "");
+const FALLBACK_ORIGIN = "https://nanovm.example.com";
+
+function resolveMetadataBase(): URL {
+  const raw = process.env.NEXT_PUBLIC_NANOVM_WEB_ORIGIN?.trim();
+  const candidates = [raw, FALLBACK_ORIGIN].filter(
+    (v): v is string => typeof v === "string" && v.length > 0,
+  );
+  for (const c of candidates) {
+    const trimmed = c.replace(/\/+$/, "");
+    try {
+      return new URL(trimmed);
+    } catch {
+      // `NEXT_PUBLIC_NANOVM_WEB_ORIGIN` is missing the scheme or is
+      // otherwise malformed — fall through to the demo origin, which
+      // is a compile-time constant and cannot throw.
+      if (typeof console !== "undefined") {
+        console.warn(
+          `[nanovm-web] Ignoring invalid NEXT_PUBLIC_NANOVM_WEB_ORIGIN=${JSON.stringify(
+            trimmed,
+          )}; falling back to ${FALLBACK_ORIGIN}.`,
+        );
+      }
+    }
+  }
+  // Unreachable — FALLBACK_ORIGIN is a valid absolute URL. Kept as
+  // a defensive last resort so the function's return type stays
+  // non-nullable.
+  return new URL(FALLBACK_ORIGIN);
+}
+
+const METADATA_BASE = resolveMetadataBase();
+const WEB_ORIGIN = METADATA_BASE.origin;
 
 const TITLE = "nanovm — sub-second microVMs for AI agents";
 const DESCRIPTION =
   "Fork a real KVM microVM in ~12 ms. Give your AI agent a sandbox its tool calls can actually run in.";
 
 export const metadata: Metadata = {
-  metadataBase: new URL(WEB_ORIGIN),
+  metadataBase: METADATA_BASE,
   title: {
     default: TITLE,
     // Per-page `metadata.title` values become `<value> — nanovm`, so

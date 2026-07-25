@@ -55,12 +55,27 @@ client = nanovm.Client("https://api.nanovm.example.com", token="nv_...")
 ```
 
 Give Claude Code a tool that shells out into a fresh microVM per
-call:
+call. `Client.execute_shell(..., snapshot=...)` accepts a numeric
+snapshot id — use the marketplace fork endpoint to turn a name into
+one:
+
+```python
+snap = client.fork_marketplace("python-3.12-minimal").snapshot()
+
+def execute_shell(cmd: str) -> str:
+    r = client.execute_shell(cmd, snapshot=snap.id)
+    return f"exit={r.exit_code}\n{r.stdout}\n{r.stderr}"
+```
+
+Or, if you don't want to manage snapshot ids at all, use the
+`Sandbox` context manager (accepts marketplace names) and let it
+open/close a VM per tool call:
 
 ```python
 def execute_shell(cmd: str) -> str:
-    r = client.execute_shell(cmd, snapshot="python-3.12-minimal")
-    return f"exit={r.exit_code}\n{r.stdout}\n{r.stderr}"
+    with client.sandbox(snapshot="python-3.12-minimal") as sb:
+        r = sb.execute_shell(cmd)
+        return f"exit={r.exit_code}\n{r.stdout}\n{r.stderr}"
 ```
 
 Wire that into Claude Code's MCP surface (or into your Claude Code
@@ -121,10 +136,14 @@ run — evals, dev-loop, prod — instead of only when you remember.
    ships ready-to-fork Python / Node / shell images so you don't
    build one yourself. `snapshot="python-3.12-ds"` picks up a
    pandas + numpy + scipy image.
-3. **Per-org fork quota** — the control plane enforces
-   `NANOVM_FORK_RPS` per token, so a runaway agent can't exhaust
-   your budget in a loop. `RateLimited` surfaces as a typed
-   exception so your retry policy is one `except` clause.
+3. **Fork quota with two dimensions** — the control plane enforces
+   both a per-token AND a per-org rate limit on `/fork`. Env
+   defaults (`NANOVM_FORK_RPS` / `NANOVM_FORK_BURST`) apply when a
+   caller has no tier-configured cap; when `billing` is enabled the
+   per-org bucket is sized off the caller's Stripe subscription
+   tier. Either way, a runaway agent can't exhaust your budget in
+   a loop — `RateLimited` surfaces as a typed exception so your
+   retry policy is one `except` clause.
 
 ## Try it
 
