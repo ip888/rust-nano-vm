@@ -2,9 +2,11 @@ import Link from "next/link";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  // Root layout's title template turns "Why nanovm" into
-  // "Why nanovm — nanovm". Override the template with `absolute` on
-  // routes whose title already carries the brand.
+  // Root layout's title template appends "— nanovm" to whatever
+  // `title` we set here. This page's title already carries the
+  // brand (`Why nanovm — comparison …`), so applying the template
+  // would double it up to `Why nanovm — comparison … — nanovm`.
+  // Use `absolute` so the template is skipped on this one route.
   title: {
     absolute: "Why nanovm — comparison vs Lambda MicroVMs, E2B, Modal, Docker",
   },

@@ -602,15 +602,22 @@ function OnboardingChecklist({
   // celebrating first-success regardless of surface.
   useEffect(() => {
     if (!ready) return;
-    if (usage && usage.fork_count >= 1 && !state.done["run-first"]) {
+    if (!usage || usage.fork_count < 1) return;
+    // Functional setState so we merge onto the LATEST persisted
+    // done-map instead of the render-snapshot copy we'd close over.
+    // Prevents a rare race where two concurrent updates (auto-detect
+    // firing while the user also clicks a manual step) clobber each
+    // other's `done` bits with last-write-wins.
+    setState((prev) => {
+      if (prev.done["run-first"]) return prev;
       const next = {
-        ...state,
-        done: { ...state.done, "run-first": true },
+        ...prev,
+        done: { ...prev.done, "run-first": true },
       };
-      setState(next);
       persistChecklistState(next);
-    }
-  }, [ready, usage, state]);
+      return next;
+    });
+  }, [ready, usage]);
 
   const steps: ChecklistStep[] = useMemo(
     () => [
@@ -648,15 +655,19 @@ function OnboardingChecklist({
   );
 
   function markDone(id: string) {
-    const next = { ...state, done: { ...state.done, [id]: true } };
-    setState(next);
-    persistChecklistState(next);
+    setState((prev) => {
+      const next = { ...prev, done: { ...prev.done, [id]: true } };
+      persistChecklistState(next);
+      return next;
+    });
   }
 
   function dismiss() {
-    const next = { ...state, dismissed: true };
-    setState(next);
-    persistChecklistState(next);
+    setState((prev) => {
+      const next = { ...prev, dismissed: true };
+      persistChecklistState(next);
+      return next;
+    });
   }
 
   if (!ready || state.dismissed) return null;
@@ -698,6 +709,50 @@ function OnboardingChecklist({
         ))}
       </ol>
     </section>
+  );
+}
+
+function ChecklistAction({
+  action,
+  onMarkDone,
+  onCopy,
+  copyState,
+}: {
+  action: ChecklistStep["action"];
+  onMarkDone: () => void;
+  onCopy: (payload: string) => void;
+  copyState: "idle" | "copied" | "failed";
+}) {
+  // Extracting into its own component lets TypeScript narrow the
+  // discriminated union cleanly in each branch — the earlier inline
+  // ternary lost the narrowing inside the button's onClick closure
+  // and needed a `(step.action as { payload })` cast.
+  if (action.kind === "link") {
+    return (
+      <div className="mt-2">
+        <Link
+          href={action.href}
+          onClick={onMarkDone}
+          className="inline-block rounded-md bg-brand-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-brand-600"
+        >
+          {action.cta} →
+        </Link>
+      </div>
+    );
+  }
+  return (
+    <div className="mt-2">
+      <button
+        onClick={() => onCopy(action.payload)}
+        className="rounded-md bg-brand-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-brand-600"
+      >
+        {copyState === "copied"
+          ? "Copied ✓"
+          : copyState === "failed"
+            ? "Clipboard blocked — copy your key from /dashboard/keys"
+            : action.cta}
+      </button>
+    </div>
   );
 }
 
@@ -756,30 +811,7 @@ function ChecklistRow({
         <div className="mt-1 text-xs text-gray-600 dark:text-gray-400">
           {step.description}
         </div>
-        {!done && (
-          <div className="mt-2">
-            {step.action.kind === "link" ? (
-              <Link
-                href={step.action.href}
-                onClick={onMarkDone}
-                className="inline-block rounded-md bg-brand-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-brand-600"
-              >
-                {step.action.cta} →
-              </Link>
-            ) : (
-              <button
-                onClick={() => handleCopy((step.action as { payload: string }).payload)}
-                className="rounded-md bg-brand-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-brand-600"
-              >
-                {copyState === "copied"
-                  ? "Copied ✓"
-                  : copyState === "failed"
-                    ? "Couldn't copy — select the key from a code block"
-                    : step.action.cta}
-              </button>
-            )}
-          </div>
-        )}
+        {!done && <ChecklistAction action={step.action} onMarkDone={onMarkDone} onCopy={handleCopy} copyState={copyState} />}
       </div>
     </li>
   );
