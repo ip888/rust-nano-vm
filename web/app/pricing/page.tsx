@@ -72,6 +72,7 @@ const TIERS: Tier[] = [
     bullets: [
       "5 forks/second sustained",
       "10,000 forks / month",
+      "In-browser playground (no SDK install)",
       "Community support (GitHub issues)",
       "1 GB snapshot storage",
       "Public marketplace snapshots",
