@@ -82,6 +82,15 @@ export const metadata: Metadata = {
     title: TITLE,
     description: DESCRIPTION,
   },
+  alternates: {
+    // Advertise the RSS feed so browsers with feed extensions,
+    // Feedly's auto-discovery, and Slack's RSS bot find it without
+    // being handed the URL. Kept relative — `metadataBase` above
+    // resolves it against `NEXT_PUBLIC_NANOVM_WEB_ORIGIN`.
+    types: {
+      "application/rss+xml": "/rss.xml",
+    },
+  },
 };
 
 /**
