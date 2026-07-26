@@ -12,6 +12,7 @@ Fully client-side. Every page is either a static route or a client component; th
 | `/pricing` | Public pricing tiers (Free / Pro / Team / Enterprise), competitor comparison, FAQ. Static route. |
 | `/sitemap.xml` | Crawler index of the marketing routes. File-convention `app/sitemap.ts`. |
 | `/robots.txt` | Crawler policy — allows marketing routes, disallows dashboard / login / signup. File-convention `app/robots.ts`. |
+| `/rss.xml` | RSS 2.0 feed of the engineering blog (posts live in `docs/blog/` and render on GitHub). Auto-discovered via a root `<link rel="alternate">`. |
 | `/signup` | Email + org form → POST `/v1/signup/request`. |
 | `/signup/verify` | Magic-link landing (`?token=…`). POSTs `/v1/signup/verify`, shows the API key once, persists the session. |
 | `/login` | Paste API key. Verifies against `/v1/billing/plan` before caching. |
