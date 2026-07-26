@@ -131,6 +131,7 @@ export default function DashboardPage() {
         </div>
       )}
 
+      <FreeTierNudge plan={plan} usage={usage} />
       <OnboardingChecklist apiKey={session.apiKey} usage={usage} />
 
       <div className="grid gap-6 md:grid-cols-2">
@@ -814,5 +815,151 @@ function ChecklistRow({
         {!done && <ChecklistAction action={step.action} onMarkDone={onMarkDone} onCopy={handleCopy} copyState={copyState} />}
       </div>
     </li>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Free-tier upsell nudge
+// ---------------------------------------------------------------------------
+
+/**
+ * Fires when a Free-tier caller's cumulative `fork_count` approaches
+ * or exceeds the Free tier's monthly cap (10,000 — matches the
+ * `/pricing` page). Two levels:
+ *
+ * - **Approaching** (5,000–9,999): friendly "you're using X of 10K"
+ *   nudge with an "Upgrade to Pro" CTA. Dismissable per 1000-fork
+ *   window so we don't nag but do re-appear as usage climbs.
+ * - **Exceeded** (10,000+): stronger "you've exceeded the free-tier
+ *   monthly limit" banner. Also dismissable but re-arms less
+ *   generously.
+ *
+ * A caveat: today the server exposes only lifetime `fork_count`, not
+ * a monthly rolling window. So "you've used 5000 of 10K this month"
+ * is an over-count for long-lived Free-tier accounts — an honest
+ * approximation that errs on the side of nudging too early rather
+ * than too late. When per-month counters land server-side, this
+ * component switches to those with no other change.
+ *
+ * Paid tiers (`plan.plan?.name !== "free"`) never see either banner.
+ */
+const NUDGE_APPROACHING_THRESHOLD = 5_000;
+const NUDGE_EXCEEDED_THRESHOLD = 10_000;
+/** localStorage key holds the last `fork_count` at which the user
+ *  dismissed the banner. The banner re-fires once usage crosses
+ *  the next 1000-fork window. */
+const NUDGE_STORAGE_KEY = "nanovm.freetier.nudge.dismissedAt.v1";
+const NUDGE_REARM_WINDOW = 1_000;
+
+function loadDismissedForkCount(): number {
+  if (typeof window === "undefined") return -1;
+  try {
+    const raw = window.localStorage.getItem(NUDGE_STORAGE_KEY);
+    if (!raw) return -1;
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) ? n : -1;
+  } catch {
+    return -1;
+  }
+}
+
+function persistDismissedForkCount(forkCount: number) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(NUDGE_STORAGE_KEY, String(forkCount));
+  } catch {
+    // Private-window Safari / sandboxed iframe — banner will
+    // re-appear next reload. Acceptable failure mode.
+  }
+}
+
+function FreeTierNudge({
+  plan,
+  usage,
+}: {
+  plan: PlanResponse | null;
+  usage: UsageResponseDto | null;
+}) {
+  const [ready, setReady] = useState(false);
+  const [dismissedAt, setDismissedAt] = useState<number>(-1);
+
+  useEffect(() => {
+    setDismissedAt(loadDismissedForkCount());
+    setReady(true);
+  }, []);
+
+  // Wait for both signals before rendering to avoid a flash on load.
+  if (!ready || !plan || !usage) return null;
+  // Only Free-tier callers get nudged; the pricing page treats a
+  // resolved `plan.name === "free"` OR a missing plan (unassigned
+  // token) as Free.
+  const tierName = plan.plan?.name?.toLowerCase();
+  const isFreeTier = !tierName || tierName === "free";
+  if (!isFreeTier) return null;
+
+  const forkCount = usage.fork_count;
+  if (forkCount < NUDGE_APPROACHING_THRESHOLD) return null;
+
+  // Re-arm: if the user dismissed the banner at fork_count = 5200
+  // and is now at 6300, dismissedAt < forkCount - NUDGE_REARM_WINDOW
+  // → show again. Same math handles the exceeded case.
+  const rearmed = forkCount >= dismissedAt + NUDGE_REARM_WINDOW;
+  if (!rearmed) return null;
+
+  const exceeded = forkCount >= NUDGE_EXCEEDED_THRESHOLD;
+
+  function dismiss() {
+    setDismissedAt(forkCount);
+    persistDismissedForkCount(forkCount);
+  }
+
+  return (
+    <section
+      className={
+        exceeded
+          ? "mb-6 rounded-lg border border-red-300 bg-red-50 p-6 dark:border-red-900 dark:bg-red-950/40"
+          : "mb-6 rounded-lg border border-amber-300 bg-amber-50 p-6 dark:border-amber-900 dark:bg-amber-950/40"
+      }
+    >
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold">
+            {exceeded
+              ? "You've hit the Free-tier limit"
+              : `You've used ${forkCount.toLocaleString()} of your ~${NUDGE_EXCEEDED_THRESHOLD.toLocaleString()} monthly free forks`}
+          </h2>
+          <p className="mt-1 text-sm text-gray-700 dark:text-gray-300">
+            {exceeded ? (
+              <>
+                Free tier is capped at{" "}
+                {NUDGE_EXCEEDED_THRESHOLD.toLocaleString()} forks per month. Fork
+                requests will keep hitting rate limits (<code>429</code>) until you
+                upgrade or the counter rolls over next month. Pro is $29/mo for
+                unlimited monthly forks.
+              </>
+            ) : (
+              <>
+                Pro is $29/mo for unlimited monthly forks and 20× the burst rate
+                (100 vs 5 forks/sec). Team is $199/mo with priority support.
+              </>
+            )}
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Link
+            href="/pricing"
+            className="rounded-md bg-brand-500 px-4 py-2 text-sm font-medium text-white hover:bg-brand-600"
+          >
+            {exceeded ? "Upgrade to Pro →" : "See pricing →"}
+          </Link>
+          <button
+            onClick={dismiss}
+            className="text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+          >
+            Dismiss
+          </button>
+        </div>
+      </div>
+    </section>
   );
 }
