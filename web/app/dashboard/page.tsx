@@ -131,7 +131,7 @@ export default function DashboardPage() {
         </div>
       )}
 
-      <FreeTierNudge plan={plan} usage={usage} />
+      <FreeTierNudge plan={plan} usage={usage} onOpenPortal={openBillingPortal} />
       <OnboardingChecklist apiKey={session.apiKey} usage={usage} />
 
       <div className="grid gap-6 md:grid-cols-2">
@@ -876,12 +876,18 @@ function persistDismissedForkCount(forkCount: number) {
 function FreeTierNudge({
   plan,
   usage,
+  onOpenPortal,
 }: {
   plan: PlanResponse | null;
   usage: UsageResponseDto | null;
+  /** Same handler the Plan tile's "Manage billing" button uses.
+   *  Fires a Stripe portal session URL and window-navigates to it
+   *  (or surfaces an error via the parent's error banner). */
+  onOpenPortal: () => Promise<void> | void;
 }) {
   const [ready, setReady] = useState(false);
   const [dismissedAt, setDismissedAt] = useState<number>(-1);
+  const [opening, setOpening] = useState(false);
 
   useEffect(() => {
     setDismissedAt(loadDismissedForkCount());
@@ -911,6 +917,23 @@ function FreeTierNudge({
   function dismiss() {
     setDismissedAt(forkCount);
     persistDismissedForkCount(forkCount);
+  }
+
+  async function handleUpgrade() {
+    if (opening) return;
+    setOpening(true);
+    try {
+      // The Stripe customer portal handles both "no active
+      // subscription" (renders the plan picker) and "existing sub"
+      // (renders plan-change UI). Free-tier callers land on the
+      // picker directly — no /pricing round-trip.
+      await onOpenPortal();
+    } finally {
+      // If openBillingPortal succeeds it window.location.hrefs away
+      // and this line never runs; if it fails the parent surfaces
+      // the error banner and we un-busy so a retry is possible.
+      setOpening(false);
+    }
   }
 
   return (
@@ -945,12 +968,19 @@ function FreeTierNudge({
             )}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={handleUpgrade}
+            disabled={opening}
+            className="rounded-md bg-brand-500 px-4 py-2 text-sm font-medium text-white hover:bg-brand-600 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {opening ? "Opening…" : "Upgrade to Pro →"}
+          </button>
           <Link
             href="/pricing"
-            className="rounded-md bg-brand-500 px-4 py-2 text-sm font-medium text-white hover:bg-brand-600"
+            className="text-xs text-brand-700 underline hover:text-brand-600 dark:text-brand-300"
           >
-            {exceeded ? "Upgrade to Pro →" : "See pricing →"}
+            See all plans
           </Link>
           <button
             onClick={dismiss}
