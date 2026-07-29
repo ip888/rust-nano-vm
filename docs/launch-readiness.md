@@ -90,18 +90,24 @@ elapsed time: a working day. Actual keyboard time: ≈ 2 hours.
      site env vars and redeploy the web app.
    - Confirm the landing page's LiveForkBenchmark pill flips from
      "Seeded — not live" to "Live" and shows real numbers.
-2. **Launch content** (write these in a shared doc first, publish
-   after you're happy):
-   - Show HN post: link + one-paragraph pitch + top comment
-     with the technical deep-dive.
-   - Twitter/X thread: 5–7 tweets with the LiveForkBenchmark GIF,
-     the ~12 ms claim, and the free-tier CTA.
-   - LinkedIn post: the same content in longer prose.
-   - Product Hunt submission: gallery images (crop the OG images),
-     one-line pitch, first-comment technical detail.
-   - dev.to cross-posts of blog posts 05 (Claude Code) and 06
-     (LangChain.js), each ending with a "hosted on nanovm — free
-     tier" CTA linking home.
+2. **Launch content** — ready-to-paste drafts live in
+   [`docs/launch/`](launch/README.md):
+   - [`show-hn.md`](launch/show-hn.md) — post + top-comment
+     technical deep-dive + prepared defenses for the four most
+     likely follow-up questions.
+   - [`twitter-thread.md`](launch/twitter-thread.md) — 6-tweet
+     thread with the LiveForkBenchmark GIF as the hook.
+   - [`linkedin.md`](launch/linkedin.md) — the same story
+     reshaped for LinkedIn's audience.
+   - [`producthunt.md`](launch/producthunt.md) — Product Hunt
+     submission with gallery, description, first comment.
+   - [`dev-to-crosspost-05.md`](launch/dev-to-crosspost-05.md)
+     + [`06`](launch/dev-to-crosspost-06.md) — dev.to versions
+     of blog posts 05 (Claude Code) and 06 (LangChain.js),
+     each with the "hosted on nanovm — free tier" footer.
+   - [`metrics.md`](launch/metrics.md) — the two Prometheus
+     alerts that predict trouble + comment-triage table + when
+     to declare victory or defeat 24 h in.
 3. **Support surface** — decide before launch:
    - GitHub issues (already there).
    - Optional Discord + a `SECURITY.md` for responsible
