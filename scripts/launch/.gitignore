@@ -1,0 +1,3 @@
+# Never commit the real .env — it holds every production secret.
+.env
+.env.local
