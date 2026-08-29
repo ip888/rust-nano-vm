@@ -1,0 +1,54 @@
+name: dependabot-auto-merge
+
+# Auto-merge Dependabot PRs the moment CI turns green. Removes the
+# "click merge on 15 PRs every Monday" chore from the operator's
+# week. Safe scope:
+#
+# - **Minor + patch**: merged automatically after all required
+#   checks pass. Semver rules mean these don't break API surface.
+# - **Major bumps**: labeled `dependencies` but NOT auto-merged —
+#   they show up in the PR list for manual review because a major
+#   bump usually means a migration.
+#
+# Requires:
+#   Settings → General → Pull Requests → "Allow auto-merge" enabled.
+#   Settings → Branches → main branch protection → "Require status
+#   checks to pass before merging" with the `test` job from
+#   deploy.yml selected.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge for minor + patch
+        if: |
+          steps.metadata.outputs.update-type == 'version-update:semver-minor' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-patch'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr merge --auto --squash "${PR_URL}"
+
+      - name: Comment on major bumps (skip auto-merge)
+        if: steps.metadata.outputs.update-type == 'version-update:semver-major'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr comment "${PR_URL}" --body "⚠️ Major version bump — leaving open for manual review. Check the upstream changelog before merging."

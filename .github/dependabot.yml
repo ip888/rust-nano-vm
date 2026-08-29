@@ -1,0 +1,102 @@
+# Dependabot — weekly dependency updates across every ecosystem
+# this repo touches. PRs auto-merge on green CI via the
+# `dependabot-auto-merge.yml` workflow.
+#
+# Cadence is weekly on Monday morning UTC so the operator sees a
+# single grouped PR set at the start of the week instead of a
+# trickle every day.
+#
+# Grouping: minor + patch updates get grouped per ecosystem into a
+# single PR so 20 minor bumps don't fan out as 20 PRs. Major bumps
+# stay separate for individual attention (they usually need a
+# migration).
+
+version: 2
+updates:
+  # ---- Rust workspace ----------------------------------------------------
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+    labels: [dependencies, cargo]
+
+  # ---- Next.js marketing site + TypeScript SDK ---------------------------
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 10
+    groups:
+      web-minor-and-patch:
+        update-types: [minor, patch]
+    labels: [dependencies, npm, web]
+    ignore:
+      # React 19 is pinned intentionally to match Next 15's peer dep.
+      - dependency-name: react
+        update-types: [version-update:semver-major]
+      - dependency-name: react-dom
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: npm
+    directory: /clients/typescript
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 10
+    groups:
+      ts-sdk-minor-and-patch:
+        update-types: [minor, patch]
+    labels: [dependencies, npm, sdk-typescript]
+
+  # ---- Python SDK --------------------------------------------------------
+  - package-ecosystem: pip
+    directory: /clients/python
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    groups:
+      py-sdk-minor-and-patch:
+        update-types: [minor, patch]
+    labels: [dependencies, pip, sdk-python]
+
+  # ---- GitHub Actions themselves -----------------------------------------
+  # actions/checkout@v4 → v5 etc — quiet security work that keeps CI on
+  # supported action versions.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-and-patch:
+        update-types: [minor, patch]
+    labels: [dependencies, github-actions]
+
+  # ---- Dockerfile bases --------------------------------------------------
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 3
+    labels: [dependencies, docker]

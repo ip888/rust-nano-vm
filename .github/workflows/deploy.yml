@@ -1,0 +1,233 @@
+name: deploy
+
+# Zero-touch continuous deployment: every merge to main runs the
+# test suite, then (if green) deploys the web tier to Vercel and
+# the control plane to Fly.io. Post-deploy smoke tests re-verify
+# the live surface; a failure at any step leaves the previous
+# version live and surfaces via the standard GitHub Actions
+# notification channel.
+#
+# Manual re-deploy: `gh workflow run deploy.yml`.
+#
+# What this workflow does NOT do (by design):
+#   - Ship the SDKs — that's `python-publish.yml` + `npm-publish.yml`
+#     on `v*.*.*` tag pushes, unchanged.
+#   - Change Stripe / Cloudflare / DNS state — those are one-time
+#     `scripts/launch/*.sh` runs; changing them from CI would let a
+#     bad merge nuke production billing.
+#
+# Required repository secrets (set once via
+# `gh secret set` — see docs/autonomous-ops.md):
+#   FLY_API_TOKEN          — from `flyctl auth token`
+#   VERCEL_TOKEN           — from vercel.com/account/tokens
+#   VERCEL_ORG_ID          — from vercel.com/<org>/settings
+#   VERCEL_PROJECT_ID      — from web/.vercel/project.json after first deploy
+#
+# Required repository variables (public — set via `gh variable set`):
+#   NANOVM_FLY_APP         — Fly app name, default nanovm-control-plane-prod
+#   NANOVM_DOMAIN          — apex domain used by the smoke test
+#   NANOVM_API_DOMAIN      — api subdomain used by the smoke test
+
+on:
+  push:
+    branches: [main]
+  # Manual re-deploy from the Actions tab or CLI.
+  workflow_dispatch:
+
+# Cancel superseded runs so a rapid burst of merges doesn't queue up
+# obsolete deploys.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---- gate: unit + integration tests ------------------------------------
+
+  test:
+    name: test (rust + web)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Rust toolchain
+        run: rustup show
+
+      - name: Rust — build workspace
+        run: cargo build --workspace
+
+      - name: Rust — test (mock backend; KVM tests are feature-gated)
+        run: cargo test --workspace
+
+      - name: Rust — clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Rust — fmt
+        run: cargo fmt --all -- --check
+
+      - name: Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            clients/typescript/package-lock.json
+
+      - name: Web — typecheck + build
+        working-directory: web
+        run: |
+          npm ci
+          npm run typecheck
+          npm run build
+
+      - name: TS SDK — typecheck + test
+        working-directory: clients/typescript
+        run: |
+          npm ci
+          npm run typecheck
+          npm run test
+
+  # ---- deploy: web to Vercel + control plane to Fly.io -------------------
+  #
+  # The two happen in parallel — no cross-dependency. If either
+  # deploy step fails, the previous version keeps serving (Fly
+  # rollback via `flyctl releases`, Vercel via automatic previous-
+  # deploy retention).
+
+  deploy-web:
+    name: deploy web → Vercel
+    needs: test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment:
+      name: production-web
+      url: https://${{ vars.NANOVM_DOMAIN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Vercel CLI
+        run: npm install --global vercel@latest
+
+      - name: Pull Vercel project config
+        working-directory: web
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: vercel pull --yes --environment=production --token="${{ secrets.VERCEL_TOKEN }}"
+
+      - name: Build (Vercel prebuild)
+        working-directory: web
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: vercel build --prod --token="${{ secrets.VERCEL_TOKEN }}"
+
+      - name: Deploy (prebuilt)
+        working-directory: web
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          vercel deploy --prebuilt --prod \
+              --token="${{ secrets.VERCEL_TOKEN }}" \
+              > /tmp/deploy-url.txt
+          echo "deployed to: $(cat /tmp/deploy-url.txt)"
+
+  deploy-control-plane:
+    name: deploy control plane → Fly.io
+    needs: test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment:
+      name: production-api
+      url: https://${{ vars.NANOVM_API_DOMAIN }}/v1/health
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP: ${{ vars.NANOVM_FLY_APP }}
+        run: |
+          set -euo pipefail
+          # `-c deploy/live-demo/fly/fly.toml` uses the same manifest
+          # scripts/launch/fly-deploy.sh generates from. Deploy is
+          # blue/green by default on Fly with rollback-on-check-fail.
+          flyctl deploy \
+              -a "${FLY_APP}" \
+              -c deploy/live-demo/fly/fly.toml \
+              --strategy rolling \
+              --wait-timeout 600
+
+  # ---- post-deploy: smoke test the live surface --------------------------
+  #
+  # A failure here doesn't automatically roll back (Vercel + Fly already
+  # did the primary rollback if the deploy step failed) but does mark
+  # the run red so the operator investigates. In practice this catches
+  # deploy-succeeded-but-CORS-is-wrong and similar cross-service
+  # config drift.
+
+  smoke:
+    name: smoke test live surface
+    needs: [deploy-web, deploy-control-plane]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for DNS + edge propagation
+        # Vercel deploys serve globally in ~5 s; Fly.io machine
+        # rolling deploys can take up to 60 s. Give the whole thing
+        # a minute before we start smoke-testing.
+        run: sleep 60
+
+      - name: Marketing routes
+        env:
+          DOMAIN: ${{ vars.NANOVM_DOMAIN }}
+        run: |
+          set -euo pipefail
+          for path in "" /pricing /why-nanovm /marketplace /signup /sitemap.xml /robots.txt /rss.xml; do
+            url="https://${DOMAIN}${path}"
+            status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 --location "${url}")"
+            if [[ "${status}" != "200" ]]; then
+              echo "::error::${url} returned ${status}"
+              exit 1
+            fi
+            echo "  ✓ ${url}  200"
+          done
+
+      - name: Control-plane health
+        env:
+          API_DOMAIN: ${{ vars.NANOVM_API_DOMAIN }}
+        run: |
+          set -euo pipefail
+          for path in /v1/health /openapi.json /metrics; do
+            url="https://${API_DOMAIN}${path}"
+            status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 --location "${url}")"
+            if [[ "${status}" != "200" ]]; then
+              echo "::error::${url} returned ${status}"
+              exit 1
+            fi
+            echo "  ✓ ${url}  200"
+          done
