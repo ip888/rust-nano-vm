@@ -17,6 +17,11 @@ code. Every step below is either running a command, filling a form
 on a third-party dashboard, or writing a post. None of it needs
 another PR to the codebase in the base case.
 
+> **Want the 30-minute autonomous version instead?** Read
+> [`docs/autonomous-ops.md`](autonomous-ops.md) — one page that
+> gets you from clean laptop to hands-off SaaS. The runbook below
+> is the manual reference; autonomous-ops is what you actually do.
+
 ---
 
 ## Order of operations (three-day plan)
