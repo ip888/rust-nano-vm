@@ -854,7 +854,7 @@ dependencies = [
  "base64",
  "flate2",
  "getrandom 0.2.17",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "http-body-util",
  "nanovm-fleet",
  "reqwest",
