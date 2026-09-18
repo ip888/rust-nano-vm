@@ -45,7 +45,7 @@ tracing-subscriber.workspace = true
 # links libsqlite via `rusqlite/bundled` so a distroless runtime image
 # doesn't need a system libsqlite3. Only pulled when the `sqlite`
 # feature is on.
-rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 # Stripe billing (POST /v1/signup, GET /v1/billing/portal). rustls
 # variant so distroless doesn't need OpenSSL. Optional; only pulled
 # when the `billing` feature is on.
