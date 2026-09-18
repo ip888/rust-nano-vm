@@ -54,7 +54,7 @@ reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots"], op
 # are already in the dep tree via reqwest/rustls; declaring them
 # directly keeps the billing module's use explicit + testable.
 hmac = { version = "0.13", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 # OS RNG for magic-link signup tokens. `getrandom` is transitively in
 # the tree via reqwest/rustls; declaring 0.2 explicitly keeps the API
 # stable across upstream churn (0.3+ renamed the entry point).
