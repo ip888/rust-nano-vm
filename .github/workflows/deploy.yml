@@ -50,7 +50,7 @@ jobs:
     name: test (rust + web)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -116,7 +116,7 @@ jobs:
       name: production-web
       url: https://${{ vars.NANOVM_DOMAIN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Node 20
         uses: actions/setup-node@v4
@@ -160,7 +160,7 @@ jobs:
       name: production-api
       url: https://${{ vars.NANOVM_API_DOMAIN }}/v1/health
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: flyctl
         uses: superfly/flyctl-actions/setup-flyctl@master
@@ -194,7 +194,7 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Wait for DNS + edge propagation
         # Vercel deploys serve globally in ~5 s; Fly.io machine

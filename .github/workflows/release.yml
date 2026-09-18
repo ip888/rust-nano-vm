@@ -34,7 +34,7 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install toolchain
         run: rustup show && rustup target add ${{ matrix.target }}
