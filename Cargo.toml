@@ -59,7 +59,7 @@ tower-http = { version = "0.5", features = ["trace", "cors"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", features = ["json", "blocking"], default-features = false }
 vsock = "0.5"
-base64 = "0.22"
+base64 = "0.23"
 seccompiler = "0.5"
 # tar + flate2 back the marketplace-fork endpoint's tarball pull. Kept
 # workspace-wide (rather than crate-local) so tests + fixture builders
