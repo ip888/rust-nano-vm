@@ -47,7 +47,7 @@ jobs:
       # can pin loosely.
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -73,7 +73,7 @@ jobs:
       # right shape for their deployment without parsing tag flavors.
       - name: Extract Docker metadata (KVM image)
         id: meta-kvm
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-kvm
           tags: |
