@@ -53,12 +53,17 @@ set +a
 
 echo
 echo "-- tools --"
-for tool in flyctl vercel gh stripe jq curl openssl; do
+for tool in flyctl vercel gh stripe jq curl openssl dig; do
   if command -v "${tool}" > /dev/null 2>&1; then
     ver="$("${tool}" --version 2>&1 | head -n1 || true)"
     ok "${tool}  ${ver}"
   else
     bad "${tool} not installed"
+    if [[ "${tool}" == "dig" ]]; then
+      bad "  dig is used by status.sh + smoke.sh; install with:"
+      bad "    Ubuntu/Debian: sudo apt-get install -y dnsutils"
+      bad "    macOS:         brew install bind"
+    fi
   fi
 done
 
@@ -96,8 +101,11 @@ check_env CLOUDFLARE_ZONE_ID       '^[a-f0-9]{16,}$'
 check_env VERCEL_TOKEN
 check_env FLY_API_TOKEN
 check_env STRIPE_SECRET_KEY        '^sk_(test|live)_'
-check_env NANOVM_SMTP_URL          '^smtps?://'
-check_env NANOVM_SMTP_FROM         '^[^@]+@[a-z0-9.-]+\.[a-z]{2,}$'
+# Email delivery — the control-plane binary reads RESEND_API_KEY +
+# NANOVM_SIGNUP_FROM. The older SMTP_URL/SMTP_FROM template values
+# were never wired and are gone from .env.example.
+check_env RESEND_API_KEY           '^re_'
+check_env NANOVM_SIGNUP_FROM       '^[^@]+@[a-z0-9.-]+\.[a-z]{2,}$'
 check_env NANOVM_SIGNUP_TOKEN
 check_env NANOVM_OPERATOR_TOKEN    '^[^:]+:[^@]+@(admin|developer|viewer)$'
 
@@ -106,8 +114,8 @@ echo "-- optional env --"
 for var in STRIPE_WEBHOOK_SIGNING_SECRET \
            STRIPE_PRICE_ID_FREE STRIPE_PRICE_ID_PRO STRIPE_PRICE_ID_TEAM \
            NEXT_PUBLIC_NANOVM_DEMO_TOKEN \
-           NANOVM_SNAPSHOT_STORE_URL \
-           GRAFANA_CLOUD_PROM_URL; do
+           NANOVM_SNAPSHOT_STORE \
+           NANOVM_OWNERSHIP_STORE; do
   val="${!var:-}"
   if [[ -z "${val}" ]]; then
     warn "${var}  unset (fine for first-run — filled in by later scripts)"
@@ -120,16 +128,22 @@ done
 
 echo
 echo "-- sanity --"
+# Default unbound-safe (`${…:-}`) so a variable omitted from .env
+# renders a clean warning line instead of aborting preflight before
+# the summary. `NANOVM_SIGNUP_TOKEN` in particular used to trip this.
 if [[ "${STRIPE_SECRET_KEY:-}" == sk_live_* ]]; then
   warn "STRIPE_SECRET_KEY is a LIVE key — every checkout will charge a real card. Confirm intentional."
 fi
-if [[ "${NANOVM_OPERATOR_TOKEN:-}" == *CHANGEME* ]]; then
-  bad "NANOVM_OPERATOR_TOKEN still contains CHANGEME — replace it with a real random secret."
-  bad "  generate: openssl rand -hex 32"
+_operator_token="${NANOVM_OPERATOR_TOKEN:-}"
+if [[ "${_operator_token}" == *CHANGEME* ]]; then
+  bad "NANOVM_OPERATOR_TOKEN contains CHANGEME — the .env.example placeholder never should reach a deploy."
+  bad "  generate: printf 'operator:%s@admin\\n' \"\$(openssl rand -hex 32)\""
 fi
-if [[ ${#NANOVM_SIGNUP_TOKEN} -lt 32 ]]; then
-  bad "NANOVM_SIGNUP_TOKEN is under 32 chars; too weak. Regenerate with `openssl rand -hex 32`."
+_signup_token="${NANOVM_SIGNUP_TOKEN:-}"
+if [[ ${#_signup_token} -lt 32 ]]; then
+  bad "NANOVM_SIGNUP_TOKEN is under 32 chars; too weak. Regenerate with \`openssl rand -hex 32\`."
 fi
+unset _operator_token _signup_token
 
 # ---- 5. Report -------------------------------------------------------------
 

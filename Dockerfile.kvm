@@ -50,6 +50,7 @@ WORKDIR /src
 COPY . .
 
 RUN cargo build --release --locked \
+    --features billing,marketplace-fork,s3 \
     -p control-plane --bin nanovm-control-plane && \
     cargo build --release --locked \
     -p nanovm-jailer --bin nanovm-jailer && \
