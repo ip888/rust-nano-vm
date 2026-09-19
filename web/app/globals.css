@@ -1,6 +1,9 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/* Tailwind v4 CSS-first entry. `@config` bridges to the existing
+ * tailwind.config.ts so the brand palette + font stack keep working
+ * unchanged. When the JS config is retired the palette moves into a
+ * `@theme` block right below this import. */
+@import "tailwindcss";
+@config "../tailwind.config.ts";
 
 /* Body defaults — kept plain so utility classes on the layout do the
  * real work. Dark mode uses the same accent hues; the surface tone
