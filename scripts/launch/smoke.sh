@@ -81,7 +81,9 @@ http "OG (pricing)"        "https://${NANOVM_DOMAIN}/pricing/opengraph-image"
 
 echo
 echo "-- control plane (Fly.io)"
-http "health"              "https://${NANOVM_API_DOMAIN}/v1/health"
+# /healthz is the unauthenticated liveness probe; /v1/health is
+# behind the bearer-token auth middleware and would 401 here.
+http "health"              "https://${NANOVM_API_DOMAIN}/healthz"
 http "openapi"             "https://${NANOVM_API_DOMAIN}/openapi.json"
 http "metrics"             "https://${NANOVM_API_DOMAIN}/metrics"
 http "marketplace listing" "https://${NANOVM_API_DOMAIN}/v1/marketplace/snapshots"
@@ -90,41 +92,52 @@ http "marketplace listing" "https://${NANOVM_API_DOMAIN}/v1/marketplace/snapshot
 # NANOVM_CORS_ORIGIN silently breaks every dashboard fetch.
 echo
 echo "-- CORS"
-cors_origin="$(curl -sS -o /dev/null -w '%{header.access-control-allow-origin}' \
+cors_origin="$(curl -sS -o /dev/null -w '%header{access-control-allow-origin}' \
     -X OPTIONS \
     -H "Origin: https://${NANOVM_DOMAIN}" \
     -H "Access-Control-Request-Method: GET" \
-    "https://${NANOVM_API_DOMAIN}/v1/health" 2>/dev/null || true)"
+    "https://${NANOVM_API_DOMAIN}/healthz" 2>/dev/null || true)"
 if [[ "${cors_origin}" == "https://${NANOVM_DOMAIN}" || "${cors_origin}" == "*" ]]; then
   ok "CORS  Access-Control-Allow-Origin = ${cors_origin}"
 else
   bad "CORS  expected https://${NANOVM_DOMAIN}, got '${cors_origin}' (NANOVM_CORS_ORIGIN?)"
 fi
 
-# ---- 4. Signup gate is enforced (auth token required) ------------------
+# ---- 4. Admin signup endpoint is gated (NANOVM_SIGNUP_TOKEN enforced) --
+#
+# `/v1/signup` is the ADMIN provisioning endpoint — it's the one
+# gated by NANOVM_SIGNUP_TOKEN. Customer-facing sign-in flows through
+# `/v1/signup/request` which is intentionally open (that's the magic-
+# link path). Probing the open one would tell us nothing about the
+# gate; probing the admin one without the token verifies enforcement.
 
 echo
 echo "-- auth"
-signup_status="$(curl -sS -o /dev/null -w '%{http_code}' \
+admin_signup_status="$(curl -sS -o /dev/null -w '%{http_code}' \
     -X POST -H 'content-type: application/json' \
-    --data '{"email":"smoke@example.com","org":"smoke"}' \
-    "https://${NANOVM_API_DOMAIN}/v1/signup/request")"
-if [[ "${signup_status}" == "401" || "${signup_status}" == "403" ]]; then
-  ok "signup gate rejects no-token requests (${signup_status})"
-elif [[ "${signup_status}" == "200" || "${signup_status}" == "202" ]]; then
-  warn "signup is OPEN — NANOVM_SIGNUP_TOKEN not enforced. Confirm intentional."
+    --data '{"org":"smoke","email":"smoke@example.com"}' \
+    "https://${NANOVM_API_DOMAIN}/v1/signup")"
+if [[ "${admin_signup_status}" == "401" || "${admin_signup_status}" == "403" ]]; then
+  ok "admin /v1/signup gate rejects no-token requests (${admin_signup_status})"
+elif [[ "${admin_signup_status}" == "404" ]]; then
+  warn "/v1/signup returned 404 — is the billing feature built into the image?"
 else
-  bad "signup returned unexpected status ${signup_status}"
+  bad "/v1/signup returned unexpected status ${admin_signup_status} (expected 401/403)"
 fi
 
 # ---- 5. Stripe billing plumbing (needs live subscription to be full) --
 
 echo
 echo "-- Stripe"
-if [[ -n "${STRIPE_WEBHOOK_SIGNING_SECRET:-}" && "${STRIPE_WEBHOOK_SIGNING_SECRET}" != *placeholder* ]]; then
+stripe_wh="${STRIPE_WEBHOOK_SIGNING_SECRET:-}"
+# Reject the .env template default (`whsec_...`) as well as the
+# `placeholder-run-stripe-webhook-sh` sentinel that fly-deploy.sh
+# plants when the operator hasn't run stripe-webhook.sh yet. Also
+# require the real Stripe prefix + a plausible length.
+if [[ "${stripe_wh}" =~ ^whsec_[A-Za-z0-9]{20,}$ ]]; then
   ok "webhook signing secret present in .env"
 else
-  bad "STRIPE_WEBHOOK_SIGNING_SECRET missing — run stripe-webhook.sh + re-run fly-deploy.sh"
+  bad "STRIPE_WEBHOOK_SIGNING_SECRET missing/placeholder — run stripe-webhook.sh + re-run fly-deploy.sh"
 fi
 if [[ -n "${STRIPE_PRICE_ID_PRO:-}" ]]; then
   ok "STRIPE_PRICE_ID_PRO  ${STRIPE_PRICE_ID_PRO}"
