@@ -12,7 +12,7 @@ readme = "../../README.md"
 
 [dependencies]
 vm-core.workspace = true
-kvm-ioctls = { version = "0.24.0", optional = true }
+kvm-ioctls = { version = "0.25.0", optional = true }
 kvm-bindings = { version = "0.14.0", optional = true }
 vm-memory = { version = "0.17.1", default-features = false, features = ["backend-mmap"], optional = true }
 linux-loader = { version = "0.14.0", features = ["bzimage"], optional = true }
