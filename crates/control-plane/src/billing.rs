@@ -1095,7 +1095,8 @@ pub(crate) fn hash_signup_token(token: &str) -> String {
 /// crate needed here — we call `getrandom` directly).
 fn mint_signup_token() -> String {
     let mut buf = [0u8; 24];
-    getrandom::getrandom(&mut buf).expect("getrandom is available on all supported platforms");
+    // getrandom 0.4 renamed the free `getrandom()` helper to `fill()`.
+    getrandom::fill(&mut buf).expect("getrandom is available on all supported platforms");
     // Base64-url without padding: 24 bytes → 32 chars, only [A-Za-z0-9_-].
     // Hand-rolled so we don't pull in a base64-url dep for this one use.
     const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -1449,7 +1450,8 @@ pub fn verify_webhook_signature(
             tolerance_secs,
         });
     }
-    let mut mac = <SimpleHmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
+    // hmac 0.13 moved `new_from_slice` from the `Mac` trait to `KeyInit`.
+    let mut mac = <SimpleHmac<Sha256> as hmac::KeyInit>::new_from_slice(secret.as_bytes())
         .expect("HMAC accepts any key length");
     mac.update(ts.to_string().as_bytes());
     mac.update(b".");
@@ -1958,9 +1960,10 @@ mod tests {
     /// Sign a payload the same way Stripe would — helper for the tests
     /// below. Returns the `t=…,v1=…` header value.
     fn sign(secret: &str, payload: &[u8], ts: i64) -> String {
-        use hmac::{Mac, SimpleHmac};
+        use hmac::{KeyInit, Mac, SimpleHmac};
         use sha2::Sha256;
-        let mut mac = <SimpleHmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
+        // hmac 0.13 moved `new_from_slice` from Mac to KeyInit.
+        let mut mac = <SimpleHmac<Sha256> as KeyInit>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(ts.to_string().as_bytes());
         mac.update(b".");
         mac.update(payload);

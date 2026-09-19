@@ -145,7 +145,7 @@ impl OwnershipStore for SqliteStore {
             c.execute(
                 "INSERT INTO vms (id, org) VALUES (?1, ?2)
                  ON CONFLICT(id) DO UPDATE SET org = excluded.org",
-                params![vm.0, org.as_str()],
+                params![vm.0 as i64, org.as_str()],
             )?;
             Ok(())
         })
@@ -156,7 +156,7 @@ impl OwnershipStore for SqliteStore {
             c.execute(
                 "INSERT INTO snapshots (id, org) VALUES (?1, ?2)
                  ON CONFLICT(id) DO UPDATE SET org = excluded.org",
-                params![snap.0, org.as_str()],
+                params![snap.0 as i64, org.as_str()],
             )?;
             Ok(())
         })
@@ -164,23 +164,28 @@ impl OwnershipStore for SqliteStore {
 
     fn forget_vm(&self, vm: VmId) -> Result<(), OwnershipStoreError> {
         self.with_conn(|c| {
-            c.execute("DELETE FROM vms WHERE id = ?1", params![vm.0])?;
+            c.execute("DELETE FROM vms WHERE id = ?1", params![vm.0 as i64])?;
             Ok(())
         })
     }
 
     fn forget_snapshot(&self, snap: SnapshotId) -> Result<(), OwnershipStoreError> {
         self.with_conn(|c| {
-            c.execute("DELETE FROM snapshots WHERE id = ?1", params![snap.0])?;
+            c.execute(
+                "DELETE FROM snapshots WHERE id = ?1",
+                params![snap.0 as i64],
+            )?;
             Ok(())
         })
     }
 
     fn vm_owner(&self, vm: VmId) -> Option<OrgId> {
         self.with_conn(|c| {
-            c.query_row("SELECT org FROM vms WHERE id = ?1", params![vm.0], |r| {
-                r.get::<_, String>(0)
-            })
+            c.query_row(
+                "SELECT org FROM vms WHERE id = ?1",
+                params![vm.0 as i64],
+                |r| r.get::<_, String>(0),
+            )
             .optional()
         })
         .ok()
@@ -192,7 +197,7 @@ impl OwnershipStore for SqliteStore {
         self.with_conn(|c| {
             c.query_row(
                 "SELECT org FROM snapshots WHERE id = ?1",
-                params![snap.0],
+                params![snap.0 as i64],
                 |r| r.get::<_, String>(0),
             )
             .optional()
