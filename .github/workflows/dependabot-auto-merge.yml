@@ -10,14 +10,23 @@ name: dependabot-auto-merge
 #   they show up in the PR list for manual review because a major
 #   bump usually means a migration.
 #
+# Trigger note: uses `pull_request_target` (not `pull_request`) so the
+# workflow receives a read-write `GITHUB_TOKEN` even on PRs opened by
+# Dependabot, which the `pull_request` trigger scopes down to read-only
+# for bot-authored PRs (breaking `gh pr merge` + `gh pr comment`). This
+# workflow never checks out or executes PR-branch code, so the
+# elevated token is safe here — the only inputs it consumes are
+# Dependabot's own signed metadata.
+#
 # Requires:
 #   Settings → General → Pull Requests → "Allow auto-merge" enabled.
 #   Settings → Branches → main branch protection → "Require status
-#   checks to pass before merging" with the `test` job from
-#   deploy.yml selected.
+#   checks to pass before merging" with the required jobs from
+#   ci.yml (test, clippy, rustfmt, cargo-deny) selected — NOT
+#   deploy.yml's `test`, which only runs on push to main.
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, reopened, synchronize]
 
 permissions:
