@@ -24,17 +24,26 @@ set +a
 
 WEBHOOK_URL="https://${NANOVM_API_DOMAIN}/v1/stripe/webhook"
 
-# Every event we handle in `crates/control-plane/src/billing.rs`:
+# Every event `crates/control-plane/src/billing.rs::handle_webhook`
+# actually routes:
 # — customer.subscription.created / updated / deleted   → plan changes
-# — invoice.payment_succeeded / failed                  → dunning state
-# — checkout.session.completed                          → first-charge
+# — invoice.paid                                        → dunning clear
+# — invoice.payment_failed                              → dunning enter
+#
+# Notes:
+# — Stripe fires `invoice.paid` for the successful-charge case; the
+#   older `invoice.payment_succeeded` name is redundant and the
+#   handler doesn't listen for it, so registering it just wastes
+#   webhook delivery attempts.
+# — `checkout.session.completed` is intentionally ignored: subscription
+#   lifecycle is driven by the `customer.subscription.*` stream
+#   instead, which fires for both hosted-checkout and portal flows.
 EVENTS=(
   "customer.subscription.created"
   "customer.subscription.updated"
   "customer.subscription.deleted"
-  "invoice.payment_succeeded"
+  "invoice.paid"
   "invoice.payment_failed"
-  "checkout.session.completed"
 )
 
 echo "== Stripe webhook registration =="
