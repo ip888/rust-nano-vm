@@ -1,8 +1,10 @@
 # Autonomous production ops — the one-page runbook
 
-> **Goal**: 30 minutes of human work → a live SaaS that keeps
+> **Goal**: ~40 minutes of human work → a live SaaS that keeps
 > running, self-heals, and ships incremental improvements without
-> you touching it.
+> you touching it. (The steps below individually sum to 40 min —
+> 5 domain + 10 accounts + 10 credentials + 5 bootstrap + 10 CI wiring.
+> Faster with prior experience of Cloudflare/Vercel/Fly/Stripe.)
 >
 > **What "autonomous" means honestly**: everything that doesn't
 > require your legal identity (account creation, payment methods,
@@ -50,11 +52,11 @@
 
 | Loop | Runs | Trigger | What it does |
 |---|---|---|---|
-| **CI/CD deploy** | On every merge to `main` | GitHub push event | Test → build → deploy web + control-plane → smoke; auto-rollback on failure. |
+| **CI/CD deploy** | On every merge to `main` | GitHub push event | Test → build → deploy web + control-plane → smoke. A failure in the deploy step leaves the previous release live (Fly + Vercel each retain the previous version on failure). A failure in the *smoke* step does NOT auto-roll-back — the just-deployed version stays live and the run is marked red; investigate before merging further changes. |
 | **SDK ship** | On every `v*.*.*` git tag | Push tag | Publishes `nanovm` to PyPI + `@nanovm/sdk` to npm via Trusted Publishers (zero long-lived secrets). |
 | **Dependency updates** | Weekly, Monday morning UTC | Dependabot | Opens PRs to bump cargo / npm / pip / gh-actions deps. |
 | **Auto-merge** | Every Dependabot PR | GitHub PR event | Merges the PR the moment all required checks pass. |
-| **Uptime + billing alerts** | Continuous | Prometheus / Fly checks | Fly notifies you if the machine crash-loops; Stripe emails you on failed payments; both are self-fixing (Fly restarts, Stripe retries dunning per `NANOVM_DUNNING_GRACE_HOURS`). |
+| **Uptime + billing alerts** | Continuous (with the extra setup step below) | Prometheus / Fly checks | Fly notifies you if the machine crash-loops; Stripe emails you on failed payments; both are self-fixing (Fly restarts, Stripe retries dunning per `NANOVM_DUNNING_GRACE_HOURS`). **Prometheus alerts are NOT wired by Steps 1–5** — see "Optional: hook up Prometheus alerts" below. |
 | **Copilot review sweeps** | On every PR you open | GitHub Copilot review bot | Not you-triggered; Copilot posts findings and you address them via the PR sweep pattern already established in the repo (see #200, #196, #181). |
 
 Everything above is **already shipped** in this repo. The remaining
@@ -72,9 +74,9 @@ you Cloudflare DNS for free. Popular choices:
 - `nanovm.ai`
 - `<yourbrand>.com` if this is a rebrand
 
-### Step 2 — create the four service accounts (10 min)
+### Step 2 — create the seven service accounts (10 min)
 
-Sign up (free tiers) for all four in a browser. No CLI yet.
+Sign up (free tiers where noted) for all seven in a browser. No CLI yet.
 
 | Account | Why | Cost |
 |---|---|---|
@@ -82,12 +84,43 @@ Sign up (free tiers) for all four in a browser. No CLI yet.
 | [Vercel](https://vercel.com/signup) | Marketing site hosting | Free tier |
 | [Fly.io](https://fly.io/app/sign-up) | Control-plane hosting (needs KVM) | Add credit card; ~$25/mo baseline |
 | [Stripe](https://dashboard.stripe.com/register) | Billing | Free until first charge |
-| [Postmark](https://account.postmarkapp.com/sign_up) OR [Resend](https://resend.com/signup) | Magic-link email | ~$10-20/mo |
+| [Resend](https://resend.com/signup) | Magic-link email (the control-plane binary only wires the Resend provider — `RESEND_API_KEY` + `NANOVM_SIGNUP_FROM`) | Free up to 100 emails/day; ~$20/mo after |
 | [npmjs](https://www.npmjs.com/signup) | `@nanovm/sdk` publish | Free |
 | [PyPI](https://pypi.org/account/register/) | `nanovm` publish | Free |
 
 Add a credit card to Fly.io only — the others are free tier for
 launch.
+
+### Prerequisite tools
+
+The launch scripts drive Fly, Vercel, Stripe, Cloudflare, and GitHub
+through their CLIs. Install these once on the machine you'll run
+`scripts/launch/preflight.sh` from:
+
+```sh
+# macOS
+brew install flyctl vercel-cli gh stripe/stripe-cli/stripe jq openssl bind
+
+# Ubuntu / Debian
+curl -L https://fly.io/install.sh | sh                             # flyctl
+sudo apt-get install -y curl jq openssl dnsutils                   # curl, jq, openssl, dig
+type -p curl >/dev/null || sudo apt install curl -y                # gh prereq
+curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+ && sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    | sudo tee /etc/apt/sources.list.d/github-cli.list \
+ && sudo apt update && sudo apt install gh -y                      # gh
+curl -fsSL https://cli.vercel.com/install.sh | sh                  # vercel-cli
+curl -s https://packages.stripe.dev/api/security/keypair/stripe-cli-gpg/public \
+    | sudo gpg --dearmor -o /usr/share/keyrings/stripe.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/stripe.gpg] https://packages.stripe.dev/stripe-cli-debian-local stable main" \
+    | sudo tee /etc/apt/sources.list.d/stripe.list \
+ && sudo apt update && sudo apt install stripe -y                  # stripe
+```
+
+`preflight.sh` reports each missing tool with a `[×]` line so this
+list stays honest across OS variations.
 
 ### Step 3 — gather one bag of credentials (10 min)
 
@@ -101,7 +134,7 @@ text file:
 | Vercel token | https://vercel.com/account/tokens (Create) | `vercel_...` |
 | Fly.io token | terminal: `flyctl auth login` then `flyctl auth token` | multi-line JWT |
 | Stripe secret key | https://dashboard.stripe.com/test/apikeys (start in test mode) | `sk_test_...` |
-| Postmark server token | https://account.postmarkapp.com/servers → server → API tokens | 36-char UUID |
+| Resend API key | https://resend.com/api-keys → "Create API Key" | `re_...` |
 
 ### Step 4 — bootstrap the launch (5 min)
 
@@ -133,14 +166,22 @@ is idempotent.
 
 ### Step 5 — wire the CI/CD once (10 min, one-time)
 
-The `.github/workflows/deploy.yml` shipped in this repo needs three
-secrets in the repo's Actions settings:
+The `.github/workflows/deploy.yml` shipped in this repo needs four
+secrets AND three variables in the repo's Actions settings. Secrets
+are opaque to the workflow (Fly + Vercel credentials); variables are
+readable in logs (app + domain names — non-sensitive).
 
 ```sh
-gh secret set FLY_API_TOKEN            --body "$(cat ~/.fly/token)"
-gh secret set VERCEL_TOKEN             --body "<vercel token from step 3>"
-gh secret set VERCEL_ORG_ID            --body "<vercel dashboard → settings>"
-gh secret set VERCEL_PROJECT_ID        --body "<from .vercel/project.json after first deploy>"
+# ---- Secrets (four) ---------------------------------------------------
+gh secret set FLY_API_TOKEN     --body "$(flyctl auth token)"
+gh secret set VERCEL_TOKEN      --body "<vercel token from step 3>"
+gh secret set VERCEL_ORG_ID     --body "<vercel dashboard → settings>"
+gh secret set VERCEL_PROJECT_ID --body "<from web/.vercel/project.json after first deploy>"
+
+# ---- Variables (three, non-secret) -----------------------------------
+gh variable set NANOVM_FLY_APP    --body "nanovm-control-plane-prod"
+gh variable set NANOVM_DOMAIN     --body "<your.domain>"
+gh variable set NANOVM_API_DOMAIN --body "api.<your.domain>"
 ```
 
 Two more one-time steps for SDK auto-publish:
@@ -185,19 +226,45 @@ backups (Fly volumes), SSL renewal (Fly + Cloudflare), OS patches
 
 ## Ongoing cost budget
 
+Two shapes, depending on how you host the control plane:
+
+### Always-on machine (what the shipped `deploy/live-demo/fly/fly.toml` picks)
+
 | Line | Cost |
 |---|---|
 | Domain | ~$12/yr |
 | Cloudflare | $0 (free tier) |
 | Vercel | $0 (free tier, upgrade to $20/mo Pro when > 100 GB bandwidth/mo) |
-| Fly.io control plane (`performance-2x`, always-on) | ~$25/mo |
+| Fly.io control plane (`performance-2x`, 2 vCPU / 4 GB, `auto_stop_machines=off`, `min_machines_running=1`) — **~$0.30/hr × 730 h/mo ≈ $219/mo** | ~$219/mo |
 | Fly.io storage volume (10 GB) | ~$1.50/mo |
-| Postmark / Resend email | ~$10-20/mo |
+| Resend email (Free tier covers 100 emails/day; upgrade past that) | $0 → ~$20/mo |
 | Stripe fees | 2.9% + 30¢ per charge — no fixed cost |
-| **Total baseline** | **~$40/mo** before customers |
+| **Baseline** | **~$232/mo** before customers |
 
-Every paid customer at $29/mo Pro puts you profitably ahead of that
-baseline.
+That's the honest number if you keep the machine hot 24×7 the way
+the shipped Fly manifest does. Break-even: **9 Pro customers at
+$29/mo**.
+
+### Scale-to-zero (for pre-launch and light-traffic operation)
+
+Flip `deploy/live-demo/fly/fly.toml` to `auto_stop_machines = "stop"`
+and `min_machines_running = 0`, and set an `auto_start = true`
+service. The machine sleeps between requests and pays only for the
+seconds it's actually serving.
+
+| Line | Cost |
+|---|---|
+| Domain | ~$12/yr |
+| Cloudflare | $0 |
+| Vercel | $0 |
+| Fly.io control plane (idle most of the day, cold-start ~1 s on next request) | **~$5-15/mo** at pre-launch traffic |
+| Fly.io storage volume (10 GB) | ~$1.50/mo |
+| Resend email | Free tier |
+| **Baseline** | **~$20/mo** pre-launch |
+
+Cold-start cost is a ~1 s delay on the first request after quiet.
+Fine for pre-launch and demo traffic; flip back to always-on when
+paid usage starts driving the machine hot anyway.
 
 ## What to do RIGHT NOW to launch
 
@@ -218,12 +285,17 @@ is a good problem. Two responses:
 
 - **If most traffic is signups**: nothing to do; the free tier
   spreads the load organically.
-- **If the LiveForkBenchmark on the landing page bogs down**: bump
-  the demo tenant's cap:
+- **If the LiveForkBenchmark on the landing page bogs down**: raise
+  the global fork-rate cap (the control plane parses global
+  `NANOVM_FORK_RPS` / `NANOVM_FORK_BURST`; per-org caps come from
+  Stripe plan tiers, so there is no `NANOVM_FORK_RPS_demo`
+  per-tenant override):
   ```sh
-  flyctl secrets set -a nanovm-control-plane-prod NANOVM_FORK_RPS_demo=5
+  flyctl secrets set -a nanovm-control-plane-prod NANOVM_FORK_RPS=100 NANOVM_FORK_BURST=200
   ```
   Fly restarts the machine in ~30 seconds; nothing else changes.
+  Tighten the Free-tier plan's fork quota via `NANOVM_PLAN_TIERS` if
+  you want to prevent free traffic from starving paid traffic.
 
 ## Where to look when something feels wrong
 

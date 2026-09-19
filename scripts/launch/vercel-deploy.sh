@@ -74,10 +74,23 @@ echo "   deployed:  ${deploy_url}"
 
 echo
 echo "-- attach custom domain: ${NANOVM_DOMAIN}"
-# `vercel domains add` is idempotent — no-ops if the domain is already attached
-# to the project.
-vercel domains add "${NANOVM_DOMAIN}" "${VERCEL_PROJECT}" \
-    --token "${VERCEL_TOKEN}" 2>&1 | grep -Ev '^$' || true
+# `vercel domains add` is idempotent — no-ops if the domain is already
+# attached to the project. Real failures (auth, project mismatch,
+# domain not owned) MUST fail the script — piping through `grep …
+# || true` used to swallow the exit status and leave the operator
+# with a green "== SUCCESS ==" while the custom domain wasn't actually
+# attached. Capture the output, check the exit code, and only ignore
+# the specific "already exists" case.
+set +e
+domain_out="$(vercel domains add "${NANOVM_DOMAIN}" "${VERCEL_PROJECT}" \
+    --token "${VERCEL_TOKEN}" 2>&1)"
+domain_rc=$?
+set -e
+echo "${domain_out}" | sed -E '/^$/d'
+if [[ ${domain_rc} -ne 0 ]] && ! echo "${domain_out}" | grep -qiE 'already (exists|assigned|configured)'; then
+  echo "!! vercel domains add failed (rc=${domain_rc}) — see output above" >&2
+  exit 1
+fi
 
 echo
 echo "== SUCCESS =="

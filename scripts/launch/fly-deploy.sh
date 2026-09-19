@@ -22,10 +22,11 @@ set +a
 : "${NANOVM_DOMAIN:?run preflight.sh first}"
 : "${NANOVM_API_DOMAIN:?run preflight.sh first}"
 : "${STRIPE_SECRET_KEY:?run preflight.sh first}"
-: "${NANOVM_SMTP_URL:?run preflight.sh first}"
-: "${NANOVM_SMTP_FROM:?run preflight.sh first}"
+: "${RESEND_API_KEY:?run preflight.sh first}"
+: "${NANOVM_SIGNUP_FROM:?run preflight.sh first}"
 : "${NANOVM_SIGNUP_TOKEN:?run preflight.sh first}"
 : "${NANOVM_OPERATOR_TOKEN:?run preflight.sh first}"
+: "${NANOVM_OWNERSHIP_STORE:=/data/nanovm.sqlite}"
 : "${NANOVM_FLY_APP:=nanovm-control-plane-prod}"
 : "${NANOVM_FLY_REGION:=iad}"
 
@@ -83,6 +84,12 @@ fi
 # `flyctl secrets set` diffs against existing values by hash — no-op
 # when unchanged. Deploys the machine to pick up new values in the
 # same call.
+# Optional S3 snapshot store — only plant if the operator filled it in.
+SNAPSHOT_STORE_ARG=()
+if [[ -n "${NANOVM_SNAPSHOT_STORE:-}" ]]; then
+  SNAPSHOT_STORE_ARG=(NANOVM_SNAPSHOT_STORE="${NANOVM_SNAPSHOT_STORE}")
+fi
+
 flyctl secrets set -a "${NANOVM_FLY_APP}" --stage \
     NANOVM_API_TOKENS="${NANOVM_OPERATOR_TOKEN}" \
     NANOVM_SIGNUP_TOKEN="${NANOVM_SIGNUP_TOKEN}" \
@@ -91,11 +98,13 @@ flyctl secrets set -a "${NANOVM_FLY_APP}" --stage \
     STRIPE_WEBHOOK_SIGNING_SECRET="${STRIPE_WEBHOOK_SIGNING_SECRET:-placeholder-run-stripe-webhook-sh}" \
     STRIPE_BILLING_PORTAL_RETURN_URL="https://${NANOVM_DOMAIN}/dashboard" \
     NANOVM_PLAN_TIERS="${PLAN_TIERS_STR}" \
-    NANOVM_SMTP_URL="${NANOVM_SMTP_URL}" \
-    NANOVM_SMTP_FROM="${NANOVM_SMTP_FROM}" \
+    RESEND_API_KEY="${RESEND_API_KEY}" \
+    NANOVM_SIGNUP_FROM="${NANOVM_SIGNUP_FROM}" \
     NANOVM_SIGNUP_VERIFY_URL="https://${NANOVM_DOMAIN}/signup/verify" \
     NANOVM_TOKEN_STORE_PATH="/data/tokens.json" \
-    NANOVM_AUDIT_LOG="/data/audit.jsonl"
+    NANOVM_AUDIT_LOG="/data/audit.jsonl" \
+    NANOVM_OWNERSHIP_STORE="${NANOVM_OWNERSHIP_STORE}" \
+    "${SNAPSHOT_STORE_ARG[@]}"
 
 # ---- 4. Copy fly.toml to a launch-specific one ---------------------------
 
