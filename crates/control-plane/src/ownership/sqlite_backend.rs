@@ -171,16 +171,21 @@ impl OwnershipStore for SqliteStore {
 
     fn forget_snapshot(&self, snap: SnapshotId) -> Result<(), OwnershipStoreError> {
         self.with_conn(|c| {
-            c.execute("DELETE FROM snapshots WHERE id = ?1", params![snap.0 as i64])?;
+            c.execute(
+                "DELETE FROM snapshots WHERE id = ?1",
+                params![snap.0 as i64],
+            )?;
             Ok(())
         })
     }
 
     fn vm_owner(&self, vm: VmId) -> Option<OrgId> {
         self.with_conn(|c| {
-            c.query_row("SELECT org FROM vms WHERE id = ?1", params![vm.0 as i64], |r| {
-                r.get::<_, String>(0)
-            })
+            c.query_row(
+                "SELECT org FROM vms WHERE id = ?1",
+                params![vm.0 as i64],
+                |r| r.get::<_, String>(0),
+            )
             .optional()
         })
         .ok()
