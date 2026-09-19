@@ -1,20 +1,20 @@
 name: docker
 
 # Publish a container image of `nanovm-control-plane` to GitHub
-# Container Registry on every semver tag push (linux/amd64 only — the
-# job runs on `ubuntu-latest` with no QEMU/buildx-platforms config, so
-# this is a single-arch build). Multi-arch is a follow-up that adds
-# `platforms: linux/amd64,linux/arm64` + a QEMU setup step.
+# Container Registry on every semver tag push AND every push to
+# `main`. Two flavors of `:latest` are produced:
 #
-# The release workflow (release.yml) ships the prebuilt tarballs in
-# parallel; this workflow ships the Docker image at
-# `ghcr.io/ip888/nanovm-control-plane:<tag>`.
+#   - On semver tag: `<tag>`, `<major.minor>`, and `latest` (the
+#     release channel; what customers pin).
+#   - On main push: `main` and `edge` (the continuous channel;
+#     `.github/workflows/deploy.yml` deploys `edge` so post-merge
+#     changes actually reach the SaaS Fly app without a manual tag).
 #
-# Triggers on the same `v*.*.*` tag pattern as `release.yml` so a
-# single tag push produces both artifacts.
+# Single-arch (linux/amd64) — multi-arch is a follow-up.
 
 on:
   push:
+    branches: [main]
     tags: ["v*.*.*"]
 
 permissions:
@@ -53,7 +53,10 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push (mock backend)
         uses: docker/build-push-action@v5
@@ -79,7 +82,10 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push (KVM backend)
         uses: docker/build-push-action@v5
