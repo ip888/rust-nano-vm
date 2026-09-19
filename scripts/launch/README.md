@@ -50,8 +50,9 @@ $EDITOR scripts/launch/.env
 ./scripts/launch/preflight.sh
 
 # 3. Set up Stripe products (Free/Pro/Team) + billing portal config.
-#    Idempotent — safe to re-run. Prints the price IDs you paste
-#    into .env's NANOVM_PLAN_TIERS.
+#    Idempotent — safe to re-run. Prints STRIPE_PRICE_ID_FREE /
+#    STRIPE_PRICE_ID_PRO / STRIPE_PRICE_ID_TEAM to paste into .env;
+#    fly-deploy.sh assembles NANOVM_PLAN_TIERS from those three.
 ./scripts/launch/stripe-setup.sh
 
 # 4. Configure DNS at your registrar (Cloudflare API).
