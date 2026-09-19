@@ -1960,9 +1960,10 @@ mod tests {
     /// Sign a payload the same way Stripe would — helper for the tests
     /// below. Returns the `t=…,v1=…` header value.
     fn sign(secret: &str, payload: &[u8], ts: i64) -> String {
-        use hmac::{Mac, SimpleHmac};
+        use hmac::{KeyInit, Mac, SimpleHmac};
         use sha2::Sha256;
-        let mut mac = <SimpleHmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
+        // hmac 0.13 moved `new_from_slice` from Mac to KeyInit.
+        let mut mac = <SimpleHmac<Sha256> as KeyInit>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(ts.to_string().as_bytes());
         mac.update(b".");
         mac.update(payload);
