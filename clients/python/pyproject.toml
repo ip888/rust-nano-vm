@@ -48,7 +48,7 @@ nanovm = "nanovm.cli:main"
 # Async client — non-agent users who want `AsyncClient` on their own
 # asyncio loop. Small dep footprint.
 async = [
-    "httpx>=0.27",
+    "httpx>=0.28.1",
 ]
 # LangChain agent adapter — plugs a nanovm sandbox into a LangChain /
 # LangGraph agent as a first-class tool. Pulls the small, focused
@@ -71,7 +71,7 @@ agents = [
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
-    "httpx>=0.27",
+    "httpx>=0.28.1",
     "langchain-core>=0.3",
     "pydantic>=2.13.5",
 ]
