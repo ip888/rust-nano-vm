@@ -95,59 +95,59 @@ echo "  team  ${team_price}    \$199/mo"
 
 echo
 echo "-- customer portal --"
-# Configure the portal with all three products visible, plan switching
-# on, cancellation allowed. Retry-idempotent — updating an existing
-# config with the same shape is a no-op.
-portal_json="$(cat <<JSON
-{
-  "features": {
-    "customer_update": { "enabled": true, "allowed_updates": ["email", "tax_id", "address"] },
-    "invoice_history": { "enabled": true },
-    "payment_method_update": { "enabled": true },
-    "subscription_cancel": { "enabled": true, "mode": "at_period_end" },
-    "subscription_update": {
-      "enabled": true,
-      "default_allowed_updates": ["price"],
-      "products": [
-        { "product": "${free_pid}", "prices": ["${free_price}"] },
-        { "product": "${pro_pid}",  "prices": ["${pro_price}"] },
-        { "product": "${team_pid}", "prices": ["${team_price}"] }
-      ]
-    }
-  },
-  "business_profile": {
-    "headline": "Manage your nanovm subscription",
-    "privacy_policy_url": "https://${NANOVM_DOMAIN}/privacy",
-    "terms_of_service_url": "https://${NANOVM_DOMAIN}/terms"
-  },
-  "default_return_url": "https://${NANOVM_DOMAIN}/dashboard"
-}
-JSON
-)"
+# Configure the portal with all three products visible (Free included
+# so paid customers can downgrade back), plan switching on,
+# cancellation allowed.
+#
+# Idempotency: look up any existing configuration tagged with
+# `metadata.nanovm_managed=1` and POST an UPDATE to that id; only
+# create a fresh configuration on the very first run. Without this
+# lookup, re-running stripe-setup.sh would accumulate a new portal
+# configuration each time and Stripe would silently keep using the
+# oldest one.
 
-# Post via the raw API — the stripe CLI's `billing_portal configurations`
-# command is limited on shape.
-portal_config_id="$(curl -sS -u "${STRIPE_SECRET_KEY}:" \
-  https://api.stripe.com/v1/billing_portal/configurations \
-  --data-urlencode "features[customer_update][enabled]=true" \
-  --data-urlencode "features[customer_update][allowed_updates][0]=email" \
-  --data-urlencode "features[customer_update][allowed_updates][1]=address" \
-  --data-urlencode "features[invoice_history][enabled]=true" \
-  --data-urlencode "features[payment_method_update][enabled]=true" \
-  --data-urlencode "features[subscription_cancel][enabled]=true" \
-  --data-urlencode "features[subscription_cancel][mode]=at_period_end" \
-  --data-urlencode "features[subscription_update][enabled]=true" \
-  --data-urlencode "features[subscription_update][default_allowed_updates][0]=price" \
-  --data-urlencode "features[subscription_update][products][0][product]=${pro_pid}" \
-  --data-urlencode "features[subscription_update][products][0][prices][0]=${pro_price}" \
-  --data-urlencode "features[subscription_update][products][1][product]=${team_pid}" \
-  --data-urlencode "features[subscription_update][products][1][prices][0]=${team_price}" \
-  --data-urlencode "business_profile[headline]=Manage your nanovm subscription" \
-  --data-urlencode "default_return_url=https://${NANOVM_DOMAIN}/dashboard" \
-  | jq -r '.id')"
+portal_form=(
+  --data-urlencode "metadata[nanovm_managed]=1"
+  --data-urlencode "features[customer_update][enabled]=true"
+  --data-urlencode "features[customer_update][allowed_updates][0]=email"
+  --data-urlencode "features[customer_update][allowed_updates][1]=address"
+  --data-urlencode "features[invoice_history][enabled]=true"
+  --data-urlencode "features[payment_method_update][enabled]=true"
+  --data-urlencode "features[subscription_cancel][enabled]=true"
+  --data-urlencode "features[subscription_cancel][mode]=at_period_end"
+  --data-urlencode "features[subscription_update][enabled]=true"
+  --data-urlencode "features[subscription_update][default_allowed_updates][0]=price"
+  --data-urlencode "features[subscription_update][products][0][product]=${free_pid}"
+  --data-urlencode "features[subscription_update][products][0][prices][0]=${free_price}"
+  --data-urlencode "features[subscription_update][products][1][product]=${pro_pid}"
+  --data-urlencode "features[subscription_update][products][1][prices][0]=${pro_price}"
+  --data-urlencode "features[subscription_update][products][2][product]=${team_pid}"
+  --data-urlencode "features[subscription_update][products][2][prices][0]=${team_price}"
+  --data-urlencode "business_profile[headline]=Manage your nanovm subscription"
+  --data-urlencode "default_return_url=https://${NANOVM_DOMAIN}/dashboard"
+)
+
+existing_portal_id="$(curl -sS -u "${STRIPE_SECRET_KEY}:" \
+    'https://api.stripe.com/v1/billing_portal/configurations?limit=100' \
+    | jq -r '.data[] | select(.metadata.nanovm_managed == "1") | .id' \
+    | head -n1)"
+
+if [[ -n "${existing_portal_id}" ]]; then
+  echo "  updating existing portal config: ${existing_portal_id}"
+  portal_config_id="$(curl -sS -u "${STRIPE_SECRET_KEY}:" \
+      "https://api.stripe.com/v1/billing_portal/configurations/${existing_portal_id}" \
+      "${portal_form[@]}" \
+      | jq -r '.id')"
+else
+  echo "  creating portal config"
+  portal_config_id="$(curl -sS -u "${STRIPE_SECRET_KEY}:" \
+      https://api.stripe.com/v1/billing_portal/configurations \
+      "${portal_form[@]}" \
+      | jq -r '.id')"
+fi
 
 if [[ "${portal_config_id}" == "null" || -z "${portal_config_id}" ]]; then
-  echo "!! portal config creation failed; the returned JSON was:" >&2
+  echo "!! portal config write failed; the returned JSON did not carry an id" >&2
   exit 1
 fi
 echo "  portal_config  ${portal_config_id}"
