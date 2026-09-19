@@ -17,12 +17,15 @@ target/
 
 # Docs and bench / dev tooling — not needed for the control plane build.
 docs/
-tools/
-# Except: Dockerfile.kvm's `kvm-images` stage COPYs tools/kvm-images/fetch.sh
-# to fetch the bundled Firecracker vmlinux + Alpine rootfs into the runtime
-# image. Excluding it here breaks `docker build -f Dockerfile.kvm` with
-# "failed to compute cache key: '/tools/kvm-images/fetch.sh': not found".
-!tools/kvm-images/
+# `tools/*` (with the wildcard, NOT `tools/`) leaves the `tools/`
+# directory itself traversable while excluding its children —
+# `.dockerignore` follows the same "cannot re-include a child under an
+# excluded parent" rule as `.gitignore`, so `!tools/kvm-images/…` would
+# be a no-op if `tools/` were the excluded entry. Dockerfile.kvm's
+# `kvm-images` stage COPYs `tools/kvm-images/fetch.sh` to fetch the
+# bundled Firecracker vmlinux + Alpine rootfs into the runtime image.
+tools/*
+!tools/kvm-images
 !tools/kvm-images/**
 
 # Repo policy + docs files. (cargo doesn't need README.md or LICENSE
