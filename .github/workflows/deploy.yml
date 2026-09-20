@@ -166,7 +166,7 @@ jobs:
         # Pinned by SHA (v1.5) so a compromised `master` on the action
         # cannot exfiltrate `FLY_API_TOKEN`. Dependabot bumps this
         # alongside the other github-actions ecosystem entries.
-        uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be
+        uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
 
       - name: Deploy
         env:
