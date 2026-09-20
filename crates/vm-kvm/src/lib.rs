@@ -1982,7 +1982,11 @@ fn add_e820_entry(params: &mut boot_params, addr: u64, size: u64, mem_type: u32)
     let entry = &mut params.e820_table[usize::from(params.e820_entries)];
     entry.addr = addr;
     entry.size = size;
-    entry.type_ = mem_type;
+    // linux-loader 0.14 renamed `type_` to `r#type` on boot_e820_entry
+    // (the field is `type` in the kernel headers; older bindgen output
+    // used the trailing-underscore fallback, newer output uses the raw
+    // identifier).
+    entry.r#type = mem_type;
     params.e820_entries += 1;
     Ok(())
 }

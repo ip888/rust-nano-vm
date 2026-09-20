@@ -1717,7 +1717,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d54207cb617cd75b10c57ad20235c914ab62b180ceeff2ef3111983670d3b321"
 dependencies = [
- "vm-memory",
+ "vm-memory 0.18.0",
 ]
 
 [[package]]
@@ -3096,8 +3096,17 @@ dependencies = [
  "snapshot",
  "virtio-vsock",
  "vm-core",
- "vm-memory",
+ "vm-memory 0.17.2",
  "vmm-sys-util",
+]
+
+[[package]]
+name = "vm-memory"
+version = "0.17.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e201ed63fdaba7bdafd07176f2060ffa6949aa05559acbc3f5189824bb285428"
+dependencies = [
+ "vm-memory 0.18.0",
 ]
 
 [[package]]
