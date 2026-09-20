@@ -27,12 +27,17 @@ updates:
         update-types: [minor, patch]
     labels: [dependencies, cargo]
     ignore:
+      # vm-memory 0.18 + linux-loader 0.14 are a coupled migration:
       # vm-memory 0.18 moved `checked_offset`, `last_addr`, and `iter`
-      # from `GuestMemory` to `GuestMemoryBackend`, renamed the
-      # `boot_e820_entry.type_` field, and other breaking changes we
-      # rely on across ~11 sites in `crates/vm-kvm/src/lib.rs`. Pinning
-      # to 0.17 until we schedule the migration.
+      # off `GuestMemory` onto `GuestMemoryBackend` and reshaped
+      # `GuestRegionCollection` (~8 API sites in vm-kvm/src/lib.rs);
+      # linux-loader 0.14 requires vm-memory 0.18 as its public dep
+      # AND rebinds the `boot_e820_entry.type_` field to `r#type` in
+      # its regenerated bindings. Ignoring both here — bump them
+      # together during a scheduled migration.
       - dependency-name: vm-memory
+        update-types: [version-update:semver-major]
+      - dependency-name: linux-loader
         update-types: [version-update:semver-major]
       # axum 0.8 changed `Sse::keep_alive()` return type (now wraps
       # `KeepAliveStream<S>`) and swapped the route-matcher syntax from
