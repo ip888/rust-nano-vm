@@ -26,6 +26,25 @@ updates:
       cargo-minor-and-patch:
         update-types: [minor, patch]
     labels: [dependencies, cargo]
+    ignore:
+      # vm-memory 0.18 + linux-loader 0.14 are a coupled migration:
+      # vm-memory 0.18 moved `checked_offset`, `last_addr`, and `iter`
+      # off `GuestMemory` onto `GuestMemoryBackend` and reshaped
+      # `GuestRegionCollection` (~8 API sites in vm-kvm/src/lib.rs);
+      # linux-loader 0.14 requires vm-memory 0.18 as its public dep
+      # AND rebinds the `boot_e820_entry.type_` field to `r#type` in
+      # its regenerated bindings. Ignoring both here — bump them
+      # together during a scheduled migration.
+      - dependency-name: vm-memory
+        update-types: [version-update:semver-major]
+      - dependency-name: linux-loader
+        update-types: [version-update:semver-major]
+      # axum 0.8 changed `Sse::keep_alive()` return type (now wraps
+      # `KeepAliveStream<S>`) and swapped the route-matcher syntax from
+      # `:name` to `{name}` — needs a coordinated migration across
+      # `crates/control-plane/src/routes.rs` and `exec_stream.rs`.
+      - dependency-name: axum
+        update-types: [version-update:semver-major]
 
   # ---- Next.js marketing site + TypeScript SDK ---------------------------
   - package-ecosystem: npm
