@@ -12,11 +12,11 @@ Milestone 2 (separate PR series).
 
 Three PRs on `main`, each self-contained:
 
-| PR | Scope | Depends on |
+| PR | Scope | Status |
 |---|---|---|
-| **#267 (merged)** | `tools/java-rootfs/` scaffold: Dockerfile, fetch.sh, guest init/warmup, initial docs | — |
-| **#268 (this PR)** | `build.sh` now emits `initramfs.cpio.gz` in addition to `rootfs.ext4`; docs updated to reflect the initramfs-based boot path (see rationale below) | #267 |
-| **#269 (planned)** | New `crates/bench` binary `nanovm-jvm-bench`: boot → warmup → snapshot (cold\|warm\|both) → fork N → HTTP-200 p50/p90/p99 | #267 + #268 |
+| **#267** | `tools/java-rootfs/` scaffold: Dockerfile, fetch.sh, guest init/warmup, initial docs | Merged |
+| **#268** | `build.sh` now emits `initramfs.cpio.gz` in addition to `rootfs.ext4`; docs updated to reflect the initramfs-based boot path | Merged |
+| **#269 (this PR)** | New `crates/bench` binary `nanovm-jvm-bench`: golden boot → snapshot (cold\|warm\|both) → fork N → p50/p95/p99 | This PR |
 
 ## Boot path: initramfs, not virtio-blk
 
@@ -129,21 +129,27 @@ warmup driver hits `127.0.0.1:8080` from *inside* the container.
 
 ### 5. Boot under KVM and run the snapshot-fork benchmark
 
-*(Available after `nanovm-jvm-bench` lands in PR #269.)*
-
 ```sh
 cargo run --release --features kvm -p bench --bin nanovm-jvm-bench -- \
     --kernel    tools/kvm-images/cache/vmlinux \
     --initramfs tools/java-rootfs/cache/initramfs.cpio.gz \
     --memory-mib 2048 \
     --snapshot-at both \
-    --forks 20 --warmup 5
+    --forks 20 --warmup 3
 ```
 
 The `--memory-mib 2048` is intentional: the initramfs unpacks to
 ~450 MiB in guest RAM; the JVM wants 1 GiB heap; the kernel + slack
-eat the rest. Emits a two-column markdown table with p50 / p90 / p99
-for both the cold- and warm-snapshot paths, plus a histogram.
+eat the rest.
+
+Modes:
+
+- **`--snapshot-at warm`** (default) — snapshot after `NANOVM_PETCLINIC_READY`. Each restored fork is instantly serving; the reported per-fork latency is just `restore()`. The marketing number.
+- **`--snapshot-at cold`** — snapshot right after JVM launch (before Spring finishes). Each forked child completes Spring init in isolation; reported latency is `restore()` + wait-for-ready in the child. Verifies that the fork mechanism preserves an in-progress JVM heap correctly.
+- **`--snapshot-at both`** — do both back-to-back on the same golden VM, print a side-by-side cold-vs-warm comparison table with the speedup ratio.
+
+Emits per-mode p50 / p95 / p99 latency plus, in `both` mode, a
+cold-vs-warm speedup table.
 
 ## Developer platform matrix
 

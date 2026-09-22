@@ -13,6 +13,10 @@ categories = ["virtualization", "development-tools::profiling"]
 name = "nanovm-fork-bench"
 path = "src/main.rs"
 
+[[bin]]
+name = "nanovm-jvm-bench"
+path = "src/bin/jvm_bench.rs"
+
 [dependencies]
 vm-core.workspace = true
 vm-kvm = { workspace = true }

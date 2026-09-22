@@ -27,18 +27,22 @@ updates:
         update-types: [minor, patch]
     labels: [dependencies, cargo]
     ignore:
-      # vm-memory 0.18 + linux-loader 0.14 are a coupled migration:
-      # vm-memory 0.18 moved `checked_offset`, `last_addr`, and `iter`
-      # off `GuestMemory` onto `GuestMemoryBackend` and reshaped
-      # `GuestRegionCollection` (~8 API sites in vm-kvm/src/lib.rs);
-      # linux-loader 0.14 requires vm-memory 0.18 as its public dep
-      # AND rebinds the `boot_e820_entry.type_` field to `r#type` in
-      # its regenerated bindings. Ignoring both here — bump them
-      # together during a scheduled migration.
+      # vm-memory + linux-loader are a coupled pin, NOT a coupled
+      # major-migration only. `linux-loader = "0.13.2"` declares
+      # `vm-memory >=0.16, <=0.17.1` in its public dep — any bump
+      # above 0.17.1 (even a patch like 0.17.1 → 0.17.2) makes Cargo
+      # resolve two versions of vm-memory in the same build and the
+      # KVM backend fails to compile. We were bitten by exactly this
+      # in PR #261 (Dependabot bumped =0.17.1 to =0.17.2 within
+      # the group PR) and had to revert.
+      #
+      # Both crates stay fully ignored here until the coordinated
+      # vm-memory 0.18 + linux-loader 0.14 migration lands (bigger
+      # patch: ~8 API sites in vm-kvm/src/lib.rs for the GuestMemory
+      # reshape, plus `boot_e820_entry.type_` → `r#type` rename in
+      # regenerated bindings).
       - dependency-name: vm-memory
-        update-types: [version-update:semver-major]
       - dependency-name: linux-loader
-        update-types: [version-update:semver-major]
       # axum 0.8 changed `Sse::keep_alive()` return type (now wraps
       # `KeepAliveStream<S>`) and swapped the route-matcher syntax from
       # `:name` to `{name}` — needs a coordinated migration across

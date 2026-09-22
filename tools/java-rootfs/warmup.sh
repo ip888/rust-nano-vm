@@ -31,6 +31,50 @@ WARMUP_URLS="http://127.0.0.1:8080/vets \
 READY_WAIT_SECS="${READY_WAIT_SECS:-60}"
 READY_STEP=1
 WARMUP_SECS="${WARMUP_SECS:-30}"
+COLD_WAIT_SECS="${COLD_WAIT_SECS:-30}"
+
+# ---- 0. wait for the JVM to actually be running (TCP socket open) ----
+#
+# `init.sh` prints `[init] launching JVM` BEFORE fork+exec of `java`,
+# so that line alone can't be used as the cold-snapshot synchronisation
+# point — the guest may still be executing shell code or mid-execve
+# when a host tailing the serial buffer sees it. We instead poll for
+# the TCP socket the JVM binds (:8080). curl exits with code 7
+# ("Failed to connect") until the socket is open, non-7 once it is,
+# so the loop terminates the first time Petclinic's server socket
+# accepts connections — a well-defined, kernel-observable state.
+#
+# The COLD marker is emitted after that check succeeds; the host
+# reads it as "JVM is running, Spring init is in progress, no
+# hand-off has happened yet". That's the state the cold snapshot
+# is supposed to capture.
+echo "[warmup] waiting up to ${COLD_WAIT_SECS}s for JVM TCP socket to open" >&2
+elapsed=0
+while [ "$elapsed" -lt "$COLD_WAIT_SECS" ]; do
+    if [ -n "$JVM_PID" ] && ! kill -0 "$JVM_PID" 2>/dev/null; then
+        echo "[warmup] FATAL: JVM (pid=$JVM_PID) exited before TCP open" >&2
+        cat /tmp/petclinic.log >&2 || true
+        exit 1
+    fi
+    # curl exit 7 = connection refused. Any other exit (including
+    # success or protocol error) means the socket accepted.
+    curl -sS -o /dev/null --max-time 1 http://127.0.0.1:8080/ 2>/dev/null
+    rc=$?
+    if [ "$rc" != 7 ]; then
+        echo "[warmup] JVM TCP socket open after ${elapsed}s" >&2
+        break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+if [ "$rc" = 7 ]; then
+    echo "[warmup] FATAL: JVM TCP socket never opened within ${COLD_WAIT_SECS}s" >&2
+    cat /tmp/petclinic.log >&2 || true
+    exit 1
+fi
+
+# Ready-for-cold-snapshot marker. Host bench binary reads this.
+echo "NANOVM_PETCLINIC_COLD"
 
 # ---- 1. wait for /actuator/health to be 200 --------------------------
 echo "[warmup] waiting up to ${READY_WAIT_SECS}s for ${HEALTH_URL}" >&2
