@@ -3,10 +3,14 @@
 # the JVM in the background, then hand off to /warmup.sh (which does
 # the readiness poll and the actual warmup hits).
 #
-# Runs as PID 1 inside the microVM. No busybox reaper: the JVM is the
-# only non-init long-lived process, and when it dies the kernel
-# panics — which is what we want (the host sees the panic on stdio
-# and knows the guest is unrecoverable, no zombie).
+# Runs as PID 1 inside the microVM (installed at both /sbin/init and,
+# via symlink, /init so either kernel-cmdline convention works). No
+# busybox reaper: the JVM is the only non-init long-lived process, and
+# `warmup.sh` (which this script `exec`s into after launching the JVM)
+# uses `wait $JVM_PID` at the end so PID 1 exits when the JVM exits.
+# That in turn triggers a kernel panic on the guest — which is what we
+# want (the host sees the panic on stdio and knows the guest is
+# unrecoverable, no zombie).
 
 set -eu
 

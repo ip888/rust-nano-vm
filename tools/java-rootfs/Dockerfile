@@ -11,6 +11,11 @@
 # Stage 3 (final): Debian 12 slim + JDK + jar + init/warmup scripts.
 # The output is intended to be flattened into an ext4 image by
 # `build.sh`, not run as a container.
+#
+# The Debian slim base is pinned by digest (DEBIAN_DIGEST) rather than
+# the mutable `debian:12-slim` tag. Both `FROM` references below
+# interpolate `${DEBIAN_DIGEST}` so an override via
+# `--build-arg DEBIAN_DIGEST=sha256:...` takes effect everywhere.
 
 ARG DEBIAN_DIGEST=sha256:PLACEHOLDER_PIN_BEFORE_MERGE
 ARG PETCLINIC_REPO=https://github.com/spring-projects/spring-petclinic.git
@@ -43,7 +48,7 @@ RUN cp target/spring-petclinic-*.jar /petclinic.jar \
  && ls -lh /petclinic.jar
 
 # ---- stage 2: extract Oracle JDK 21 ----------------------------------
-FROM debian:12-slim AS jdk-extract
+FROM debian:12-slim@${DEBIAN_DIGEST} AS jdk-extract
 ARG JDK_TARBALL
 COPY cache/${JDK_TARBALL} /tmp/jdk.tar.gz
 RUN mkdir -p /opt/jdk-21 \
@@ -59,7 +64,7 @@ RUN rm -rf /opt/jdk-21/jmods /opt/jdk-21/legal /opt/jdk-21/man \
 RUN /opt/jdk-21/bin/java -Xshare:dump
 
 # ---- stage 3: assemble the rootfs ------------------------------------
-FROM debian:12-slim
+FROM debian:12-slim@${DEBIAN_DIGEST}
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates curl iproute2 procps \
@@ -67,11 +72,18 @@ RUN apt-get update \
  && rm -rf /usr/share/doc /usr/share/man /usr/share/locale
 COPY --from=jdk-extract         /opt/jdk-21     /opt/jdk-21
 COPY --from=petclinic-builder   /petclinic.jar  /opt/petclinic.jar
-COPY init.sh    /init
+COPY init.sh    /sbin/init
 COPY warmup.sh  /warmup.sh
-RUN chmod +x /init /warmup.sh
+# `/sbin/init` is what Linux expects to exec when the kernel command
+# line either omits `init=` or an initramfs hands off to the rootfs
+# with no override. A `/init` symlink covers the alternative style
+# (some KVM boot recipes pass `init=/init`) so the same rootfs works
+# either way.
+RUN chmod +x /sbin/init /warmup.sh \
+ && ln -s /sbin/init /init
 # `docker run` isn't the intended launch path — `build.sh` extracts
 # the layer contents and packs them into an ext4 image the KVM
 # backend mounts as rootfs. The CMD below is set only so `docker run`
-# works for smoke-checking the layer contents.
-CMD ["/init"]
+# works for smoke-checking the layer contents (see the reproduce
+# doc's step 3).
+CMD ["/sbin/init"]
