@@ -34,8 +34,7 @@ use vm_core::{Hypervisor, VmConfig, VmState};
 /// Resolve the freshly-built `nanovm-vmm-child` binary from the
 /// workspace target dir. cargo only sets `CARGO_BIN_EXE_<name>`
 /// for binaries IN the package under test, so we fall back to
-/// scanning sibling target dirs the way `nanovm-mcp` integration
-/// tests do.
+/// scanning sibling target dirs.
 fn vmm_child_binary() -> PathBuf {
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)

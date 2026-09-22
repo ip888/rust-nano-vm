@@ -159,21 +159,6 @@ fork = nv.fork(snap.id)
 print(fork.fork_ms, "ms")  # headline product number
 ```
 
-### MCP bridge (Claude / Cursor agents)
-
-```sh
-NANOVM_ENDPOINT=https://<endpoint> NANOVM_TOKEN=<token> nanovm-mcp
-```
-
-Then add to your agent's MCP config:
-```json
-{
-  "mcpServers": {
-    "nanovm": { "command": "nanovm-mcp" }
-  }
-}
-```
-
 ---
 
 ## Rotating / revoking tenant keys

@@ -17,7 +17,7 @@
 //! cargo run -p api-bench --release -- \
 //!     --api-url https://api.your-saas.com \
 //!     --token   nv_your-throwaway-key \
-//!     --marketplace-name python-3.12-minimal \
+//!     --snapshot-id 42 \
 //!     --n 100 --warmup 10
 //! ```
 //!
@@ -33,7 +33,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{ArgGroup, Parser};
+use clap::Parser;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::StatusCode;
@@ -43,15 +43,12 @@ use serde::Serialize;
 #[command(
     version,
     about = "Fork-latency benchmark against a running nanovm control plane",
-    long_about = "Sequential POSTs to /v1/snapshots/:id/fork or /v1/marketplace/snapshots/:name/fork; \
+    long_about = "Sequential POSTs to /v1/snapshots/:id/fork; \
                   reads server-reported `fork_ms` from each response; \
                   destroys the returned VM after each measured fork; \
                   prints p50/p90/p95/p99/min/max/mean/stddev + text histogram \
                   + copy-pasteable markdown table."
 )]
-#[command(group(
-    ArgGroup::new("target").required(true).args(&["snapshot_id", "marketplace_name"])
-))]
 struct Args {
     /// Base URL of the control plane. e.g. `https://api.your-saas.com`.
     #[arg(long, env = "NANOVM_BENCH_URL")]
@@ -62,23 +59,15 @@ struct Args {
     #[arg(long, env = "NANOVM_BENCH_TOKEN")]
     token: String,
 
-    /// Snapshot id to fork. Mutually exclusive with `--marketplace-name`.
-    #[arg(long, group = "target")]
-    snapshot_id: Option<u64>,
-
-    /// Marketplace entry name to fork. Mutually exclusive with
-    /// `--snapshot-id`.
-    #[arg(long, group = "target")]
-    marketplace_name: Option<String>,
+    /// Snapshot id to fork.
+    #[arg(long)]
+    snapshot_id: u64,
 
     /// Number of measured forks. Reported statistics are over these.
     #[arg(long, default_value_t = 100)]
     n: usize,
 
-    /// Warmup forks that are discarded from statistics. First-fork
-    /// latency for a marketplace snapshot includes a tarball download
-    /// (seconds); this filter isolates the steady-state warm-pool
-    /// number the marketing surface cites.
+    /// Warmup forks that are discarded from statistics.
     #[arg(long, default_value_t = 10)]
     warmup: usize,
 
@@ -188,30 +177,11 @@ fn build_client(args: &Args) -> Result<Client> {
 }
 
 fn fork_path(args: &Args) -> String {
-    if let Some(id) = args.snapshot_id {
-        return format!("/v1/snapshots/{id}/fork");
-    }
-    // clap enforces exactly-one via ArgGroup, so this branch means the
-    // marketplace name is present.
-    let name = args
-        .marketplace_name
-        .as_ref()
-        .expect("clap arg group ensures one target is set");
-    format!(
-        "/v1/marketplace/snapshots/{}/fork",
-        url_encode_path_segment(name)
-    )
+    format!("/v1/snapshots/{}/fork", args.snapshot_id)
 }
 
 fn describe_target(args: &Args) -> String {
-    if let Some(id) = args.snapshot_id {
-        format!("snapshot id {id}")
-    } else {
-        format!(
-            "marketplace/{}",
-            args.marketplace_name.as_deref().unwrap_or("?")
-        )
-    }
+    format!("snapshot id {}", args.snapshot_id)
 }
 
 /// Do one fork request. Returns `(fork_ms, vm_id)`. Uses the
@@ -284,23 +254,6 @@ fn destroy_vm(
     } else {
         Err(anyhow!("destroy of vm {id} failed: HTTP {}", resp.status()))
     }
-}
-
-/// Percent-encode a marketplace entry name so any `/`, `?`, `&`, etc.
-/// stays inside one path segment. Handrolled to avoid pulling in
-/// `url`/`percent-encoding` as an extra workspace dep — the harness
-/// is otherwise <5 direct deps.
-fn url_encode_path_segment(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
-        if unreserved {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{:02X}", b));
-        }
-    }
-    out
 }
 
 /// Summary statistics over a sample vector. All values in ms, u32-sized.
@@ -483,21 +436,5 @@ mod tests {
         assert_eq!(s.p50, 0);
         assert_eq!(s.mean, 0);
         assert_eq!(s.stddev, 0);
-    }
-
-    #[test]
-    fn url_encode_reserved_chars_stay_in_one_segment() {
-        // `/`, `?`, `&`, `%`, space — all must percent-encode.
-        assert_eq!(
-            url_encode_path_segment("weird/name?with&chars"),
-            "weird%2Fname%3Fwith%26chars"
-        );
-        assert_eq!(url_encode_path_segment("has space"), "has%20space");
-        // Unreserved chars pass through.
-        assert_eq!(
-            url_encode_path_segment("python-3.12-minimal"),
-            "python-3.12-minimal"
-        );
-        assert_eq!(url_encode_path_segment("a_b.c-d~e"), "a_b.c-d~e");
     }
 }
