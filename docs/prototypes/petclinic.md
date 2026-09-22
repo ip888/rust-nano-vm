@@ -6,22 +6,41 @@ many times, measure per-fork time to first HTTP-200 on `/vets`.
 
 The **single-jar Petclinic** variant is scoped for this milestone.
 The seven-service Spring-Petclinic-Microservices variant lands as
-Milestone 2 (separate PR).
+Milestone 2 (separate PR series).
 
-## Milestone-1 pieces and their landing order
+## Milestone-1 landing plan
 
-The milestone splits into three commits on the same branch. The first
-one (this PR at scaffold time) lands the rootfs artifact half; the
-next two land the vm-kvm plumbing and the host driver.
+Three PRs on `main`, each self-contained:
 
-| Commit | What lands | Blocks |
+| PR | Scope | Depends on |
 |---|---|---|
-| **1. `feat(petclinic-m1): scaffold Java rootfs builder`** (this PR) | `tools/java-rootfs/` builder + Dockerfile + guest init + warmup.sh + docs | — |
-| **2. `feat(vm-kvm): virtio-blk rootfs attachment`** (this PR, follow-up commit) | `crates/vm-kvm` consumes `VmConfig.rootfs`, attaches it at `/dev/vda`, sets `root=/dev/vda init=/sbin/init` on cmdline | Real KVM boot of this rootfs |
-| **3. `feat(bench): nanovm-jvm-bench`** (this PR, follow-up commit) | Host binary that boots, warms, snapshots (`--snapshot-at cold\|warm\|both`), forks N times, reports p50/p90/p99 | The demo run in step 4 below |
+| **#267 (merged)** | `tools/java-rootfs/` scaffold: Dockerfile, fetch.sh, guest init/warmup, initial docs | — |
+| **#268 (this PR)** | `build.sh` now emits `initramfs.cpio.gz` in addition to `rootfs.ext4`; docs updated to reflect the initramfs-based boot path (see rationale below) | #267 |
+| **#269 (planned)** | New `crates/bench` binary `nanovm-jvm-bench`: boot → warmup → snapshot (cold\|warm\|both) → fork N → HTTP-200 p50/p90/p99 | #267 + #268 |
 
-All three land on this branch before the PR merges. Reviewing the
-rootfs half first keeps each commit's diff bounded.
+## Boot path: initramfs, not virtio-blk
+
+The Milestone 1 demo uses the **initramfs boot path**, not a virtio-blk
+disk device. Two reasons:
+
+1. **vm-kvm already supports initramfs.** `VmConfig.initrd` is fully
+   plumbed today: `load_initrd()` copies the archive high in guest
+   RAM, boot params get `ramdisk_image` / `ramdisk_size` set, kernel
+   unpacks into a tmpfs and execs `/sbin/init`. No new device code.
+2. **MAP_PRIVATE fork of guest RAM captures the whole rootfs for
+   free.** The unpacked initramfs lives in guest memory as tmpfs; our
+   fork mechanism does copy-on-write on that memory, so each forked
+   child inherits an identical, private rootfs at zero copy cost.
+   That's exactly the shape the sub-second fork-many demo wants.
+
+Virtio-blk stays on the roadmap for a production-shape disk-backed
+rootfs (larger images, stateful workloads). It's a substantial
+addition to `crates/vm-kvm` and doesn't unblock the demo, so it's
+deferred to after the M1 demo lands.
+
+`build.sh` still emits `rootfs.ext4` alongside `initramfs.cpio.gz`
+so a future virtio-blk path can reuse the same content without a
+rebuild.
 
 ## What the demo shows
 
@@ -40,10 +59,12 @@ result. Both are recorded so anyone reproducing the demo can compare.
 
 ### 1. Prerequisites
 
-- Linux host with `/dev/kvm`
+- Linux host with `/dev/kvm` (needed for step 4 only; steps 2–3 work
+  on any Docker-capable machine including Mac M1, see
+  "Developer platform matrix" below)
 - Docker with `buildx`
-- `e2fsprogs` (for `mkfs.ext4`), `sudo` (for the loopback mount in
-  `build.sh`)
+- Optional: `e2fsprogs` + `sudo` for the ext4 pack (`SKIP_EXT4=1`
+  skips it)
 - ~1 GiB free in `tools/java-rootfs/cache/`
 - Rust toolchain matching `rust-toolchain.toml`
 
@@ -51,17 +72,16 @@ result. Both are recorded so anyone reproducing the demo can compare.
 
 ```sh
 tools/java-rootfs/build.sh
+# or, on a rootless host / CI:
+SKIP_EXT4=1 tools/java-rootfs/build.sh
 ```
 
-Output: `tools/java-rootfs/cache/rootfs.ext4` (≤ 450 MiB uncompressed).
+Outputs:
+- `tools/java-rootfs/cache/initramfs.cpio.gz` — the demo boot path
+- `tools/java-rootfs/cache/rootfs.ext4` — unused today, kept for the
+  future virtio-blk story
 
 ### 3. Smoke-check the rootfs contents (no KVM required)
-
-The vm-kvm virtio-blk attachment is a follow-up commit, so you can't
-yet boot this through the repo's KVM backend directly. But the same
-Docker image the rootfs is built from can be `docker run`'d as a
-sanity check that the JVM starts, Spring boots, and the warmup driver
-emits the ready marker:
 
 ```sh
 docker run --rm -it --network host nanovm-java-rootfs:local
@@ -85,49 +105,53 @@ warmup driver hits `127.0.0.1:8080` from *inside* the container.
 
 ### 4. Boot under KVM and run the snapshot-fork benchmark
 
-*(Available after the vm-kvm virtio-blk and `nanovm-jvm-bench`
-follow-up commits land in this PR.)*
+*(Available after `nanovm-jvm-bench` lands in PR #269.)*
 
 ```sh
 cargo run --release --features kvm -p bench --bin nanovm-jvm-bench -- \
-    --kernel  tools/java-rootfs/cache/vmlinux \
-    --rootfs  tools/java-rootfs/cache/rootfs.ext4 \
+    --kernel    tools/kvm-images/cache/vmlinux \
+    --initramfs tools/java-rootfs/cache/initramfs.cpio.gz \
+    --memory-mib 2048 \
     --snapshot-at both \
     --forks 20 --warmup 5
 ```
 
-Emits a two-column markdown table with p50 / p90 / p99 for both the
-cold- and warm-snapshot paths, plus a histogram. The `vmlinux` reuses
-the Firecracker sample kernel from `tools/kvm-images/`.
+The `--memory-mib 2048` is intentional: the initramfs unpacks to
+~450 MiB in guest RAM; the JVM wants 1 GiB heap; the kernel + slack
+eat the rest. Emits a two-column markdown table with p50 / p90 / p99
+for both the cold- and warm-snapshot paths, plus a histogram.
+
+## Developer platform matrix
+
+Not every step needs a KVM Linux host. The tests are stratified:
+
+| Test level | Runs on | What it verifies |
+|---|---|---|
+| **L1 — mock backend** (`cargo test --workspace`) | any OS/CPU (Linux, macOS Intel + Apple Silicon, Windows via WSL) | Rust API surface, protocol framing, snapshot format, ownership store, the whole non-hardware code path |
+| **L2 — rootfs smoke** (`docker run`) | any Docker-capable host, including Mac M1 (auto-emulates x86_64 via QEMU inside Docker Desktop; slower but works) | The rootfs boots, JVM launches, Spring Petclinic hits ready marker |
+| **L3 — KVM boot + snapshot + fork** (`nanovm-jvm-bench`) | Linux + `/dev/kvm` + x86_64 (Intel VT-x or AMD-V) | The actual demo numbers |
+
+Contributor workflow on Mac M1:
+- **L1 during coding** — `cargo test --workspace` runs full mock-backend suite in <10 s on M1.
+- **L2 before PR** — `tools/java-rootfs/build.sh && docker run` on M1 exercises the whole rootfs path minus KVM. Docker Desktop on M1 runs the container in a Rosetta/QEMU-backed x86_64 environment — ~3–5× slower than native x86 but confirms the boot sequence, JVM start, Spring context, warmup driver.
+- **L3 for demo numbers** — needs a Linux/KVM host. Options: EC2 metal (`i3.metal`, `m5.metal`), GCP with nested-virt, a Linux workstation, or the CI matrix once we add a KVM-capable runner.
+
+We're not building an in-browser demo path in Milestone 1 (would need
+a hosted control-plane deployment on a metal instance behind a public
+API + a web UI to drive it — that's a separate marketing milestone).
 
 ## Pinning workflow
 
-Three moving pieces need real values before this PR merges to `main`.
-All three are called out in the PR description checklist and land in
-the same follow-up commit that flips this scaffold to a shipping
-build:
+The three digest pins land together with the release-track PR that
+follows Milestone 1. Not part of the scaffold PRs.
 
-1. **Oracle JDK 21.0.5 tarball SHA-256.** Currently `SKIP` in
-   `tools/java-rootfs/fetch.sh`. `fetch.sh` refuses to run under
-   `NANOVM_STRICT_PINS=1` while `SKIP` is in place. Capture with:
-
-   ```sh
-   curl -fSL "https://download.oracle.com/java/21/archive/jdk-21.0.5_linux-x64_bin.tar.gz" \
-       | sha256sum
-   ```
-
-2. **Spring Petclinic commit.** Currently a `PLACEHOLDER_PIN_BEFORE_MERGE`
-   sentinel in `Dockerfile`'s `PETCLINIC_REF` build arg. Pin to a
-   specific commit hash on the upstream `main` branch, e.g.:
-
-   ```sh
-   git ls-remote https://github.com/spring-projects/spring-petclinic.git main
-   ```
-
-3. **Debian 12 slim digest.** Same story — pin the actual `sha256:…`
-   from the current tag. Both `FROM debian:12-slim@${DEBIAN_DIGEST}`
-   references in the Dockerfile interpolate this arg so a single
-   override covers both stages.
+Before any release-track branch merges:
+1. **Oracle JDK 21.0.5 tarball SHA-256** — `tools/java-rootfs/fetch.sh`
+   currently `SKIP`; refuses to run under `NANOVM_STRICT_PINS=1`.
+2. **Spring Petclinic commit hash** — `PLACEHOLDER_PIN_BEFORE_MERGE`
+   in `Dockerfile`'s `PETCLINIC_REF` build arg.
+3. **`debian:12-slim` digest** — `Dockerfile`'s `DEBIAN_DIGEST` arg,
+   applied to both `FROM` lines.
 
 ## What Milestone 1 explicitly does NOT include
 
@@ -137,6 +161,8 @@ build:
 - **CRaC-based warmup coordination** — this milestone uses console-tail
   for the ready marker, which is simpler and covers the whole demo.
   Vsock signaling replaces it in a later milestone if profiling shows
-  the console read adds meaningful latency.
+  console-read latency matters.
 - **ARM64 (aarch64) support** — this milestone targets x86_64 only,
   matching the enterprise-Java v1 platform scope in `CLAUDE.md`.
+- **Virtio-blk device in vm-kvm** — deferred (see "Boot path" above).
+- **In-browser hosted demo** — separate marketing milestone.

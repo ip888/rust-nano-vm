@@ -1,6 +1,6 @@
 # `tools/java-rootfs/`
 
-Builds a Debian-slim–based ext4 rootfs (`cache/rootfs.ext4`) containing:
+Builds a Debian-slim–based rootfs containing:
 
 - **Oracle JDK 21 LTS** (pinned point release), the JDK the target
   enterprise customer stack (Citibank et al.) standardises on.
@@ -10,24 +10,33 @@ Builds a Debian-slim–based ext4 rootfs (`cache/rootfs.ext4`) containing:
   the JVM on boot and starts an in-guest warmup driver
   (`warmup.sh`).
 
-This is the **rootfs artifact half** of the Petclinic prototype's
-Milestone 1. Actually booting it through the repository's `vm-kvm`
-backend needs **two follow-up commits** on this branch before merge:
+Two build artifacts land in `cache/`, both from the exact same
+staged filesystem:
 
-1. **virtio-blk device attachment in `crates/vm-kvm`** — today
-   `KvmHypervisor::build_runtime` reads `VmConfig.kernel` /
-   `VmConfig.cmdline` but does not consume `VmConfig.rootfs`. Booting
-   from an ext4 image needs a virtio-blk device attached at
-   `/dev/vda` plus `root=/dev/vda init=/sbin/init` on the kernel
-   cmdline.
-2. **`nanovm-jvm-bench`** — the host-side driver that snapshots the
-   warmed guest, forks N times, and measures per-fork time to first
-   HTTP-200.
+| Artifact | Purpose | Booted by |
+|---|---|---|
+| **`initramfs.cpio.gz`** | RAM-backed rootfs the demo uses today | vm-kvm's existing `VmConfig.initrd` path |
+| **`rootfs.ext4`** | Disk-backed rootfs for the eventual virtio-blk story | Not consumed by the current backend |
 
-The rootfs artifact this builder produces is **verifiable independently**
-with `docker run` (see the smoke check in
-[`docs/prototypes/petclinic.md`](../../docs/prototypes/petclinic.md))
-so review of this piece isn't gated on the follow-ups.
+## Why initramfs, not virtio-blk (for the demo)
+
+Two reasons:
+
+1. **vm-kvm already loads initramfs.** `VmConfig.initrd` is fully
+   plumbed — `load_initrd()` reads bytes into high guest RAM, boot
+   params get `ramdisk_image` / `ramdisk_size` set. No new device
+   code needed for the demo.
+2. **MAP_PRIVATE fork of guest RAM captures the whole rootfs for free.**
+   When the initramfs unpacks into a tmpfs at `/`, that tmpfs lives
+   in guest memory. Our fork mechanism does copy-on-write on guest
+   RAM pages — so each forked child inherits an identical, private
+   rootfs at zero copy cost. That's the shape the sub-second
+   fork-many demo wants.
+
+Virtio-blk stays on the roadmap for a production-shape story (larger
+disk-backed rootfs, arbitrary size, stateful workloads). It's a
+substantial addition to `crates/vm-kvm` (~500-1000 LOC of virtio
+state machine + MMIO trap handling) and doesn't unblock the demo.
 
 ## Why Debian, not Alpine
 
@@ -37,27 +46,29 @@ source of subtle JVM misbehavior (JNI mismatches, hotspot crashes).
 Debian 12 (bookworm) slim adds ~20 MiB over Alpine minirootfs but
 avoids the whole class of issue.
 
-Total rootfs size target: **≤ 450 MiB uncompressed ext4**
-(`ROOTFS_MB=450` default in `build.sh`). Rough breakdown: Debian slim
-base (~50 MiB after doc/man/locale strip) + Oracle JDK 21
-(~180 MiB after `jmods`/`legal`/`man` strip + CDS dump) + Petclinic
-uber-jar (~70 MiB) + curl/iproute2/procps + init + warmup scripts
-(< 5 MiB). Raise `ROOTFS_MB` if a future JDK point release exceeds
-this budget.
+## Sizes
+
+- **`initramfs.cpio.gz`** — expected ~150 MiB compressed (JDK + jar
+  are the bulk; cpio + gzip -9 give ~2:1 ratio on already-compressed
+  content). Unpacks to ~450 MiB in guest RAM.
+- **`rootfs.ext4`** — 450 MiB uncompressed (`ROOTFS_MB=450` default).
+  Raise it if a future JDK point release outgrows the budget.
+
+Because the initramfs unpacks to ~450 MiB in guest RAM, size guest
+memory to at least **2 GiB** (`VmConfig.memory_mib = 2048`) — 450 MiB
+for the unpacked rootfs + 1 GiB for the JVM heap + kernel + slack.
 
 ## Build
 
-Requires Docker with `buildx`, `mkfs.ext4` (from `e2fsprogs`), and
-~1 GiB of free disk in `cache/`.
+Requires Docker with `buildx`. `mkfs.ext4` + `sudo` are only needed
+for the optional ext4 pack — pass `SKIP_EXT4=1` to skip it in
+non-root / CI environments; `initramfs.cpio.gz` builds without either.
 
 ```sh
 tools/java-rootfs/build.sh
+# or, for rootless / CI:
+SKIP_EXT4=1 tools/java-rootfs/build.sh
 ```
-
-Outputs `tools/java-rootfs/cache/rootfs.ext4`. Once the vm-kvm
-virtio-blk follow-up lands, this file becomes the KVM backend's
-`--rootfs`; today it can be smoke-checked via `docker run` per the
-reproduce doc.
 
 ## Pins
 
