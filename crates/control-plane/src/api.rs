@@ -792,45 +792,6 @@ pub fn openapi_spec() -> Value {
                     }
                 }
             },
-            "/v1/marketplace/snapshots": {
-                "get": {
-                    "summary": "Public curated snapshot registry",
-                    "description": "Returns the marketplace catalogue loaded from NANOVM_MARKETPLACE_CONFIG. UNAUTHENTICATED so a dashboard or CLI can browse entries pre-signup. When the env var is unset the array is empty.",
-                    "responses": {
-                        "200": {
-                            "description": "Marketplace snapshot entries",
-                            "content": {
-                                "application/json": { "schema": { "$ref": "#/components/schemas/MarketplaceListResponse" } }
-                            }
-                        }
-                    }
-                }
-            },
-            "/v1/marketplace/snapshots/{name}/fork": {
-                "post": {
-                    "summary": "Fork a marketplace snapshot into the caller's tenant",
-                    "description": "First call per (tenant, name, snapshot_url) downloads the tarball named by the entry's `snapshot_url`, extracts it, and adopts it into the backend under a fresh local snapshot id (cold; seconds). Subsequent calls hit the process-local cache and fork the local snapshot directly (~12 ms with a warm pool). Counts against the caller's fork quota and usage exactly like `/v1/snapshots/:id/fork`. Only available when the control-plane binary was built with `--features marketplace-fork`.",
-                    "parameters": [{
-                        "name": "name",
-                        "in": "path",
-                        "required": true,
-                        "description": "The marketplace entry `name` field (URL-safe id).",
-                        "schema": { "type": "string" }
-                    }],
-                    "responses": {
-                        "201": {
-                            "description": "Forked child VM plus per-fork latency and caller usage totals",
-                            "content": {
-                                "application/json": { "schema": { "$ref": "#/components/schemas/ForkResponse" } }
-                            }
-                        },
-                        "404": { "description": "No marketplace entry with that name" },
-                        "402": { "description": "Subscription is dunning-blocked past the grace window; body includes `upgrade_endpoint`" },
-                        "429": { "description": "Rate-limited by per-token or per-org fork quota" },
-                        "501": { "description": "The entry has no `snapshot_url` and cannot yet be forked" }
-                    }
-                }
-            },
             "/v1/health": {
                 "get": {
                     "summary": "Structured health detail (backend, version, uptime)",
@@ -1120,45 +1081,6 @@ pub fn openapi_spec() -> Value {
                         "id": { "type": "string" },
                         "org": { "type": "string" },
                         "created_at": { "type": "string" }
-                    }
-                },
-                "MarketplaceSnapshot": {
-                    "type": "object",
-                    "required": ["name", "description", "size_bytes", "kernel_url", "rootfs_url", "cmdline", "labels", "maintainer"],
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "URL-safe id matching `[a-z0-9][a-z0-9.-]*` with no trailing `-` or `.`.",
-                            "example": "python-3.12-ds"
-                        },
-                        "description": { "type": "string" },
-                        "size_bytes": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "description": "Approximate uncompressed rootfs size for UI display."
-                        },
-                        "kernel_url": { "type": "string", "description": "Public HTTPS URL of the vmlinux blob (display/provenance; the fork endpoint pulls `snapshot_url`)." },
-                        "rootfs_url": { "type": "string", "description": "Public HTTPS URL of the rootfs.ext4 blob (display/provenance; the fork endpoint pulls `snapshot_url`)." },
-                        "snapshot_url": {
-                            "type": "string",
-                            "description": "Optional public HTTPS URL to a `.tar.gz` containing the pre-captured snapshot (manifest.json + memory.cow). The marketplace-fork endpoint pulls this. Absent → the entry is discoverable but not yet forkable (501)."
-                        },
-                        "cmdline": { "type": "string" },
-                        "labels": {
-                            "type": "array",
-                            "items": { "type": "string" }
-                        },
-                        "maintainer": { "type": "string", "example": "nanovm-marketplace" }
-                    }
-                },
-                "MarketplaceListResponse": {
-                    "type": "object",
-                    "required": ["snapshots"],
-                    "properties": {
-                        "snapshots": {
-                            "type": "array",
-                            "items": { "$ref": "#/components/schemas/MarketplaceSnapshot" }
-                        }
                     }
                 },
                 "HealthResponse": {

@@ -31,9 +31,7 @@ team.
 | Persistent-volume backing for `NANOVM_OWNERSHIP_STORE` (SQLite) | | ✅ |
 | Persistent-volume backing for JSONL audit log (`NANOVM_AUDIT_LOG`) | | ✅ |
 | Reverse-proxy TLS termination (Ingress / gateway) | Chart provides Ingress stub | ✅ (certs, WAF, DDoS) |
-| Stripe billing plumbing (`--features billing`) | ✅ (code) | ✅ (Stripe account, secrets, portal URL) |
 | SIEM / audit-sink HTTPS collector (`--features audit-sink`) | ✅ (code + sink) | ✅ (collector endpoint, API key) |
-| Marketplace snapshot fork (`--features marketplace-fork`) | ✅ (code) | ✅ (`NANOVM_MARKETPLACE_CONFIG`, tarball CDN if any) |
 | Observability wiring (Prometheus / Grafana dashboards) | Chart provides `ServiceMonitor`; dashboards under `deploy/grafana/` | ✅ (Prometheus, alertmanager, on-call rotation) |
 | Backup + disaster-recovery of the SQLite / audit volumes | | ✅ |
 | Guest kernel + rootfs choice, CVE tracking on those images | ✅ (defaults under `tools/*-rootfs/`) | ✅ (image rebuild cadence for the base you ship) |
@@ -52,27 +50,9 @@ reference this flag in its templates, so toggling it has no runtime
 effect on its own.
 
 The Rust binary already defaults to a safe airgap posture without any
-chart wiring:
-
-- The metered-billing reporter is **off by default** — it only activates
-  when `NANOVM_BILLING_REPORT_SECS` is explicitly set by the operator.
-- Magic-link delivery defaults to logging the verify URL to stdout — no
-  outbound email unless `RESEND_API_KEY` and `NANOVM_SIGNUP_FROM` are
-  both configured.
-- Stripe billing endpoints return `503 billing_disabled` until `STRIPE_*`
-  env vars are wired in.
-
-Airgapped operators: simply omit those env vars. The SIEM sink
-(`NANOVM_AUDIT_SINK_URL`) is still honored when configured — it targets
-whatever URL you provide, including an in-cluster collector.
-
-Marketplace fork tarball URLs must be reachable from inside the private
-network — supply your own `NANOVM_MARKETPLACE_CONFIG` with in-cluster
-URLs rather than `https://cdn.nanovm.io` paths.
-
-Non-airgap connected deployments (customer running on AWS with public
-outbound) can leave `airgap=false` and enable the SaaS-facing bits by
-setting the corresponding env vars as needed.
+chart wiring. The SIEM sink (`NANOVM_AUDIT_SINK_URL`) is still honored
+when configured — it targets whatever URL you provide, including an
+in-cluster collector.
 
 ## Pre-pinned images
 
@@ -85,8 +65,7 @@ before the airgap install, then override each `image.repository` in
 |---|---|---|
 | `ghcr.io/ip888/nanovm-control-plane-kvm:0.0.3` | REST server + jailer + vmm-child, KVM-enabled | see `Dockerfile.kvm` |
 | `ghcr.io/ip888/nanovm-control-plane:0.0.3` | Same REST server, mock hypervisor only (dev / smoke) | see `Dockerfile` |
-| `ghcr.io/ip888/nanovm-web:0.0.3` | Next.js dashboard, distroless-node runtime | see `Dockerfile.web` |
-| `ghcr.io/ip888/nanovm-vmlinux:0.0.3` *(optional)* | Prebuilt Firecracker vmlinux + Alpine rootfs, bundled at `/usr/local/share/nanovm/` in the KVM image | see `tools/firecracker-rootfs/` |
+| `ghcr.io/ip888/nanovm-vmlinux:0.0.3` *(optional)* | Prebuilt Firecracker vmlinux + Alpine rootfs, bundled at `/usr/local/share/nanovm/` in the KVM image | see `tools/kvm-images/` |
 
 **Pin by digest, not tag.** Every image is published with an
 immutable SHA-256 digest in the release notes. The example values file
@@ -123,14 +102,11 @@ enterprise capabilities:
 | Feature | Deploy shape | Enables |
 |---|---|---|
 | `sqlite` | Any multi-tenant | `NANOVM_OWNERSHIP_STORE` — org→VM/snapshot mapping survives restart. Non-negotiable for real multi-tenant. |
-| `billing` | SaaS | Stripe signup, billing portal, webhook, metered-usage reporter. Implies `sqlite`. |
-| `marketplace-fork` | Customer-facing SaaS or on-prem marketplace | `POST /v1/marketplace/snapshots/:name/fork`. Requires tarballs reachable at the URLs in `NANOVM_MARKETPLACE_CONFIG`. |
 | `audit-sink` | Enterprise / regulated | HTTP webhook sink for the audit log — see `docs/enterprise-audit.md`. |
 | `s3` | Any snapshot-heavy deploy | S3 snapshot store backend. Alt: `file://` for on-cluster PVC. |
 
 Recommended enterprise builds:
-- **Regulated on-prem** (no Stripe, yes SIEM): `--features sqlite,audit-sink,marketplace-fork`
-- **Full SaaS**: `--features billing,marketplace-fork,audit-sink,s3`
+- **Regulated on-prem** (SIEM + persistent ownership): `--features sqlite,audit-sink`
 - **Bare on-prem lab**: `--features sqlite` (everything else default)
 
 To enable feature-gated endpoints, rebuild from source with
@@ -161,8 +137,6 @@ Both are covered in dedicated docs:
 - **Bearer tokens fingerprinted in logs** (never the raw secret).
 - **RFC 3339 timestamps** on every audit record; SIEM sink preserves
   the same shape for correlation.
-- **HMAC-SHA256 webhook verification** on the Stripe endpoint (when
-  `billing` is on).
 - **Distroless runtime image** (`gcr.io/distroless/*:nonroot`) — no
   shell, no package manager, no unrelated userland inside the container.
 - **`readOnlyRootFilesystem: true`** in the chart's default

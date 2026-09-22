@@ -54,9 +54,6 @@ mod error;
 mod exec_stream;
 pub mod fork_quota;
 mod keys;
-pub mod marketplace;
-#[cfg(feature = "marketplace-fork")]
-pub mod marketplace_fork;
 pub mod metrics;
 mod ownership;
 mod request_id;
@@ -71,7 +68,6 @@ pub use api::{openapi_spec, VmConfigDefaults};
 pub use audit::AuditLog;
 pub use auth::{ApiTokens, IssuedToken, OrgId, Role, RuntimeTokenInfo, TokenId};
 pub use fork_quota::ForkQuota;
-pub use marketplace::{Marketplace, MarketplaceListResponse, MarketplaceSnapshot};
 pub use metrics::Metrics;
 pub use ownership::{OwnershipMap, OwnershipStoreError};
 pub use request_id::RequestId;

@@ -112,7 +112,7 @@ Response:
 
 `fork_count` × your-per-fork-price + `fork_total_ms` × your-per-compute-ms-price = invoice line.
 
-For continuous Stripe Metering / Orb push: scrape `/metrics` every 5 min, send the rate-of-counter delta to your billing provider.
+For continuous usage push to your billing provider: scrape `/metrics` every 5 min and send the rate-of-counter delta.
 
 > The `?all=true` flag only works for the `default` org (the operator scope). Other orgs see their own row only — safe to hand to tenant dashboards.
 
@@ -157,21 +157,6 @@ nv = Client("https://<endpoint>", token="<token>")
 snap = nv.snapshot_from_running(nv.create_vm(vcpus=1, memory_mib=256).id)
 fork = nv.fork(snap.id)
 print(fork.fork_ms, "ms")  # headline product number
-```
-
-### MCP bridge (Claude / Cursor agents)
-
-```sh
-NANOVM_ENDPOINT=https://<endpoint> NANOVM_TOKEN=<token> nanovm-mcp
-```
-
-Then add to your agent's MCP config:
-```json
-{
-  "mcpServers": {
-    "nanovm": { "command": "nanovm-mcp" }
-  }
-}
 ```
 
 ---
