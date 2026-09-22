@@ -15,14 +15,39 @@
 set -eu
 
 # ---- basic pseudo-filesystems ----------------------------------------
-mount -t proc     none /proc
-mount -t sysfs    none /sys
-mount -t devtmpfs none /dev  || true   # optional; kernel may auto-mount
-mount -t tmpfs    none /tmp
-mount -t tmpfs    none /run
+# Each mount is guarded by an idempotency check so the same init works
+# under three different launch contexts:
+#   1. nanovm KVM guest (nothing mounted yet, we mount everything)
+#   2. docker run --privileged (Docker mounted /proc already; skip it)
+#   3. docker run WITHOUT --privileged (mount attempts fail; we cope by
+#      only failing if a truly required mount is missing after we tried)
+#
+# `mountpoint -q PATH` returns 0 when PATH is already a mount, non-zero
+# otherwise. `2>/dev/null || true` on the mount itself keeps
+# unprivileged Docker from taking down PID 1 before the JVM launches;
+# the guest bootcase panics anyway if /proc really isn't mounted (curl
+# in warmup.sh needs it for network resolution), so a silent no-op
+# here just changes where the failure surfaces.
+try_mount() {
+    fstype="$1"
+    target="$2"
+    mountpoint -q "$target" 2>/dev/null && return 0
+    mount -t "$fstype" none "$target" 2>/dev/null || {
+        echo "[init] note: could not mount $fstype at $target (unprivileged?)" >&2
+    }
+}
+try_mount proc     /proc
+try_mount sysfs    /sys
+try_mount devtmpfs /dev
+try_mount tmpfs    /tmp
+try_mount tmpfs    /run
 
 # ---- loopback --------------------------------------------------------
-ip link set lo up
+# `ip link set lo up` needs CAP_NET_ADMIN. Under unprivileged Docker it
+# fails; we tolerate that because Petclinic's warmup driver hits
+# 127.0.0.1 which routes over lo — under Docker the kernel bring-up
+# already happened at container start, so nothing to do.
+ip link set lo up 2>/dev/null || true
 
 # ---- JVM launch ------------------------------------------------------
 #
