@@ -112,7 +112,7 @@ Response:
 
 `fork_count` × your-per-fork-price + `fork_total_ms` × your-per-compute-ms-price = invoice line.
 
-For continuous Stripe Metering / Orb push: scrape `/metrics` every 5 min, send the rate-of-counter delta to your billing provider.
+For continuous usage push to your billing provider: scrape `/metrics` every 5 min and send the rate-of-counter delta.
 
 > The `?all=true` flag only works for the `default` org (the operator scope). Other orgs see their own row only — safe to hand to tenant dashboards.
 

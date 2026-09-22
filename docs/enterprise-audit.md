@@ -19,7 +19,7 @@ both destinations.
 {
   "ts": "2026-07-21T14:03:12.418Z",
   "method": "POST",
-  "path": "/v1/marketplace/snapshots/python-3.12-ds/fork",
+  "path": "/v1/snapshots/42/fork",
   "status": 201,
   "token": "tok-abcd-42",
   "request_id": "0a1b2c3d4e5f"

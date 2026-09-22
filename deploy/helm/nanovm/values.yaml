@@ -6,10 +6,9 @@
 # It exists so operators can document intent (`airgap: true`) in their
 # values files; it will be wired into template rendering in a future
 # chart release.
-# The Rust binary already defaults to a safe airgap posture without any
-# chart wiring: the billing reporter, Resend email delivery, and Stripe
-# endpoints are all off unless the corresponding env vars are set.
-# See `deploy/enterprise/README.md` for details.
+# The Rust binary already defaults to a safe airgap posture without
+# any chart wiring — no outbound calls unless the operator explicitly
+# opts in via env vars. See `deploy/enterprise/README.md` for details.
 airgap: false
 
 image:

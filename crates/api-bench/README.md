@@ -16,18 +16,17 @@ Firecracker-benchmark posts compare against.
 
 ## 30-second reproduce
 
-1. Provision an org + API key (either via the dashboard `/dashboard/keys`
-   or via `NANOVM_API_TOKENS=acme:tok@developer` on the server).
-2. Have a snapshot to fork — either a `snapshot_id` you captured
-   yourself or a marketplace entry name (`python-3.12-minimal` is the
-   canonical one that ships with every marketplace config).
+1. Provision an org + API key (via `NANOVM_API_TOKENS=acme:tok@developer`
+   on the server, or the `POST /v1/keys` endpoint).
+2. Have a snapshot to fork — a `snapshot_id` you captured yourself with
+   `POST /v1/vms/:id/snapshot` on a running warmed guest.
 3. Run:
 
 ```sh
 cargo run -p api-bench --release -- \
     --api-url https://api.your-saas.com \
     --token   nv_YOUR_KEY \
-    --marketplace-name python-3.12-minimal \
+    --snapshot-id 42 \
     --n 100 --warmup 10
 ```
 
@@ -37,7 +36,7 @@ Or via env vars:
 export NANOVM_BENCH_URL=https://api.your-saas.com
 export NANOVM_BENCH_TOKEN=nv_YOUR_KEY
 cargo run -p api-bench --release -- \
-    --marketplace-name python-3.12-minimal
+    --snapshot-id 42
 ```
 
 ## Sample output (markdown mode)
@@ -48,7 +47,7 @@ cargo run -p api-bench --release -- \
 | Field           | Value                    |
 |-----------------|--------------------------|
 | API             | `https://api.your-saas.com` |
-| Target          | `marketplace/python-3.12-minimal` |
+| Target          | `snapshot id 42` |
 | Measured forks  | 100 |
 | Warmup (discarded) | 10 |
 
