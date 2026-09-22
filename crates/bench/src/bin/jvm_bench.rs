@@ -73,12 +73,16 @@ mod inner {
     /// see `tools/java-rootfs/warmup.sh`.
     const READY_MARKER: &str = "NANOVM_PETCLINIC_READY";
 
-    /// The kernel-cmdline marker the guest kernel prints on any boot
-    /// (init.sh's first stderr line). The "cold" mode uses it to
-    /// tell when the guest is far enough for a snapshot — early
-    /// enough that Spring hasn't started, late enough that KVM has
-    /// finished bring-up.
-    const COLD_MARKER: &str = "[init] launching JVM";
+    /// Cold-snapshot synchronisation marker. Emitted by `warmup.sh`
+    /// AFTER it confirms the JVM's TCP socket at :8080 is open,
+    /// which is a kernel-observable state ("JVM has execve'd,
+    /// Spring init is in progress"). The earlier
+    /// `[init] launching JVM` shell echo cannot be used for cold
+    /// synchronisation because it prints before `fork()+execve()` of
+    /// `java` returns — snapshotting on that marker would capture
+    /// nondeterministic guest state (shell mid-fork, mid-execve, or
+    /// mid-init-of-JVM). See `tools/java-rootfs/warmup.sh` header.
+    const COLD_MARKER: &str = "NANOVM_PETCLINIC_COLD";
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
     pub(crate) enum SnapshotAt {
@@ -145,6 +149,13 @@ mod inner {
         if args.forks == 0 {
             bail!("--forks must be > 0");
         }
+        // Guard against overflow when a caller passes wild values like
+        // --forks usize::MAX --warmup 1. Well below the memory allocs
+        // the loop would need would blow up first, but arithmetic
+        // panic is a worse failure mode than a clean bail.
+        args.forks
+            .checked_add(args.warmup)
+            .ok_or_else(|| anyhow!("--forks + --warmup overflowed usize"))?;
         if !args.kernel.exists() {
             bail!("kernel not found: {}", args.kernel.display());
         }
@@ -163,8 +174,13 @@ mod inner {
 
         let hv = Arc::new(KvmHypervisor::new().context("open /dev/kvm")?);
 
-        // Boot the golden VM once. We may take up to two snapshots
-        // off it (cold + warm) if the mode is Both.
+        // Boot the golden VM. Every subsequent early-return uses
+        // `TeardownGuard` so the golden VM + any snapshots taken so
+        // far get cleaned up even when a wait times out or a restore
+        // fails — a `--snapshot-at both` run that fails after the
+        // cold snapshot but before the warm one would otherwise
+        // leave hundreds of MiB of memory.cow behind under
+        // `/tmp/nanovm-snapshots/`.
         let cfg = VmConfig {
             vcpus: 1,
             memory_mib: args.memory_mib,
@@ -174,21 +190,36 @@ mod inner {
             ..VmConfig::default()
         };
         let golden = hv.create_vm(&cfg).context("create golden VM")?;
+        let mut teardown = TeardownGuard::new(Arc::clone(&hv), golden.id);
         hv.start(golden.id).context("start golden VM")?;
 
+        let result = run_phases(&hv, &args, &mut teardown);
+        // `TeardownGuard` drops here whether `run_phases` succeeded
+        // or errored; it destroys the golden VM and deletes any
+        // snapshots the guard was told about.
+        drop(teardown);
+        result
+    }
+
+    /// Everything from cold-marker wait through the warm-phase bench.
+    /// Kept as its own function so the `TeardownGuard` in `run` can
+    /// clean up on any early return, including intermediate failures
+    /// like a warmup timeout after the cold snapshot has been written.
+    fn run_phases(hv: &KvmHypervisor, args: &Args, teardown: &mut TeardownGuard) -> Result<()> {
+        let golden_id = teardown.vm;
         let need_cold = matches!(args.snapshot_at, SnapshotAt::Cold | SnapshotAt::Both);
         let need_warm = matches!(args.snapshot_at, SnapshotAt::Warm | SnapshotAt::Both);
 
-        // Wait for the "cold" point (JVM has been exec'd, Spring not
-        // yet ready). Guaranteed to precede the ready marker.
-        wait_for_marker(&hv, golden.id, COLD_MARKER, args.cold_marker_secs)
-            .context("wait for cold marker (JVM launch)")?;
+        // Wait for the cold-synchronisation marker.
+        wait_for_marker(hv, golden_id, COLD_MARKER, args.cold_marker_secs)
+            .context("wait for cold marker (JVM TCP socket open)")?;
 
         let cold_snap = if need_cold {
             let t = Instant::now();
             let s = hv
-                .snapshot(golden.id)
+                .snapshot(golden_id)
                 .context("cold snapshot of golden VM")?;
+            teardown.snapshots.push(s);
             println!(
                 "nanovm-jvm-bench: COLD snapshot taken ({s}, {} ms)",
                 t.elapsed().as_millis()
@@ -198,16 +229,15 @@ mod inner {
             None
         };
 
-        // Continue the golden VM until Spring is warm; this is where
-        // the warm snapshot lives. The COLD snapshot above holds the
-        // earlier state — the golden VM keeps running.
+        // Continue the golden VM until Spring is warm.
         let warm_snap = if need_warm {
-            wait_for_marker(&hv, golden.id, READY_MARKER, args.warmup_secs)
+            wait_for_marker(hv, golden_id, READY_MARKER, args.warmup_secs)
                 .context("wait for ready marker on golden VM")?;
             let t = Instant::now();
             let s = hv
-                .snapshot(golden.id)
+                .snapshot(golden_id)
                 .context("warm snapshot of golden VM")?;
+            teardown.snapshots.push(s);
             println!(
                 "nanovm-jvm-bench: WARM snapshot taken ({s}, {} ms)",
                 t.elapsed().as_millis()
@@ -217,52 +247,70 @@ mod inner {
             None
         };
 
-        // Cold-phase fork loop.
         let cold_stats = if let Some(snap) = cold_snap {
             Some(bench_snapshot(
-                &hv,
+                hv,
                 snap,
                 "COLD",
                 args.forks,
                 args.warmup,
                 args.progress_every,
-                /* wait_ready_secs */ args.warmup_secs,
+                args.warmup_secs,
                 /* wait_ready_in_fork */ true,
             )?)
         } else {
             None
         };
 
-        // Warm-phase fork loop.
         let warm_stats = if let Some(snap) = warm_snap {
             Some(bench_snapshot(
-                &hv,
+                hv,
                 snap,
                 "WARM",
                 args.forks,
                 args.warmup,
                 args.progress_every,
-                /* wait_ready_secs */ args.warmup_secs,
+                args.warmup_secs,
                 /* wait_ready_in_fork */ false,
             )?)
         } else {
             None
         };
 
-        // Side-by-side comparison when both modes ran.
         if let (Some(c), Some(w)) = (cold_stats.as_ref(), warm_stats.as_ref()) {
             print_comparison(c, w);
         }
-
-        // Cleanup.
-        finalize(&hv, golden.id);
-        if let Some(s) = cold_snap {
-            let _ = hv.delete_snapshot(s);
-        }
-        if let Some(s) = warm_snap {
-            let _ = hv.delete_snapshot(s);
-        }
         Ok(())
+    }
+
+    /// RAII cleanup for the golden VM and any snapshots taken off it.
+    /// Dropping the guard finalises the VM (stop + destroy) and
+    /// removes each snapshot from the local snapshot store — best
+    /// effort, we don't want teardown errors to mask a real earlier
+    /// error the caller is propagating.
+    struct TeardownGuard {
+        hv: Arc<KvmHypervisor>,
+        vm: VmId,
+        snapshots: Vec<SnapshotId>,
+    }
+
+    impl TeardownGuard {
+        fn new(hv: Arc<KvmHypervisor>, vm: VmId) -> Self {
+            Self {
+                hv,
+                vm,
+                snapshots: Vec::new(),
+            }
+        }
+    }
+
+    impl Drop for TeardownGuard {
+        fn drop(&mut self) {
+            finalize(&self.hv, self.vm);
+            for s in self.snapshots.drain(..) {
+                let _ = self.hv.delete_snapshot(s);
+            }
+        }
     }
 
     /// One snapshot's fork loop. Returns per-fork latencies (measured
@@ -326,16 +374,34 @@ mod inner {
 
     /// Poll the guest's serial output until `marker` appears or the
     /// deadline passes. Returns Ok(()) when the marker is seen.
+    /// Fails fast if the guest state transitions to Stopped mid-wait
+    /// (guest kernel panic or clean shutdown from PID 1 exiting) so
+    /// the caller doesn't burn `max_secs` on a dead VM.
     fn wait_for_marker(hv: &KvmHypervisor, vm: VmId, marker: &str, max_secs: u64) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(max_secs);
         loop {
-            let s = hv
+            // Propagate serial-read errors instead of swallowing them
+            // as empty output — a persistent `serial_output` error
+            // used to look identical to "marker just hasn't appeared
+            // yet" and hide real backend problems.
+            let bytes = hv
                 .serial_output(vm)
-                .ok()
-                .map(|b| String::from_utf8_lossy(&b).into_owned())
-                .unwrap_or_default();
+                .with_context(|| format!("read serial output for vm {}", vm.0))?;
+            let s = String::from_utf8_lossy(&bytes);
             if s.contains(marker) {
                 return Ok(());
+            }
+            // Detect a dead guest early. `state` returns the
+            // last-observed lifecycle state; anything but Running
+            // means the marker will never appear.
+            let state = hv.state(vm).ok();
+            if matches!(state, Some(vm_core::VmState::Stopped)) {
+                return Err(anyhow!(
+                    "guest {} transitioned to Stopped before marker {marker:?}\n\
+                     serial tail (last 4 KiB):\n{}",
+                    vm.0,
+                    tail(&s, 4096),
+                ));
             }
             if Instant::now() >= deadline {
                 return Err(anyhow!(
@@ -348,12 +414,22 @@ mod inner {
         }
     }
 
+    /// Last `≤ n` bytes of `s`, aligned to a UTF-8 char boundary.
+    /// Slicing `&s[s.len()-n..]` directly can panic when the target
+    /// byte offset lands in the middle of a multibyte codepoint (say,
+    /// an em-dash from the guest's warmup log). `is_char_boundary`
+    /// checks the offset; if it's mid-codepoint we walk forward to
+    /// the next boundary. Worst-case walk is 3 bytes (UTF-8 code
+    /// points are at most 4 bytes).
     fn tail(s: &str, n: usize) -> &str {
         if s.len() <= n {
-            s
-        } else {
-            &s[s.len() - n..]
+            return s;
         }
+        let mut start = s.len() - n;
+        while start < s.len() && !s.is_char_boundary(start) {
+            start += 1;
+        }
+        &s[start..]
     }
 
     /// Best-effort teardown; a leftover error here shouldn't tank
