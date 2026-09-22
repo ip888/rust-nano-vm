@@ -60,14 +60,28 @@ for the unpacked rootfs + 1 GiB for the JVM heap + kernel + slack.
 
 ## Build
 
-Requires Docker with `buildx`. `mkfs.ext4` + `sudo` are only needed
-for the optional ext4 pack — pass `SKIP_EXT4=1` to skip it in
-non-root / CI environments; `initramfs.cpio.gz` builds without either.
+Host prerequisites (`build.sh` checks them upfront):
+
+- `docker` with `buildx`
+- `cpio`, `gzip`, `find` — the initramfs pack step needs these. GNU
+  cpio (Linux) and BSD cpio (macOS default) are both fine; `build.sh`
+  uses portable short-option calls.
+- `sudo` + `mkfs.ext4` from `e2fsprogs` — **only if** you also pack
+  the ext4 artifact. `SKIP_EXT4=1` skips it entirely.
+
+The build tags the multi-stage image `linux/amd64` by default
+(`TARGET_PLATFORM=linux/amd64` in `build.sh`). Oracle JDK 21 ships
+x86-64 binaries; on Apple Silicon this pin makes Docker Desktop
+select the amd64 base images and emulate the runtime under
+Rosetta/QEMU, so `java -Xshare:dump` in the JDK-extract stage
+succeeds instead of erroring with exec-format mismatch.
 
 ```sh
 tools/java-rootfs/build.sh
-# or, for rootless / CI:
+# or, for rootless / CI (initramfs only, no ext4):
 SKIP_EXT4=1 tools/java-rootfs/build.sh
+# or, override the platform (e.g. arm64 for a native ARM64 JDK):
+TARGET_PLATFORM=linux/arm64 tools/java-rootfs/build.sh
 ```
 
 ## Pins

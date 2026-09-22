@@ -32,6 +32,18 @@
 #   SKIP_EXT4=1         Skip the ext4 pack (needs root for the loopback
 #                       mount); useful in CI or non-root environments.
 #                       initramfs.cpio.gz always builds — no root needed.
+#   TARGET_PLATFORM     Docker platform for the build (default
+#                       linux/amd64). Oracle JDK ships x86-64 binaries;
+#                       on Apple Silicon (M-series) hosts the buildx
+#                       default of linux/arm64 would pick a mismatched
+#                       base image and `java -Xshare:dump` would fail
+#                       with exec-format error, so we pin.
+#
+# Host prerequisites:
+#   - docker + buildx (any host, including Apple Silicon via Docker
+#     Desktop's amd64 emulation)
+#   - cpio, gzip, find, sudo (only sudo when packing ext4 — set
+#     SKIP_EXT4=1 to skip that)
 
 set -euo pipefail
 
@@ -40,8 +52,19 @@ CACHE_DIR="${SCRIPT_DIR}/cache"
 IMAGE_TAG="nanovm-java-rootfs:local"
 ROOTFS_MB="${ROOTFS_MB:-450}"
 SKIP_EXT4="${SKIP_EXT4:-0}"
+TARGET_PLATFORM="${TARGET_PLATFORM:-linux/amd64}"
 
 DOCKER_BIN="${DOCKER_BIN:-docker}"
+
+# Sanity-check the host tools upfront so a missing `cpio` fails the
+# script here rather than mid-way through the (long) docker build.
+for tool in cpio gzip find; do
+    if ! command -v "${tool}" >/dev/null 2>&1; then
+        echo "✗ required host tool not found: ${tool}" >&2
+        echo "  install ${tool} (Linux: apt/yum, macOS: brew install ${tool})" >&2
+        exit 2
+    fi
+done
 
 mkdir -p "${CACHE_DIR}"
 
@@ -57,8 +80,9 @@ if [[ -n "${DEBIAN_DIGEST:-}" ]]; then
     BUILD_ARGS+=("--build-arg" "DEBIAN_DIGEST=${DEBIAN_DIGEST}")
 fi
 
-echo "➜ docker buildx build ${IMAGE_TAG}"
+echo "➜ docker buildx build --platform ${TARGET_PLATFORM} ${IMAGE_TAG}"
 "${DOCKER_BIN}" buildx build \
+    --platform "${TARGET_PLATFORM}" \
     --load \
     --tag "${IMAGE_TAG}" \
     "${BUILD_ARGS[@]}" \
@@ -75,18 +99,23 @@ CID="$("${DOCKER_BIN}" create "${IMAGE_TAG}")"
 "${DOCKER_BIN}" rm -f "${CID}" > /dev/null
 
 # ---- 4. pack initramfs.cpio.gz --------------------------------------
-# The kernel expects the cpio "newc" format (a.k.a. SVR4). `find | cpio -o`
-# reads paths on stdin and writes the archive on stdout; `-D` sets the
-# base dir so the archive entries are rooted at "/" rather than the
-# scratch dir path. `-0` and `-print0` handle whitespace-in-names
-# safely (unlikely in a Debian rootfs but zero-cost insurance).
+# The kernel expects the cpio "newc" format (a.k.a. SVR4). Short-option
+# form (`-o -H newc`) is what BOTH GNU cpio (Linux) and BSD cpio
+# (macOS default) accept — the long options `--create --format=newc
+# --quiet` are GNU-only and would break the Apple-Silicon workflow the
+# platform matrix promises. `-0` in combination with `find -print0`
+# handles whitespace-in-names safely; both cpios accept `-0` short.
+# stderr goes to /dev/null to swallow the "N blocks" summary BSD cpio
+# always prints; a real failure trips `set -e` via the pipe status
+# check below.
 OUT_CPIO="${CACHE_DIR}/initramfs.cpio.gz"
 echo "➜ packing ${OUT_CPIO}"
 rm -f "${OUT_CPIO}"
 (
     cd "${STAGE_DIR}"
+    set -o pipefail
     find . -print0 \
-        | cpio --null --create --format=newc --quiet \
+        | cpio -o -0 -H newc 2>/dev/null \
         | gzip -9 -c > "${OUT_CPIO}"
 )
 echo "✓ ${OUT_CPIO} ($(du -h "${OUT_CPIO}" | awk '{print $1}'))"

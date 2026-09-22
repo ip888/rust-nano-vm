@@ -68,7 +68,16 @@ result. Both are recorded so anyone reproducing the demo can compare.
 - ~1 GiB free in `tools/java-rootfs/cache/`
 - Rust toolchain matching `rust-toolchain.toml`
 
-### 2. Build the rootfs
+### 2. Fetch the guest kernel
+
+```sh
+tools/kvm-images/fetch.sh tools/kvm-images/cache
+```
+
+The nanovm-jvm-bench step below reads `tools/kvm-images/cache/vmlinux`;
+a fresh checkout has no file there.
+
+### 3. Build the rootfs
 
 ```sh
 tools/java-rootfs/build.sh
@@ -76,16 +85,31 @@ tools/java-rootfs/build.sh
 SKIP_EXT4=1 tools/java-rootfs/build.sh
 ```
 
+Host prerequisites (checked upfront by `build.sh`):
+- `docker` with `buildx`
+- `cpio`, `gzip`, `find` — the initramfs pack step needs them; on
+  macOS they ship with the base OS (BSD cpio; short-option cpio calls
+  in `build.sh` are portable across GNU and BSD variants).
+- `sudo` + `mkfs.ext4` from `e2fsprogs` — only if you pack the ext4
+  artifact (`SKIP_EXT4=1` skips it entirely).
+
 Outputs:
 - `tools/java-rootfs/cache/initramfs.cpio.gz` — the demo boot path
 - `tools/java-rootfs/cache/rootfs.ext4` — unused today, kept for the
   future virtio-blk story
 
-### 3. Smoke-check the rootfs contents (no KVM required)
+### 4. Smoke-check the rootfs contents (no KVM required)
 
 ```sh
-docker run --rm -it --network host nanovm-java-rootfs:local
+docker run --rm -it --privileged --network host nanovm-java-rootfs:local
 ```
+
+`--privileged` is required because `init.sh` mounts `/proc`, `/sys`,
+`/dev` (devtmpfs), `/tmp` and `/run` — an unprivileged container
+lacks `CAP_SYS_ADMIN` for those. Under the nanovm KVM guest the same
+init runs unprivileged (guest kernel gives PID 1 the caps); the init
+script tolerates already-mounted or unmountable pseudo-fs so both
+paths produce the same behavior.
 
 Expected on stdout within ~10 s:
 
@@ -103,7 +127,7 @@ If Petclinic is already listening on 8080 on your host, either kill
 that process or drop `--network host` and add `-p 8080:8080` — the
 warmup driver hits `127.0.0.1:8080` from *inside* the container.
 
-### 4. Boot under KVM and run the snapshot-fork benchmark
+### 5. Boot under KVM and run the snapshot-fork benchmark
 
 *(Available after `nanovm-jvm-bench` lands in PR #269.)*
 
@@ -133,7 +157,7 @@ Not every step needs a KVM Linux host. The tests are stratified:
 
 Contributor workflow on Mac M1:
 - **L1 during coding** — `cargo test --workspace` runs full mock-backend suite in <10 s on M1.
-- **L2 before PR** — `tools/java-rootfs/build.sh && docker run` on M1 exercises the whole rootfs path minus KVM. Docker Desktop on M1 runs the container in a Rosetta/QEMU-backed x86_64 environment — ~3–5× slower than native x86 but confirms the boot sequence, JVM start, Spring context, warmup driver.
+- **L2 before PR** — `tools/java-rootfs/build.sh && docker run --privileged` on M1 exercises the whole rootfs path minus KVM. `build.sh` sets `TARGET_PLATFORM=linux/amd64` by default so Docker Desktop selects the amd64 base images and emulates the runtime under Rosetta/QEMU — ~3–5× slower than native x86 but confirms the boot sequence, JVM start, Spring context, warmup driver. Explicit `--platform` is required because Oracle JDK 21 ships x86-64 binaries; without the pin, buildx would pull an arm64 base on M1 and `java -Xshare:dump` in the JDK-extract stage would fail with exec-format error.
 - **L3 for demo numbers** — needs a Linux/KVM host. Options: EC2 metal (`i3.metal`, `m5.metal`), GCP with nested-virt, a Linux workstation, or the CI matrix once we add a KVM-capable runner.
 
 We're not building an in-browser demo path in Milestone 1 (would need

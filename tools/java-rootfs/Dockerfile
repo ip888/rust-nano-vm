@@ -81,9 +81,27 @@ COPY warmup.sh  /warmup.sh
 # either way.
 RUN chmod +x /sbin/init /warmup.sh \
  && ln -s /sbin/init /init
+# Docker export drops the runtime /dev bind-mount, so the layer would
+# otherwise ship with no device nodes at all. Linux wires PID 1's
+# stdin/stdout/stderr from /dev/console BEFORE running the binary, so
+# a rootfs missing /dev/console loses every log line the JVM and
+# warmup driver print — the host-side ready-marker tail sees nothing.
+# Create the essentials here so they land in the docker-export tar
+# and, via that, in the initramfs cpio. `init.sh` still mounts
+# devtmpfs to pick up dynamic nodes, but the baseline entries have to
+# exist before PID 1 runs.
+RUN mkdir -p /dev \
+ && mknod -m 600 /dev/console c 5 1 \
+ && mknod -m 666 /dev/null    c 1 3 \
+ && mknod -m 666 /dev/zero    c 1 5 \
+ && mknod -m 666 /dev/tty     c 5 0 \
+ && mknod -m 666 /dev/random  c 1 8 \
+ && mknod -m 666 /dev/urandom c 1 9
 # `docker run` isn't the intended launch path — `build.sh` extracts
-# the layer contents and packs them into an ext4 image the KVM
-# backend mounts as rootfs. The CMD below is set only so `docker run`
-# works for smoke-checking the layer contents (see the reproduce
-# doc's step 3).
+# the layer contents and packs them into an initramfs cpio the KVM
+# backend loads via `VmConfig.initrd`. The CMD below is set only so
+# `docker run` works for smoke-checking the layer contents (see the
+# reproduce doc's step 3), and needs `--privileged` in Docker because
+# `init.sh`'s pseudo-fs mounts require CAP_SYS_ADMIN outside the
+# nanovm guest.
 CMD ["/sbin/init"]
