@@ -84,9 +84,14 @@ Same command shape as M1:
 tools/java-microservices-rootfs/build.sh
 # rootless / CI (initramfs only, no ext4):
 SKIP_EXT4=1 tools/java-microservices-rootfs/build.sh
-# native ARM64 host with an arm64 JDK:
-TARGET_PLATFORM=linux/arm64 tools/java-microservices-rootfs/build.sh
 ```
+
+`TARGET_PLATFORM` defaults to `linux/amd64` for a reason: `fetch.sh`
+downloads the x86-64 Oracle JDK tarball, and the Dockerfile executes
+that JDK during `-Xshare:dump`. Overriding to `linux/arm64` on Apple
+Silicon would fail with an exec-format error until an arm64 JDK
+fetch is wired in — that's a follow-up. Docker Desktop's amd64
+emulation on Apple Silicon is the supported path today.
 
 Host prerequisites: `docker` + `buildx`, `cpio`, `gzip`, `find`,
 optionally `sudo` + `mkfs.ext4` for the ext4 pack. `build.sh`
@@ -98,13 +103,14 @@ Outputs:
 
 ## Pins
 
-Same three pins as M1 (JDK sha256, Debian digest) + one new one:
+Same three pins as M1 (JDK sha256, Debian digest) + two new ones:
 
 | Component | Pinned to | Verified with |
 |---|---|---|
 | Oracle JDK | `21.0.5` | sha256 in `fetch.sh` (currently `SKIP`; strict mode fails) |
 | Debian base | `debian:12-slim@sha256:…` | Digest at buildx time |
 | **Microservices repo** | commit hash in `Dockerfile` `PETCLINIC_MS_REF` | Git checkout by hash |
+| **Config repo** | commit hash in `Dockerfile` `PETCLINIC_MS_CONFIG_REF` | Git checkout by hash |
 
 Pinning workflow same as M1 — see `docs/prototypes/petclinic.md`
 "Pinning workflow" section.

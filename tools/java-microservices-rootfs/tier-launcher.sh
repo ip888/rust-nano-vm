@@ -104,9 +104,16 @@ wait_health() {
 }
 
 # ---- infra tier: config → eureka → admin -----------------------------
+# Config-server runs with the `native` profile and points at the
+# bundled `/opt/petclinic-ms/config` directory (populated by the
+# Dockerfile with the upstream spring-petclinic-microservices-config
+# repo contents). That gives us a self-contained boot with no network
+# reachability to GitHub — the whole reason this rootfs bundles the
+# config repo alongside the service jars.
 INFRA_PIDS=""
 if [ "$NANOVM_TIER" = "all" ] || [ "$NANOVM_TIER" = "infra" ]; then
-    CFG_PID="$(run_jvm config-server 512m "--server.port=8888")"
+    CFG_PID="$(run_jvm config-server 512m "--server.port=8888" \
+        "-Dspring.profiles.active=native -Dspring.cloud.config.server.native.search-locations=file:/opt/petclinic-ms/config/")"
     INFRA_PIDS="${INFRA_PIDS} ${CFG_PID}"
     wait_health config-server http://127.0.0.1:8888/actuator/health
 

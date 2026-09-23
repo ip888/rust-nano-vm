@@ -53,14 +53,19 @@ any_jvm_dead() {
 }
 
 # ---- 0. cold marker: api-gateway TCP socket open ---------------------
+# `set -e` above would kill the script on curl's exit 7 ("Failed to
+# connect"), which is the whole state we want to poll. `rc=0; curl … ||
+# rc=$?` captures the exit code without tripping `set -e`, because
+# `||` short-circuits and marks the whole expression as handled.
 echo "[warmup] waiting up to ${COLD_WAIT_SECS}s for api-gateway TCP :8080" >&2
 elapsed=0
+rc=7
 while [ "$elapsed" -lt "$COLD_WAIT_SECS" ]; do
     if any_jvm_dead; then
         exit 1
     fi
-    curl -sS -o /dev/null --max-time 1 "$GATEWAY_URL/" 2>/dev/null
-    rc=$?
+    rc=0
+    curl -sS -o /dev/null --max-time 1 "$GATEWAY_URL/" 2>/dev/null || rc=$?
     if [ "$rc" != 7 ]; then
         echo "[warmup] api-gateway TCP socket open after ${elapsed}s" >&2
         break
@@ -140,10 +145,25 @@ fi
 echo "NANOVM_MICROSERVICES_READY"
 
 # ---- 4. block until any JVM exits ------------------------------------
-# `wait` on multiple pids blocks until ANY of them exits. That's the
-# right semantic for the panic-on-first-exit contract — if any service
-# crashes we lose the demo state and the guest should reboot fresh
-# rather than serve half-working traffic.
-# shellcheck disable=SC2086
-wait ${ALL_PIDS} || true
-echo "[warmup] first JVM exited; init returning" >&2
+# POSIX `wait pid1 pid2 pid3` blocks on each argument in order, NOT on
+# the first-of-any to exit. If pid3 dies while pid1 is still alive,
+# `wait` sits on pid1 and doesn't observe pid3's death until pid1
+# also exits — which means PID 1 stays blocked and the guest keeps
+# limping along with a partially-dead stack, contradicting the
+# panic-on-first-exit contract.
+#
+# Correct semantic: poll each pid with `kill -0` at a modest interval
+# and return as soon as any one is gone. 250 ms strikes the balance
+# between "detect crash quickly" and "don't burn CPU on the polling
+# loop itself" (guest CPU is a scarce shared resource with the JVMs).
+echo "[warmup] supervising ${ALL_PIDS} — first-exit terminates PID 1" >&2
+while true; do
+    for p in $ALL_PIDS; do
+        [ -z "$p" ] && continue
+        if ! kill -0 "$p" 2>/dev/null; then
+            echo "[warmup] pid=$p exited; init returning" >&2
+            exit 0
+        fi
+    done
+    sleep 0.25 2>/dev/null || sleep 1
+done

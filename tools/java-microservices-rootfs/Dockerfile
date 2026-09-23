@@ -18,16 +18,20 @@
 
 ARG DEBIAN_DIGEST=sha256:PLACEHOLDER_PIN_BEFORE_MERGE
 ARG PETCLINIC_MS_REPO=https://github.com/spring-petclinic/spring-petclinic-microservices.git
-# Pin to a specific commit on `main` before merging any release track.
-# Sentinel makes the build fail loudly if left unpinned in a shipping
+ARG PETCLINIC_MS_CONFIG_REPO=https://github.com/spring-petclinic/spring-petclinic-microservices-config.git
+# Pin to specific commits on `main` before merging any release track.
+# Sentinels make the build fail loudly if left unpinned in a shipping
 # build.
 ARG PETCLINIC_MS_REF=PLACEHOLDER_PIN_BEFORE_MERGE
+ARG PETCLINIC_MS_CONFIG_REF=PLACEHOLDER_PIN_BEFORE_MERGE
 ARG JDK_TARBALL=jdk-21.0.5_linux-x64_bin.tar.gz
 
 # ---- stage 1: build the seven microservice jars ----------------------
 FROM eclipse-temurin:21-jdk AS petclinic-ms-builder
 ARG PETCLINIC_MS_REPO
 ARG PETCLINIC_MS_REF
+ARG PETCLINIC_MS_CONFIG_REPO
+ARG PETCLINIC_MS_CONFIG_REF
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
@@ -49,6 +53,20 @@ RUN mkdir -p /jars \
  && cp spring-petclinic-vets-service/target/spring-petclinic-vets-service-*.jar       /jars/vets-service.jar \
  && cp spring-petclinic-visits-service/target/spring-petclinic-visits-service-*.jar   /jars/visits-service.jar \
  && ls -lh /jars
+# Clone the config repository too. Upstream's config-server defaults to
+# reading YAML from a Git backend pointed at
+# `spring-petclinic-microservices-config` — the KVM guests have no
+# network by default, so we bundle the repo contents inside the rootfs
+# and switch config-server to Spring Cloud Config's `native` file
+# backend (see tier-launcher.sh).
+WORKDIR /src
+RUN git clone "$PETCLINIC_MS_CONFIG_REPO" spring-petclinic-microservices-config
+WORKDIR /src/spring-petclinic-microservices-config
+RUN git checkout "$PETCLINIC_MS_CONFIG_REF" \
+ && mkdir -p /config \
+ && cp -a . /config/ \
+ && rm -rf /config/.git \
+ && ls -la /config
 
 # ---- stage 2: extract Oracle JDK 21 ----------------------------------
 FROM debian:12-slim@${DEBIAN_DIGEST} AS jdk-extract
@@ -70,6 +88,10 @@ RUN apt-get update \
  && rm -rf /usr/share/doc /usr/share/man /usr/share/locale
 COPY --from=jdk-extract           /opt/jdk-21  /opt/jdk-21
 COPY --from=petclinic-ms-builder  /jars        /opt/petclinic-ms
+# Config repo bundled into the rootfs alongside the jars. config-server
+# reads from `/opt/petclinic-ms/config/` via Spring Cloud Config's
+# native (file) backend — no outbound Git needed at guest boot.
+COPY --from=petclinic-ms-builder  /config      /opt/petclinic-ms/config
 COPY init.sh            /sbin/init
 COPY tier-launcher.sh   /tier-launcher.sh
 COPY warmup.sh          /warmup.sh
