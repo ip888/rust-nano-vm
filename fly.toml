@@ -1,0 +1,44 @@
+# Fly.io app configuration for the nanovm-web site.
+#
+# App name and region are placeholders — override at `fly launch` time
+# by editing this file OR by running `fly apps rename` after the
+# initial deploy. The GitHub Actions workflow reads `app = "..."`
+# from here to know which app to deploy to.
+
+app = "nanovm-web"
+primary_region = "ams"  # Amsterdam — good latency to EU + US East
+
+# The site is stateless — every request hits Next.js's SSR/ISR and
+# either returns from the in-memory cache or fetches upstream (GitHub
+# API). No volumes needed today. When the interactive playground
+# lands in week 3, we'll add a control-plane sidecar with a state
+# volume; that's a separate fly.toml or a machines-API deploy.
+[build]
+  dockerfile = "Dockerfile.web"
+
+[env]
+  NEXT_TELEMETRY_DISABLED = "1"
+  # NODE_ENV set by Dockerfile.web's ENV. PORT bound below via
+  # internal_port; Fly's edge terminates HTTPS and forwards to this
+  # port over its private network.
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "suspend"    # save $$ during low traffic
+  auto_start_machines = true
+  min_machines_running = 1          # keep one warm for < 100 ms TTFB
+  processes = ["app"]
+
+# Small footprint until the playground grows. 512 MiB is comfortable
+# for Next.js SSR + a single fetch pool; upgrade to 1 GiB when we
+# start driving KVM forks from this same host.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+[deploy]
+  strategy = "rolling"
+  # Fly's default is `bluegreen` for HTTP services. `rolling` is
+  # enough for a stateless site and avoids the extra machine cost
+  # during deploys.
