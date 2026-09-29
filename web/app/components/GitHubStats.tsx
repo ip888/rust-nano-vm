@@ -20,11 +20,18 @@ async function fetchRepo(
   owner: string,
   repo: string
 ): Promise<GitHubRepo | null> {
+  // Short abort deadline so a hung GitHub connection can't stall
+  // page render / ISR revalidation. 5 s is plenty for a JSON response
+  // measured in kilobytes; a slower response is a failure mode we
+  // want to surface as a fallback, not a delayed render.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
   try {
     const res = await fetch(
       `https://api.github.com/repos/${owner}/${repo}`,
       {
         next: { revalidate: 60 },
+        signal: controller.signal,
         headers: {
           Accept: "application/vnd.github+json",
           "X-GitHub-Api-Version": "2022-11-28",
@@ -35,6 +42,8 @@ async function fetchRepo(
     return (await res.json()) as GitHubRepo;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

@@ -1,8 +1,9 @@
 name: web-deploy
 
 # Deploys the nanovm-web Next.js site to Fly.io on every push to
-# main that touches `web/**`, `Dockerfile.web`, or `fly.toml`.
-# Skipped for docs-only changes elsewhere in the repo.
+# main that touches `web/**`, `Dockerfile.web`, `fly.toml`, or this
+# workflow file itself. Skipped for docs-only changes elsewhere in
+# the repo.
 #
 # One-time setup (do NOT commit these):
 #   1. flyctl auth token  → paste as GitHub secret `FLY_API_TOKEN`.
@@ -27,6 +28,7 @@ on:
       - "web/**"
       - "Dockerfile.web"
       - "fly.toml"
+      - ".github/workflows/web-deploy.yml"
 
 concurrency:
   group: web-deploy-${{ github.ref }}
@@ -35,6 +37,12 @@ concurrency:
 jobs:
   # PR + push: build + typecheck. Confirms the site compiles before
   # the deploy step touches Fly.io. Fast (~90 s cold, ~30 s cached).
+  #
+  # Order matters: `next build` runs FIRST because Next generates
+  # `.next/types/routes.d.ts` that `next-env.d.ts` references via
+  # `/// <reference path=…>`. On a clean checkout that file doesn't
+  # exist yet; running `tsc --noEmit` before `next build` can trip
+  # the missing-reference check on stricter TS configs.
   build:
     name: build + typecheck
     runs-on: ubuntu-latest
@@ -48,14 +56,14 @@ jobs:
       - name: install
         working-directory: web
         run: npm ci --no-audit --no-fund
-      - name: typecheck
-        working-directory: web
-        run: npm run typecheck
       - name: build
         working-directory: web
         env:
           NEXT_TELEMETRY_DISABLED: "1"
         run: npm run build
+      - name: typecheck
+        working-directory: web
+        run: npm run typecheck
 
   # Push-to-main only: hand the build off to Fly.io's remote builder
   # which redoes the Docker build (image cache lives there so it's

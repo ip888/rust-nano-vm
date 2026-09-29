@@ -70,6 +70,14 @@ export default function PlaygroundTeaser() {
                   : "text-[var(--color-fg)]"
               }
             >
+              {/*
+                sr-only status text so a screen reader announces
+                completion. The visual line-through + filled
+                checkmark alone don't reach assistive-tech users.
+              */}
+              <span className="sr-only">
+                {done ? "Completed: " : "Upcoming: "}
+              </span>
               <span className="mr-3 inline-block w-14 text-[var(--color-fg-faint)]">
                 {week}
               </span>

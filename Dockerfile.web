@@ -9,6 +9,11 @@
 # Layer order is optimised for Fly.io remote builder cache: package
 # manifest first, then everything else. A change to source code
 # rebuilds only stage-1's copy + build; the deps layer stays cached.
+#
+# All COPYs into the runtime stage use `--chown=nonroot:nonroot` so
+# the distroless `nonroot` user (UID 65532) owns the files. Next.js
+# writes to `.next/cache/` during ISR revalidation, so root-owned
+# files there would cause silent write failures in production.
 
 FROM node:22-alpine AS builder
 WORKDIR /app
@@ -31,9 +36,12 @@ FROM gcr.io/distroless/nodejs22-debian12:nonroot AS runtime
 WORKDIR /app
 
 # Standalone bundle + Next's static assets + user-facing public dir.
-COPY --from=builder /app/.next/standalone ./
-COPY --from=builder /app/.next/static ./.next/static
-COPY --from=builder /app/public ./public
+# `--chown=nonroot:nonroot` gives the runtime user write access to
+# `.next/cache` for ISR-driven fetch revalidations. `public/` is
+# owned but never written — safe either way.
+COPY --from=builder --chown=nonroot:nonroot /app/.next/standalone ./
+COPY --from=builder --chown=nonroot:nonroot /app/.next/static ./.next/static
+COPY --from=builder --chown=nonroot:nonroot /app/public ./public
 
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
