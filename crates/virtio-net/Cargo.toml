@@ -1,0 +1,45 @@
+[package]
+name = "virtio-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "virtio-net paravirtualised network device for the nanovm KVM backend. TAP-backed host side + descriptor-ring wire format."
+keywords = ["virtio", "net", "microvm", "kvm", "virtualization"]
+categories = ["virtualization", "network-programming"]
+readme = "README.md"
+
+[dependencies]
+# `thiserror` — the workspace's standard idiom for deriving
+# implementations of `std::error::Error`. Lets us write:
+#
+#     #[derive(Debug, thiserror::Error)]
+#     enum TapError {
+#         #[error("open /dev/net/tun: {0}")]
+#         Open(std::io::Error),
+#         ...
+#     }
+#
+# instead of hand-writing `impl std::fmt::Display + std::error::Error`
+# for every enum variant. Rust doesn't have exceptions — every error
+# is a value returned from a function. `thiserror` makes those values
+# ergonomic to define. Zero runtime cost, all comptime macro.
+thiserror.workspace = true
+
+# `libc` — raw C-level libc bindings. We need it because opening
+# /dev/net/tun involves a TUNSETIFF ioctl whose request number and
+# argument struct aren't in Rust's standard library. `libc` gives us
+# the raw `ioctl(2)`, `open(2)`, `close(2)` FFI without pulling in a
+# larger platform-abstraction crate. Same crate `vm-kvm` uses for
+# KVM ioctls, kept consistent.
+libc = "0.2"
+
+[dev-dependencies]
+# `tempfile` — used by tests that need to create disposable Unix
+# domain sockets or scratch paths. Deterministic cleanup via RAII
+# (the `TempDir` struct removes the directory on Drop).
+tempfile = "3"
+
+[lints]
+workspace = true
