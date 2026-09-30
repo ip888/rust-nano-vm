@@ -1,0 +1,29 @@
+{
+  "name": "nanovm-web",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Public site + upcoming interactive playground for rust-nano-vm. Deployed to Fly.io.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start -p ${PORT:-3000}",
+    "typecheck": "tsc --noEmit",
+    "lint": "next lint --dir app"
+  },
+  "dependencies": {
+    "next": "^15.5.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@tailwindcss/postcss": "^4.1.0",
+    "eslint": "^9.30.0",
+    "eslint-config-next": "^15.5.0",
+    "postcss": "^8.5.0",
+    "tailwindcss": "^4.1.0",
+    "typescript": "^5.8.0"
+  }
+}

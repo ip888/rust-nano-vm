@@ -1,0 +1,28 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens. Kept in :root so any component can pick them up
+ * without importing a TS module. Deliberately monochrome + one
+ * accent (electric blue) — the site's job is to communicate a
+ * technical product, not to sell colour theory.
+ */
+:root {
+  --color-bg: #0a0a0b;
+  --color-bg-elev: #131315;
+  --color-fg: #e6e6e8;
+  --color-fg-dim: #b3b3b8;
+  --color-fg-faint: #8a8a92;
+  --color-accent: #4d9cff;
+  --color-border: #23232a;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  -webkit-font-smoothing: antialiased;
+}
