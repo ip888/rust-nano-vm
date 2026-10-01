@@ -129,3 +129,14 @@ pub use tap::TapDevice;
 
 pub mod mock;
 pub use mock::MockBackend;
+
+pub mod header;
+pub use header::{HeaderError, VirtioNetHdr, VIRTIO_NET_HDR_LEN};
+
+pub mod mmio;
+pub use mmio::{
+    MmioTransport, QueueConfig, QueueNotify, RX_QUEUE_INDEX, TX_QUEUE_INDEX, VIRTIO_ID_NET,
+};
+
+pub mod device;
+pub use device::VirtioNetDevice;

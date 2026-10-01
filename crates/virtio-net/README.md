@@ -5,12 +5,21 @@ enterprise-Java guests (Petclinic single-jar, Petclinic
 microservices) real IP connectivity to the host and the outside
 world. Lands across four sub-PRs:
 
-| Sub-PR | What lands | This file describes |
+| Sub-PR | What lands | Status |
 |---|---|---|
-| **#A (this crate's scaffold)** | Crate skeleton + `NetworkBackend` trait + `TapDevice` Linux-only wrapper | ✅ |
-| #B | virtio-mmio device state machine, descriptor ring processing, guest cmdline hookup | Later |
-| #C | Wire the device into `crates/vm-kvm` (register MMIO region, add to boot params) | Later |
+| **#A** | Crate skeleton + `NetworkBackend` trait + `TapDevice` Linux-only wrapper | ✅ merged |
+| **#B** | virtio-net wire header + MMIO transport (`MmioTransport::new_net`) + `VirtioNetDevice` skeleton owning a `Box<dyn NetworkBackend>` | ✅ this PR |
+| #B.2 | Descriptor-ring processing: pull TX chains, fill RX chains, strip/prepend the 12-byte virtio-net header, raise the device IRQ | Next |
+| #C | Wire the device into `crates/vm-kvm` (register MMIO region, add to boot params, kernel cmdline) | Later |
 | #D | Host-side bridge + NAT + IP allocation so guests reach the external network | Later |
+
+**Why #B split in half:** The transport (register layout, feature
+negotiation, config space) is pure state and testable without any
+guest memory, while descriptor-ring processing needs a `GuestMemory`
+accessor that only `vm-kvm` can provide. Landing the transport on its
+own keeps the review surface digestible and locks the public API
+(`VirtioNetDevice::mmio_read`, `mmio_write`, `backend_arc`) before
+anything depends on it.
 
 ## Why virtio-net at all
 
