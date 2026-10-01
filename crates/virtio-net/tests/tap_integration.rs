@@ -1,8 +1,14 @@
-//! Integration test that opens a real TAP interface via
-//! `/dev/net/tun` and writes+reads a canned Ethernet frame through
-//! it. Runs only when the host has `CAP_NET_ADMIN` and TUN is
-//! available; skips otherwise so `cargo test --workspace` on a
-//! contributor laptop stays green.
+//! Integration tests that exercise the real Linux TAP path:
+//! open an interface via `/dev/net/tun` + `TUNSETIFF`, verify the
+//! readiness fd and the non-blocking read behaviour. The write side
+//! requires an attached bridge (the kernel otherwise reports EIO on
+//! a down interface) and lands with sub-PR #D's host networking
+//! plumbing — this file does not cover frame transfer.
+//!
+//! Skipped (returns 0 passed, 0 failed) on hosts without
+//! `CAP_NET_ADMIN` or without the TUN module. Follows the same
+//! skip-when-fixtures-missing pattern the `crates/vm-kvm` real-KVM
+//! integration tests use.
 
 #![cfg(target_os = "linux")]
 
@@ -10,41 +16,59 @@ use std::path::Path;
 
 use virtio_net::{NetworkBackend, TapDevice};
 
-/// Skip pattern used by other `crates/vm-kvm/tests/*_boot.rs` tests:
-/// return early rather than fail when the environment can't run us.
+/// Capability + device probe. Returns `true` when the test should
+/// skip, `false` when the environment has what we need.
 ///
 /// We can't just check for `/dev/net/tun` existence — the character
 /// device is readable to any user, but the TUNSETIFF ioctl inside
 /// `TapDevice::open` requires `CAP_NET_ADMIN`. GitHub Actions
 /// runners are the classic case: TUN module loaded, device present,
 /// but no capability. Probe by actually opening a short-lived TAP
-/// and detecting EPERM (`PermissionDenied` kind) from the ioctl.
+/// and detecting only the error kinds that mean "environment can't
+/// do this": `PermissionDenied` (EPERM / EACCES from the ioctl).
+///
+/// Any other error — bad ioctl request number, invalid flags,
+/// resource exhaustion, ENODEV — bubbles up as a real test failure
+/// so a regression in `TapDevice::open` can't masquerade as a skip.
+/// `EBUSY` from the exclusive-creation flag is the one exception:
+/// seeing EBUSY proves the ioctl succeeded past the capability
+/// check, so we have the capability and should run the test — the
+/// specific probe name was just already taken by a parallel test
+/// run (cargo runs integration tests in parallel threads).
 fn skip_if_no_tun() -> bool {
     if !Path::new("/dev/net/tun").exists() {
         eprintln!("skip: /dev/net/tun not present — kernel without TUN");
         return true;
     }
-    // Try the full open path with a probe interface name. Success →
-    // drop + continue; EPERM / EACCES → missing capability, skip.
-    match TapDevice::open("nanovm-probe") {
+    // Unique probe name so parallel tests don't race on the same
+    // interface. Thread id + PID gives per-run uniqueness.
+    let probe_name = format!("np-{}", thread_tag());
+    match TapDevice::open(&probe_name) {
         Ok(_) => false,
         Err(virtio_net::VirtioNetError::Io(e))
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-            ) =>
+            if e.kind() == std::io::ErrorKind::PermissionDenied =>
         {
-            eprintln!(
-                "skip: TAP probe failed with {} — likely no CAP_NET_ADMIN",
-                e
-            );
+            eprintln!("skip: TAP probe EPERM — missing CAP_NET_ADMIN");
             true
         }
-        Err(e) => {
-            eprintln!("skip: TAP probe failed: {e}");
-            true
-        }
+        // EBUSY means the ioctl passed the capability check and
+        // failed on IFF_TUN_EXCL finding an existing interface
+        // with the same name. That proves we have the capability.
+        Err(virtio_net::VirtioNetError::Io(e)) if e.raw_os_error() == Some(libc::EBUSY) => false,
+        Err(e) => panic!("TAP probe failed in an unexpected way: {e:?}"),
     }
+}
+
+/// Short, unique-per-thread tag for interface names so a cargo-test
+/// parallel run doesn't race on IFF_TUN_EXCL. 11 bytes max because
+/// Linux IFNAMSIZ caps names at 15 bytes and the test prefix uses
+/// up some of that.
+fn thread_tag() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    std::thread::current().id().hash(&mut hasher);
+    format!("{:x}", hasher.finish() & 0xffff)
 }
 
 #[test]
@@ -52,11 +76,11 @@ fn open_close_tap_smoke() {
     if skip_if_no_tun() {
         return;
     }
-    let tap = TapDevice::open("nanovm-tap-t0").expect("open TAP");
-    assert_eq!(tap.name(), "nanovm-tap-t0");
-    // readiness_fd should be a positive integer.
-    assert!(tap.readiness_fd().unwrap_or(-1) > 0);
-    // Drop drops the fd + kernel deletes the interface.
+    let name = format!("nvm-t0-{}", thread_tag());
+    let tap = TapDevice::open(&name).expect("open TAP");
+    assert_eq!(tap.name(), &name);
+    let fd = tap.readiness_fd().expect("Some(fd)");
+    assert!(fd >= 0, "readiness_fd must be a non-negative descriptor");
 }
 
 #[test]
@@ -64,10 +88,9 @@ fn tap_read_returns_zero_when_no_traffic() {
     if skip_if_no_tun() {
         return;
     }
-    let tap = TapDevice::open("nanovm-tap-t1").expect("open TAP");
+    let name = format!("nvm-t1-{}", thread_tag());
+    let tap = TapDevice::open(&name).expect("open TAP");
     let mut buf = [0u8; 2048];
-    // Non-blocking read on a fresh TAP with no attached bridge and
-    // no traffic → EAGAIN → mapped to `Ok(0)` by our impl.
     let n = tap.read_frame(&mut buf).expect("read");
     assert_eq!(n, 0);
 }
@@ -81,15 +104,13 @@ fn tap_read_returns_zero_when_no_traffic() {
 // integration suite where we can attach both ends.
 
 #[test]
-fn readiness_fd_is_the_tap_fd() {
+fn readiness_fd_is_a_valid_pollable_fd() {
     if skip_if_no_tun() {
         return;
     }
-    let tap = TapDevice::open("nanovm-tap-t3").expect("open TAP");
+    let name = format!("nvm-t3-{}", thread_tag());
+    let tap = TapDevice::open(&name).expect("open TAP");
     let rfd = tap.readiness_fd().expect("Some(fd)");
-    // Poll it for POLLIN with timeout 0 — expect not-ready given
-    // no traffic. The important assertion is that poll() accepts
-    // the fd at all (positive rc, no EBADF).
     let mut pfd = libc::pollfd {
         fd: rfd,
         events: libc::POLLIN,
@@ -101,8 +122,10 @@ fn readiness_fd_is_the_tap_fd() {
         "poll rc={rc} errno={}",
         std::io::Error::last_os_error()
     );
-    // Also verify AsRawFd correspondence — the fd exposed via the
-    // trait should match what the internal `File` reports.
-    let _internal_fd = rfd; // just checks readiness_fd returned same value type
+    assert_eq!(
+        pfd.revents & libc::POLLNVAL,
+        0,
+        "poll reported POLLNVAL — the readiness_fd is not a valid descriptor"
+    );
     drop(tap);
 }

@@ -1,8 +1,10 @@
 //! Host-side virtio-net paravirtualised network device.
 //!
 //! See the crate `README.md` for the architectural preface: what
-//! virtio-net is, why we need it for the Petclinic web playground,
-//! and how this crate splits across four sub-PRs of Week 2.
+//! virtio-net is, how TX/RX descriptor rings + the MMIO doorbell
+//! work, and how this crate splits across four sub-PRs that
+//! together give enterprise-Java guests real host-to-guest
+//! networking.
 //!
 //! # Public surface (sub-PR #A — scaffold)
 //!
@@ -57,18 +59,6 @@ pub enum VirtioNetError {
         name: String,
         /// Why it was rejected.
         reason: &'static str,
-    },
-
-    /// Requested frame is larger than the destination buffer.
-    /// Ethernet's standard MTU is 1500 bytes payload + 14 header +
-    /// 4 FCS = 1518, but with virtio-net's mergeable-buffers
-    /// feature or jumbo frames a caller might pass a bigger buffer.
-    #[error("frame size {frame_len} exceeds buffer capacity {buf_len}")]
-    FrameTooLarge {
-        /// Frame size the caller wanted to write.
-        frame_len: usize,
-        /// Buffer they gave us.
-        buf_len: usize,
     },
 }
 

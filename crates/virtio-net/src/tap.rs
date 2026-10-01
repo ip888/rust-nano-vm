@@ -56,8 +56,13 @@ const TUNSETIFF: libc::c_ulong = 0x400454ca;
 // Flags for the `ifr_flags` field of `ifreq` when passed to
 // TUNSETIFF. `IFF_TAP` — L2 device (Ethernet frames). `IFF_NO_PI` —
 // don't prepend a 4-byte "packet info" header; we want raw frames.
+// `IFF_TUN_EXCL` — require creation of a brand-new interface; refuse
+// to attach to an existing persistent TAP that happens to have the
+// requested name. Without this flag Linux may silently bind our fd
+// to an old interface and the caller never knows.
 const IFF_TAP: libc::c_short = 0x0002;
 const IFF_NO_PI: libc::c_short = 0x1000;
+const IFF_TUN_EXCL: libc::c_short = 0x8000u16 as libc::c_short;
 
 // Struct layout matches the kernel's `struct ifreq` used with
 // `TUNSETIFF`. The full C definition is a union of many variants —
@@ -148,7 +153,7 @@ impl TapDevice {
         // any type by writing 0s; for our `#[repr(C)]` struct with
         // all-integer fields this is a safe zero-value.
         let mut ifr: Ifreq = unsafe { mem::zeroed() };
-        ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+        ifr.ifr_flags = IFF_TAP | IFF_NO_PI | IFF_TUN_EXCL;
         for (i, &b) in cname.as_bytes().iter().enumerate() {
             ifr.ifr_name[i] = b as libc::c_char;
         }

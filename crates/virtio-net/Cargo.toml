@@ -36,10 +36,8 @@ thiserror.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
-# `tempfile` — used by tests that need to create disposable Unix
-# domain sockets or scratch paths. Deterministic cleanup via RAII
-# (the `TempDir` struct removes the directory on Drop).
-tempfile = "3"
+# No dev-only deps today. When sub-PR #B's integration tests need
+# `tempfile` for scratch Unix sockets or similar, add it back here.
 
 [lints]
 workspace = true

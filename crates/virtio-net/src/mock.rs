@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use crate::{NetworkBackend, Result, VirtioNetError};
+use crate::{NetworkBackend, Result};
 
 /// In-memory network backend. See module docs.
 ///
@@ -78,22 +78,18 @@ impl NetworkBackend for MockBackend {
         match rx.pop_front() {
             None => Ok(0),
             Some(frame) => {
-                if frame.len() > buf.len() {
-                    // Buffer too small for the frame. Return the
-                    // frame to the queue so a caller with a bigger
-                    // buffer can retrieve it — matches the shape a
-                    // real kernel gives us via TUN's E_MSGSIZE.
-                    let frame_len = frame.len();
-                    let buf_len = buf.len();
-                    rx.push_front(frame);
-                    return Err(VirtioNetError::FrameTooLarge { frame_len, buf_len });
-                }
-                // `copy_from_slice` panics on length mismatch — we
-                // just checked above so this is safe. Alternative
-                // `buf[..frame.len()].copy_from_slice(&frame)` reads
-                // more clearly than a raw memcpy.
-                let n = frame.len();
-                buf[..n].copy_from_slice(&frame);
+                // Match Linux TAP semantics: a `read()` into a buffer
+                // smaller than the next frame **truncates and consumes**
+                // the frame; the trailing bytes are lost and the caller
+                // sees whatever fit. This matches the behavior of
+                // `read(/dev/net/tun)` as implemented by the kernel's
+                // tun driver (see `tun_do_read` in `drivers/net/tun.c`).
+                // The virtio device from sub-PR #B always sizes its
+                // RX buffers at ≥ MTU, so truncation never happens in
+                // practice; tests that pass an undersized buffer are
+                // asserting the truncation contract explicitly.
+                let n = frame.len().min(buf.len());
+                buf[..n].copy_from_slice(&frame[..n]);
                 Ok(n)
             }
         }
@@ -143,24 +139,22 @@ mod tests {
     }
 
     #[test]
-    fn frame_too_large_returns_error_and_preserves_queue() {
+    fn oversized_frame_is_truncated_and_consumed_like_tap() {
+        // Linux TAP read() into an undersized buffer truncates the
+        // frame and consumes it. Mock matches that contract.
         let mock = MockBackend::new();
-        let big = vec![0u8; 1500];
+        let big = vec![0xabu8; 1500];
         mock.inject_rx(big.clone());
 
         let mut small = [0u8; 64];
-        let err = mock.read_frame(&mut small).unwrap_err();
-        match err {
-            VirtioNetError::FrameTooLarge { frame_len, buf_len } => {
-                assert_eq!(frame_len, 1500);
-                assert_eq!(buf_len, 64);
-            }
-            other => panic!("unexpected error variant: {other:?}"),
-        }
-        // Frame must still be in the queue for a retry with a
-        // bigger buffer.
+        let n = mock.read_frame(&mut small).unwrap();
+        assert_eq!(n, 64, "mock truncates to buf.len()");
+        assert_eq!(&small[..], &big[..64]);
+
+        // Frame was consumed — no retry with a bigger buffer gets
+        // the rest back. Next read sees empty queue.
         let mut big_buf = [0u8; 2048];
-        let n = mock.read_frame(&mut big_buf).unwrap();
-        assert_eq!(&big_buf[..n], big.as_slice());
+        let n2 = mock.read_frame(&mut big_buf).unwrap();
+        assert_eq!(n2, 0, "frame was consumed on the truncating read");
     }
 }

@@ -2990,7 +2990,6 @@ name = "virtio-net"
 version = "0.0.3"
 dependencies = [
  "libc",
- "tempfile",
  "thiserror",
 ]
 

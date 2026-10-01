@@ -1,14 +1,16 @@
 # virtio-net
 
-Host-side virtio-net device for the nanovm KVM backend. Landing
-across four sub-PRs in Week 2 of the enterprise-Java web rollout:
+Host-side virtio-net device for the nanovm KVM backend. Gives
+enterprise-Java guests (Petclinic single-jar, Petclinic
+microservices) real IP connectivity to the host and the outside
+world. Lands across four sub-PRs:
 
 | Sub-PR | What lands | This file describes |
 |---|---|---|
 | **#A (this crate's scaffold)** | Crate skeleton + `NetworkBackend` trait + `TapDevice` Linux-only wrapper | ✅ |
 | #B | virtio-mmio device state machine, descriptor ring processing, guest cmdline hookup | Later |
 | #C | Wire the device into `crates/vm-kvm` (register MMIO region, add to boot params) | Later |
-| #D | Host-side bridge + IP allocation + reverse-proxy for per-visitor subdomains | Later |
+| #D | Host-side bridge + NAT + IP allocation so guests reach the external network | Later |
 
 ## Why virtio-net at all
 
@@ -75,9 +77,11 @@ into every Linux kernel. Nothing to build there.
 The trait separation exists so that:
 - The virtio device state machine (sub-PR #B) tests without touching
   the kernel — mock backend replays scripted frames.
-- The TAP backend tests without touching the virtio spec — its own
-  tests just verify byte-for-byte round-trip through
-  `/dev/net/tun`.
+- The TAP backend tests without touching the virtio spec — the
+  integration suite shipped in sub-PR #A covers open / readiness-fd /
+  non-blocking read semantics; the write side needs an attached
+  bridge to validate end-to-end and lands with sub-PR #D's host
+  networking plumbing.
 
 ## What TAP is (for readers new to Linux networking)
 
