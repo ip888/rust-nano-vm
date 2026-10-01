@@ -12,25 +12,36 @@ use virtio_net::{NetworkBackend, TapDevice};
 
 /// Skip pattern used by other `crates/vm-kvm/tests/*_boot.rs` tests:
 /// return early rather than fail when the environment can't run us.
+///
+/// We can't just check for `/dev/net/tun` existence — the character
+/// device is readable to any user, but the TUNSETIFF ioctl inside
+/// `TapDevice::open` requires `CAP_NET_ADMIN`. GitHub Actions
+/// runners are the classic case: TUN module loaded, device present,
+/// but no capability. Probe by actually opening a short-lived TAP
+/// and detecting EPERM (`PermissionDenied` kind) from the ioctl.
 fn skip_if_no_tun() -> bool {
     if !Path::new("/dev/net/tun").exists() {
-        eprintln!("skip: /dev/net/tun not present — kernel without TUN or no privilege");
+        eprintln!("skip: /dev/net/tun not present — kernel without TUN");
         return true;
     }
-    // Cheap capability probe: try to open it O_RDWR. If it fails
-    // with EPERM we don't have CAP_NET_ADMIN and can't create a TAP.
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/net/tun")
-    {
+    // Try the full open path with a probe interface name. Success →
+    // drop + continue; EPERM / EACCES → missing capability, skip.
+    match TapDevice::open("nanovm-probe") {
         Ok(_) => false,
-        Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
-            eprintln!("skip: no CAP_NET_ADMIN, can't open /dev/net/tun O_RDWR");
+        Err(virtio_net::VirtioNetError::Io(e))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            eprintln!(
+                "skip: TAP probe failed with {} — likely no CAP_NET_ADMIN",
+                e
+            );
             true
         }
         Err(e) => {
-            eprintln!("skip: /dev/net/tun open failed: {e}");
+            eprintln!("skip: TAP probe failed: {e}");
             true
         }
     }
