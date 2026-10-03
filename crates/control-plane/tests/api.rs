@@ -3046,12 +3046,12 @@ async fn cors_layer_with_explicit_origin_echoes_that_origin_only() {
     let app = router()
         .layer(Extension(Arc::new(ApiTokens::default())))
         .with_state(AppState::new(hv))
-        .layer(cors_layer_from("https://app.nanovm.io"));
+        .layer(cors_layer_from("https://app.nanovm.app"));
     // Allowed origin — preflight succeeds with echoed value.
     let req = Request::builder()
         .method(Method::OPTIONS)
         .uri("/healthz")
-        .header("origin", "https://app.nanovm.io")
+        .header("origin", "https://app.nanovm.app")
         .header("access-control-request-method", "GET")
         .body(Body::empty())
         .unwrap();
@@ -3061,7 +3061,7 @@ async fn cors_layer_with_explicit_origin_echoes_that_origin_only() {
             .get("access-control-allow-origin")
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default(),
-        "https://app.nanovm.io"
+        "https://app.nanovm.app"
     );
     // Different origin — layer must NOT emit an
     // Access-Control-Allow-Origin, so the browser blocks the request.

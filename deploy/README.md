@@ -40,7 +40,7 @@ Works on any cluster whose nodes expose `/dev/kvm`. Tested on:
 Label the KVM-capable nodes so the chart's `nodeSelector` finds them:
 
 ```sh
-kubectl label node <node-name> nanovm.io/kvm=true
+kubectl label node <node-name> nanovm.app/kvm=true
 ```
 
 If your nodes use a non-standard `kvm` group GID (Debian = 36, RHEL = 78), set it in your override:

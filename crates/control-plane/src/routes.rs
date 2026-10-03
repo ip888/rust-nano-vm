@@ -415,7 +415,7 @@ pub fn router() -> Router<AppState> {
 /// - **unset** or empty → returns a permissive-nothing layer that
 ///   does not touch the response (effectively disabled). Same shape
 ///   as pre-CORS builds.
-/// - **comma-separated list of origins** (e.g. `https://app.nanovm.io,
+/// - **comma-separated list of origins** (e.g. `https://app.nanovm.app,
 ///   http://localhost:3000`) → each origin is allow-listed
 ///   individually. Credentials (cookies, `Authorization` header) are
 ///   allowed. Preflight cache is 1 hour.

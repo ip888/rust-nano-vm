@@ -13,7 +13,7 @@ developer's laptop. Pick the row that matches your setup.
 ## The honest matrix
 
 - **KVM is a Linux-kernel feature.** Mac and Windows can only get "real" microVM isolation by running Linux themselves (WSL2 on Windows; Lima/UTM/Docker Desktop on Mac).
-- **The SDK + CLI ship everywhere Python does.** If you're targeting our SaaS (`nanovm.io`), or someone else's hosted control-plane, the CLI works on any Python-supported OS with no VM stack needed locally.
+- **The SDK + CLI ship everywhere Python does.** If you're targeting our SaaS (`nanovm.app`), or someone else's hosted control-plane, the CLI works on any Python-supported OS with no VM stack needed locally.
 - **Local mock backend works everywhere.** Great for SDK development / CI / testing agent integrations without a real hypervisor. Not usable for real workloads.
 
 ## Common flow (any platform)
