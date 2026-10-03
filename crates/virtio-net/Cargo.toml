@@ -35,6 +35,15 @@ thiserror.workspace = true
 # KVM ioctls, kept consistent.
 libc = "0.2"
 
+# `virtio-queue` — this workspace's shared split-virtqueue crate.
+# Provides `GuestMemory`, `Descriptor`, `DescriptorChain`, `AvailRing`,
+# `UsedRing`, and ring-size helpers. The queue consumer in `queue.rs`
+# walks TX/RX chains out of guest memory through these primitives.
+# Keeping the ring parser in a workspace crate lets virtio-vsock,
+# virtio-fs, and virtio-net share one audited implementation of the
+# split-virtqueue wire format.
+virtio-queue.workspace = true
+
 [dev-dependencies]
 # No dev-only deps today. When sub-PR #B's integration tests need
 # `tempfile` for scratch Unix sockets or similar, add it back here.
