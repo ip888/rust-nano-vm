@@ -16,6 +16,22 @@ bridge, marketplace of curated snapshots, live Fly.io demo, Stripe
 consumer billing) was cut in the Java-enterprise pivot cleanup. Its full
 state is preserved on the `pre-java-pivot` branch for reference.
 
+## Public URLs
+
+- **Production landing:** <https://nanovm.app> (Fly.io app `nanovm-web`,
+  Cloudflare-registered domain, Fly-issued Let's Encrypt certs). DNS
+  records live in Cloudflare with Proxy status = DNS only (grey cloud)
+  so Fly can renew the TLS cert via Let's Encrypt. **Do not flip to
+  Proxied** without first switching to a Cloudflare Origin Cert — the
+  renewal will fail silently and the site will go HTTPS-insecure.
+- **Fly built-in URL** (<https://nanovm-web.fly.dev>) is 301-redirected
+  to `nanovm.app` by `web/next.config.ts` so Google doesn't index the
+  duplicate. Keep both reachable; keep only `nanovm.app` canonical.
+- The GitHub repo (`ip888/rust-nano-vm`) stays the single source of
+  truth. The crate workspace is still named `rust-nano-vm` internally;
+  renaming the repo to match the public domain is a separate decision
+  and not part of the current roadmap.
+
 ## PR lifecycle: review comments are part of "ready"
 
 **Before reporting that a PR is "ready to merge" or marking it out of

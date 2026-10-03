@@ -7,9 +7,11 @@ name: web-deploy
 #
 # One-time setup (do NOT commit these):
 #   1. flyctl auth token  → paste as GitHub secret `FLY_API_TOKEN`.
-#   2. Domain: `fly certs create nanovm.io` (and any subdomains).
-#      DNS: point A / AAAA of nanovm.io at Fly's shared IPs, or
-#      allocate a dedicated one via `fly ips allocate-v4`.
+#   2. Domain: `fly certs create nanovm.app` (and any subdomains).
+#      DNS: point A / AAAA of nanovm.app at a dedicated Fly IP from
+#      `fly ips allocate-v4 -a nanovm-web`. Cloudflare Proxy must stay
+#      "DNS only" (grey cloud) or Fly can't complete Let's Encrypt
+#      ownership validation. Production URL today: https://nanovm.app.
 #
 # PR builds run typecheck + `next build` but do NOT deploy. Merge to
 # main → deploy.
