@@ -1,54 +1,223 @@
-//! Virtqueue consumer for the virtio-net device.
+//! # Virtqueue consumer for the virtio-net device
 //!
-//! Sub-PR #B landed the register model and the device skeleton; this
-//! module adds the piece that actually moves bytes between guest RAM
-//! and the host [`NetworkBackend`](crate::NetworkBackend):
+//! This module is the piece of the device that **moves bytes between
+//! the guest's memory and the host's [`NetworkBackend`]**. Sub-PR #B
+//! landed the registers the guest driver pokes to discover and set up
+//! the device; this file is the actual data path that runs every time
+//! the guest kicks a queue.
+//!
+//! New reader? Start with the **terminology** box below, then read the
+//! two **data-flow diagrams** (TX and RX). The rest of the module is
+//! the Rust implementation of exactly those two flows.
+//!
+//! ## Terminology (every acronym in one place)
+//!
+//! | Term | What it means |
+//! |---|---|
+//! | **virtio** | Industry-standard paravirtualised I/O protocol for guest ↔ host communication in KVM-based VMs. Guest kernels ship drivers (`virtio_net`, `virtio_blk`, …); hosts ship devices (us). |
+//! | **virtio-net** | The specific virtio device class for a network interface card. Spec: *Virtio 1.3 §5.1*. |
+//! | **virtqueue (vq)** | A FIFO of buffer descriptors shared between guest and host, living in guest-physical RAM. One vq per direction: `vq[0] = RX`, `vq[1] = TX` for a basic virtio-net. |
+//! | **TX** | *Transmit* — guest → host direction. Guest writes an outgoing Ethernet frame into a descriptor chain, kicks us, we read it and hand it to the backend (TAP, userspace stack). |
+//! | **RX** | *Receive* — host → guest direction. Backend hands us an incoming Ethernet frame; we write it into a chain the guest driver pre-posted for us; guest reads. |
+//! | **descriptor** | 16-byte record `{ addr: u64, len: u32, flags: u16, next: u16 }` that points at a buffer somewhere in guest RAM. Does not contain the data itself. |
+//! | **descriptor table** | A flat array of descriptors in guest RAM. Size is a power of two (we use 256 max). The guest allocates it at device setup. |
+//! | **descriptor chain** | A linked list through the descriptor table via each descriptor's `next` field, terminated when `flags & DESC_F_NEXT == 0`. One chain = one logical message. For virtio-net it holds the net header + Ethernet frame. |
+//! | **avail ring** | A circular queue the **guest writes** and we read. Each slot is a `u16` index into the descriptor table — the "head" of one chain the guest has prepared for us to consume. |
+//! | **used ring** | A circular queue **we write** and the guest reads. Each slot is `{ head: u32, written_len: u32 }` — the head of a chain we've finished with, plus how many bytes we wrote into the chain's writable buffers (0 on TX, 12 + frame.len() on RX). |
+//! | **head** | Descriptor-table index of the first descriptor in a chain. The avail ring publishes heads; the used ring returns them. |
+//! | **slot** | A position inside the avail or used ring. Slots are indexed modulo queue size — the ring is circular. |
+//! | **idx** | Producer counter at the top of each ring. Driver's `avail.idx` ↑ when it adds a head; our `used.idx` ↑ when we return one. The counter is `u16` and allowed to wrap. |
+//! | **cursor** | Our local "last seen" copy of `avail.idx`. Difference between `avail.idx` and the cursor tells us how many new chains the guest has made available since our last run. |
+//! | **MMIO** | *Memory-Mapped I/O.* A memory address range that, when the guest reads/writes it, triggers a trap into KVM (`KVM_EXIT_MMIO`) which hands control to us. That's how the guest "kicks" the device. |
+//! | **MMIO doorbell** | The specific MMIO register `QueueNotify` the guest writes to tell us "I just added heads to queue N, come drain it". |
+//! | **VRING interrupt** | The IRQ bit we set in `InterruptStatus` to tell the guest "I just added used entries, come consume them". From the guest's POV an IRQ fires on the device's vector. |
+//! | **virtio-net header** | 12-byte struct that prefixes every frame on the wire of a virtio-net queue. Carries offload hints the real NIC would set. We advertise no offload, so it's all zeros, but it's still mandatory per spec. |
+//! | **MTU** | *Maximum Transmission Unit.* The largest Ethernet payload we accept — 1500 bytes, standard Ethernet. 14-byte L2 header + 1500 payload = 1514 bytes per frame on the wire. |
+//! | **FCS** | *Frame Check Sequence* — 4-byte CRC Ethernet uses on physical wires. Virtual interfaces (TAP, virtio-net) do not carry it; the host kernel adds/strips it at the real NIC. So our frames are 1514 bytes max, not 1518. |
+//! | **GSO / TSO** | *Generic / TCP Segmentation Offload* — hardware feature where guest hands over one big TCP segment and the NIC splits it. We don't negotiate it; `gso_type = NONE` in every header. |
+//!
+//! ## Split-virtqueue layout in guest RAM
+//!
+//! Each queue is three contiguous regions in guest-physical memory,
+//! allocated by the guest driver and whose base addresses it programs
+//! into our MMIO registers (`QueueDescLow/High`, `QueueDriverLow/High`,
+//! `QueueDeviceLow/High`). Our side **never allocates guest memory** —
+//! the guest sized it, we read/write at the addresses it gave us.
 //!
 //! ```text
-//!  guest side                 host side (this module)
-//! ──────────────────────────────────────────────────────────────
-//!                                        │
-//!  Linux virtio_net driver               │
-//!      │                                 │
-//!      │ 1. put Ethernet frame in        │
-//!      │    descriptor chain, publish    │
-//!      │    head to avail ring           │
-//!      │ 2. write QueueNotify            │
-//!      │                                 │
-//!  ╔═══╧════════════════╗                │  ← our MmioTransport takes
-//!  ║ avail / used rings ║ ◄──── TX ──────┼─── the kick, then calls
-//!  ║ descriptor table   ║                │    process_tx():
-//!  ║  in guest RAM      ║                │
-//!  ╚═══╤════════════════╝                │    - walk chain
-//!      │                                 │    - strip 12-byte net header
-//!      │ 3. read used ring,              │    - backend.write_frame()
-//!      │    free the descriptors         │    - push head to used ring
-//!      │                                 │    - raise VRING interrupt
-//!      ▼                                 ▼
+//!   descriptor table (QueueDesc...): N * 16 bytes
+//!   ┌─────────┬─────────┬─────────┬─────┬─────────┐
+//!   │ desc[0] │ desc[1] │ desc[2] │ ... │ desc[N-1]│   N = queue size
+//!   └─────────┴─────────┴─────────┴─────┴─────────┘   (power of two)
+//!   each desc = { addr: u64, len: u32, flags: u16, next: u16 }
+//!
+//!   avail ring (QueueDriver...): 6 + 2*N bytes
+//!   ┌────────┬────────┬──────────────────────────┬──────────────┐
+//!   │ flags  │ idx    │ ring[0..N] : u16 heads   │ used_event   │
+//!   │ u16    │ u16 ↑  │                          │ u16          │
+//!   └────────┴────────┴──────────────────────────┴──────────────┘
+//!             │
+//!             └── driver increments this when it adds a head to ring[]
+//!
+//!   used ring (QueueDevice...): 6 + 8*N bytes
+//!   ┌────────┬────────┬──────────────────────────┬──────────────┐
+//!   │ flags  │ idx    │ ring[0..N] :             │ avail_event  │
+//!   │ u16    │ u16 ↑  │   { head: u32, len: u32 } │ u16          │
+//!   └────────┴────────┴──────────────────────────┴──────────────┘
+//!             │
+//!             └── WE increment this when we return a head to ring[]
 //! ```
 //!
-//! The RX direction is the mirror: the guest driver publishes empty
-//! writable chains to the RX avail ring; we pull a frame from the
-//! backend, prepend a `no_offload` net header, write both into the
-//! chain, and push the head onto the RX used ring.
+//! Keep three facts in your head while reading the code:
+//! - **The guest OWNS the memory,** we just read/write at offsets it
+//!   gave us. Not a single `malloc` or `mmap` happens on our side.
+//! - **The driver is the producer of avail, the consumer of used.**
+//!   We are the opposite — consumer of avail, producer of used.
+//! - **Indices wrap at `u16::MAX`.** Difference-based reasoning
+//!   (`avail.idx.wrapping_sub(cursor)`) is correct across the wrap;
+//!   absolute comparisons are not.
 //!
-//! # Guest memory boundary
+//! ## TX data flow: guest sends an Ethernet frame
 //!
-//! Every descriptor's `addr` is a **guest-physical address**. We never
-//! dereference it directly — all guest-memory access goes through
-//! [`virtio_queue::GuestMemory`], which is implemented by `vm-kvm`
-//! over its mmap'd guest RAM and by `SliceGuestMemory` in unit tests.
-//! That abstraction is what keeps this file pure logic and testable
-//! without KVM or a real guest.
+//! ```text
+//!   GUEST                                      HOST (process_tx)
+//!   ─────                                      ─────────────────
+//!   1. Spring Boot does socket.write(bytes)
+//!   2. Linux TCP/IP stack builds Ethernet frame
+//!   3. virtio_net driver:
+//!        a. picks a free descriptor chain in TX desc table
+//!        b. puts  { net_header[12] || frame[N] }  in it
+//!        c. publishes head index to avail.ring[avail.idx % qsize]
+//!        d. increments avail.idx
+//!        e. writes QueueNotify = 1   ← MMIO trap
+//!                                              │
+//!                                              ▼
+//!                                              KVM_EXIT_MMIO
+//!                                              │
+//!                                              ▼
+//!                                              VirtioNetDevice::mmio_write
+//!                                              sees QueueNotify, returns
+//!                                              Some(TX_QUEUE_INDEX)
+//!                                              │
+//!                                              ▼
+//!                                              process_tx(cfg, cursor, mem, backend):
+//!                                                for head in avail.iter_new(cursor):
+//!                                                  chain = walk desc_table from head
+//!                                                  payload = concat readable descs
+//!                                                  if payload too small / big: drop
+//!                                                  else:
+//!                                                    strip 12-byte net header
+//!                                                    backend.write_frame(&frame)
+//!                                                  used.push(head, 0)
+//!                                                  cursor += 1
+//!                                              │
+//!                                              ▼
+//!                                              VirtioNetDevice sets VRING in
+//!                                              InterruptStatus; vm-kvm injects
+//!                                              the device IRQ into the guest.
+//!   4. virtio_net driver IRQ handler:
+//!        a. reads used.ring[used.idx % qsize]
+//!        b. frees the descriptors in the chain
+//!        c. ACKs the IRQ by writing InterruptACK
+//! ```
 //!
-//! # Why no `unsafe`
+//! TX used-elem writes `written_len = 0` because the TX chain is all
+//! **device-readable** descriptors — we never write anything back to
+//! guest memory on TX. The virtio spec pins this (§2.7.8).
+//!
+//! ## RX data flow: host delivers an Ethernet frame to the guest
+//!
+//! ```text
+//!   GUEST                                      HOST (process_rx)
+//!   ─────                                      ─────────────────
+//!   Before any traffic:
+//!     virtio_net driver pre-posts N empty
+//!     writable buffers on RX avail ring,
+//!     ready for us to fill.
+//!
+//!   (meanwhile, on the wire or TAP backend...)
+//!                                              some frame arrives on TAP fd
+//!                                              epoll wakes us, we call process_rx:
+//!                                                for each avail entry:
+//!                                                  frame = backend.read_frame(&mut buf)
+//!                                                  if 0 bytes: stop (no more backend data)
+//!                                                  else:
+//!                                                    head = avail.ring[slot]
+//!                                                    walk writable desc chain
+//!                                                    if total_cap < 12+frame.len(): drop
+//!                                                    else:
+//!                                                      payload = net_hdr(no_offload) || frame
+//!                                                      scatter-write payload across writable descs
+//!                                                      used.push(head, 12 + frame.len())
+//!                                                      cursor += 1
+//!                                                raise VRING interrupt
+//!                                              │
+//!                                              ▼
+//!                                              IRQ delivered to guest
+//!   virtio_net driver IRQ handler:
+//!     a. reads used.ring[used.idx]
+//!     b. strips the 12-byte net header
+//!     c. hands the Ethernet frame to the Linux
+//!        TCP/IP stack
+//!     d. Spring Boot's socket.read() returns.
+//! ```
+//!
+//! Note the asymmetry: on TX we strip the header before giving the
+//! frame to the backend; on RX we prepend the header after reading
+//! from the backend. The backend only ever sees raw Ethernet frames,
+//! never virtio-net headers — that's the layering boundary.
+//!
+//! ## Cursor arithmetic
+//!
+//! The cursor is our local `last_seen_avail`. Each call to
+//! `process_tx` or `process_rx` walks from `cursor` up to the guest's
+//! current `avail.idx`:
+//!
+//! ```text
+//!    cursor         avail.idx
+//!      │                │
+//!      ▼                ▼
+//!    ╭───┬───┬───┬───┬───┬───┬───┬───╮
+//!    │ A │ B │ C │ D │ E │ F │   │   │   avail.ring (circular, qsize=8)
+//!    ╰───┴───┴───┴───┴───┴───┴───┴───╯
+//!      ▲───── chains we need to drain ──▲
+//!
+//!   After process_tx returns:
+//!    cursor = avail.idx
+//!    used.idx += number of chains we processed
+//! ```
+//!
+//! Both counters wrap at `u16::MAX`. `cursor != avail.idx` is the
+//! loop condition — compared for inequality, not ordering, so wrap is
+//! transparent.
+//!
+//! ## Guest memory boundary (why this file is pure logic)
+//!
+//! Every descriptor's `addr` field is a **guest-physical address** —
+//! an address inside the guest VM's RAM, meaningless to our process on
+//! its own. We never dereference it as a raw pointer. All guest-memory
+//! access goes through [`virtio_queue::GuestMemory`], a trait with
+//! two methods:
+//!
+//! ```text
+//!     fn read (&self,     addr: u64, dst: &mut [u8]) -> Result<(), QueueError>;
+//!     fn write(&mut self, addr: u64, src: &    [u8]) -> Result<(), QueueError>;
+//! ```
+//!
+//! `vm-kvm` implements this over its `mmap`'d guest RAM (one method
+//! call = one bounds-checked `memcpy`). Unit tests use
+//! `SliceGuestMemory`, a `Vec<u8>`-backed fake. The queue consumer
+//! does not know or care which it has — this is why the whole module
+//! is testable without KVM, a real guest, or any `unsafe`.
+//!
+//! ## Why no `unsafe`
 //!
 //! The crate root is `#![deny(unsafe_code)]`. This file obeys that:
-//! every byte read/write of guest memory happens inside the
-//! `GuestMemory` trait implementation, which is responsible for its
-//! own bounds checking. From this file's perspective, it's just
-//! `read(addr, &mut buf)` / `write(addr, &buf)` — safe Rust end to
-//! end.
+//! every byte of guest memory flows through the `GuestMemory` trait,
+//! which bounds-checks internally. From this file's perspective it's
+//! just `read(addr, &mut buf)` / `write(addr, &buf)` — safe Rust end
+//! to end. The only `allow(unsafe_code)` escape in this crate lives
+//! in `tap.rs`, which wraps the `TUNSETIFF` ioctl FFI.
 
 use virtio_queue::{Descriptor, DescriptorChain, GuestMemory, QueueError, DESC_SIZE};
 
