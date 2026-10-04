@@ -7,11 +7,11 @@ world. Lands across four sub-PRs:
 
 | Sub-PR | What lands | Status |
 |---|---|---|
-| **#A** | Crate skeleton + `NetworkBackend` trait + `TapDevice` Linux-only wrapper | ✅ merged |
-| **#B** | virtio-net wire header + MMIO transport (`MmioTransport::new_net`) + `VirtioNetDevice` skeleton owning a `Box<dyn NetworkBackend>` | ✅ this PR |
-| #B.2 | Descriptor-ring processing: pull TX chains, fill RX chains, strip/prepend the 12-byte virtio-net header, raise the device IRQ | Next |
-| #C | Wire the device into `crates/vm-kvm` (register MMIO region, add to boot params, kernel cmdline) | Later |
-| #D | Host-side bridge + NAT + IP allocation so guests reach the external network | Later |
+| **#A** | Crate skeleton + `NetworkBackend` trait + `TapDevice` Linux-only wrapper | ✅ merged (#274) |
+| **#B** | virtio-net wire header + MMIO transport (`MmioTransport::new_net`) + `VirtioNetDevice` skeleton owning a `Box<dyn NetworkBackend>` | ✅ merged (#275) |
+| **#B.2** | Descriptor-ring processing: pull TX chains, fill RX chains, strip/prepend the 12-byte virtio-net header, raise the device IRQ | ✅ this PR (#277) |
+| #C | Wire the device into `crates/vm-kvm` (register MMIO region, add to boot params, kernel cmdline) | Next |
+| #D | Host-side bridge + NAT + IP allocation so guests reach the external network | After #C |
 
 **Why #B split in half:** The transport (register layout, feature
 negotiation, config space) is pure state and testable without any
