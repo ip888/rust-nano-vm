@@ -19,6 +19,8 @@ mod cgroups;
 #[cfg(feature = "kvm")]
 mod seccomp;
 #[cfg(feature = "kvm")]
+mod virtio_net_dev;
+#[cfg(feature = "kvm")]
 mod vmstate;
 
 // Public re-export so integration tests (and downstream callers that
