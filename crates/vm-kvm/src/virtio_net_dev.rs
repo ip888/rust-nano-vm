@@ -55,8 +55,46 @@
 
 #![cfg(feature = "kvm")]
 
+use std::sync::{Arc, Mutex};
+
+use kvm_ioctls::VmFd;
+use virtio_net::{MockBackend, NetworkBackend, QueueCursor, VirtioNetDevice};
 use virtio_queue::{GuestMemory, QueueError};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+// --------------------------------------------------------------------------
+// MMIO window + IRQ allocation
+// --------------------------------------------------------------------------
+//
+// Our KVM backend already reserves 0xd000_0000..+0x1000 for the
+// virtio-vsock device (see `VSOCK_MMIO_BASE` in `lib.rs`). virtio-net
+// takes the next 4 KiB slot and the next free IRQ line.
+//
+// Why 0xd000_0000+? x86 microVM convention: guest kernel's "high MMIO
+// hole" sits in the 3-4 GiB window (0xc000_0000..0xffff_ffff), above
+// conventional RAM and below the APIC region. Firecracker, Cloud
+// Hypervisor, QEMU-microvm all place virtio-mmio devices in this
+// hole. Our vm-kvm memory map does not back these addresses with
+// guest RAM — every guest access faults out as `KVM_EXIT_MMIO` and
+// returns to us.
+//
+// 4 KiB (0x1000) is a comfortable window: the virtio-MMIO register
+// bank is <0x200 bytes, so one 4-KiB page per device trivially
+// contains it and leaves room for future config-space growth.
+
+/// Guest-physical base address of the virtio-net MMIO register window.
+/// Immediately after the virtio-vsock window.
+pub(crate) const NET_MMIO_BASE: u64 = 0xd000_1000;
+
+/// Size of the virtio-net MMIO window in bytes. One 4 KiB page.
+pub(crate) const NET_MMIO_SIZE: u64 = 0x1000;
+
+/// IRQ line the virtio-net device raises to notify the guest driver
+/// that it has finished a virtqueue buffer. Next free line after
+/// vsock's IRQ 5. The guest kernel command line references this
+/// number via the `virtio_mmio.device=4K@0xd0001000:6` directive
+/// that commit #4 of this sub-PR appends.
+pub(crate) const NET_MMIO_IRQ: u32 = 6;
 
 /// Adapter that lets the virtio-net queue consumer
 /// ([`virtio_net::process_tx`] / [`virtio_net::process_rx`]) read and
@@ -124,6 +162,197 @@ impl GuestMemory for KvmNetGuestMemory<'_> {
     }
 }
 
+/// If `addr` falls inside the virtio-net device's MMIO register
+/// window, return the offset within the window; otherwise `None`.
+/// Lets the vCPU exit handler dispatch each MMIO exit to the right
+/// device without needing a `NetBackend` reference (useful for the
+/// case where the VM has no net device configured).
+///
+/// Free function rather than a method so unit tests can exercise it
+/// without needing a `VmFd` (which requires `/dev/kvm`).
+#[allow(dead_code)]
+pub(crate) fn window_offset(addr: u64) -> Option<u64> {
+    let off = addr.checked_sub(NET_MMIO_BASE)?;
+    (off < NET_MMIO_SIZE).then_some(off)
+}
+
+// --------------------------------------------------------------------------
+// NetBackend — shared handle on the virtio-net device (commit 2/5)
+// --------------------------------------------------------------------------
+//
+// Mirrors the layout of `VsockBackend` in `lib.rs`: a device object
+// behind `Arc<Mutex<_>>` so the vCPU thread (which services MMIO
+// exits) and the backend-poll thread (which pulls RX frames from the
+// network) can both reach it safely. `guest_mem` and `vm_fd` are
+// cheaply cloneable handles the device-cycle paths need.
+//
+// What this commit sets up but does NOT yet wire:
+//
+// - the vCPU exit routing that dispatches `VcpuExit::MmioRead/Write`
+//   through `window_offset` + `read` / `write` (commit 3/5),
+// - the guest kernel cmdline + IRQ raising on virtqueue completion
+//   (commit 4/5),
+// - the real-KVM integration test that boots a guest and asserts
+//   the driver probes the device (commit 5/5).
+//
+// So the public methods here are temporarily `#[allow(dead_code)]`.
+// The exception goes away mechanically when commit 3 wires them up.
+
+/// Shared handle on the host side of a virtio-net device, held by
+/// both the hypervisor (for status queries / snapshot capture) and
+/// the vCPU thread (for MMIO exit routing + IRQ injection).
+///
+/// # Rust concept: `Arc<Mutex<T>>` composition
+///
+/// - **`Arc<T>`** — Atomic Reference Counted shared pointer. Clones
+///   are cheap (`Arc::clone(&self.device)` bumps a counter); the
+///   underlying object is dropped when the last `Arc` goes away.
+///   Thread-safe (atomic counter), unlike the single-thread `Rc`.
+/// - **`Mutex<T>`** — mutual exclusion lock. Only one thread holds
+///   `&mut T` at a time via `.lock()`; others block. Compile-time
+///   guarantee replaces the usual runtime-only Java `synchronized`.
+/// - **Composition `Arc<Mutex<T>>`** — "many owners, one at a time
+///   mutates". The pattern Rust uses whenever a mutable resource
+///   crosses thread boundaries without a dedicated owner.
+///
+/// We clone the whole `NetBackend` (its three `Arc`s and the
+/// `GuestMemoryMmap` handle) into the vCPU thread at VM startup.
+/// Both sides now have equally-valid handles; the Mutex arbitrates
+/// mutation.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct NetBackend {
+    /// The virtio-net device state (register bank, queue config,
+    /// negotiated features). Locked for every MMIO exit and every
+    /// virtqueue drain. Lock contention is low: a guest driver sees
+    /// a few hundred MMIO exits during probe + feature negotiation,
+    /// then only `QueueNotify` writes per packet — virtqueue drains
+    /// are the hot path and they don't nest.
+    device: Arc<Mutex<VirtioNetDevice>>,
+    /// Per-queue cursors (`last_seen_avail` for TX and RX). The
+    /// virtio-net queue consumer carries this state between calls to
+    /// `process_tx` / `process_rx`. Stored behind a `Mutex` because
+    /// both queue-drain threads (TX from MMIO kick, RX from backend
+    /// readiness) may touch them.
+    cursors: Arc<Mutex<NetQueueCursors>>,
+    /// Shared handle on the guest's physical memory map. Cheap to
+    /// clone — `GuestMemoryMmap` is internally refcounted. The queue
+    /// consumer wraps this in `KvmNetGuestMemory` per call to satisfy
+    /// the `virtio_queue::GuestMemory` trait.
+    guest_mem: GuestMemoryMmap,
+    /// Shared handle on the VM file descriptor; needed to raise the
+    /// device's IRQ line (`KVM_IRQ_LINE` via `VmFd::set_irq_line`).
+    /// Commit #4 of this sub-PR actually calls this; today the field
+    /// is parked.
+    vm_fd: Arc<VmFd>,
+    /// The IRQ line this device raises. Mirrors [`NET_MMIO_IRQ`]
+    /// but kept as an instance field so later changes to use a
+    /// dynamic IRQ allocator don't ripple through callers.
+    irq: u32,
+}
+
+/// Per-queue cursor state the virtio-net consumer carries between
+/// `process_tx` / `process_rx` calls. Separate struct so the
+/// `NetBackend` can own one `Mutex` protecting both cursors instead
+/// of two — the two queues are drained from the same thread today,
+/// so finer-grained locking would be overhead without benefit.
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+pub(crate) struct NetQueueCursors {
+    pub tx: QueueCursor,
+    pub rx: QueueCursor,
+}
+
+#[allow(dead_code)]
+impl NetBackend {
+    /// Construct a NetBackend around `device_backend` with the given
+    /// MAC address. The MAC is advertised to the guest driver via
+    /// the virtio-net config-space.
+    ///
+    /// `guest_mem` and `vm_fd` are stored as cheap-to-clone handles;
+    /// future queue drains + IRQ raises use them without extra setup.
+    pub fn new(
+        mac: [u8; 6],
+        device_backend: Arc<dyn NetworkBackend>,
+        guest_mem: GuestMemoryMmap,
+        vm_fd: Arc<VmFd>,
+    ) -> Self {
+        let device = VirtioNetDevice::with_backend_arc(device_backend, mac);
+        Self {
+            device: Arc::new(Mutex::new(device)),
+            cursors: Arc::new(Mutex::new(NetQueueCursors::default())),
+            guest_mem,
+            vm_fd,
+            irq: NET_MMIO_IRQ,
+        }
+    }
+
+    /// Convenience constructor that wires a [`MockBackend`] as the
+    /// transport. Used before sub-PR #D lands the smoltcp backend so
+    /// that integration tests can exercise the KVM wiring end-to-end
+    /// without a real network stack.
+    pub fn with_mock_backend(mac: [u8; 6], guest_mem: GuestMemoryMmap, vm_fd: Arc<VmFd>) -> Self {
+        Self::new(
+            mac,
+            Arc::new(MockBackend::new()) as Arc<dyn NetworkBackend>,
+            guest_mem,
+            vm_fd,
+        )
+    }
+
+    /// Service a guest MMIO read inside the register window. Writes
+    /// the little-endian value into `data` (zero-extending if the
+    /// device returned fewer bytes than requested).
+    pub fn read(&self, offset: u64, data: &mut [u8]) {
+        let val = self
+            .device
+            .lock()
+            .expect("vm-kvm: virtio-net device mutex poisoned")
+            .mmio_read(offset, data.len());
+        let bytes = val.to_le_bytes();
+        for (i, slot) in data.iter_mut().enumerate() {
+            *slot = bytes.get(i).copied().unwrap_or(0);
+        }
+    }
+
+    /// Service a guest MMIO write inside the register window.
+    /// Returns `Some(queue_idx)` when the write was a `QueueNotify`
+    /// kick — the caller then drains that queue (commit #3 wires
+    /// this). A write that only mutates feature-negotiation /
+    /// config-space state returns `None`.
+    pub fn write(&self, offset: u64, data: &[u8]) -> Option<u32> {
+        let mut buf = [0u8; 8];
+        for (i, b) in data.iter().take(buf.len()).enumerate() {
+            buf[i] = *b;
+        }
+        let value = u64::from_le_bytes(buf);
+        self.device
+            .lock()
+            .expect("vm-kvm: virtio-net device mutex poisoned")
+            .mmio_write(offset, data.len(), value)
+    }
+
+    /// Access the IRQ this device raises on virtqueue completion.
+    /// Exposed for the vCPU thread; commit #4 calls `vm_fd.set_irq_line`
+    /// with this value.
+    pub fn irq(&self) -> u32 {
+        self.irq
+    }
+
+    /// Clone the shared VmFd handle. Used by commit #4 so the IRQ
+    /// raise path doesn't need to go through `NetBackend` on the
+    /// hot path.
+    pub fn vm_fd(&self) -> Arc<VmFd> {
+        Arc::clone(&self.vm_fd)
+    }
+
+    /// Clone the shared guest-memory handle. Used by commit #3 to
+    /// build a `KvmNetGuestMemory` per queue drain.
+    pub fn guest_mem(&self) -> GuestMemoryMmap {
+        self.guest_mem.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +414,58 @@ mod tests {
         let mut adapter = KvmNetGuestMemory(&mem);
         let err = adapter.write(1016, &[0u8; 16]).unwrap_err();
         assert!(matches!(err, QueueError::GuestMemoryOutOfBounds { .. }));
+    }
+
+    // ----------------------------------------------------------------
+    // Constants + window_offset (commit 2 scope)
+    // ----------------------------------------------------------------
+
+    // Compile-time invariants on the MMIO constants. These are
+    // `const _:` items rather than runtime `#[test]`s because every
+    // comparison is between literals — clippy's
+    // `assertions_on_constants` rule rightly prefers the compile-time
+    // form. A violation turns into a build error, not a test failure,
+    // which is a strictly better outcome.
+    const _: () = {
+        // vsock lives at 0xd000_0000..+0x1000. We must not overlap it.
+        const VSOCK_BASE: u64 = 0xd000_0000;
+        const VSOCK_END: u64 = VSOCK_BASE + 0x1000;
+        assert!(NET_MMIO_BASE >= VSOCK_END, "net overlaps vsock window");
+        assert!(NET_MMIO_SIZE > 0);
+        // virtio-mmio spec requires a page-aligned register window.
+        assert!(
+            NET_MMIO_BASE.is_multiple_of(0x1000),
+            "net base must be page-aligned"
+        );
+        assert!(
+            NET_MMIO_SIZE.is_multiple_of(0x1000),
+            "net size must be page-aligned"
+        );
+        // IRQ must not collide with vsock (IRQ 5).
+        assert!(NET_MMIO_IRQ != 5, "net IRQ collides with vsock IRQ");
+    };
+
+    #[test]
+    fn window_offset_accepts_addresses_inside_window() {
+        // First byte of the window → offset 0.
+        assert_eq!(window_offset(NET_MMIO_BASE), Some(0));
+        // Last byte of the window → offset SIZE-1.
+        assert_eq!(
+            window_offset(NET_MMIO_BASE + NET_MMIO_SIZE - 1),
+            Some(NET_MMIO_SIZE - 1)
+        );
+    }
+
+    #[test]
+    fn window_offset_rejects_addresses_below_window() {
+        assert_eq!(window_offset(NET_MMIO_BASE - 1), None);
+        assert_eq!(window_offset(0), None);
+    }
+
+    #[test]
+    fn window_offset_rejects_addresses_past_window_end() {
+        assert_eq!(window_offset(NET_MMIO_BASE + NET_MMIO_SIZE), None);
+        assert_eq!(window_offset(NET_MMIO_BASE + NET_MMIO_SIZE + 100), None);
     }
 
     #[test]
