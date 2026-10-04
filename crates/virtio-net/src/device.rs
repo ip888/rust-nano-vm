@@ -1,9 +1,26 @@
-//! Host-side virtio-net device skeleton.
+//! # Host-side virtio-net device skeleton
+//!
+//! > **Terminology:** every term in this file (MMIO, virtqueue,
+//! > NetworkBackend, TAP, dyn trait object, …) is defined once in
+//! > the crate-root terminology table — see the top of `lib.rs`.
 //!
 //! This is the piece sub-PR #C will register with `crates/vm-kvm` so
-//! that guest MMIO exits in the device's register window route into
-//! [`VirtioNetDevice::mmio_read`] / [`VirtioNetDevice::mmio_write`].
-//! The device owns:
+//! that guest **MMIO** (Memory-Mapped I/O) exits in the device's
+//! register window route into [`VirtioNetDevice::mmio_read`] /
+//! [`VirtioNetDevice::mmio_write`]. The device **composes two
+//! lower-level pieces** into one object the KVM backend can hold:
+//!
+//! ```text
+//!    VirtioNetDevice
+//!    ├── MmioTransport     ← registers, feature negotiation, queue config
+//!    │                       (the "control plane" the guest driver pokes)
+//!    │
+//!    └── Arc<dyn NetworkBackend>  ← actual Ethernet frame transport
+//!        │                           (the "data plane")
+//!        │
+//!        ├── TapDevice (production)   ← /dev/net/tun fd + bridge
+//!        └── MockBackend (tests)       ← VecDeque<Vec<u8>>
+//! ```
 //!
 //! - a [`MmioTransport`](crate::MmioTransport) — the register model
 //!   the guest driver pokes to discover the device and program the

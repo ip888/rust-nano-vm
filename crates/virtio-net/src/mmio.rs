@@ -1,10 +1,36 @@
-//! virtio-MMIO transport register model for a virtio-net device.
+//! # virtio-MMIO transport register model for a virtio-net device
 //!
-//! This is the device-discovery and configuration surface the guest's
-//! `virtio_net` kernel driver pokes to find and set up our device over
-//! a memory-mapped register window. The module is **pure state** —
-//! no KVM, no guest memory, no descriptor-ring traversal — so it is
-//! fully unit-testable on any host.
+//! > **Terminology:** every term in this file (MMIO, MMIO doorbell,
+//! > virtqueue, feature bits, VRING interrupt, …) is defined once in
+//! > the crate-root terminology table — see the top of `lib.rs`.
+//!
+//! This is the **device-discovery and configuration surface** the
+//! guest's `virtio_net` kernel driver pokes to find and set up our
+//! device over a memory-mapped register window.
+//!
+//! > **What is "MMIO"?** Memory-Mapped I/O. A specific address range
+//! > in guest RAM that, when the guest reads/writes it, triggers a
+//! > trap into KVM (`KVM_EXIT_MMIO`) which hands control to us. The
+//! > device's registers (status, features, queue config, doorbell)
+//! > "live" at those addresses from the guest's perspective, but
+//! > they're actually fields on the `MmioTransport` struct in our
+//! > process — we fulfill the reads/writes in software.
+//!
+//! The module is **pure state** — no KVM, no guest memory, no
+//! descriptor-ring traversal — so it is fully unit-testable on any
+//! host, including macOS laptops where KVM doesn't exist.
+//!
+//! ```text
+//!   GUEST sees:                               HOST (this module) has:
+//!   ─────────                                 ───────────────────────
+//!   mmio[0x000] = "virt" (magic)       ◄─── MmioTransport.read(0x000)
+//!   mmio[0x070] = status                     returns constants or
+//!   mmio[0x050] = QueueNotify  (write) ───►  MmioTransport.write(0x050, N)
+//!       │                                     stores N as "pending kick";
+//!       │ KVM_EXIT_MMIO trap                  queue consumer drains it.
+//!       ▼
+//!   kernel ← nanovm process
+//! ```
 //!
 //! Sub-PR #C will register the device's register window with
 //! `crates/vm-kvm` so guest MMIO exits (reads/writes against that

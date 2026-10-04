@@ -1,11 +1,32 @@
-//! virtio-net packet header (`struct virtio_net_hdr`).
+//! # virtio-net packet header (`struct virtio_net_hdr`)
 //!
-//! Every frame that crosses a virtio-net queue — guest → host (TX) or
-//! host → guest (RX) — is prefixed with this 12-byte header. The
-//! Ethernet frame starts immediately after. The header carries metadata
-//! the hardware would have supplied in a physical NIC: checksum offload
-//! hints, segmentation (TSO/UFO) info, and a count of merged RX
-//! buffers.
+//! > **Terminology:** every term in this file (TX, RX, GSO, TSO, MTU,
+//! > FCS, Ethernet frame, …) is defined once in the crate-root
+//! > terminology table — see the top of `lib.rs`.
+//!
+//! Every frame that crosses a virtio-net queue — guest → host (TX,
+//! *transmit*) or host → guest (RX, *receive*) — is prefixed with
+//! this 12-byte header. The Ethernet frame starts immediately after.
+//! The header carries metadata the hardware would have supplied in a
+//! physical NIC: checksum offload hints, segmentation (TSO/UFO) info,
+//! and a count of merged RX buffers.
+//!
+//! On the wire, every TX chain the guest produces and every RX chain
+//! we fill looks like:
+//!
+//! ```text
+//!   ┌────────────────────────┬──────────────────────────────────┐
+//!   │  virtio-net header     │          Ethernet frame           │
+//!   │       12 bytes         │  14 B hdr + up to 1500 B payload │
+//!   └────────────────────────┴──────────────────────────────────┘
+//!   ◄──────────── 12 bytes ─────────────► ◄── up to 1514 bytes ──►
+//! ```
+//!
+//! On TX the queue consumer **strips** this header before handing the
+//! Ethernet frame to the backend. On RX it **prepends** an all-zeros
+//! `no_offload()` header to the frame the backend produced. The
+//! backend only ever sees raw Ethernet frames — that's the layering
+//! boundary between this crate and the transport.
 //!
 //! Wire format (virtio 1.3 §5.1.6, with VIRTIO_F_VERSION_1 negotiated):
 //!
