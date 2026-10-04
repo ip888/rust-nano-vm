@@ -72,10 +72,10 @@ containerSecurityContext:
     type: RuntimeDefault
 
 # Node selector: pin to nodes that expose /dev/kvm. The recommended
-# pattern is to label your KVM-capable nodes with `nanovm.io/kvm=true`
+# pattern is to label your KVM-capable nodes with `nanovm.app/kvm=true`
 # during the AWS *.metal / Fly.io setup.
 nodeSelector:
-  nanovm.io/kvm: "true"
+  nanovm.app/kvm: "true"
 
 tolerations: []
 affinity: {}

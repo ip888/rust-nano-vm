@@ -3,7 +3,7 @@
 This directory is for enterprise customers who want to run
 `rust-nano-vm` **inside their own network** — private cloud, air-gapped
 data center, or a customer's own AWS / GCP / Azure account. It exists
-because the SaaS at nanovm.io answers "we run it for you" and the OSS
+because the SaaS at nanovm.app answers "we run it for you" and the OSS
 `README.md` answers "run it on your laptop," but neither covers the
 security-questionnaire posture that regulated buyers (finance / health
 / gov / defense) require.
@@ -40,7 +40,7 @@ team.
 
 **No implied SLA on the OSS binary.** A commercial support subscription
 covering incident response, patch backports, and a named on-call
-contact is negotiated separately — email support@nanovm.io.
+contact is negotiated separately — email support@nanovm.app.
 
 ## Airgap knob
 
@@ -162,8 +162,8 @@ cosign verify ghcr.io/ip888/nanovm-control-plane-kvm:0.0.3 \
 - **Bug reports / feature requests**: GitHub issues at
   https://github.com/ip888/rust-nano-vm.
 - **Commercial support** (guaranteed response times, patch backports,
-  named on-call): email support@nanovm.io.
-- **Security vulnerabilities**: security@nanovm.io — please DO NOT
+  named on-call): email support@nanovm.app.
+- **Security vulnerabilities**: security@nanovm.app — please DO NOT
   file public GitHub issues for security-impacting bugs; use the
   private disclosure channel first. Standard 90-day disclosure with
   coordinated release.

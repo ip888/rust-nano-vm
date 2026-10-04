@@ -8,12 +8,22 @@ export const metadata: Metadata = {
   },
   description:
     "KVM microVM snapshot/restore + MAP_PRIVATE fork-many for enterprise Java workloads. ~200 ms Spring Boot cold-start, no code changes, any JDK.",
-  metadataBase: new URL("https://nanovm.io"),
+  metadataBase: new URL("https://nanovm.app"),
+  alternates: {
+    // Explicit canonical. metadataBase + openGraph.url already imply
+    // this, but a declared alternates.canonical is the SEO-robust
+    // belt-and-braces — the same deployment is also reachable at
+    // nanovm-web.fly.dev and we never want THAT URL indexed. The
+    // next.config.ts redirect catches browser hits; the canonical tag
+    // tells search engines directly, which is what actually prevents
+    // the duplicate from entering the index in the first place.
+    canonical: "https://nanovm.app",
+  },
   openGraph: {
     title: "nanovm — sub-second JVM cold-start for enterprise Java",
     description:
       "KVM microVM snapshot/restore + MAP_PRIVATE fork-many for enterprise Java workloads.",
-    url: "https://nanovm.io",
+    url: "https://nanovm.app",
     siteName: "nanovm",
     type: "website",
   },
