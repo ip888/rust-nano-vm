@@ -224,17 +224,23 @@ use virtio_queue::{Descriptor, DescriptorChain, GuestMemory, QueueError, DESC_SI
 use crate::{mmio::QueueConfig, NetworkBackend, VirtioNetError, VirtioNetHdr, VIRTIO_NET_HDR_LEN};
 
 /// Maximum Ethernet frame bytes the device accepts on TX or produces on
-/// RX. 1514 = 14-byte Ethernet header + 1500 MTU; no FCS over
-/// TAP/virtio-net. A guest frame larger than this is dropped — the
-/// virtio driver should never produce one when the device advertises
-/// no jumbo-frame feature (we don't advertise `VIRTIO_NET_F_MTU` with
-/// a larger value yet).
-pub const MAX_FRAME_LEN: usize = 1514;
+/// RX. **1518** = 14-byte Ethernet header + **4-byte 802.1Q VLAN tag**
+/// + 1500 MTU; no FCS over TAP/virtio-net.
+///
+/// The VLAN overhead is included because Linux's `virtio_net` driver
+/// happily hands us VLAN-tagged frames when the guest is on a
+/// VLAN-aware bridge; an untagged max frame is 1514, so this constant
+/// has to cover both the tagged and untagged cases.
+///
+/// A guest frame larger than this is dropped. Jumbo frames (>1500
+/// MTU) would require advertising `VIRTIO_NET_F_MTU` with a larger
+/// value in the device config, which we don't do today.
+pub const MAX_FRAME_LEN: usize = 1518;
 
 /// Maximum bytes a single descriptor chain may carry, including the
 /// 12-byte virtio-net header. Hard cap to stop a malicious guest from
 /// forcing the device to allocate unbounded scratch by chaining 65535
-/// 4 KiB descriptors.
+/// 4 KiB descriptors. `MAX_FRAME_LEN + VIRTIO_NET_HDR_LEN = 1530`.
 pub const MAX_CHAIN_BYTES: usize = MAX_FRAME_LEN + VIRTIO_NET_HDR_LEN;
 
 /// Minimum Ethernet frame bytes the device will push to the backend:
@@ -243,6 +249,54 @@ pub const MAX_CHAIN_BYTES: usize = MAX_FRAME_LEN + VIRTIO_NET_HDR_LEN;
 /// pads with zeros so we never see short frames in practice, but a
 /// bug or an attack could.
 pub const MIN_FRAME_LEN: usize = 14 + 46;
+
+/// Maximum virtqueue size the device will consent to operate on,
+/// mirroring [`crate::mmio::QUEUE_SIZE_MAX`]. A guest can program any
+/// `u32` into the `QueueNum` MMIO register, but we refuse to walk a
+/// ring whose size is outside this bound or not a power of two.
+///
+/// The alternative — trusting the guest's `cfg.size` and casting
+/// `as u16` — is a **DoS vector**: a value of 65536 wraps to 0, and
+/// `slot % 0` panics the whole VMM. See [`validate_qsize`].
+const MAX_SUPPORTED_QUEUE_SIZE: u32 = crate::mmio::QUEUE_SIZE_MAX;
+
+/// Validate the guest-programmed queue size and return it as a `u16`.
+///
+/// Rejects:
+/// - zero (would trigger division by zero on `%`),
+/// - sizes above the advertised [`MAX_SUPPORTED_QUEUE_SIZE`],
+/// - sizes that are not a power of two (required by virtio spec
+///   §2.7 for split rings).
+///
+/// Returning `None` means "treat the queue as malformed and skip
+/// this call" — we deliberately do not raise an error, because an
+/// Err would propagate through every MMIO exit handler for what is
+/// a well-contained guest misbehaviour. Silent skip + per-call
+/// stats = `0` is the Firecracker-style posture: don't crash the
+/// VMM for a buggy guest.
+fn validate_qsize(cfg_size: u32) -> Option<u16> {
+    if cfg_size == 0 || cfg_size > MAX_SUPPORTED_QUEUE_SIZE {
+        return None;
+    }
+    if !cfg_size.is_power_of_two() {
+        return None;
+    }
+    // Safe: cfg_size is now in [1, MAX_SUPPORTED_QUEUE_SIZE = 256].
+    Some(cfg_size as u16)
+}
+
+/// Validate that the guest's `avail.idx` cursor has moved by **at most
+/// `qsize`** entries since our last visit. The spec limits in-flight
+/// entries to the queue size — any more means the guest is either
+/// buggy or malicious. A huge jump would make the drain loop reuse
+/// the same ring slot many times, re-sending the same frame to the
+/// backend tens of thousands of times from a single kick.
+///
+/// `u16::wrapping_sub` makes this correct across the natural ring
+/// wrap at 65535.
+fn avail_delta_is_sane(last_seen: u16, avail_idx: u16, qsize: u16) -> bool {
+    avail_idx.wrapping_sub(last_seen) <= qsize
+}
 
 /// Per-queue cursor the consumer carries across calls. Tracks how far
 /// through the avail ring we've already drained — this is the `last
@@ -314,10 +368,17 @@ pub fn process_tx<M: GuestMemory>(
     backend: &dyn NetworkBackend,
 ) -> Result<ProcessStats, VirtioNetError> {
     let mut stats = ProcessStats::default();
-    if !cfg.ready || cfg.size == 0 {
+    if !cfg.ready {
         return Ok(stats);
     }
-    let qsize = cfg.size as u16;
+    // Validate the guest-programmed queue size before the `as u16`
+    // cast. A bogus value (0, 65536, non-power-of-two) would either
+    // panic on `% qsize` or let the guest mis-configure the ring.
+    // Silent skip + Ok(default stats) — don't crash the VMM for a
+    // malformed queue (same posture as Firecracker).
+    let Some(qsize) = validate_qsize(cfg.size) else {
+        return Ok(stats);
+    };
 
     // Snapshot the descriptor table and avail ring up front, so we
     // can walk the chains with just reads before coming back for the
@@ -325,6 +386,14 @@ pub fn process_tx<M: GuestMemory>(
     // split halfway through the loop.
     let table = read_descriptor_table(mem, cfg.desc, qsize)?;
     let avail_idx = read_u16(mem, cfg.driver.wrapping_add(2))?;
+
+    // Reject bogus avail-index jumps. The virtio spec caps in-flight
+    // entries at `qsize`; a larger `avail.idx - cursor` means the
+    // guest is lying or buggy. Loop silently drops this call — the
+    // guest kicks again if it fixes itself.
+    if !avail_delta_is_sane(cursor.last_seen_avail, avail_idx, qsize) {
+        return Ok(stats);
+    }
 
     while cursor.last_seen_avail != avail_idx {
         let slot = (cursor.last_seen_avail % qsize) as u64;
@@ -404,13 +473,22 @@ pub fn process_rx<M: GuestMemory>(
     backend: &dyn NetworkBackend,
 ) -> Result<ProcessStats, VirtioNetError> {
     let mut stats = ProcessStats::default();
-    if !cfg.ready || cfg.size == 0 {
+    if !cfg.ready {
         return Ok(stats);
     }
-    let qsize = cfg.size as u16;
+    // Same validation as process_tx — reject malformed queue sizes
+    // and avail-index jumps larger than qsize before touching guest
+    // memory with the bad values.
+    let Some(qsize) = validate_qsize(cfg.size) else {
+        return Ok(stats);
+    };
 
     let table = read_descriptor_table(mem, cfg.desc, qsize)?;
     let avail_idx = read_u16(mem, cfg.driver.wrapping_add(2))?;
+
+    if !avail_delta_is_sane(cursor.last_seen_avail, avail_idx, qsize) {
+        return Ok(stats);
+    }
 
     // Reusable scratch for the backend's frame read, sized for the
     // largest frame we'd accept. Allocation lives for the whole
@@ -1023,5 +1101,172 @@ mod tests {
     fn tx_queue_indices_are_as_expected_from_mmio() {
         assert_eq!(TX_QUEUE_INDEX, 1);
         assert_eq!(RX_QUEUE_INDEX, 0);
+    }
+
+    // --------------------------------------------------------------
+    // Guest-safety hardening tests (Copilot review on PR #277).
+    //
+    // Each of these drives the device through a malformed-queue
+    // scenario a hostile or buggy guest could set up, and asserts
+    // we neither panic nor flood the backend. Posture: silent skip,
+    // return default stats, keep the VMM alive.
+    // --------------------------------------------------------------
+
+    #[test]
+    fn tx_rejects_zero_queue_size_without_panicking() {
+        // Division by zero on `% qsize` would crash the VMM.
+        let mut raw = fresh_mem();
+        let mut mem = SliceGuestMemory::new(BASE, &mut raw);
+        let (_dev, mock) = new_device();
+
+        let mut cfg = fresh_cfg();
+        cfg.size = 0;
+        set_avail_idx(&mut mem, 7);
+
+        let mut cursor = QueueCursor::default();
+        let stats = process_tx(&cfg, &mut cursor, &mut mem, &*mock as &dyn NetworkBackend).unwrap();
+        assert_eq!(stats, ProcessStats::default());
+        assert_eq!(mock.queue_depths(), (0, 0));
+    }
+
+    #[test]
+    fn tx_rejects_oversized_queue_size_u16_wrap() {
+        // 65536 as u16 == 0 — exactly the panic a hostile guest could
+        // trigger. Must be caught by validate_qsize before the cast.
+        let mut raw = fresh_mem();
+        let mut mem = SliceGuestMemory::new(BASE, &mut raw);
+        let (_dev, mock) = new_device();
+
+        let mut cfg = fresh_cfg();
+        cfg.size = 65536;
+        set_avail_idx(&mut mem, 7);
+
+        let mut cursor = QueueCursor::default();
+        let stats = process_tx(&cfg, &mut cursor, &mut mem, &*mock as &dyn NetworkBackend).unwrap();
+        assert_eq!(stats, ProcessStats::default());
+    }
+
+    #[test]
+    fn tx_rejects_non_power_of_two_queue_size() {
+        // The virtio spec requires qsize to be a power of two. A guest
+        // setting 7 is spec-violation territory; we skip the queue.
+        let mut raw = fresh_mem();
+        let mut mem = SliceGuestMemory::new(BASE, &mut raw);
+        let (_dev, mock) = new_device();
+
+        let mut cfg = fresh_cfg();
+        cfg.size = 7;
+        set_avail_idx(&mut mem, 3);
+
+        let mut cursor = QueueCursor::default();
+        let stats = process_tx(&cfg, &mut cursor, &mut mem, &*mock as &dyn NetworkBackend).unwrap();
+        assert_eq!(stats, ProcessStats::default());
+    }
+
+    #[test]
+    fn tx_rejects_avail_idx_jump_exceeding_qsize() {
+        // Guest publishes avail.idx = 9, queue size = 8, cursor = 0.
+        // 9 - 0 > 8 => malformed. If we processed this naively we'd
+        // walk ring[0]..ring[8] = ring[0..0] reusing the same desc,
+        // delivering the same frame 9 times to the backend.
+        let mut raw = fresh_mem();
+        let mut mem = SliceGuestMemory::new(BASE, &mut raw);
+        let (_dev, mock) = new_device();
+
+        // Lay out a single legitimate TX descriptor at index 0 so IF
+        // we DID loop we'd actually hand things to the backend.
+        let header = VirtioNetHdr::no_offload().to_bytes();
+        let frame: Vec<u8> = (0..60u8).collect();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&header);
+        payload.extend_from_slice(&frame);
+        mem.write(BUF_BASE, &payload).unwrap();
+        write_desc(
+            &mut mem,
+            0,
+            Descriptor {
+                addr: BUF_BASE,
+                len: payload.len() as u32,
+                flags: 0,
+                next: 0,
+            },
+        );
+        write_avail_head(&mut mem, 0, 0);
+        set_avail_idx(&mut mem, 9); // jump > qsize=8
+
+        let cfg = fresh_cfg(); // qsize = 8
+        let mut cursor = QueueCursor::default();
+        let stats = process_tx(&cfg, &mut cursor, &mut mem, &*mock as &dyn NetworkBackend).unwrap();
+
+        // Nothing processed, nothing delivered, cursor untouched.
+        assert_eq!(stats, ProcessStats::default());
+        assert_eq!(cursor.last_seen_avail, 0);
+        assert_eq!(mock.pop_tx(), None, "backend must NOT be flooded");
+    }
+
+    #[test]
+    fn rx_rejects_malformed_queue_the_same_way_as_tx() {
+        // Symmetric check — zero qsize, oversized qsize, bad delta
+        // all three must leave rx a no-op.
+        let mut raw = fresh_mem();
+        let mut mem = SliceGuestMemory::new(BASE, &mut raw);
+        let (_dev, mock) = new_device();
+
+        mock.inject_rx(vec![0xAA; 80]);
+
+        for bad_size in [0u32, 65536, 65537, 7, 5] {
+            let mut cfg = fresh_cfg();
+            cfg.size = bad_size;
+            set_avail_idx(&mut mem, 1);
+            let mut cursor = QueueCursor::default();
+            let stats =
+                process_rx(&cfg, &mut cursor, &mut mem, &*mock as &dyn NetworkBackend).unwrap();
+            assert_eq!(
+                stats,
+                ProcessStats::default(),
+                "qsize={bad_size} must be rejected"
+            );
+        }
+        // Frame still sitting in backend — never got pulled.
+        assert_eq!(mock.queue_depths().0, 1);
+    }
+
+    #[test]
+    fn validate_qsize_accepts_only_valid_values() {
+        // Direct unit test on the helper. Spec: power of two in 1..=256.
+        for good in [1u32, 2, 4, 8, 16, 32, 64, 128, 256] {
+            assert_eq!(validate_qsize(good), Some(good as u16), "qsize={good}");
+        }
+        for bad in [0u32, 3, 5, 7, 100, 257, 1024, 65536, u32::MAX] {
+            assert_eq!(validate_qsize(bad), None, "qsize={bad}");
+        }
+    }
+
+    #[test]
+    fn avail_delta_wraps_correctly_at_u16_max() {
+        // Cursor near wrap, avail just past: wrapping_sub gives the
+        // small real delta even though the raw numbers look huge.
+        // last_seen = 65_530, avail_idx = 2 → 2.wrapping_sub(65_530)
+        //           = 2 + (65_536 - 65_530) = 8. qsize=8 → ≤ 8 ✓
+        assert!(avail_delta_is_sane(65_530, 2, 8));
+        // delta = 7 → ≤ 8 ✓
+        assert!(avail_delta_is_sane(65_530, 1, 8));
+        // Delta exactly qsize is allowed.
+        assert!(avail_delta_is_sane(0, 8, 8));
+        // Delta > qsize is not.
+        assert!(!avail_delta_is_sane(0, 9, 8));
+        // last_seen=65_530, avail_idx=3 → delta = 9 → > 8 ✗
+        assert!(!avail_delta_is_sane(65_530, 3, 8));
+        assert!(!avail_delta_is_sane(65_530, 100, 8));
+    }
+
+    #[test]
+    fn max_frame_len_covers_vlan_tagged_ethernet() {
+        // Copilot MEDIUM: 802.1Q VLAN tag adds 4 bytes.
+        // Untagged max = 14 + 1500 = 1514
+        // Tagged   max = 14 + 4 + 1500 = 1518
+        // We must accept the tagged case to not drop legit VLAN traffic.
+        assert_eq!(MAX_FRAME_LEN, 1518);
+        assert_eq!(MAX_CHAIN_BYTES, 1518 + VIRTIO_NET_HDR_LEN);
     }
 }
