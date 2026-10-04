@@ -121,6 +121,7 @@
 ///
 /// ~30 lines that compile to identical code but scream "boilerplate".
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum VirtioNetError {
     /// Underlying I/O error opening or operating on the TAP device.
     #[error("virtio-net I/O: {0}")]
@@ -135,6 +136,18 @@ pub enum VirtioNetError {
         /// Why it was rejected.
         reason: &'static str,
     },
+
+    /// Error from parsing / serializing the 12-byte virtio-net header.
+    /// Produced by the queue consumer when a guest TX chain's leading
+    /// bytes aren't a valid header.
+    #[error("virtio-net header: {0}")]
+    Header(#[from] header::HeaderError),
+
+    /// Error from the shared split-virtqueue parser (bad descriptor
+    /// chain, guest-memory bounds, oversized `len` field, …). Produced
+    /// by the queue consumer while walking rings.
+    #[error("virtqueue: {0}")]
+    Queue(#[from] virtio_queue::QueueError),
 }
 
 /// Result specialised to this crate's error type. Keeps signatures
@@ -215,3 +228,8 @@ pub use mmio::{
 
 pub mod device;
 pub use device::VirtioNetDevice;
+
+pub mod queue;
+pub use queue::{
+    process_rx, process_tx, ProcessStats, QueueCursor, MAX_CHAIN_BYTES, MAX_FRAME_LEN,
+};
