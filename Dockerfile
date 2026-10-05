@@ -30,7 +30,7 @@
 #   ghcr.io/ip888/nanovm-control-plane:<version>
 
 # ---- Stage 1: build the binary ---------------------------------------
-FROM rust:1.98.1-bookworm AS builder
+FROM rust:1.99.0-bookworm AS builder
 
 WORKDIR /src
 
