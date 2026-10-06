@@ -1387,6 +1387,28 @@ impl KvmBootPlan {
                     "virtio_mmio.device={VSOCK_MMIO_SIZE:#x}@{VSOCK_MMIO_BASE:#x}:{VSOCK_MMIO_IRQ}"
                 ))
                 .map_err(|e| VmError::Backend(format!("vsock cmdline: {e}")))?;
+        }
+
+        // virtio-net device advertisement. Unconditional for now —
+        // every KVM VM gets a NIC (see KvmVmRuntime::net construction).
+        // Guest's virtio_mmio driver scans cmdline tokens with this
+        // prefix and registers each as a separate device; the one
+        // whose DeviceID reads back as 1 (VIRTIO_ID_NET) binds to the
+        // in-tree `virtio_net` driver, exposing an `eth0` interface
+        // in guest userspace. The driver reads DRIVER_OK status after
+        // feature negotiation; sub-PR #C commit 5 adds the queue-drain
+        // + IRQ-raise paths that actually move Ethernet frames.
+        {
+            use virtio_net_dev::{NET_MMIO_BASE, NET_MMIO_IRQ, NET_MMIO_SIZE};
+            cmdline
+                .insert_str(format!(
+                    "virtio_mmio.device={NET_MMIO_SIZE:#x}@{NET_MMIO_BASE:#x}:{NET_MMIO_IRQ}"
+                ))
+                .map_err(|e| VmError::Backend(format!("virtio-net cmdline: {e}")))?;
+        }
+
+        // ------- vsock sidecar vars continue below -------
+        if cfg.vsock_cid.is_some() {
             // The Linux init path hands unknown `key=value` cmdline
             // tokens to PID 1 as environment variables. The guest agent
             // reads NANOVM_AGENT_VSOCK to switch its transport from
