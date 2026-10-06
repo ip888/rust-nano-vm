@@ -60,6 +60,7 @@ use std::sync::{Arc, Mutex};
 use kvm_ioctls::VmFd;
 use virtio_net::{MockBackend, NetworkBackend, QueueCursor, VirtioNetDevice};
 use virtio_queue::{GuestMemory, QueueError};
+use vm_core::{VmError, VmResult};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 // --------------------------------------------------------------------------
@@ -112,12 +113,6 @@ pub(crate) const NET_MMIO_IRQ: u32 = 6;
 /// accidentally pass a raw `&GuestMemoryMmap` where a
 /// `KvmNetGuestMemory` is expected (good — different semantics), but
 /// generates identical machine code for the wrapper's method calls.
-// `dead_code` is a temporary artifact of sub-PR #C's commit sequence:
-// this adapter is used by the queue consumer wiring that lands two
-// commits from now (MMIO exit routing). Granting the exception here
-// instead of up at the module level narrows the escape hatch to one
-// item and makes the next commit a mechanical removal.
-#[allow(dead_code)]
 pub(crate) struct KvmNetGuestMemory<'a>(pub(crate) &'a GuestMemoryMmap);
 
 impl GuestMemory for KvmNetGuestMemory<'_> {
@@ -170,7 +165,6 @@ impl GuestMemory for KvmNetGuestMemory<'_> {
 ///
 /// Free function rather than a method so unit tests can exercise it
 /// without needing a `VmFd` (which requires `/dev/kvm`).
-#[allow(dead_code)]
 pub(crate) fn window_offset(addr: u64) -> Option<u64> {
     let off = addr.checked_sub(NET_MMIO_BASE)?;
     (off < NET_MMIO_SIZE).then_some(off)
@@ -220,7 +214,6 @@ pub(crate) fn window_offset(addr: u64) -> Option<u64> {
 /// Both sides now have equally-valid handles; the Mutex arbitrates
 /// mutation.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct NetBackend {
     /// The virtio-net device state (register bank, queue config,
     /// negotiated features). Locked for every MMIO exit and every
@@ -257,13 +250,11 @@ pub(crate) struct NetBackend {
 /// of two — the two queues are drained from the same thread today,
 /// so finer-grained locking would be overhead without benefit.
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub(crate) struct NetQueueCursors {
     pub tx: QueueCursor,
     pub rx: QueueCursor,
 }
 
-#[allow(dead_code)]
 impl NetBackend {
     /// Construct a NetBackend around `device_backend` with the given
     /// MAC address. The MAC is advertised to the guest driver via
@@ -332,24 +323,111 @@ impl NetBackend {
             .mmio_write(offset, data.len(), value)
     }
 
-    /// Access the IRQ this device raises on virtqueue completion.
-    /// Exposed for the vCPU thread; commit #4 calls `vm_fd.set_irq_line`
-    /// with this value.
-    pub fn irq(&self) -> u32 {
-        self.irq
+    /// Drain the queue the guest just kicked (`queue_idx` from a
+    /// `QueueNotify` MMIO write). Walks every descriptor chain the
+    /// guest driver has published since the cursor's last run,
+    /// hands the Ethernet frames to the backend (`process_tx`) or
+    /// fills guest buffers with backend-produced frames
+    /// (`process_rx`), returns the chain heads to the used ring,
+    /// and — if any chain completed — raises the device IRQ.
+    ///
+    /// The lock order here matters:
+    ///
+    /// 1. Lock the device to snapshot the queue config + clone the
+    ///    backend Arc (both cheap). Release.
+    /// 2. Lock the cursors mutex (also cheap).
+    /// 3. Call `process_tx` or `process_rx` with the shared
+    ///    backend handle. Backend calls may do blocking syscalls
+    ///    (TAP write / smoltcp socket read), which is why step 1
+    ///    released the device lock before this.
+    /// 4. If stats say we should raise, re-lock the device to flip
+    ///    the VRING bit in the transport's InterruptStatus register.
+    /// 5. Pulse the KVM IRQ line (level-triggered: assert, deassert).
+    ///
+    /// Unknown `queue_idx` → no-op. The guest driver only has two
+    /// legitimate queues; anything else is a buggy or malicious
+    /// kick we silently drop.
+    pub fn drain_queue(&self, queue_idx: u32) -> VmResult<()> {
+        use virtio_net::{process_rx, process_tx, RX_QUEUE_INDEX, TX_QUEUE_INDEX};
+
+        // --- Step 1: snapshot inside device lock, then release ------
+        let (queue_cfg, backend) = {
+            let device = self
+                .device
+                .lock()
+                .expect("vm-kvm: virtio-net device mutex poisoned");
+            // Both queues at known indices (0=RX, 1=TX from mmio.rs).
+            // Reject anything else without taking the backend ref.
+            let Some(cfg) = device.transport().queue(queue_idx as usize) else {
+                return Ok(());
+            };
+            (*cfg, device.backend_arc())
+        };
+
+        if queue_idx != TX_QUEUE_INDEX && queue_idx != RX_QUEUE_INDEX {
+            return Ok(());
+        }
+
+        // --- Step 2 + 3: drain outside the device lock -------------
+        let mut cursors = self
+            .cursors
+            .lock()
+            .expect("vm-kvm: virtio-net cursors mutex poisoned");
+        let mut mem = KvmNetGuestMemory(&self.guest_mem);
+
+        let stats = if queue_idx == TX_QUEUE_INDEX {
+            process_tx(&queue_cfg, &mut cursors.tx, &mut mem, &*backend)
+                .map_err(|e| VmError::Backend(format!("virtio-net process_tx: {e}")))?
+        } else {
+            // RX_QUEUE_INDEX
+            process_rx(&queue_cfg, &mut cursors.rx, &mut mem, &*backend)
+                .map_err(|e| VmError::Backend(format!("virtio-net process_rx: {e}")))?
+        };
+        drop(cursors);
+
+        // --- Step 4: re-lock device to flip InterruptStatus bit ----
+        if stats.should_raise_interrupt() {
+            self.device
+                .lock()
+                .expect("vm-kvm: virtio-net device mutex poisoned")
+                .raise_vring_interrupt();
+
+            // --- Step 5: pulse the KVM IRQ line (level-triggered) --
+            // Assert, then deassert — the KVM edge triggers the IDT
+            // vector; the guest driver reads InterruptStatus to
+            // discover which bit was set and ACKs by writing
+            // InterruptACK (handled by MmioTransport::write).
+            self.vm_fd.set_irq_line(self.irq, true).map_err(|e| {
+                VmError::Backend(format!("assert virtio-net IRQ {}: {e}", self.irq))
+            })?;
+            self.vm_fd.set_irq_line(self.irq, false).map_err(|e| {
+                VmError::Backend(format!("deassert virtio-net IRQ {}: {e}", self.irq))
+            })?;
+        }
+        Ok(())
     }
 
-    /// Clone the shared VmFd handle. Used by commit #4 so the IRQ
-    /// raise path doesn't need to go through `NetBackend` on the
-    /// hot path.
-    pub fn vm_fd(&self) -> Arc<VmFd> {
-        Arc::clone(&self.vm_fd)
+    /// Current virtio-net device status register as the guest sees
+    /// it: `ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK` bits set
+    /// as the guest driver walks the bring-up. Used by the host-side
+    /// `KvmHypervisor::net_status` accessor and by integration tests
+    /// that poll for guest readiness.
+    pub fn status(&self) -> u32 {
+        self.device
+            .lock()
+            .expect("vm-kvm: virtio-net device mutex poisoned")
+            .status()
     }
 
-    /// Clone the shared guest-memory handle. Used by commit #3 to
-    /// build a `KvmNetGuestMemory` per queue drain.
-    pub fn guest_mem(&self) -> GuestMemoryMmap {
-        self.guest_mem.clone()
+    /// `true` once the guest driver has finished bringing up the
+    /// device (set `DRIVER_OK` after feature negotiation + queue
+    /// setup). The integration test polls this to confirm the full
+    /// virtio probe sequence succeeded.
+    pub fn driver_ok(&self) -> bool {
+        self.device
+            .lock()
+            .expect("vm-kvm: virtio-net device mutex poisoned")
+            .driver_ok()
     }
 }
 

@@ -898,6 +898,53 @@ impl KvmHypervisor {
         ))
     }
 
+    /// The virtio-net device's status register, if this VM has one.
+    /// `None` when no net device is attached (real-mode / snapshot-
+    /// restore paths today).
+    ///
+    /// The guest's virtio core sets `ACKNOWLEDGE | DRIVER` once it
+    /// recognises the device during the virtio_mmio probe, so a
+    /// non-zero status with `ACKNOWLEDGE` set is a host-observable
+    /// signal that the guest found our virtio-net device. Used by
+    /// the `virtio_net_boot.rs` integration test to poll for guest
+    /// readiness without touching the data path.
+    #[cfg(feature = "kvm")]
+    pub fn net_status(&self, id: VmId) -> VmResult<Option<u32>> {
+        let inner = self.lock_inner()?;
+        let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+        Ok(vm.runtime.net.as_ref().map(|b| b.status()))
+    }
+
+    /// Non-KVM build: returns [`VmError::Unsupported`].
+    #[cfg(not(feature = "kvm"))]
+    pub fn net_status(&self, _id: VmId) -> VmResult<Option<u32>> {
+        Err(VmError::Unsupported(
+            "vm-kvm: net_status requires the `kvm` feature",
+        ))
+    }
+
+    /// `true` once the guest's `virtio_net` driver has finished
+    /// bringing up the device (set `DRIVER_OK` after feature
+    /// negotiation + queue setup). `None` when no net device is
+    /// attached. Unlike [`net_status`](Self::net_status) — which
+    /// only needs the generic virtio-MMIO core to probe the device
+    /// — `DRIVER_OK` requires the kernel's `virtio_net` driver,
+    /// so it's the signal that the data path is live.
+    #[cfg(feature = "kvm")]
+    pub fn net_driver_ok(&self, id: VmId) -> VmResult<Option<bool>> {
+        let inner = self.lock_inner()?;
+        let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+        Ok(vm.runtime.net.as_ref().map(|b| b.driver_ok()))
+    }
+
+    /// Non-KVM build: returns [`VmError::Unsupported`].
+    #[cfg(not(feature = "kvm"))]
+    pub fn net_driver_ok(&self, _id: VmId) -> VmResult<Option<bool>> {
+        Err(VmError::Unsupported(
+            "vm-kvm: net_driver_ok requires the `kvm` feature",
+        ))
+    }
+
     /// Build a minimal, compile-time-validated boot plan without touching
     /// `/dev/kvm`.
     ///
@@ -2317,13 +2364,16 @@ fn run_vcpu_loop(
                 }
                 // virtio-net MMIO write dispatch. `NetBackend::write`
                 // returns `Some(queue_idx)` when the write was a
-                // `QueueNotify` kick — commit #4 of this sub-PR drains
-                // that queue + raises the IRQ. For now the kick is
-                // captured in the transport's `pending_notify` and
-                // simply drained-and-dropped on the next MMIO cycle.
+                // `QueueNotify` kick — we then drain that queue:
+                // process TX (guest→host frames) or fill RX
+                // (host→guest frames) through the virtio-net consumer
+                // from sub-PR #B.2, then raise the device's IRQ via
+                // `KVM_IRQ_LINE` if any chain completed.
                 if let Some(net) = net.as_ref() {
                     if let Some(offset) = virtio_net_dev::window_offset(addr) {
-                        let _queue_idx = net.write(offset, data);
+                        if let Some(queue_idx) = net.write(offset, data) {
+                            net.drain_queue(queue_idx)?;
+                        }
                     }
                 }
             }

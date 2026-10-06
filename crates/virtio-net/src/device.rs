@@ -153,6 +153,27 @@ impl VirtioNetDevice {
         self.transport.write(offset, size, value);
         self.transport.take_notify().map(|QueueNotify(q)| q)
     }
+
+    /// Assert the device's used-buffer interrupt. Call this after a
+    /// successful [`crate::process_tx`] / [`crate::process_rx`] has
+    /// pushed one or more completed chains back onto the used ring,
+    /// so the guest driver reads the ring and reclaims its buffers.
+    ///
+    /// Pass-through to `MmioTransport::raise_vring_interrupt` — kept
+    /// as a method on the device so callers don't need the internal
+    /// transport reference (`transport()` returns `&`, not `&mut`).
+    pub fn raise_vring_interrupt(&mut self) {
+        self.transport.raise_vring_interrupt();
+    }
+
+    /// Current value of the device status register. Composed of
+    /// `STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK |
+    /// STATUS_DRIVER_OK` bits as the guest driver walks the
+    /// bring-up sequence. Non-zero with `ACKNOWLEDGE` set proves
+    /// the guest driver has probed and recognised the device.
+    pub fn status(&self) -> u32 {
+        self.transport.status()
+    }
 }
 
 #[cfg(test)]
