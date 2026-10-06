@@ -21,6 +21,18 @@ vmm-sys-util = { version = "0.15.0", optional = true }
 # virtio-vsock's MmioTransport is pure logic (no KVM), but it's only
 # used by the KVM backend's device model, so gate it behind `kvm`.
 virtio-vsock = { workspace = true, optional = true }
+# virtio-net — host-side paravirtualised NIC device. Same posture as
+# virtio-vsock above: pure logic in the crate itself, but only used
+# from the KVM backend's device model. The queue consumer
+# (`process_tx` / `process_rx`) pulls Ethernet frames between guest
+# RAM and the `NetworkBackend` trait (TAP in production, mock in
+# tests, smoltcp userspace stack in sub-PR #D).
+virtio-net = { workspace = true, optional = true }
+# virtio-queue — shared split-ring parser crate. We take a direct
+# dep so we can `impl virtio_queue::GuestMemory` for our newtype
+# wrapper over `vm_memory::GuestMemoryMmap` (orphan rule — see
+# `KvmNetGuestMemory` in `virtio_net_dev.rs`).
+virtio-queue = { workspace = true, optional = true }
 # proto framing/messages for the host side of the vsock exec path; only
 # the KVM backend speaks it, so gate it behind `kvm` too.
 proto = { workspace = true, optional = true }
@@ -44,7 +56,7 @@ seccompiler = { workspace = true, optional = true }
 [features]
 default = []
 # Enable the real KVM backend. Requires Linux + /dev/kvm at runtime.
-kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:vm-memory", "dep:linux-loader", "dep:libc", "dep:vmm-sys-util", "dep:virtio-vsock", "dep:proto", "dep:snapshot", "dep:serde", "dep:serde_json", "dep:seccompiler"]
+kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:vm-memory", "dep:linux-loader", "dep:libc", "dep:vmm-sys-util", "dep:virtio-vsock", "dep:virtio-net", "dep:virtio-queue", "dep:proto", "dep:snapshot", "dep:serde", "dep:serde_json", "dep:seccompiler"]
 
 [lints]
 workspace = true

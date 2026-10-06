@@ -19,6 +19,8 @@ mod cgroups;
 #[cfg(feature = "kvm")]
 mod seccomp;
 #[cfg(feature = "kvm")]
+mod virtio_net_dev;
+#[cfg(feature = "kvm")]
 mod vmstate;
 
 // Public re-export so integration tests (and downstream callers that
@@ -154,6 +156,15 @@ struct KvmVmRuntime {
     /// IRQ when the device completes virtqueue buffers. `None` = no
     /// vsock device.
     vsock: Option<VsockBackend>,
+    /// virtio-MMIO network device. Always present in sub-PR #C
+    /// commit 3 onward: every KVM-backed VM gets a virtio-net device
+    /// so Spring Boot / Petclinic in-guest workloads can speak TCP.
+    /// Backend is a `MockBackend` for now; sub-PR #D wires the real
+    /// smoltcp userspace stack. The vCPU thread routes MMIO exits in
+    /// `NET_MMIO_BASE..+NET_MMIO_SIZE` into it (register-level reads
+    /// and writes). Guest-cmdline advertisement + QueueNotify queue
+    /// draining + IRQ raising land in commits 4 and 5.
+    net: Option<virtio_net_dev::NetBackend>,
 }
 
 /// The host side of the virtio-vsock device, shared between the
@@ -887,6 +898,53 @@ impl KvmHypervisor {
         ))
     }
 
+    /// The virtio-net device's status register, if this VM has one.
+    /// `None` when no net device is attached (real-mode / snapshot-
+    /// restore paths today).
+    ///
+    /// The guest's virtio core sets `ACKNOWLEDGE | DRIVER` once it
+    /// recognises the device during the virtio_mmio probe, so a
+    /// non-zero status with `ACKNOWLEDGE` set is a host-observable
+    /// signal that the guest found our virtio-net device. Used by
+    /// the `virtio_net_boot.rs` integration test to poll for guest
+    /// readiness without touching the data path.
+    #[cfg(feature = "kvm")]
+    pub fn net_status(&self, id: VmId) -> VmResult<Option<u32>> {
+        let inner = self.lock_inner()?;
+        let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+        Ok(vm.runtime.net.as_ref().map(|b| b.status()))
+    }
+
+    /// Non-KVM build: returns [`VmError::Unsupported`].
+    #[cfg(not(feature = "kvm"))]
+    pub fn net_status(&self, _id: VmId) -> VmResult<Option<u32>> {
+        Err(VmError::Unsupported(
+            "vm-kvm: net_status requires the `kvm` feature",
+        ))
+    }
+
+    /// `true` once the guest's `virtio_net` driver has finished
+    /// bringing up the device (set `DRIVER_OK` after feature
+    /// negotiation + queue setup). `None` when no net device is
+    /// attached. Unlike [`net_status`](Self::net_status) — which
+    /// only needs the generic virtio-MMIO core to probe the device
+    /// — `DRIVER_OK` requires the kernel's `virtio_net` driver,
+    /// so it's the signal that the data path is live.
+    #[cfg(feature = "kvm")]
+    pub fn net_driver_ok(&self, id: VmId) -> VmResult<Option<bool>> {
+        let inner = self.lock_inner()?;
+        let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+        Ok(vm.runtime.net.as_ref().map(|b| b.driver_ok()))
+    }
+
+    /// Non-KVM build: returns [`VmError::Unsupported`].
+    #[cfg(not(feature = "kvm"))]
+    pub fn net_driver_ok(&self, _id: VmId) -> VmResult<Option<bool>> {
+        Err(VmError::Unsupported(
+            "vm-kvm: net_driver_ok requires the `kvm` feature",
+        ))
+    }
+
     /// Build a minimal, compile-time-validated boot plan without touching
     /// `/dev/kvm`.
     ///
@@ -1043,6 +1101,23 @@ impl KvmHypervisor {
             }
         });
 
+        // virtio-net device. Unconditional for now (every KVM VM gets
+        // a NIC); the opt-in knob comes via VmConfig later. MAC is a
+        // fixed locally-administered OUI/suffix — fine as long as we
+        // run one VM at a time. Multi-VM networks pick per-VM MACs
+        // from a sub-PR #D allocator.
+        //
+        // The backend is a MockBackend for now so the full data path
+        // (sub-PR #B.2 queue consumer) is testable end-to-end without
+        // a host network stack. Sub-PR #D swaps this for the smoltcp
+        // userspace TCP/IP backend.
+        const DEFAULT_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let net = Some(virtio_net_dev::NetBackend::with_mock_backend(
+            DEFAULT_MAC,
+            boot_plan.guest_mem.clone(),
+            Arc::clone(&vm_fd),
+        ));
+
         Ok(KvmVmRuntime {
             vm_fd,
             boot_plan,
@@ -1050,6 +1125,7 @@ impl KvmHypervisor {
             serial_output: Arc::new(Mutex::new(Vec::new())),
             real_mode: false,
             vsock,
+            net,
         })
     }
 
@@ -1094,8 +1170,9 @@ impl KvmHypervisor {
             entry_point: GuestAddress(0),
             serial_output: Arc::new(Mutex::new(Vec::new())),
             real_mode: true,
-            // Real-mode flat binaries don't get a virtio device.
+            // Real-mode flat binaries don't get virtio devices.
             vsock: None,
+            net: None,
         })
     }
 
@@ -1126,11 +1203,19 @@ impl KvmHypervisor {
         let control_for_thread = Arc::clone(&control);
         let serial_output = Arc::clone(&runtime.serial_output);
         let vsock = runtime.vsock.clone();
+        let net = runtime.net.clone();
         let msr_indices = Arc::clone(&self.msr_indices);
         let handle = thread::Builder::new()
             .name(format!("kvm-vcpu-{}", id.0))
             .spawn(move || {
-                run_vcpu_loop(vcpu, serial_output, control_for_thread, vsock, msr_indices)
+                run_vcpu_loop(
+                    vcpu,
+                    serial_output,
+                    control_for_thread,
+                    vsock,
+                    net,
+                    msr_indices,
+                )
             })
             .expect("spawn vCPU thread");
         KvmVcpuThread { control, handle }
@@ -1285,6 +1370,12 @@ impl KvmHypervisor {
             serial_output: Arc::new(Mutex::new(Vec::new())),
             real_mode: false,
             vsock: None,
+            // Snapshot-restore path reconstructs devices separately
+            // from the device-model init that `build_runtime` runs;
+            // for now the restored VM comes up without a net device.
+            // Preserving virtio-net state across snapshot/restore is
+            // a sub-PR of its own in Milestone 1.5.
+            net: None,
         };
         Ok((runtime, vcpu))
     }
@@ -1343,6 +1434,28 @@ impl KvmBootPlan {
                     "virtio_mmio.device={VSOCK_MMIO_SIZE:#x}@{VSOCK_MMIO_BASE:#x}:{VSOCK_MMIO_IRQ}"
                 ))
                 .map_err(|e| VmError::Backend(format!("vsock cmdline: {e}")))?;
+        }
+
+        // virtio-net device advertisement. Unconditional for now —
+        // every KVM VM gets a NIC (see KvmVmRuntime::net construction).
+        // Guest's virtio_mmio driver scans cmdline tokens with this
+        // prefix and registers each as a separate device; the one
+        // whose DeviceID reads back as 1 (VIRTIO_ID_NET) binds to the
+        // in-tree `virtio_net` driver, exposing an `eth0` interface
+        // in guest userspace. The driver reads DRIVER_OK status after
+        // feature negotiation; sub-PR #C commit 5 adds the queue-drain
+        // + IRQ-raise paths that actually move Ethernet frames.
+        {
+            use virtio_net_dev::{NET_MMIO_BASE, NET_MMIO_IRQ, NET_MMIO_SIZE};
+            cmdline
+                .insert_str(format!(
+                    "virtio_mmio.device={NET_MMIO_SIZE:#x}@{NET_MMIO_BASE:#x}:{NET_MMIO_IRQ}"
+                ))
+                .map_err(|e| VmError::Backend(format!("virtio-net cmdline: {e}")))?;
+        }
+
+        // ------- vsock sidecar vars continue below -------
+        if cfg.vsock_cid.is_some() {
             // The Linux init path hands unknown `key=value` cmdline
             // tokens to PID 1 as environment variables. The guest agent
             // reads NANOVM_AGENT_VSOCK to switch its transport from
@@ -2203,6 +2316,7 @@ fn run_vcpu_loop(
     serial_output: Arc<Mutex<Vec<u8>>>,
     control: Arc<VcpuControl>,
     vsock: Option<VsockBackend>,
+    net: Option<virtio_net_dev::NetBackend>,
     msr_indices: Arc<Vec<u32>>,
 ) -> VmResult<()> {
     loop {
@@ -2231,11 +2345,35 @@ fn run_vcpu_loop(
                         backend.read(offset, data);
                     }
                 }
+                // virtio-net MMIO window dispatch. The free function
+                // `virtio_net_dev::window_offset` means we check the
+                // range even if `net` is None — a buggy guest that
+                // probes the net address with no device installed just
+                // sees zeros (the `data.fill(0)` above).
+                if let Some(net) = net.as_ref() {
+                    if let Some(offset) = virtio_net_dev::window_offset(addr) {
+                        net.read(offset, data);
+                    }
+                }
             }
             Ok(VcpuExit::MmioWrite(addr, data)) => {
                 if let Some(backend) = vsock.as_ref() {
                     if let Some(offset) = backend.window_offset(addr) {
                         backend.write(offset, data)?;
+                    }
+                }
+                // virtio-net MMIO write dispatch. `NetBackend::write`
+                // returns `Some(queue_idx)` when the write was a
+                // `QueueNotify` kick — we then drain that queue:
+                // process TX (guest→host frames) or fill RX
+                // (host→guest frames) through the virtio-net consumer
+                // from sub-PR #B.2, then raise the device's IRQ via
+                // `KVM_IRQ_LINE` if any chain completed.
+                if let Some(net) = net.as_ref() {
+                    if let Some(offset) = virtio_net_dev::window_offset(addr) {
+                        if let Some(queue_idx) = net.write(offset, data) {
+                            net.drain_queue(queue_idx)?;
+                        }
                     }
                 }
             }
