@@ -233,3 +233,8 @@ pub mod queue;
 pub use queue::{
     process_rx, process_tx, ProcessStats, QueueCursor, MAX_CHAIN_BYTES, MAX_FRAME_LEN,
 };
+
+#[cfg(feature = "smoltcp-backend")]
+pub mod smoltcp_backend;
+#[cfg(feature = "smoltcp-backend")]
+pub use smoltcp_backend::{SmoltcpBackend, DEFAULT_GUEST_IPV4, DEFAULT_HOST_IPV4};
