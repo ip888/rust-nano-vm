@@ -50,30 +50,36 @@
 //! bytes as if we were a kernel TAP backend. The whole difference
 //! lives on the host side.
 //!
-//! ## This commit (sub-PR #D commit 3/6)
+//! ## This commit (sub-PR #D commit 4/6)
 //!
-//! Adds a built-in TCP echo listener on top of the smoltcp Interface
-//! from commit #2:
+//! Adds **client-mode TCP sockets** so the backend can originate
+//! connections (not just answer them with the echo listener from
+//! commit #3). This is the half of the API the host-side byte
+//! proxy will drive when forwarding external TCP flows into the
+//! guest's Spring Boot:
 //!
-//! - A persistent [`smoltcp::iface::SocketSet`] stored inside
-//!   [`State`] so TCP state survives across `poll_and_echo` calls
-//!   (connection state, retransmission timers, receive window).
-//! - A single [`smoltcp::socket::tcp::Socket`] seeded with its own
-//!   RX/TX buffers and placed in `Listen` on
-//!   [`DEFAULT_LISTEN_PORT`] (8080 — matches Spring Boot's default).
-//! - A `drive_echo` pump: whenever the socket has both received
-//!   bytes and send-side capacity, we recv-then-send them straight
-//!   back on the same socket.
-//! - A real monotonic clock (`std::time::Instant`) feeding
-//!   smoltcp's `Instant`, so TCP timeouts and retransmissions
-//!   actually progress.
+//! - A [`BackendConfig`] struct that captures the host IP / MAC /
+//!   gateway / listen-port tuple. Lets a test spin up two backends
+//!   on different IPs so they can shuttle Ethernet frames at each
+//!   other without ARP ambiguity.
+//! - A [`SmoltcpBackend::with_config`] constructor; the pre-existing
+//!   [`SmoltcpBackend::new`] and [`SmoltcpBackend::with_listen_port`]
+//!   now delegate to it.
+//! - A client-socket API:
+//!   [`open_client_socket`](SmoltcpBackend::open_client_socket) adds
+//!   a new TCP socket to the set and initiates `connect(remote)`;
+//!   [`socket_send`](SmoltcpBackend::socket_send) /
+//!   [`socket_recv`](SmoltcpBackend::socket_recv) /
+//!   [`socket_state`](SmoltcpBackend::socket_state) /
+//!   [`close_socket`](SmoltcpBackend::close_socket) wrap the per-
+//!   socket plumbing behind the backend's one `Mutex<State>`.
 //!
-//! After this commit, a guest that completes the TCP handshake to
-//! `169.254.0.1:8080` and sends bytes gets those exact bytes back.
-//! The host-side byte proxy (connecting an external listener on
-//! e.g. `:443` to the guest's TCP flow) lands in commit #4;
-//! vm-kvm opt-in wiring in #5; integration test with Spring Boot
-//! in #6.
+//! After this commit, two `SmoltcpBackend` instances can complete
+//! a real TCP handshake and echo bytes end-to-end across their
+//! Ethernet-frame queues — the exact shape the proxy module in
+//! commit #5 will plug a `std::net::TcpStream` into. Commit #6
+//! wires it into vm-kvm as an opt-in; the Spring-Boot integration
+//! test closes out sub-PR #D.
 //!
 //! Gated behind the `smoltcp-backend` crate feature so users on the
 //! kernel-TAP path aren't forced to depend on smoltcp.
@@ -86,7 +92,7 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 
 use crate::{NetworkBackend, Result};
 
@@ -124,6 +130,43 @@ pub const DEFAULT_LISTEN_PORT: u16 = 8080;
 /// ring buffers. 4 KiB per direction is enough to absorb a typical
 /// HTTP request/response burst without back-pressuring the guest.
 const TCP_SOCKET_BUFFER_BYTES: usize = 4096;
+
+/// Addressing + port config for a single [`SmoltcpBackend`]. Carries
+/// everything a stand-alone backend needs to come up on its own IP;
+/// a second backend built from a different `BackendConfig` can
+/// shuttle Ethernet frames at the first and complete a real TCP
+/// handshake, which is exactly how the host-side proxy will drive
+/// smoltcp against the guest.
+#[derive(Debug, Clone)]
+pub struct BackendConfig {
+    /// IPv4 address this backend answers to. Routes point at
+    /// `gateway_ipv4`.
+    pub host_ipv4: [u8; 4],
+    /// MAC advertised to the peer at the other end of the virtio-net
+    /// link. Must be distinct from the peer's MAC for ARP to work.
+    pub host_mac: [u8; 6],
+    /// Default-route target. For the standard host↔guest link-local
+    /// setup this is the guest IP (host backend's gateway) or vice
+    /// versa.
+    pub gateway_ipv4: [u8; 4],
+    /// Port the built-in echo listener binds to. Set to 0 to skip
+    /// seeding a listener — handy for the host-side proxy backend
+    /// which only ever opens client sockets.
+    pub listen_port: u16,
+}
+
+impl Default for BackendConfig {
+    /// Host-side defaults from the module-level constants
+    /// (`169.254.0.1`, `52:54:00:ff:ff:01`, echo listener on 8080).
+    fn default() -> Self {
+        Self {
+            host_ipv4: DEFAULT_HOST_IPV4,
+            host_mac: DEFAULT_HOST_MAC,
+            gateway_ipv4: DEFAULT_GUEST_IPV4,
+            listen_port: DEFAULT_LISTEN_PORT,
+        }
+    }
+}
 
 /// Userspace TCP/IP backend for virtio-net.
 ///
@@ -163,12 +206,20 @@ struct State {
     /// means the socket storage is heap-allocated (`Vec<u8>`), not
     /// borrowed from a stack frame.
     sockets: SocketSet<'static>,
-    /// Handle to the TCP echo socket inside `sockets`. Stable for
-    /// the lifetime of the backend.
-    echo_handle: SocketHandle,
-    /// Port the echo listener is bound to; also used to re-arm the
-    /// listener after a connection fully tears down.
+    /// Handle to the TCP echo socket inside `sockets`, present only
+    /// when the backend's `listen_port` is non-zero. Client-mode
+    /// backends (proxy side) skip the listener entirely.
+    echo_handle: Option<SocketHandle>,
+    /// Port the echo listener is bound to (0 means "no listener,
+    /// client-mode only"). Also used to re-arm the listener after
+    /// a connection fully tears down.
     listen_port: u16,
+    /// Monotonically-increasing counter for ephemeral local ports
+    /// allocated to client sockets via
+    /// [`SmoltcpBackend::open_client_socket`]. Starts at the IANA
+    /// ephemeral-range base and wraps if we somehow exhaust it
+    /// (realistically not going to happen in a nano-VM lifetime).
+    next_ephemeral_port: u16,
     /// Wall-clock epoch the backend was constructed at; we feed
     /// elapsed millis into smoltcp's `Instant` so TCP timers and
     /// retransmissions actually progress.
@@ -222,15 +273,24 @@ impl State {
         self.iface.poll(now, &mut self.device, &mut self.sockets);
     }
 
-    /// Simple echo loop over the one TCP socket in the set:
+    /// Simple echo loop over the backend's one listener socket.
+    /// Client sockets added via
+    /// [`SmoltcpBackend::open_client_socket`] are **not** touched
+    /// here — their byte flow is driven externally by the caller
+    /// (`socket_send` / `socket_recv`) so each proxied connection
+    /// keeps its own forward/reverse state.
     ///
-    /// - Fresh socket in `Closed` state → re-arm the listener.
+    /// - No listener configured (`echo_handle == None`): no-op.
+    /// - Fresh listener in `Closed` state → re-arm `listen`.
     /// - `Established` with pending RX and send-side room → forward.
     /// - Peer-FIN'd (`CloseWait` with empty RX buffer) → close our
     ///   half so the connection can finish teardown.
     fn drive_echo(&mut self) {
+        let Some(echo_handle) = self.echo_handle else {
+            return;
+        };
         let listen_port = self.listen_port;
-        let socket = self.sockets.get_mut::<tcp::Socket>(self.echo_handle);
+        let socket = self.sockets.get_mut::<tcp::Socket>(echo_handle);
 
         // Re-arm after a prior connection fully closed. `listen`
         // returns `Err` only when the socket is already in a
@@ -268,24 +328,36 @@ impl State {
 }
 
 impl SmoltcpBackend {
-    /// Build a backend with the default IPv4 (`169.254.0.1`), MAC
-    /// (`52:54:00:ff:ff:01`) and TCP echo listener on
-    /// [`DEFAULT_LISTEN_PORT`]. Multi-tenant knobs land with the
-    /// per-tenant backend plumbing in later commits.
+    /// Build a backend with every default from
+    /// [`BackendConfig::default`]: host IP `169.254.0.1`, MAC
+    /// `52:54:00:ff:ff:01`, gateway `169.254.0.2`, echo listener
+    /// on [`DEFAULT_LISTEN_PORT`].
     pub fn new() -> Self {
-        Self::with_listen_port(DEFAULT_LISTEN_PORT)
+        Self::with_config(BackendConfig::default())
     }
 
-    /// Same as [`SmoltcpBackend::new`] but picks the TCP listen
-    /// port. Useful for tests that want multiple backends on one
-    /// host without smoltcp-level port collisions.
+    /// Shortcut over [`SmoltcpBackend::with_config`] that only
+    /// overrides the TCP listen port. Keeps old call-sites working
+    /// after commit #3 shipped it; tests that need distinct IPs
+    /// should use [`with_config`](SmoltcpBackend::with_config).
     pub fn with_listen_port(listen_port: u16) -> Self {
+        Self::with_config(BackendConfig {
+            listen_port,
+            ..BackendConfig::default()
+        })
+    }
+
+    /// Build a backend from an explicit `BackendConfig`. The
+    /// interface comes up on `host_ipv4`/`host_mac` with a default
+    /// route via `gateway_ipv4`; the echo listener on `listen_port`
+    /// is seeded only when the port is non-zero.
+    pub fn with_config(cfg: BackendConfig) -> Self {
         let mut device = SmoltDevice::new(DEVICE_MTU);
 
         // Build the smoltcp interface. The config carries the MAC;
         // IP address is set separately via `update_ip_addrs`.
-        let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(DEFAULT_HOST_MAC)));
-        let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
+        let smoltcp_cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(cfg.host_mac)));
+        let mut iface = Interface::new(smoltcp_cfg, &mut device, Instant::from_millis(0));
         iface.update_ip_addrs(|addrs| {
             // `.push` returns Err if the heapless vector is full,
             // but we only push one address on a fresh interface so
@@ -293,42 +365,45 @@ impl SmoltcpBackend {
             // handling here as a safety net.
             let addr = IpCidr::new(
                 IpAddress::v4(
-                    DEFAULT_HOST_IPV4[0],
-                    DEFAULT_HOST_IPV4[1],
-                    DEFAULT_HOST_IPV4[2],
-                    DEFAULT_HOST_IPV4[3],
+                    cfg.host_ipv4[0],
+                    cfg.host_ipv4[1],
+                    cfg.host_ipv4[2],
+                    cfg.host_ipv4[3],
                 ),
                 HOST_IPV4_PREFIX_LEN,
             );
             let _ = addrs.push(addr);
         });
 
-        // Default route pointing at the guest-side IP. For a /16
-        // link-local setup both sides are "on-link" so technically
-        // no gateway is needed, but setting one makes
-        // `arp who-has 169.254.0.1` resolve through the route
-        // instead of broadcast.
+        // Default route pointing at the configured gateway. For a
+        // /16 link-local setup both sides are "on-link" so a
+        // gateway isn't strictly required for reachability, but
+        // smoltcp uses it to resolve `arp who-has gw.ip` cleanly
+        // instead of broadcasting on every outbound.
         let gateway = Ipv4Address::new(
-            DEFAULT_GUEST_IPV4[0],
-            DEFAULT_GUEST_IPV4[1],
-            DEFAULT_GUEST_IPV4[2],
-            DEFAULT_GUEST_IPV4[3],
+            cfg.gateway_ipv4[0],
+            cfg.gateway_ipv4[1],
+            cfg.gateway_ipv4[2],
+            cfg.gateway_ipv4[3],
         );
         let _ = iface.routes_mut().add_default_ipv4_route(gateway);
 
-        // Build the single TCP echo socket pre-seated in `Listen`.
-        // Both buffers are owned `Vec<u8>` so the socket set is
-        // `'static` and we don't carry a lifetime through
-        // `SmoltcpBackend`.
-        let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_BYTES]);
-        let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_BYTES]);
-        let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
-        socket
-            .listen(listen_port)
-            .expect("fresh TCP socket must accept listen on a non-zero port");
-
         let mut sockets = SocketSet::new(vec![]);
-        let echo_handle = sockets.add(socket);
+        let echo_handle = if cfg.listen_port != 0 {
+            // Build the TCP echo socket pre-seated in `Listen`.
+            // Both buffers are owned `Vec<u8>` so the socket set is
+            // `'static` and we don't carry a lifetime through
+            // `SmoltcpBackend`.
+            let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_BYTES]);
+            let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_BYTES]);
+            let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
+            socket
+                .listen(cfg.listen_port)
+                .expect("fresh TCP socket must accept listen on a non-zero port");
+            Some(sockets.add(socket))
+        } else {
+            None
+        };
 
         Self {
             inner: Mutex::new(State {
@@ -336,18 +411,140 @@ impl SmoltcpBackend {
                 iface,
                 sockets,
                 echo_handle,
-                listen_port,
+                listen_port: cfg.listen_port,
+                next_ephemeral_port: 49_152,
                 epoch: HostInstant::now(),
             }),
         }
     }
 
-    /// Port the backend's TCP echo listener is bound to.
+    /// Port the backend's TCP echo listener is bound to, or `0` if
+    /// no listener was seeded.
     pub fn listen_port(&self) -> u16 {
         self.inner
             .lock()
             .expect("smoltcp backend state mutex poisoned")
             .listen_port
+    }
+
+    // -----------------------------------------------------------------
+    // Client-mode TCP sockets
+    //
+    // These wrap `smoltcp::socket::tcp::Socket` behind the backend's
+    // one `Mutex<State>` so the host-side proxy (commit #5) can
+    // originate connections to the guest without touching smoltcp
+    // directly or juggling socket lifetimes.
+    // -----------------------------------------------------------------
+
+    /// Allocate a fresh TCP socket, initiate `connect(remote)` from
+    /// an ephemeral local port, and return a handle the caller can
+    /// pump bytes through with `socket_send`/`socket_recv`.
+    ///
+    /// The connection isn't `Established` yet when this returns —
+    /// a SYN is queued and the handshake needs the usual frame
+    /// shuttle to complete. Poll with `socket_state(handle)` or
+    /// drive bytes and look for `Ok(0)` with `may_send() == false`.
+    pub fn open_client_socket(&self, remote: IpEndpoint) -> SocketHandle {
+        let mut state = self
+            .inner
+            .lock()
+            .expect("smoltcp backend state mutex poisoned");
+
+        // Allocate RX/TX buffers for this new socket. One pair per
+        // live client connection — the proxy will drop the handle
+        // (via `close_socket`) when its paired external stream
+        // closes.
+        let rx = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_BYTES]);
+        let tx = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_BYTES]);
+        let socket = tcp::Socket::new(rx, tx);
+        let handle = state.sockets.add(socket);
+
+        let local_port = state.next_ephemeral_port;
+        // Rotate the counter around the IANA ephemeral range so a
+        // long-lived backend doesn't eventually overflow back onto
+        // reserved ports.
+        state.next_ephemeral_port = state.next_ephemeral_port.saturating_add(1).max(49_152);
+        if state.next_ephemeral_port == 0 {
+            state.next_ephemeral_port = 49_152;
+        }
+
+        // Split-borrow trick: we need `&mut sockets` to fetch the
+        // socket and `&mut iface` to get the context passed into
+        // `connect`. Rust's borrow checker lets us hold both
+        // mutably because they're **distinct struct fields** —
+        // but only when the compiler can see the fields directly,
+        // not through a smart pointer like `MutexGuard`. Deref
+        // once into a plain `&mut State` and the split borrow
+        // succeeds.
+        let s: &mut State = &mut state;
+        let cx = s.iface.context();
+        s.sockets
+            .get_mut::<tcp::Socket>(handle)
+            .connect(cx, remote, local_port)
+            .expect("connect on a fresh TCP socket should always enqueue a SYN");
+
+        // Pump once so the SYN gets emitted into the outbound
+        // frame queue right away rather than only on the next
+        // read_frame/write_frame.
+        state.poll_and_echo();
+        handle
+    }
+
+    /// Push bytes into the socket's send buffer. Returns the number
+    /// actually accepted (less than `data.len()` only if the TX ring
+    /// is full). Also polls so the bytes get a chance to flush out
+    /// as Ethernet frames before the caller's next `read_frame`.
+    pub fn socket_send(&self, handle: SocketHandle, data: &[u8]) -> Result<usize> {
+        let mut state = self
+            .inner
+            .lock()
+            .expect("smoltcp backend state mutex poisoned");
+        let socket = state.sockets.get_mut::<tcp::Socket>(handle);
+        let written = socket.send_slice(data).unwrap_or(0);
+        state.poll_and_echo();
+        Ok(written)
+    }
+
+    /// Drain whatever's ready in the socket's receive buffer into
+    /// `buf`. Returns 0 when nothing's ready (same shape as
+    /// non-blocking read on a raw socket) so a proxy can poll in a
+    /// loop without having to parse smoltcp error variants.
+    pub fn socket_recv(&self, handle: SocketHandle, buf: &mut [u8]) -> Result<usize> {
+        let mut state = self
+            .inner
+            .lock()
+            .expect("smoltcp backend state mutex poisoned");
+        state.poll_and_echo();
+        let socket = state.sockets.get_mut::<tcp::Socket>(handle);
+        Ok(socket.recv_slice(buf).unwrap_or(0))
+    }
+
+    /// Current TCP state of the given socket. Mostly useful for
+    /// testing — the proxy picks progress by trying to recv/send
+    /// instead of state-polling.
+    pub fn socket_state(&self, handle: SocketHandle) -> tcp::State {
+        let s = self
+            .inner
+            .lock()
+            .expect("smoltcp backend state mutex poisoned");
+        s.sockets.get::<tcp::Socket>(handle).state()
+    }
+
+    /// Close our half of the connection and remove the socket from
+    /// the set once smoltcp has fully torn it down. Idempotent — a
+    /// handle that already got abandoned is a no-op.
+    pub fn close_socket(&self, handle: SocketHandle) {
+        let mut state = self
+            .inner
+            .lock()
+            .expect("smoltcp backend state mutex poisoned");
+        // `close()` enqueues a FIN; the socket may still linger in
+        // FIN_WAIT_1 / FIN_WAIT_2 / TIME_WAIT until the peer
+        // acknowledges. For a shutdown-and-forget semantic we just
+        // let smoltcp finish teardown on its own schedule — the
+        // handle keeps working for state introspection.
+        state.sockets.get_mut::<tcp::Socket>(handle).close();
+        state.poll_and_echo();
     }
 
     /// Push a frame directly into the outbound-to-guest queue,
@@ -374,16 +571,20 @@ impl SmoltcpBackend {
         (s.device.guest_to_stack.len(), s.device.stack_to_guest.len())
     }
 
-    /// `true` if the backend's echo socket is in `Listen` state.
-    /// Test helper for asserting listener readiness after
-    /// construction and after full connection teardown.
+    /// `true` if the backend has an echo listener and it's in
+    /// `Listen` state. Test helper for asserting listener
+    /// readiness after construction and after a connection fully
+    /// tore down.
     #[cfg(test)]
     pub(crate) fn listener_is_listening(&self) -> bool {
         let s = self
             .inner
             .lock()
             .expect("smoltcp backend state mutex poisoned");
-        s.sockets.get::<tcp::Socket>(s.echo_handle).state() == tcp::State::Listen
+        let Some(h) = s.echo_handle else {
+            return false;
+        };
+        s.sockets.get::<tcp::Socket>(h).state() == tcp::State::Listen
     }
 }
 
@@ -840,6 +1041,159 @@ mod tests {
             established,
             "handshake did not complete; peer socket in state {:?}",
             peer.socket().state()
+        );
+    }
+
+    /// Shuttle every pending Ethernet frame between two backends
+    /// (A ↔ B) for up to `iterations` iterations. Returns early
+    /// when `done()` goes true. Used by the client-side tests
+    /// where "A" plays host-side proxy and "B" plays fake-guest.
+    fn shuttle_backends_until<F: FnMut(&SmoltcpBackend, &SmoltcpBackend) -> bool>(
+        a: &SmoltcpBackend,
+        b: &SmoltcpBackend,
+        iterations: u64,
+        mut done: F,
+    ) -> bool {
+        let mut buf = [0u8; 2048];
+        for _ in 0..iterations {
+            // A → B
+            loop {
+                let n = a.read_frame(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                b.write_frame(&buf[..n]).unwrap();
+            }
+            // B → A
+            loop {
+                let n = b.read_frame(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                a.write_frame(&buf[..n]).unwrap();
+            }
+            if done(a, b) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Build the fake-guest backend: IP = `DEFAULT_GUEST_IPV4`, MAC
+    /// swapped to a distinct value, gateway = `DEFAULT_HOST_IPV4`
+    /// (so default routes go back toward the "host" side), echo
+    /// listener on 8080 so a `connect(169.254.0.2:8080)` lands.
+    fn fake_guest_backend() -> SmoltcpBackend {
+        SmoltcpBackend::with_config(BackendConfig {
+            host_ipv4: DEFAULT_GUEST_IPV4,
+            host_mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
+            gateway_ipv4: DEFAULT_HOST_IPV4,
+            listen_port: DEFAULT_LISTEN_PORT,
+        })
+    }
+
+    /// Host-side proxy backend: default IP, but *no* echo listener
+    /// — it only ever opens outbound client sockets.
+    fn host_proxy_backend() -> SmoltcpBackend {
+        SmoltcpBackend::with_config(BackendConfig {
+            listen_port: 0,
+            ..BackendConfig::default()
+        })
+    }
+
+    #[test]
+    fn with_config_disables_listener_when_port_zero() {
+        let bk = SmoltcpBackend::with_config(BackendConfig {
+            listen_port: 0,
+            ..BackendConfig::default()
+        });
+        assert_eq!(bk.listen_port(), 0);
+        assert!(!bk.listener_is_listening());
+    }
+
+    #[test]
+    fn open_client_socket_initiates_syn_toward_remote() {
+        let host = host_proxy_backend();
+        let remote = IpEndpoint::new(
+            IpAddress::v4(
+                DEFAULT_GUEST_IPV4[0],
+                DEFAULT_GUEST_IPV4[1],
+                DEFAULT_GUEST_IPV4[2],
+                DEFAULT_GUEST_IPV4[3],
+            ),
+            DEFAULT_LISTEN_PORT,
+        );
+        let h = host.open_client_socket(remote);
+        // Fresh connect lands in SynSent (or Closed if routing is
+        // broken — the shuttle test below exercises the full path).
+        assert_eq!(host.socket_state(h), tcp::State::SynSent);
+    }
+
+    #[test]
+    fn two_backends_complete_a_tcp_handshake() {
+        let host = host_proxy_backend();
+        let guest = fake_guest_backend();
+        let remote = IpEndpoint::new(
+            IpAddress::v4(
+                DEFAULT_GUEST_IPV4[0],
+                DEFAULT_GUEST_IPV4[1],
+                DEFAULT_GUEST_IPV4[2],
+                DEFAULT_GUEST_IPV4[3],
+            ),
+            DEFAULT_LISTEN_PORT,
+        );
+        let client = host.open_client_socket(remote);
+
+        let established = shuttle_backends_until(&host, &guest, 200, |a, _| {
+            a.socket_state(client) == tcp::State::Established
+        });
+        assert!(
+            established,
+            "handshake must complete across two backends, got state {:?}",
+            host.socket_state(client)
+        );
+    }
+
+    #[test]
+    fn client_socket_echoes_payload_through_fake_guest() {
+        let host = host_proxy_backend();
+        let guest = fake_guest_backend();
+        let remote = IpEndpoint::new(
+            IpAddress::v4(
+                DEFAULT_GUEST_IPV4[0],
+                DEFAULT_GUEST_IPV4[1],
+                DEFAULT_GUEST_IPV4[2],
+                DEFAULT_GUEST_IPV4[3],
+            ),
+            DEFAULT_LISTEN_PORT,
+        );
+        let client = host.open_client_socket(remote);
+
+        // Phase 1 — handshake.
+        let established = shuttle_backends_until(&host, &guest, 200, |a, _| {
+            a.socket_state(client) == tcp::State::Established
+        });
+        assert!(established, "handshake must complete before send");
+
+        // Phase 2 — send a payload via the host-side client socket.
+        // The fake guest's echo listener bounces it back; we drain
+        // it off the client socket's recv buffer.
+        const PAYLOAD: &[u8] = b"hello from the host proxy\n";
+        let sent = host.socket_send(client, PAYLOAD).unwrap();
+        assert_eq!(sent, PAYLOAD.len(), "fresh socket must accept full write");
+
+        let mut received: Vec<u8> = Vec::new();
+        shuttle_backends_until(&host, &guest, 400, |a, _| {
+            let mut buf = [0u8; TCP_SOCKET_BUFFER_BYTES];
+            let n = a.socket_recv(client, &mut buf).unwrap();
+            received.extend_from_slice(&buf[..n]);
+            received.len() >= PAYLOAD.len()
+        });
+
+        assert_eq!(
+            &received[..PAYLOAD.len().min(received.len())],
+            PAYLOAD,
+            "echo payload must match (got {received:?})",
         );
     }
 
