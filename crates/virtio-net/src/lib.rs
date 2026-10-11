@@ -238,3 +238,8 @@ pub use queue::{
 pub mod smoltcp_backend;
 #[cfg(feature = "smoltcp-backend")]
 pub use smoltcp_backend::{SmoltcpBackend, DEFAULT_GUEST_IPV4, DEFAULT_HOST_IPV4};
+
+#[cfg(feature = "smoltcp-backend")]
+pub mod tcp_proxy;
+#[cfg(feature = "smoltcp-backend")]
+pub use tcp_proxy::TcpProxy;
