@@ -104,6 +104,42 @@ pub struct VmConfig {
     /// `manifest.json` + `memory.cow` from this directory and uses the
     /// captured state instead of booting fresh.
     pub snapshot_dir: Option<PathBuf>,
+    /// Which virtio-net transport backend to attach to the guest NIC.
+    /// Defaults to [`NetBackendChoice::Mock`] so existing tests + the
+    /// no-network boot path keep working unchanged. The KVM backend
+    /// recognises [`NetBackendChoice::Smoltcp`] when built with the
+    /// `virtio-net-smoltcp` feature; other backends currently ignore
+    /// this field.
+    pub net_backend: NetBackendChoice,
+}
+
+/// Which virtio-net transport backend to attach to the guest's
+/// paravirtualised NIC. The guest-side driver (`virtio_net` in the
+/// Linux kernel) is identical in all three cases — the choice lives
+/// entirely on the host, controlling what happens to Ethernet
+/// frames once they leave the virtqueue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum NetBackendChoice {
+    /// In-process mock. Frames are discarded; `read_frame` always
+    /// returns 0 bytes. Appropriate for every integration test that
+    /// only cares about the virtio bring-up handshake, not actual
+    /// packet flow. **Default** so legacy callers aren't surprised.
+    #[default]
+    Mock,
+    /// Userspace TCP/IP stack (crate `smoltcp`) wrapped by
+    /// `virtio_net::SmoltcpBackend`. Lets the host dial into
+    /// servers running inside the guest without needing
+    /// `/dev/net/tun` or `CAP_NET_ADMIN` — the full flow lives in
+    /// our process. Required for the Fly.io demo path and for
+    /// snapshot-restore flows (ARP cache + TCP connections live in
+    /// Rust structs we can serialise).
+    ///
+    /// Requires the KVM backend to be built with the
+    /// `virtio-net-smoltcp` cargo feature. Backends that don't
+    /// support smoltcp fall back to `Mock` with a warning rather
+    /// than failing VM creation.
+    Smoltcp,
 }
 
 impl Default for VmConfig {
@@ -118,6 +154,7 @@ impl Default for VmConfig {
             cmdline: String::new(),
             vsock_cid: None,
             snapshot_dir: None,
+            net_backend: NetBackendChoice::default(),
         }
     }
 }

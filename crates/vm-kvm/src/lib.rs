@@ -159,12 +159,20 @@ struct KvmVmRuntime {
     /// virtio-MMIO network device. Always present in sub-PR #C
     /// commit 3 onward: every KVM-backed VM gets a virtio-net device
     /// so Spring Boot / Petclinic in-guest workloads can speak TCP.
-    /// Backend is a `MockBackend` for now; sub-PR #D wires the real
-    /// smoltcp userspace stack. The vCPU thread routes MMIO exits in
+    /// Which transport sits behind it (mock vs smoltcp) is picked
+    /// at `create_vm` time from [`vm_core::VmConfig::net_backend`].
+    /// The vCPU thread routes MMIO exits in
     /// `NET_MMIO_BASE..+NET_MMIO_SIZE` into it (register-level reads
-    /// and writes). Guest-cmdline advertisement + QueueNotify queue
-    /// draining + IRQ raising land in commits 4 and 5.
+    /// and writes); QueueNotify kicks drain into the chosen backend.
     net: Option<virtio_net_dev::NetBackend>,
+    /// Live handle to the smoltcp backend when
+    /// [`NetBackendChoice::Smoltcp`] was selected and the KVM crate
+    /// was built with the `virtio-net-smoltcp` feature. Exposed via
+    /// [`KvmHypervisor::net_smoltcp_backend`] so callers can attach
+    /// a `virtio_net::TcpProxy` to bridge external TCP connections
+    /// into the guest.
+    #[cfg(feature = "virtio-net-smoltcp")]
+    net_smoltcp: Option<std::sync::Arc<virtio_net::SmoltcpBackend>>,
 }
 
 /// The host side of the virtio-vsock device, shared between the
@@ -945,6 +953,27 @@ impl KvmHypervisor {
         ))
     }
 
+    /// Shared handle to the smoltcp userspace TCP/IP stack attached
+    /// to the VM's virtio-net device, when the VM was created with
+    /// [`vm_core::NetBackendChoice::Smoltcp`] *and* the crate was
+    /// built with the `virtio-net-smoltcp` feature. Any other
+    /// configuration returns `None`.
+    ///
+    /// A caller that wants to bridge external TCP connections into
+    /// the guest wraps this handle in a
+    /// [`virtio_net::TcpProxy`](virtio_net::TcpProxy) — the
+    /// `Arc<SmoltcpBackend>` can be cloned across accept-and-bridge
+    /// threads without any further plumbing.
+    #[cfg(feature = "virtio-net-smoltcp")]
+    pub fn net_smoltcp_backend(
+        &self,
+        id: VmId,
+    ) -> VmResult<Option<std::sync::Arc<virtio_net::SmoltcpBackend>>> {
+        let inner = self.lock_inner()?;
+        let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
+        Ok(vm.runtime.net_smoltcp.as_ref().map(Arc::clone))
+    }
+
     /// Build a minimal, compile-time-validated boot plan without touching
     /// `/dev/kvm`.
     ///
@@ -1101,22 +1130,64 @@ impl KvmHypervisor {
             }
         });
 
-        // virtio-net device. Unconditional for now (every KVM VM gets
-        // a NIC); the opt-in knob comes via VmConfig later. MAC is a
-        // fixed locally-administered OUI/suffix — fine as long as we
-        // run one VM at a time. Multi-VM networks pick per-VM MACs
-        // from a sub-PR #D allocator.
+        // virtio-net device. Every KVM VM gets a NIC; which transport
+        // sits behind it comes from `cfg.net_backend`. MAC is a fixed
+        // locally-administered OUI/suffix — fine for the one-VM-at-a-
+        // time demo path; multi-VM allocators come later.
         //
-        // The backend is a MockBackend for now so the full data path
-        // (sub-PR #B.2 queue consumer) is testable end-to-end without
-        // a host network stack. Sub-PR #D swaps this for the smoltcp
-        // userspace TCP/IP backend.
+        // `NetBackendChoice::Mock` keeps every existing virtio bring-
+        // up test working end-to-end without a host network stack.
+        // `Smoltcp` plugs the userspace TCP/IP backend in; a caller
+        // can then pull the backend handle via `net_smoltcp_backend`
+        // and wrap it in a `TcpProxy` for host-side byte forwarding.
         const DEFAULT_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
-        let net = Some(virtio_net_dev::NetBackend::with_mock_backend(
-            DEFAULT_MAC,
-            boot_plan.guest_mem.clone(),
-            Arc::clone(&vm_fd),
-        ));
+        let net = match cfg.net_backend {
+            vm_core::NetBackendChoice::Mock => Some(virtio_net_dev::NetBackend::with_mock_backend(
+                DEFAULT_MAC,
+                boot_plan.guest_mem.clone(),
+                Arc::clone(&vm_fd),
+            )),
+            vm_core::NetBackendChoice::Smoltcp => {
+                #[cfg(feature = "virtio-net-smoltcp")]
+                {
+                    // The smoltcp handle gets attached to the runtime
+                    // below so callers can later wrap it in a proxy.
+                    None // real path lives inside the cfg block below
+                }
+                #[cfg(not(feature = "virtio-net-smoltcp"))]
+                {
+                    eprintln!(
+                        "vm-kvm: NetBackendChoice::Smoltcp requested but crate was built \
+                         without the `virtio-net-smoltcp` feature; falling back to Mock. \
+                         Rebuild with `--features virtio-net-smoltcp` to enable."
+                    );
+                    Some(virtio_net_dev::NetBackend::with_mock_backend(
+                        DEFAULT_MAC,
+                        boot_plan.guest_mem.clone(),
+                        Arc::clone(&vm_fd),
+                    ))
+                }
+            }
+        };
+
+        // Smoltcp fast-path: build the net backend here (not above)
+        // so we can also hold onto the Arc<SmoltcpBackend> handle.
+        // Rust won't let us put a `virtio_net::SmoltcpBackend`
+        // reference in the earlier `let net = match …` branch
+        // without widening its type to the feature-gated struct —
+        // simpler to populate the two fields side-by-side.
+        #[cfg(feature = "virtio-net-smoltcp")]
+        let (net, net_smoltcp) = match (net, cfg.net_backend) {
+            (None, vm_core::NetBackendChoice::Smoltcp) => {
+                let (nb, smoltcp) = virtio_net_dev::NetBackend::with_smoltcp_backend(
+                    DEFAULT_MAC,
+                    boot_plan.guest_mem.clone(),
+                    Arc::clone(&vm_fd),
+                );
+                (Some(nb), Some(smoltcp))
+            }
+            (nb, _) => (nb, None),
+        };
 
         Ok(KvmVmRuntime {
             vm_fd,
@@ -1126,6 +1197,8 @@ impl KvmHypervisor {
             real_mode: false,
             vsock,
             net,
+            #[cfg(feature = "virtio-net-smoltcp")]
+            net_smoltcp,
         })
     }
 
@@ -1173,6 +1246,8 @@ impl KvmHypervisor {
             // Real-mode flat binaries don't get virtio devices.
             vsock: None,
             net: None,
+            #[cfg(feature = "virtio-net-smoltcp")]
+            net_smoltcp: None,
         })
     }
 
@@ -1376,6 +1451,8 @@ impl KvmHypervisor {
             // Preserving virtio-net state across snapshot/restore is
             // a sub-PR of its own in Milestone 1.5.
             net: None,
+            #[cfg(feature = "virtio-net-smoltcp")]
+            net_smoltcp: None,
         };
         Ok((runtime, vcpu))
     }

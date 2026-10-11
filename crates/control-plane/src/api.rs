@@ -55,6 +55,7 @@ impl From<CreateVmRequest> for VmConfig {
             cmdline: r.cmdline,
             vsock_cid: r.vsock_cid,
             snapshot_dir: r.snapshot_dir,
+            ..VmConfig::default()
         }
     }
 }
@@ -1287,6 +1288,7 @@ mod vm_defaults_tests {
             cmdline: cmdline.into(),
             vsock_cid: None,
             snapshot_dir: None,
+            ..VmConfig::default()
         }
     }
 

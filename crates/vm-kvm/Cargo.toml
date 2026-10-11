@@ -57,6 +57,11 @@ seccompiler = { workspace = true, optional = true }
 default = []
 # Enable the real KVM backend. Requires Linux + /dev/kvm at runtime.
 kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:vm-memory", "dep:linux-loader", "dep:libc", "dep:vmm-sys-util", "dep:virtio-vsock", "dep:virtio-net", "dep:virtio-queue", "dep:proto", "dep:snapshot", "dep:serde", "dep:serde_json", "dep:seccompiler"]
+# Opt in to the userspace smoltcp TCP/IP stack as the virtio-net
+# backend. Pulled in by production hosts that want host-side TCP
+# bridging without `/dev/net/tun` (Fly.io demos, snapshot-restore
+# flows); off by default so the base `kvm` build stays slim.
+virtio-net-smoltcp = ["kvm", "virtio-net/smoltcp-backend"]
 
 [lints]
 workspace = true
