@@ -44,9 +44,24 @@ libc = "0.2"
 # split-virtqueue wire format.
 virtio-queue.workspace = true
 
+# `smoltcp` — pure-Rust userspace TCP/IP stack. Powers `SmoltcpBackend`
+# (sub-PR #D). The `smoltcp` feature on *this crate* is what callers
+# turn on to get the backend; without it the crate compiles without
+# pulling in smoltcp. Lets `MockBackend` + `TapDevice` keep working
+# on hosts that don't need the userspace stack (self-hosted TAP+bridge
+# deployments).
+smoltcp = { workspace = true, optional = true }
+
 [dev-dependencies]
 # No dev-only deps today. When sub-PR #B's integration tests need
 # `tempfile` for scratch Unix sockets or similar, add it back here.
+
+[features]
+default = []
+# Enables `SmoltcpBackend` — a userspace TCP/IP backend that
+# terminates TCP connections in-process instead of needing a Linux
+# bridge + TAP + CAP_NET_ADMIN. See `src/smoltcp_backend.rs`.
+smoltcp-backend = ["dep:smoltcp"]
 
 [lints]
 workspace = true
