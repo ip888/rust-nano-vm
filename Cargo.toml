@@ -46,6 +46,21 @@ nanovm-fleet = { path = "crates/nanovm-fleet", version = "0.0.3" }
 
 # External
 thiserror = "2.0"
+# `smoltcp` — pure-Rust userspace TCP/IP stack. Used by `virtio-net`'s
+# `SmoltcpBackend` (sub-PR #D) to terminate TCP connections on the
+# host without needing CAP_NET_ADMIN, Linux bridges, or iptables NAT.
+# Zero std, no OS dependencies — same crate powers Redox OS and
+# embedded tools. `std` feature pulls in `std::sync::Mutex` + the
+# Rust Instant clock; `medium-ethernet` tells smoltcp our link type;
+# `socket-tcp` + `proto-ipv4` + `proto-dhcpv4` enable the protocols
+# we need for v1 Petclinic workloads.
+smoltcp = { version = "0.11", default-features = false, features = [
+    "std",
+    "medium-ethernet",
+    "socket-tcp",
+    "proto-ipv4",
+    "proto-dhcpv4",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }

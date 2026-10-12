@@ -357,6 +357,7 @@ mod tests {
             cmdline: "console=ttyS0".to_owned(),
             vsock_cid: Some(3),
             snapshot_dir: None,
+            ..VmConfig::default()
         }
     }
 

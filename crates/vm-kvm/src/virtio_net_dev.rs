@@ -279,9 +279,10 @@ impl NetBackend {
     }
 
     /// Convenience constructor that wires a [`MockBackend`] as the
-    /// transport. Used before sub-PR #D lands the smoltcp backend so
-    /// that integration tests can exercise the KVM wiring end-to-end
-    /// without a real network stack.
+    /// transport. Frames the guest emits are discarded; `read_frame`
+    /// never returns anything. Used by every virtio bring-up test
+    /// that only cares about handshake (feature negotiation + queue
+    /// setup + DRIVER_OK), not actual packet flow.
     pub fn with_mock_backend(mac: [u8; 6], guest_mem: GuestMemoryMmap, vm_fd: Arc<VmFd>) -> Self {
         Self::new(
             mac,
@@ -289,6 +290,33 @@ impl NetBackend {
             guest_mem,
             vm_fd,
         )
+    }
+
+    /// Convenience constructor that wires a userspace smoltcp TCP/IP
+    /// stack as the transport. The resulting NetBackend lets the
+    /// host-side `TcpProxy` from `virtio_net::tcp_proxy` dial into
+    /// servers running inside the guest (Spring Boot on :8080, etc.)
+    /// through nothing but process-local memory — no TAP device, no
+    /// `CAP_NET_ADMIN`, works in a stock Fly.io machine.
+    ///
+    /// Gated behind the crate's `virtio-net-smoltcp` cargo feature so
+    /// bare `--features kvm` builds don't drag the smoltcp dependency
+    /// in. Also exposed through `KvmHypervisor::net_backend()` so
+    /// callers can attach a proxy to the running VM.
+    #[cfg(feature = "virtio-net-smoltcp")]
+    pub fn with_smoltcp_backend(
+        mac: [u8; 6],
+        guest_mem: GuestMemoryMmap,
+        vm_fd: Arc<VmFd>,
+    ) -> (Self, Arc<virtio_net::SmoltcpBackend>) {
+        let smoltcp = Arc::new(virtio_net::SmoltcpBackend::new());
+        let backend = Self::new(
+            mac,
+            Arc::clone(&smoltcp) as Arc<dyn NetworkBackend>,
+            guest_mem,
+            vm_fd,
+        );
+        (backend, smoltcp)
     }
 
     /// Service a guest MMIO read inside the register window. Writes
