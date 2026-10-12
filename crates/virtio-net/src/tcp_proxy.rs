@@ -103,6 +103,15 @@ const BRIDGE_BUFFER_BYTES: usize = 4096;
 /// Owns an [`Arc`] to the backend so the same proxy can bridge
 /// many simultaneous connections (one per spawned thread, in a
 /// future commit) without each one needing its own backend copy.
+///
+/// # TODO (TcpListener accept-loop wrapper — follow-up PR)
+///
+/// Today only `bridge_connection(stream)` is public — the caller
+/// is responsible for accepting external TCP connections. The
+/// production path promised in the module docs ("`TcpListener`
+/// bound on `:443`, spawn one bridge per accepted stream") isn't
+/// wired yet. Lands with the vm-kvm host-port mapping work in a
+/// later PR. Tracked as Copilot finding #4252252398 on PR #283.
 #[derive(Debug)]
 pub struct TcpProxy {
     /// Shared handle to the smoltcp stack this proxy forwards
@@ -199,15 +208,36 @@ impl TcpProxy {
     /// Byte shuttle. Each iteration tries both directions once;
     /// sleeps `POLL_INTERVAL` only if nothing moved, so the loop
     /// stays snappy under load and quiet when idle.
+    ///
+    /// `pending_to_smoltcp` buffers bytes that the kernel already
+    /// handed us via `stream.read` but which smoltcp's TX ring
+    /// couldn't accept yet. Keeping them here (rather than returning
+    /// an error on partial `socket_send`) is essential: the OS
+    /// socket won't redeliver bytes it already copied to us.
     fn pump_bytes(&self, mut stream: TcpStream, handle: SocketHandle) -> Result<()> {
         let mut buf = [0u8; BRIDGE_BUFFER_BYTES];
+        let mut pending_to_smoltcp: Vec<u8> = Vec::new();
         let mut external_eof = false;
 
         loop {
             let mut did_work = false;
 
-            // Direction 1: external → smoltcp.
-            if !external_eof {
+            // Direction 1a: flush any carry-over from a previous
+            // partial write before pulling new bytes off the OS
+            // stream. Protects the invariant "bytes handed to us by
+            // the kernel never disappear."
+            if !pending_to_smoltcp.is_empty() {
+                let w = self.backend.socket_send(handle, &pending_to_smoltcp)?;
+                if w > 0 {
+                    pending_to_smoltcp.drain(..w);
+                    did_work = true;
+                }
+            }
+
+            // Direction 1b: external → smoltcp, only if we've
+            // cleared the backlog. Mixing fresh reads with pending
+            // bytes would reorder the TCP stream.
+            if !external_eof && pending_to_smoltcp.is_empty() {
                 match stream.read(&mut buf) {
                     Ok(0) => {
                         // External peer closed their send side.
@@ -220,28 +250,16 @@ impl TcpProxy {
                         self.backend.close_socket(handle);
                     }
                     Ok(n) => {
-                        // smoltcp send may short-write when its TX
-                        // buffer is nearly full. Loop the remainder
-                        // on subsequent iterations rather than
-                        // dropping bytes.
-                        let mut written = 0;
-                        while written < n {
-                            let w = self.backend.socket_send(handle, &buf[written..n])?;
-                            if w == 0 {
-                                // TX buffer full — bail out and
-                                // let the next loop iteration
-                                // reclaim capacity. The already-
-                                // consumed bytes aren't lost; the
-                                // kernel is holding them in its
-                                // own receive buffer and will
-                                // redeliver on the next read if we
-                                // don't make progress here.
-                                return Err(VirtioNetError::Io(io::Error::new(
-                                    ErrorKind::WouldBlock,
-                                    "smoltcp TX buffer full mid-write",
-                                )));
-                            }
-                            written += w;
+                        // smoltcp may accept only a prefix if its
+                        // TX ring is near-full. Buffer the remainder
+                        // in `pending_to_smoltcp` so the next loop
+                        // iteration retries once poll frees space.
+                        // Dropping bytes here would be invisible
+                        // data-loss — the OS already acknowledged
+                        // them to the external peer.
+                        let written = self.backend.socket_send(handle, &buf[..n])?;
+                        if written < n {
+                            pending_to_smoltcp.extend_from_slice(&buf[written..n]);
                         }
                         did_work = true;
                     }
@@ -250,17 +268,21 @@ impl TcpProxy {
                 }
             }
 
-            // Direction 2: smoltcp → external.
+            // Direction 2: smoltcp → external. `write_all_nonblocking`
+            // retries internally on `WouldBlock`, so a slow external
+            // reader doesn't tear the bridge down.
             let n = self.backend.socket_recv(handle, &mut buf)?;
             if n > 0 {
                 write_all_nonblocking(&mut stream, &buf[..n])?;
                 did_work = true;
             }
 
-            // Teardown condition: external already EOF'd and
-            // smoltcp has nothing more pending to deliver.
+            // Teardown condition: external already EOF'd, pending
+            // backlog drained, and smoltcp has nothing more pending
+            // to deliver.
             let state = self.backend.socket_state(handle);
             if external_eof
+                && pending_to_smoltcp.is_empty()
                 && n == 0
                 && matches!(
                     state,
@@ -270,9 +292,9 @@ impl TcpProxy {
                 return Ok(());
             }
 
-            // Also exit cleanly if the guest closed its half and
-            // we've drained everything they sent.
-            if n == 0 && state == tcp::State::Closed {
+            // Also exit cleanly if the guest closed its half, our
+            // pending backlog is empty, and we've drained the RX.
+            if pending_to_smoltcp.is_empty() && n == 0 && state == tcp::State::Closed {
                 return Ok(());
             }
 

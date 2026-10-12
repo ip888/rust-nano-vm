@@ -217,9 +217,14 @@ struct State {
     /// Monotonically-increasing counter for ephemeral local ports
     /// allocated to client sockets via
     /// [`SmoltcpBackend::open_client_socket`]. Starts at the IANA
-    /// ephemeral-range base and wraps if we somehow exhaust it
-    /// (realistically not going to happen in a nano-VM lifetime).
+    /// ephemeral-range base (49152) and wraps around at 65535 so a
+    /// long-lived backend keeps rotating through the full range.
     next_ephemeral_port: u16,
+    /// Bytes already TCP-acknowledged by `drive_echo`'s `recv_slice`
+    /// but not yet accepted by the socket's `send_slice` (TX buffer
+    /// was briefly full). Kept here so the next poll can retry
+    /// instead of dropping bytes the peer thinks we received.
+    echo_pending: Vec<u8>,
     /// Wall-clock epoch the backend was constructed at; we feed
     /// elapsed millis into smoltcp's `Instant` so TCP timers and
     /// retransmissions actually progress.
@@ -234,6 +239,7 @@ impl std::fmt::Debug for State {
             .field("sockets", &"<smoltcp::iface::SocketSet>")
             .field("echo_handle", &self.echo_handle)
             .field("listen_port", &self.listen_port)
+            .field("echo_pending_bytes", &self.echo_pending.len())
             .finish()
     }
 }
@@ -246,11 +252,10 @@ impl State {
         Instant::from_millis(self.epoch.elapsed().as_millis() as i64)
     }
 
-    /// Drive the smoltcp interface forward and pump the echo
-    /// socket: let the stack consume any inbound frames, forward
-    /// any received bytes straight back onto the same TCP flow,
-    /// and poll once more so the echoed bytes get serialised into
-    /// outbound Ethernet frames.
+    /// Drive the smoltcp interface forward, pump the echo socket,
+    /// and reap any fully-closed client sockets. One call per
+    /// `read_frame` / `write_frame`, so forward progress always
+    /// happens.
     ///
     /// # Rust concept: split borrow of struct fields
     ///
@@ -267,13 +272,17 @@ impl State {
         let now = self.now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.drive_echo();
+        self.reap_closed_client_sockets();
         // Second poll flushes bytes that `drive_echo` just pushed
         // into the TCP TX buffer out through the device as
         // Ethernet frames, so the next `read_frame` call sees them.
         self.iface.poll(now, &mut self.device, &mut self.sockets);
     }
 
-    /// Simple echo loop over the backend's one listener socket.
+    /// Echo pump for the backend's listener socket. Preserves bytes
+    /// across polls when the TX ring short-writes, so we never drop
+    /// data the peer thinks it delivered.
+    ///
     /// Client sockets added via
     /// [`SmoltcpBackend::open_client_socket`] are **not** touched
     /// here — their byte flow is driven externally by the caller
@@ -282,6 +291,8 @@ impl State {
     ///
     /// - No listener configured (`echo_handle == None`): no-op.
     /// - Fresh listener in `Closed` state → re-arm `listen`.
+    /// - Pending-echo buffer non-empty → flush as much of it as
+    ///   the TX ring accepts first, before pulling new RX bytes.
     /// - `Established` with pending RX and send-side room → forward.
     /// - Peer-FIN'd (`CloseWait` with empty RX buffer) → close our
     ///   half so the connection can finish teardown.
@@ -296,34 +307,119 @@ impl State {
         // returns `Err` only when the socket is already in a
         // non-closed state, which `is_open()` guards against.
         if !socket.is_open() {
+            // Drop any echo bytes still pending from a torn-down
+            // connection — they belonged to a stream that's gone.
+            self.echo_pending.clear();
             let _ = socket.listen(listen_port);
             return;
         }
 
-        if socket.can_recv() && socket.can_send() {
-            // `recv_slice` copies as many ready bytes as fit into
-            // `buf` and advances the receive window. On a healthy
-            // ESTABLISHED socket this is `Ok(n)` with `n > 0`.
+        // Phase 1 — drain whatever we previously `recv_slice`d but
+        // couldn't flush. `send_slice` returns the number of bytes
+        // accepted into the TX ring. Partial writes drain the
+        // prefix and keep the suffix for the next poll.
+        if !self.echo_pending.is_empty() && socket.can_send() {
+            match socket.send_slice(&self.echo_pending) {
+                Ok(w) if w > 0 => {
+                    self.echo_pending.drain(..w);
+                }
+                _ => {}
+            }
+        }
+
+        // Phase 2 — pull new RX bytes and try to send them. Any
+        // suffix the TX ring couldn't accept joins `echo_pending`
+        // so a subsequent poll retries it.
+        if self.echo_pending.is_empty() && socket.can_recv() && socket.can_send() {
             let mut buf = [0u8; TCP_SOCKET_BUFFER_BYTES];
             if let Ok(n) = socket.recv_slice(&mut buf) {
                 if n > 0 {
-                    // `send_slice` may return a short count if the
-                    // TX ring is nearly full. For an echo loop
-                    // against a cooperative peer that's rare, and
-                    // dropped bytes trigger a client-side retry;
-                    // tracking per-connection unflushed state can
-                    // land with the proxy work in commit #4.
-                    let _ = socket.send_slice(&buf[..n]);
+                    let written = socket.send_slice(&buf[..n]).unwrap_or(0);
+                    if written < n {
+                        self.echo_pending.extend_from_slice(&buf[written..n]);
+                    }
                 }
             }
         }
 
         // Peer sent FIN and we've drained their payload: close our
         // half so the four-way teardown can complete and the
-        // listener re-arm next poll.
+        // listener re-arm next poll. Still-pending echo bytes get
+        // dropped here deliberately — the peer gave up listening.
         if socket.state() == tcp::State::CloseWait && !socket.can_recv() {
+            self.echo_pending.clear();
             socket.close();
         }
+    }
+
+    /// Remove client-mode sockets that smoltcp has walked all the
+    /// way through `Closed`. Each client socket owns 2 × 4 KiB
+    /// buffers, so leaving them in the set after teardown is a
+    /// real leak at scale. The listener socket is always kept.
+    fn reap_closed_client_sockets(&mut self) {
+        let echo = self.echo_handle;
+
+        // Collect handles first — can't mutate the set while
+        // iterating it immutably.
+        let dead: Vec<SocketHandle> = self
+            .sockets
+            .iter()
+            .filter_map(|(h, s)| {
+                let smoltcp::socket::Socket::Tcp(t) = s;
+                (t.state() == tcp::State::Closed).then_some(h)
+            })
+            .filter(|h| Some(*h) != echo)
+            .collect();
+
+        for h in dead {
+            self.sockets.remove(h);
+        }
+    }
+
+    /// Pick an ephemeral local port that isn't currently in use by
+    /// any socket in the set. Walks the IANA ephemeral range
+    /// (49152..=65535) starting from the stored counter, wrapping
+    /// around at 65535 so the pool rotates through all 16 384 ports
+    /// over the backend's lifetime.
+    ///
+    /// Returns `0` only if every ephemeral port is held by a live
+    /// socket — extremely unlikely for a single-host nano-VM and
+    /// the reaper above keeps the pool trimmed.
+    fn allocate_ephemeral_port(&mut self) -> u16 {
+        use std::collections::HashSet;
+
+        const EPHEMERAL_START: u16 = 49_152;
+        const EPHEMERAL_END: u16 = u16::MAX;
+        const EPHEMERAL_SIZE: u32 = (EPHEMERAL_END as u32) - (EPHEMERAL_START as u32) + 1;
+
+        let in_use: HashSet<u16> = self
+            .sockets
+            .iter()
+            .filter_map(|(_, s)| {
+                let smoltcp::socket::Socket::Tcp(t) = s;
+                t.local_endpoint().map(|e| e.port)
+            })
+            .collect();
+
+        for _ in 0..EPHEMERAL_SIZE {
+            if self.next_ephemeral_port < EPHEMERAL_START {
+                self.next_ephemeral_port = EPHEMERAL_START;
+            }
+            let candidate = self.next_ephemeral_port;
+            // Advance now so the next call picks a different port
+            // even if `candidate` turns out to be free this time.
+            // `EPHEMERAL_END == u16::MAX`, so wrap-around happens
+            // on exact equality.
+            self.next_ephemeral_port = if candidate == EPHEMERAL_END {
+                EPHEMERAL_START
+            } else {
+                candidate + 1
+            };
+            if !in_use.contains(&candidate) {
+                return candidate;
+            }
+        }
+        0
     }
 }
 
@@ -413,6 +509,7 @@ impl SmoltcpBackend {
                 echo_handle,
                 listen_port: cfg.listen_port,
                 next_ephemeral_port: 49_152,
+                echo_pending: Vec::new(),
                 epoch: HostInstant::now(),
             }),
         }
@@ -444,6 +541,20 @@ impl SmoltcpBackend {
     /// a SYN is queued and the handshake needs the usual frame
     /// shuttle to complete. Poll with `socket_state(handle)` or
     /// drive bytes and look for `Ok(0)` with `may_send() == false`.
+    ///
+    /// # TODO (host-originated RX wake-up — follow-up PR)
+    ///
+    /// This method queues the SYN into `stack_to_guest`, but inside
+    /// the real KVM backend the vCPU loop only drains the virtio
+    /// RX queue in response to a guest-side `QueueNotify`. Without
+    /// a backend-driven wake path, a host-originated connect sits
+    /// in the queue until the guest happens to kick for its own
+    /// reasons, which can be arbitrarily long. The unit tests
+    /// here shuttle frames manually and don't exercise this gap;
+    /// the production fix needs a wake mechanism (atomic flag +
+    /// vCPU unpark, or a periodic poll thread) in
+    /// `crates/vm-kvm/src/lib.rs`. Tracked as Copilot finding
+    /// #4252252295 on PR #283 for the follow-up PR.
     pub fn open_client_socket(&self, remote: IpEndpoint) -> SocketHandle {
         let mut state = self
             .inner
@@ -459,14 +570,12 @@ impl SmoltcpBackend {
         let socket = tcp::Socket::new(rx, tx);
         let handle = state.sockets.add(socket);
 
-        let local_port = state.next_ephemeral_port;
-        // Rotate the counter around the IANA ephemeral range so a
-        // long-lived backend doesn't eventually overflow back onto
-        // reserved ports.
-        state.next_ephemeral_port = state.next_ephemeral_port.saturating_add(1).max(49_152);
-        if state.next_ephemeral_port == 0 {
-            state.next_ephemeral_port = 49_152;
-        }
+        // Pick a local port that isn't held by any other live socket
+        // in the set, wrapping around the ephemeral range properly.
+        // Avoids the earlier bug where a `saturating_add` pinned the
+        // counter at 65535 and every subsequent connection reused
+        // the same port.
+        let local_port = state.allocate_ephemeral_port();
 
         // Split-borrow trick: we need `&mut sockets` to fetch the
         // socket and `&mut iface` to get the context passed into
@@ -530,19 +639,23 @@ impl SmoltcpBackend {
         s.sockets.get::<tcp::Socket>(handle).state()
     }
 
-    /// Close our half of the connection and remove the socket from
-    /// the set once smoltcp has fully torn it down. Idempotent — a
-    /// handle that already got abandoned is a no-op.
+    /// Close our half of the connection and let the reaper remove
+    /// the socket once smoltcp has walked it through `Closed`. The
+    /// handle keeps working for state introspection in the window
+    /// between here and the reap pass.
+    ///
+    /// Avoids leaking the socket's two 4 KiB buffers per completed
+    /// connection: the reaper in `poll_and_echo` scans every poll
+    /// and `remove`s any client socket that reached `Closed`.
     pub fn close_socket(&self, handle: SocketHandle) {
         let mut state = self
             .inner
             .lock()
             .expect("smoltcp backend state mutex poisoned");
-        // `close()` enqueues a FIN; the socket may still linger in
-        // FIN_WAIT_1 / FIN_WAIT_2 / TIME_WAIT until the peer
-        // acknowledges. For a shutdown-and-forget semantic we just
-        // let smoltcp finish teardown on its own schedule — the
-        // handle keeps working for state introspection.
+        // `close()` enqueues a FIN. From the peer's point of view
+        // the connection is still half-open; smoltcp finishes the
+        // four-way handshake on its own and the reaper takes over
+        // from `Closed`.
         state.sockets.get_mut::<tcp::Socket>(handle).close();
         state.poll_and_echo();
     }

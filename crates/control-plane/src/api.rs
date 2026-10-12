@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use vm_core::{SnapshotId, VmConfig, VmHandle, VmId, VmState};
+use vm_core::{NetBackendChoice, SnapshotId, VmConfig, VmHandle, VmId, VmState};
 
 /// Body of `POST /v1/vms`. All fields are optional; missing fields fall back
 /// to the same defaults as [`VmConfig::default`].
@@ -33,6 +33,33 @@ pub(crate) struct CreateVmRequest {
     pub vsock_cid: Option<u32>,
     #[serde(default)]
     pub snapshot_dir: Option<PathBuf>,
+    /// Which virtio-net transport to attach to the VM's NIC:
+    /// `"mock"` (default) discards frames, `"smoltcp"` plugs the
+    /// userspace TCP/IP stack in so the host-side `TcpProxy` can
+    /// bridge external TCP flows into the guest. Backends built
+    /// without the `virtio-net-smoltcp` feature fall back to mock
+    /// with a stderr warning.
+    #[serde(default)]
+    pub net_backend: Option<NetBackendRequest>,
+}
+
+/// Wire-format alias for [`NetBackendChoice`]. Lives on the DTO so
+/// `vm-core` doesn't need to pull serde in just to let the control
+/// plane deserialize this one enum.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum NetBackendRequest {
+    Mock,
+    Smoltcp,
+}
+
+impl From<NetBackendRequest> for NetBackendChoice {
+    fn from(r: NetBackendRequest) -> Self {
+        match r {
+            NetBackendRequest::Mock => NetBackendChoice::Mock,
+            NetBackendRequest::Smoltcp => NetBackendChoice::Smoltcp,
+        }
+    }
 }
 
 fn default_vcpus() -> u32 {
@@ -55,7 +82,7 @@ impl From<CreateVmRequest> for VmConfig {
             cmdline: r.cmdline,
             vsock_cid: r.vsock_cid,
             snapshot_dir: r.snapshot_dir,
-            ..VmConfig::default()
+            net_backend: r.net_backend.map(Into::into).unwrap_or_default(),
         }
     }
 }
