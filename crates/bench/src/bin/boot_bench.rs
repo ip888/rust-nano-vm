@@ -102,7 +102,7 @@ struct Args {
     #[arg(
         long,
         env = "NANOVM_TEST_INITRAMFS",
-        default_value = "tools/initramfs/cache/initramfs.cpio"
+        default_value = "tools/initramfs/cache/initramfs-agent.cpio"
     )]
     initrd: PathBuf,
 
