@@ -2,8 +2,9 @@
 
 > Sub-second cold-start and fork for enterprise Java workloads.
 > KVM-based microVM snapshot/restore + MAP_PRIVATE fork-many.
-> **~12 ms fork. ~0.5 MiB private memory per fork. Independent of your
-> database, your JDK vendor, and your cloud.**
+> **Restore in 2.5 ms (p50). 50 microVMs in 472 ms. 172 KiB per fork
+> via copy-on-write. Independent of your database, your JDK vendor,
+> and your cloud.** ([measured benchmarks](BENCHMARKS.md))
 
 [![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0_OR_MIT-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.94+-orange.svg)](rust-toolchain.toml)
@@ -40,6 +41,53 @@ Aurora, CloudSQL, Azure SQL, DynamoDB, Snowflake.
 | **GraalVM Native Image** | Yes (reflection metadata) | Yes (+10 min AOT compile) | GraalVM only | — (no snapshot; native binary) |
 | **Spring AOT** (Spring 3+) | Minimal | Yes | Any | No |
 | **rust-nano-vm** | **No** | **No** | **Any** | **Yes** |
+
+## Measured performance
+
+Reproducible on any Linux + KVM host; the numbers below are from an
+Intel Broadwell @ 1.6 GHz laptop (2015-era hardware, 128 MiB guest).
+Modern Xeon / Ryzen will run faster — treat these as the floor.
+
+### Cold boot vs restore (10 runs each)
+
+```
+cold boot latency:   min 387 ms   p50 403 ms   p99 659 ms   mean 429 ms
+restore latency:     min 2.3 ms   p50 2.5 ms   p99 7.4 ms   mean 3.5 ms
+speed-up (p50):      164×
+```
+
+### 50 parallel forks from one snapshot
+
+The characteristic workload: 50 microVMs restored concurrently from
+one warm snapshot via `std::thread::spawn` + `MAP_PRIVATE` COW.
+
+```
+total wall-clock       :   472 ms   ← all 50 VMs ready
+per-fork distribution  :   min 9.6 ms   p50 139 ms   p99 397 ms
+theoretical sequential :  8094 ms   (50 × mean 162 ms)
+speed-up (vs sequential)  17×
+
+host memory per fork   :   172 KiB   (0.17 MiB)
+total RSS delta        :     8.6 MiB for all 50 forks
+```
+
+Positioning: **Firecracker optimises 1→1 restore. rust-nano-vm
+optimises 1→N parallel fork from the same warm snapshot.** On a
+single-core host the parallelism is bounded by host CPU; on a 32-core
+server the per-fork p99 spread shrinks dramatically.
+
+Full methodology, caveats, and reproduction instructions:
+**[BENCHMARKS.md](BENCHMARKS.md)**.
+
+Rebuild the numbers yourself:
+
+```sh
+NANOVM_INIT=agent tools/initramfs/build-initramfs.sh
+cargo run -p bench --release --features kvm --bin nanovm-boot-bench -- \
+    --mode both --runs 10
+cargo run -p bench --release --features kvm --bin nanovm-parallel-fork-bench -- \
+    --forks 50
+```
 
 ## Platform support
 
