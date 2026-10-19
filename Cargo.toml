@@ -54,7 +54,7 @@ thiserror = "2.0"
 # Rust Instant clock; `medium-ethernet` tells smoltcp our link type;
 # `socket-tcp` + `proto-ipv4` + `proto-dhcpv4` enable the protocols
 # we need for v1 Petclinic workloads.
-smoltcp = { version = "0.11", default-features = false, features = [
+smoltcp = { version = "0.14", default-features = false, features = [
     "std",
     "medium-ethernet",
     "socket-tcp",
