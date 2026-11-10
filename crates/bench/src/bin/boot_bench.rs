@@ -208,6 +208,8 @@ struct PhaseStats {
     mean_ms: f64,
     p99_ms: f64,
     max_ms: f64,
+    /// Sample standard deviation (Bessel-corrected). 0 when runs < 2.
+    stddev_ms: f64,
 }
 
 #[cfg(feature = "kvm")]
@@ -216,14 +218,29 @@ impl PhaseStats {
         let runs = latencies.len();
         debug_assert!(runs > 0);
         let sum_ms: f64 = latencies.iter().map(|d| d.as_secs_f64() * 1000.0).sum();
+        let mean_ms = sum_ms / runs as f64;
+        let stddev_ms = if runs < 2 {
+            0.0
+        } else {
+            let var = latencies
+                .iter()
+                .map(|d| {
+                    let x = d.as_secs_f64() * 1000.0 - mean_ms;
+                    x * x
+                })
+                .sum::<f64>()
+                / (runs as f64 - 1.0);
+            var.sqrt()
+        };
         Self {
             label,
             runs,
             min_ms: latencies[0].as_secs_f64() * 1000.0,
             p50_ms: percentile_ms(latencies, 50.0),
-            mean_ms: sum_ms / runs as f64,
+            mean_ms,
             p99_ms: percentile_ms(latencies, 99.0),
             max_ms: latencies.last().unwrap().as_secs_f64() * 1000.0,
+            stddev_ms,
         }
     }
 
@@ -233,11 +250,12 @@ impl PhaseStats {
             "nanovm-boot-bench: {} latency ({} runs)",
             self.label, self.runs,
         );
-        println!("  min   : {:>7.1} ms", self.min_ms);
-        println!("  p50   : {:>7.1} ms", self.p50_ms);
-        println!("  mean  : {:>7.1} ms", self.mean_ms);
-        println!("  p99   : {:>7.1} ms", self.p99_ms);
-        println!("  max   : {:>7.1} ms", self.max_ms);
+        println!("  min    : {:>7.1} ms", self.min_ms);
+        println!("  p50    : {:>7.1} ms", self.p50_ms);
+        println!("  mean   : {:>7.1} ms", self.mean_ms);
+        println!("  p99    : {:>7.1} ms", self.p99_ms);
+        println!("  max    : {:>7.1} ms", self.max_ms);
+        println!("  stddev : {:>7.1} ms", self.stddev_ms);
     }
 }
 
