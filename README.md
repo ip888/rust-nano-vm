@@ -48,13 +48,17 @@ Reproducible on any Linux + KVM host; the numbers below are from an
 Intel Broadwell @ 1.6 GHz laptop (2015-era hardware, 128 MiB guest).
 Modern Xeon / Ryzen will run faster — treat these as the floor.
 
-### Cold boot vs restore (10 runs each)
+### Cold boot vs restore (100 runs each, refreshed 2026-11-10)
 
 ```
-cold boot latency:   min 387 ms   p50 403 ms   p99 659 ms   mean 429 ms
-restore latency:     min 2.3 ms   p50 2.5 ms   p99 7.4 ms   mean 3.5 ms
-speed-up (p50):      164×
+cold boot latency:   min 380 ms   p50 381 ms   mean ~390 ms
+restore latency:     min 2.3 ms   p50 2.6 ms   p99 3.9 ms   max 7.5 ms   mean 2.9 ms
+speed-up (p50):      147.6×
 ```
+
+The 100-run pass tightened restore p99 from 7.4 ms (10-sample
+artifact) to 3.9 ms. Typical restore cost is 2–3 ms with occasional
+~7 ms outliers from host scheduler jitter.
 
 ### 50 parallel forks from one snapshot
 

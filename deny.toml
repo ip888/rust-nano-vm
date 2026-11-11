@@ -30,7 +30,26 @@ version = 2
 yanked = "deny"
 # Override with `ignore` entries (tracking-issue required) if we
 # intentionally accept a specific advisory.
-ignore = []
+ignore = [
+    # TODO: bump `rusqlite` 0.40 → 0.41 to pull in libsqlite3-sys 0.39
+    # (SQLite 3.54+). Semver-breaking bump of a direct dep, out of scope
+    # for the bench PR that added this ignore; track as its own hygiene
+    # PR.
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.38.2 (SQLite WAL uninit page-cache leak). Fix needs rusqlite 0.41 semver bump — queued as separate hygiene PR." },
+    # No safe upgrade: upstream `pin-utils` was archived 2026-10-01 and
+    # the advisory solution is "No safe upgrade is available!". The dep
+    # is purely transitive via the AWS smithy stack
+    # (aws-smithy-http / -runtime / -types). Will clear when
+    # aws-sdk-rust drops the dependency.
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils 0.1.0 unmaintained (upstream archived). Transitive via aws-smithy-*; no fix path from our side until aws-sdk-rust drops it." },
+    # Advisory solution asks for crypto-bigint >= 0.7.6, but the only
+    # path to it is `aws-sigv4` / `elliptic-curve` bumping their
+    # crypto-bigint = "0.5" constraint — transitive-only, no local
+    # fix. `cargo update -p crypto-bigint` is a no-op today (locks 0
+    # packages). Revisit when aws-sdk-rust / RustCrypto release
+    # compatible versions.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 timing side channels. Pinned by aws-sigv4 / elliptic-curve at 0.5.x; semver-locked until upstream bumps." },
+]
 
 [licenses]
 version = 2
