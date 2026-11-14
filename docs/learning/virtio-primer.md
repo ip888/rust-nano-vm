@@ -489,20 +489,54 @@ Chain: guest кладёт 3 дескриптора в слоты #5, #12, #0. В
 
 **Три буфера, один логический пакет, одна запись в ринге.**
 
-**Ступень 4 — ВТОРОЙ ринг. Рождается lock-free.**
+**Ступень 4 — ВТОРОЙ ринг. Рождается split-queue design.**
 
 Сейчас один ring — "available", guest говорит host-у "обработай
 эти". Как host скажет "готово"?
 
 - Вариант A — писать обратно в тот же ring → race, нужен lock →
-  **ломает lock-free**.
+  плохо.
 - Вариант B — ВТОРОЙ ring, "used":
   - **Available ring**: только guest пишет, только host читает.
   - **Used ring**: только host пишет, только guest читает.
-  - Single-writer single-reader → **no lock**.
+  - Single-writer single-reader на каждой ячейке.
 
-**Два ринга — не прихоть автора, а прямое следствие требования
-lock-free.**
+**Это и есть "split virtqueue"** — та версия, которая описана в
+§ 2.7 спеки и которая нужна тебе для vqparse.
+
+### Важные нюансы, которые я в первых объяснениях замазал:
+
+**1. "Split queue" — не единственный способ.** В VirtIO 1.1 (2019)
+добавили **"packed virtqueues"** (§ 2.8 спеки): **один** ring с
+битами ownership/wrap на каждой записи. Пишущий меняет ownership
+bit — читающий видит изменение, обрабатывает. Это **тоже lock-free**,
+но компактнее (один ring вместо двух) и дружелюбнее к cache
+(меньше cache lines touched). vqparse может сначала поддерживать
+только split (их проще и их больше в legacy); packed — отдельная
+Phase когда захочется.
+
+**2. Single-writer-single-reader ≠ "совсем без синхронизации".**
+Писатель должен выполнить **memory barrier** (fence) **между**
+записью данных в descriptor-ы и bump-ом `idx`. Иначе CPU (особенно
+на ARM, где memory model слабая) может переупорядочить:
+сначала записать новый `idx`, а потом фактические descriptor-ы.
+Читатель тогда увидит `idx` указывающий на ещё не записанные
+данные → читает мусор.
+
+В спеке это описано как "**the device MUST NOT access any part
+of a used buffer before `available_ring.idx` has been updated**" и
+"**the driver MUST perform a suitable memory barrier before
+updating `available_ring.idx`**".
+
+В Rust это `std::sync::atomic::fence(Ordering::Release)` (на
+стороне писателя) и `Ordering::Acquire` (на стороне читателя).
+**Для vqparse** это пока не критично — ты парсишь уже готовые
+байты, никакой live sync нет. Но держи в голове: full VirtIO
+reader/writer код обязан правильно fence-ить.
+
+**Два ринга — это конкретный дизайн split-queue, оптимизирующий
+lock-free SPSC обмен**, но не единственная математически возможная
+структура. Это **convention** спеки, не теорема.
 
 ### Итого — почему каждая штука
 
@@ -545,20 +579,39 @@ gpa`, читает/пишет ту же память через свой view.
 ## 8. Что нужно Java (devices wise)
 
 JVM напрямую про устройства не знает — трогает Linux под собой.
-Spring Boot минимально требует:
+Набор "virtual hardware" зависит **от workload-а** и **от того
+как ты упаковал guest-образ** — нет "обязательных 7".
 
-| Устройство | Зачем | Что при его отсутствии |
+### Абсолютный минимум для любого Linux-guest-а
+
+| Устройство | Зачем |
+|---|---|
+| **Timer** (PIT/HPET или виртуальный) | `currentTimeMillis`, `Thread.sleep`, scheduler, GC. Linux без timer-а не загрузится. |
+| **Interrupt controller** (APIC на x86, GIC на ARM) | Прерывания от устройств. Без него notify-регистры не работают. |
+| **Serial port (console)** | Вывод логов boot-а и JVM. Можно жить без serial, но отлаживать упавший guest **нечем** без него. |
+
+### Workload / boot-image зависимое
+
+| Устройство | Когда нужно | Альтернативы |
 |---|---|---|
-| **Serial port (console)** | `System.out.println`, логи boot-а | JVM стартует молча; не увидишь stack trace |
-| **Timer** (PIT/HPET или виртуальный) | `currentTimeMillis`, `Thread.sleep`, GC pauses, scheduler | Linux вообще не загрузится |
-| **Interrupt controller (APIC)** | Прерывания от других устройств | MMIO-notify не работает, guest не получит ответ |
-| **virtio-net** | Spring Boot HTTP server, JDBC, микросервисы | `Connection refused` на любую сеть |
-| **virtio-blk / virtio-fs** | Classpath (JAR-ы), конфиг-файлы, JIT-кеш | `ClassNotFoundException` |
-| **virtio-vsock** | Control-plane host↔guest ("start", "ready") | Host не узнает что guest готов |
-| **virtio-rng** | TLS, `SecureRandom`, UUIDs | **Spring Boot зависает 30+ сек** ждя `/dev/random` |
+| **virtio-net** | Spring Boot HTTP server, JDBC в БД, микросервисы | Не нужно если guest не выходит в сеть (чистая CPU-работа). |
+| **virtio-blk / virtio-fs** | Если JAR и classpath лежат на диске | **Не нужно если JAR встроен в initramfs** (так работает rust-nano-vm M1 demo). initramfs распаковывается в tmpfs в guest RAM, classpath живёт там. |
+| **virtio-vsock** | Control-plane host↔guest ("start processing", "ready" сигналы) | Можно заменить **баннером на serial** (регex в host-е по stdout guest-а) или HTTP-пробой через virtio-net. |
+| **virtio-rng** | Ускоряет entropy init (TLS, `SecureRandom`, UUIDs) | Kernel имеет fallback entropy sources (interrupt timing, scheduler jitter). На новых Linux `random.trust_cpu=on` cmdline даёт TSC-based entropy мгновенно. **Без virtio-rng Spring может залипнуть на `/dev/random`** — но это **зависит от версии kernel-а и cmdline**, не универсальный факт. |
 
-**7 устройств — минимум для Spring Boot.** Не "архитектурное
-излишество", а **требование рабочей ОС + типичного Java-приложения**.
+### Для rust-nano-vm M1 Spring Petclinic demo
+
+Что фактически нужно (посмотри `tools/java-rootfs/`):
+- Timer + APIC + serial — baseline.
+- **virtio-net** — Petclinic — HTTP server.
+- **virtio-vsock** ИЛИ serial-banner — для сигнала "warmup finished" host-у (rust-nano-vm сейчас использует serial banner `NANOVM_PETCLINIC_READY`).
+- **virtio-rng** или `random.trust_cpu=on` — чтобы не залипало на entropy.
+- **НЕ нужно virtio-blk/fs** — JAR уже в initramfs.
+
+**Итого ~4 устройства минимум для живого Spring Petclinic.** Больше —
+если workload сложнее (несколько сервисов, внешняя БД через JDBC и
+т.д.). Меньше — если у тебя максимально минимальный Spring Boot с
+чистой CPU-логикой без I/O.
 
 ---
 
