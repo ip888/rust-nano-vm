@@ -27,12 +27,24 @@
 //!
 //! ## Build
 //!
-//! The bench needs `/dev/kvm` at run time and the `kvm` feature at
-//! compile time:
+//! The bench needs `/dev/kvm` at run time, the `kvm` feature at
+//! compile time, a JVM-capable Linux bzImage, and a Java initramfs.
+//! One-time prerequisites:
+//!
+//!     # JVM-capable kernel (adds virtio-net, TCP/IP, tmpfs,
+//!     # HW_RANDOM, cgroups, HIGH_RES_TIMERS, SMP on top of the
+//!     # tiny vm-kvm test kernel):
+//!     KERNEL_PROFILE=jvm tools/kernel/build-tiny-kernel.sh
+//!
+//!     # Java rootfs (Debian slim + Oracle JDK 21 + Spring
+//!     # Petclinic single-jar, packed as initramfs):
+//!     SKIP_EXT4=1 tools/java-rootfs/build.sh
+//!
+//! Then run the bench:
 //!
 //!     cargo run -p bench --release --features kvm --bin nanovm-jvm-bench -- \
-//!         --kernel    <path-to-bzImage> \
-//!         --initramfs tools/java-rootfs/cache/initramfs.cpio.gz \
+//!         --kernel     tools/kernel/cache/bzImage-jvm \
+//!         --initramfs  tools/java-rootfs/cache/initramfs.cpio.gz \
 //!         --memory-mib 2048 \
 //!         --snapshot-at both \
 //!         --forks 20
@@ -41,18 +53,13 @@
 //! default workspace checks) but refuses to run — same posture as
 //! `nanovm-fork-bench`.
 //!
-//! ## Kernel path caveat (TODO)
+//! ## Why not `tools/kvm-images/cache/vmlinux`?
 //!
-//! `--kernel` expects a **Linux bzImage** (the protected-mode x86
-//! boot format). `tools/kvm-images/fetch.sh` currently drops a
-//! Firecracker-compatible **ELF `vmlinux`** at
-//! `tools/kvm-images/cache/vmlinux`, which the vm-kvm loader
-//! rejects with "Invalid bzImage". `tools/kernel/build-tiny-kernel.sh`
-//! produces a bzImage but its `tinyconfig` profile lacks virtio-net
-//! / TCP / tmpfs / HW_RANDOM — enough for the vm-kvm boot test, not
-//! for a running JVM. A production "JVM kernel profile" (adds the
-//! above) is the remaining blocker on M1 Petclinic end-to-end and
-//! lives in roadmap item #1.
+//! `tools/kvm-images/fetch.sh` downloads Firecracker's hello-vmlinux,
+//! which is an **ELF `vmlinux`**, not a bzImage. The vm-kvm loader
+//! parses the bzImage boot protocol and rejects the ELF with
+//! "Invalid bzImage". Use `tools/kernel/cache/bzImage-jvm` instead
+//! (produced by the `KERNEL_PROFILE=jvm` build above).
 
 #[cfg(not(feature = "kvm"))]
 fn main() {

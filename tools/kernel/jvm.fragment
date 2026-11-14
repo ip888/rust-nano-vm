@@ -1,0 +1,207 @@
+# Config fragment for a Linux bzImage that hosts a JVM + Spring Boot
+# workload inside rust-nano-vm.
+#
+# Applied like `tinyconfig.fragment`: appended to a fresh `make
+# tinyconfig` `.config` and then resolved with `make olddefconfig`.
+# This file is NOT stacked on top of `tinyconfig.fragment` — every
+# option the vm-kvm boot test also needs (serial, panic, virtio-mmio,
+# initramfs, vsock) is re-declared here so the two profiles stay
+# independently buildable.
+#
+# What a "jvm kernel" has to do that the tiny one does not:
+#
+#   - Run a real JVM process (OpenJDK / Oracle JDK / Corretto) as
+#     PID 1 or a child of a minimal init, with glibc-linked userspace.
+#   - Serve HTTP from Spring Boot over an IPv4 socket on virtio-net.
+#   - Mount tmpfs / devtmpfs / proc / sys so the JVM's startup checks
+#     and Spring Boot Actuator find what they expect.
+#   - Initialise `/dev/random` fast enough that `SecureRandom` does
+#     not stall Spring Boot's startup by 30+ seconds.
+#   - Report container-style memory and CPU limits to the JVM so
+#     `-XX:+UseContainerSupport` sizes the heap correctly.
+#
+# Target footprint: ~1-2 MB bzImage on x86_64 at kernel 6.12 LTS.
+# Build time: 10-15 min on a modern laptop.
+
+# ===================================================================
+# BASELINE — same intent as tinyconfig.fragment, re-declared here.
+# ===================================================================
+
+# ------- userspace ELF support ----------------------------------------
+# `make tinyconfig` turns BINFMT_ELF off; without it the kernel boots
+# but cannot exec any userspace ELF (JVM, /sbin/init, etc.).
+CONFIG_MULTIUSER=y
+CONFIG_BINFMT_ELF=y
+CONFIG_BINFMT_SCRIPT=y
+CONFIG_ELFCORE=y
+
+# ------- x86_64 boot --------------------------------------------------
+CONFIG_64BIT=y
+# HZ_100 keeps the timer interrupt rate low; JVM latency-sensitive
+# workloads can bump to HZ_250 or HZ_1000 locally if needed.
+CONFIG_HZ_100=y
+
+# ------- virtio-MMIO transport ---------------------------------------
+# rust-nano-vm advertises virtio devices via kernel cmdline
+# (`virtio_mmio.device=...`); no PCI bus is enumerated.
+# CMDLINE_DEVICES is what makes the kernel actually probe those.
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MENU=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+
+# ------- serial console (8250 UART at 0x3f8) --------------------------
+# All boot logs, panic traces, and JVM stdout/stderr flow out here
+# where vm-kvm captures them. Keep PCI 8250 off (there is no PCI bus).
+CONFIG_PRINTK=y
+CONFIG_PRINTK_TIME=y
+CONFIG_EARLY_PRINTK=y
+CONFIG_TTY=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_SERIAL_8250_NR_UARTS=1
+CONFIG_SERIAL_8250_RUNTIME_UARTS=1
+
+# ------- panic behavior ----------------------------------------------
+# Panic on oops + halt immediately on panic — a stuck guest wastes
+# fleet seconds. The jailer treats a halt as "VM done, reclaim".
+CONFIG_PANIC_TIMEOUT=-1
+CONFIG_PANIC_ON_OOPS=y
+
+# ------- initramfs root ----------------------------------------------
+# vm-kvm's load_initrd path populates the kernel's ramdisk_image /
+# ramdisk_size fields in the boot params. The JAR + JDK live in
+# a gzipped cpio that unpacks into tmpfs at /.
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_GZIP=y
+
+# ------- vsock (host↔guest control channel) --------------------------
+# NET is the core socket layer (needed also for the TCP/IP stack
+# below). VIRTIO_VSOCKETS is the guest-side driver that negotiates
+# with rust-nano-vm's virtio-vsock device.
+CONFIG_NET=y
+CONFIG_VSOCKETS=y
+CONFIG_VIRTIO_VSOCKETS=y
+
+# ===================================================================
+# JVM-SPECIFIC ADDITIONS (not in tinyconfig.fragment)
+# ===================================================================
+
+# ------- IPv4 stack + virtio-net for HTTP / JDBC / microservices -----
+# Spring Boot binds an HTTP listener; JDBC drivers open TCP to the DB;
+# Spring Cloud services discover each other via Eureka — all IPv4.
+# IPv6 stays off: Petclinic does not bind v6 by default, and dropping
+# it saves ~100 KB of image plus a chunk of attack surface. Flip to
+# =y if a future workload actually needs it.
+CONFIG_INET=y
+CONFIG_IP_MULTICAST=y
+CONFIG_IPV6=n
+
+# AF_UNIX: glibc's nsswitch helpers, journald sockets, Java UDS clients.
+# AF_PACKET: raw socket API; OpenJDK's inet layer uses it indirectly
+# via `getifaddrs()` which asks netlink/packet for interface state.
+CONFIG_UNIX=y
+CONFIG_PACKET=y
+
+# Netdev parent framework + the single NIC driver we actually drive.
+# All other NIC drivers stay off — there is no hardware to probe.
+CONFIG_NETDEVICES=y
+CONFIG_NET_CORE=y
+CONFIG_VIRTIO_NET=y
+
+# ------- filesystems JVM assumes exist ---------------------------------
+# JVM reads /proc/self/status (RSS, vsz), /proc/cpuinfo (NUMA, flags),
+# /proc/meminfo (free memory for GC sizing). Spring Boot Actuator
+# exports much of this via `/actuator/metrics`.
+# SYSFS backs cgroup files in /sys/fs/cgroup (see CGROUPS below) and
+# modern udev-style device discovery.
+CONFIG_PROC_FS=y
+CONFIG_PROC_SYSCTL=y
+CONFIG_SYSFS=y
+
+# TMPFS is Linux's standard /tmp. Java's File.createTempFile and the
+# JIT's code cache occasionally hit it.
+CONFIG_TMPFS=y
+CONFIG_TMPFS_POSIX_ACL=y
+
+# devtmpfs populates /dev at boot; MOUNT is the "mount before init
+# runs" convenience that avoids a chicken-and-egg problem in a
+# minimal rootfs.
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+
+# ------- entropy for Spring Boot's SecureRandom -----------------------
+# The famous 30-second Spring Boot startup stall happens when
+# /dev/random blocks waiting for enough entropy to reach the "crng
+# init done" state. Two independent sources, used together:
+#
+#   1. virtio-rng (HW_RANDOM_VIRTIO) — rust-nano-vm proxies host's
+#      /dev/urandom into guest; always available regardless of guest
+#      CPU support.
+#   2. RANDOM_TRUST_CPU — credits the CPU's dedicated hardware RNG
+#      instructions (RDRAND/RDSEED on x86) as high-quality entropy,
+#      which lets the crng init complete immediately *if* those
+#      instructions are exposed to the guest. KVM exposes them on
+#      any Intel/AMD host that has them, which is every CPU made
+#      this decade; still, the belt-and-suspenders with virtio-rng
+#      covers the corner case where they are masked out.
+#
+# Either source alone usually suffices; together they close the
+# fastest-boot path.
+CONFIG_HW_RANDOM=y
+CONFIG_HW_RANDOM_VIRTIO=y
+CONFIG_RANDOM_TRUST_CPU=y
+
+# ------- SMP + preemption + high-res timers --------------------------
+# A JVM process spawns GC threads, a compiler thread, and application
+# threads (Tomcat NIO pool, etc.) — multi-CPU is non-optional.
+# NR_CPUS=8 is the compile-time upper bound; the actual vCPU count
+# is set per-VM by vm-kvm (typically 1 or 2 for microVM guests).
+CONFIG_SMP=y
+CONFIG_NR_CPUS=8
+
+# PREEMPT_VOLUNTARY is the standard server-side tradeoff: better
+# latency than non-preempt, less overhead than full PREEMPT or
+# PREEMPT_RT. Spring Boot HTTP latency is dominated by GC and JIT
+# pauses, not kernel scheduling, so this is a safe default.
+CONFIG_PREEMPT_VOLUNTARY=y
+
+# HIGH_RES_TIMERS lets Thread.sleep(), ScheduledExecutorService, and
+# the JVM safepoint poller express sub-jiffy durations. Without it,
+# all these are clamped to jiffy resolution (10 ms at HZ_100).
+CONFIG_HIGH_RES_TIMERS=y
+
+# ------- cgroups (JVM container awareness) ---------------------------
+# Modern JVMs (JDK 10+ with -XX:+UseContainerSupport, which is on by
+# default since JDK 15) read cgroup memory / cpu limits to size the
+# heap (`MaxRAMPercentage`) and the default ForkJoinPool. Without
+# CGROUPS the JVM falls back to host memory, which in a microVM
+# means it tries to allocate more than the VM has → OOM.
+# MEMCG is the memory controller; CPUSETS pins work to CPUs;
+# CGROUP_SCHED enables CPU share accounting; CGROUP_CPUACCT reports
+# per-group CPU usage (`/sys/fs/cgroup/cpuacct.*`).
+CONFIG_CGROUPS=y
+CONFIG_MEMCG=y
+CONFIG_CPUSETS=y
+CONFIG_CGROUP_SCHED=y
+CONFIG_CGROUP_CPUACCT=y
+
+# ===================================================================
+# Explicitly OFF — things tinyconfig may or may not disable; we want
+# them off in a shipped kernel.
+# ===================================================================
+
+# No loadable modules — the guest image is built once, bundled into
+# the initramfs, and never upgraded in place. Everything built in.
+CONFIG_MODULES=n
+
+# No terminals / input / video — serial console is the only UI.
+CONFIG_INPUT=n
+CONFIG_VT=n
+CONFIG_SOUND=n
+
+# No kexec, no profiling, no kernel debug builds — this is a
+# production microVM image, not a development kernel.
+CONFIG_KEXEC=n
+CONFIG_PROFILING=n
+CONFIG_DEBUG_KERNEL=n
