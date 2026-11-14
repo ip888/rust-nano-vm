@@ -85,7 +85,8 @@
 //! kernel-TAP path aren't forced to depend on smoltcp.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::Instant as HostInstant;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
@@ -168,6 +169,35 @@ impl Default for BackendConfig {
     }
 }
 
+/// Alias for the wake callback handed to [`SmoltcpBackend`].
+///
+/// Fires after every host-side state-changing method
+/// ([`SmoltcpBackend::open_client_socket`], [`socket_send`],
+/// [`socket_recv`], [`close_socket`]) completes and the backend
+/// mutex has been released, so the callback is free to re-enter
+/// the backend without risk of deadlock.
+///
+/// The callback **must not block, allocate heavily, or panic** —
+/// production use sends a single wake event down a bounded channel
+/// to a wake thread in the VMM, and nothing else.
+///
+/// [`socket_send`]: SmoltcpBackend::socket_send
+/// [`socket_recv`]: SmoltcpBackend::socket_recv
+/// [`close_socket`]: SmoltcpBackend::close_socket
+pub type RxWaker = Arc<dyn Fn() + Send + Sync>;
+
+/// A no-op [`RxWaker`]. Used by [`SmoltcpBackend::with_config`] when
+/// the caller hasn't supplied a real waker — keeps the backend
+/// usable in unit tests (which shuttle frames manually with
+/// [`read_frame`]/[`write_frame`]) without forcing every caller to
+/// supply a closure.
+///
+/// [`read_frame`]: NetworkBackend::read_frame
+/// [`write_frame`]: NetworkBackend::write_frame
+pub fn noop_rx_waker() -> RxWaker {
+    Arc::new(|| {})
+}
+
 /// Userspace TCP/IP backend for virtio-net.
 ///
 /// # Rust concept: `Mutex<T>` for interior mutability
@@ -179,9 +209,30 @@ impl Default for BackendConfig {
 /// smoltcp interface + queues through a shared reference we need
 /// **interior mutability** — standard idiom: wrap the mutable state
 /// in a `Mutex<T>`.
-#[derive(Debug)]
 pub struct SmoltcpBackend {
     inner: Mutex<State>,
+    /// Fired after every host-side method that can push frames
+    /// into the outbound `stack_to_guest` queue. See [`RxWaker`]
+    /// for the contract. A no-op by default — the backend-only
+    /// unit tests in this crate don't need a wake path, they
+    /// shuttle frames manually via [`read_frame`]/[`write_frame`].
+    /// The VMM swaps in a real callback via
+    /// [`with_config_and_rx_waker`].
+    ///
+    /// [`read_frame`]: NetworkBackend::read_frame
+    /// [`write_frame`]: NetworkBackend::write_frame
+    /// [`with_config_and_rx_waker`]: SmoltcpBackend::with_config_and_rx_waker
+    rx_waker: RxWaker,
+}
+
+// Manual Debug because `Arc<dyn Fn>` is not Debug.
+impl fmt::Debug for SmoltcpBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SmoltcpBackend")
+            .field("inner", &self.inner)
+            .field("rx_waker", &"<fn>")
+            .finish()
+    }
 }
 
 /// All mutable state the backend holds — the smoltcp interface, its
@@ -512,7 +563,39 @@ impl SmoltcpBackend {
                 echo_pending: Vec::new(),
                 epoch: HostInstant::now(),
             }),
+            rx_waker: noop_rx_waker(),
         }
+    }
+
+    /// Same as [`with_config`](SmoltcpBackend::with_config) but also
+    /// installs the [`RxWaker`] the VMM uses to drain the guest-RX
+    /// virtqueue after a host-side operation pushes frames into
+    /// `stack_to_guest`.
+    ///
+    /// The backend calls `rx_waker` after every host-side state-
+    /// changing method ([`open_client_socket`], [`socket_send`],
+    /// [`socket_recv`], [`close_socket`]), **after** releasing the
+    /// internal mutex. It's the VMM's job to coalesce these wakes
+    /// into actual RX-queue drain work — the backend fires one per
+    /// method call regardless of whether the method actually
+    /// produced a new guest-bound frame.
+    ///
+    /// [`open_client_socket`]: SmoltcpBackend::open_client_socket
+    /// [`socket_send`]: SmoltcpBackend::socket_send
+    /// [`socket_recv`]: SmoltcpBackend::socket_recv
+    /// [`close_socket`]: SmoltcpBackend::close_socket
+    pub fn with_config_and_rx_waker(cfg: BackendConfig, rx_waker: RxWaker) -> Self {
+        let mut this = Self::with_config(cfg);
+        this.rx_waker = rx_waker;
+        this
+    }
+
+    /// Fire the configured [`RxWaker`]. Called from every host-side
+    /// method that can push frames into `stack_to_guest`, after the
+    /// state mutex has been released so the callback can re-enter
+    /// the backend without risk of deadlock.
+    fn notify_rx_available(&self) {
+        (self.rx_waker)();
     }
 
     /// Port the backend's TCP echo listener is bound to, or `0` if
@@ -542,19 +625,23 @@ impl SmoltcpBackend {
     /// shuttle to complete. Poll with `socket_state(handle)` or
     /// drive bytes and look for `Ok(0)` with `may_send() == false`.
     ///
-    /// # TODO (host-originated RX wake-up — follow-up PR)
+    /// # Wake-hook for host-originated RX
     ///
-    /// This method queues the SYN into `stack_to_guest`, but inside
-    /// the real KVM backend the vCPU loop only drains the virtio
-    /// RX queue in response to a guest-side `QueueNotify`. Without
-    /// a backend-driven wake path, a host-originated connect sits
-    /// in the queue until the guest happens to kick for its own
-    /// reasons, which can be arbitrarily long. The unit tests
-    /// here shuttle frames manually and don't exercise this gap;
-    /// the production fix needs a wake mechanism (atomic flag +
-    /// vCPU unpark, or a periodic poll thread) in
-    /// `crates/vm-kvm/src/lib.rs`. Tracked as Copilot finding
-    /// #4252252295 on PR #283 for the follow-up PR.
+    /// This method queues the SYN into `stack_to_guest`. The guest
+    /// virtio-net driver only drains the RX queue in response to a
+    /// `QueueNotify` MMIO write, so without a backend-driven wake
+    /// a host-originated connect would sit in the queue until the
+    /// guest kicked for its own reasons. The crate carries a
+    /// [`RxWaker`] (defaulted to a no-op in
+    /// [`SmoltcpBackend::with_config`], set to a real callback by
+    /// the VMM via
+    /// [`SmoltcpBackend::with_config_and_rx_waker`]) and fires it
+    /// after this method releases the backend's mutex. The unit
+    /// tests in this module shuttle frames manually and rely on
+    /// the default no-op waker; see `vm-kvm::NetBackend` for the
+    /// matching wake-thread consumer that drains the guest-RX
+    /// queue on wake. Closes Copilot finding #4252252295 from
+    /// PR #283.
     pub fn open_client_socket(&self, remote: IpEndpoint) -> SocketHandle {
         let mut state = self
             .inner
@@ -596,6 +683,8 @@ impl SmoltcpBackend {
         // frame queue right away rather than only on the next
         // read_frame/write_frame.
         state.poll_and_echo();
+        drop(state); // release mutex before firing the waker
+        self.notify_rx_available();
         handle
     }
 
@@ -604,13 +693,17 @@ impl SmoltcpBackend {
     /// is full). Also polls so the bytes get a chance to flush out
     /// as Ethernet frames before the caller's next `read_frame`.
     pub fn socket_send(&self, handle: SocketHandle, data: &[u8]) -> Result<usize> {
-        let mut state = self
-            .inner
-            .lock()
-            .expect("smoltcp backend state mutex poisoned");
-        let socket = state.sockets.get_mut::<tcp::Socket>(handle);
-        let written = socket.send_slice(data).unwrap_or(0);
-        state.poll_and_echo();
+        let written = {
+            let mut state = self
+                .inner
+                .lock()
+                .expect("smoltcp backend state mutex poisoned");
+            let socket = state.sockets.get_mut::<tcp::Socket>(handle);
+            let w = socket.send_slice(data).unwrap_or(0);
+            state.poll_and_echo();
+            w
+        };
+        self.notify_rx_available();
         Ok(written)
     }
 
@@ -619,13 +712,17 @@ impl SmoltcpBackend {
     /// non-blocking read on a raw socket) so a proxy can poll in a
     /// loop without having to parse smoltcp error variants.
     pub fn socket_recv(&self, handle: SocketHandle, buf: &mut [u8]) -> Result<usize> {
-        let mut state = self
-            .inner
-            .lock()
-            .expect("smoltcp backend state mutex poisoned");
-        state.poll_and_echo();
-        let socket = state.sockets.get_mut::<tcp::Socket>(handle);
-        Ok(socket.recv_slice(buf).unwrap_or(0))
+        let n = {
+            let mut state = self
+                .inner
+                .lock()
+                .expect("smoltcp backend state mutex poisoned");
+            state.poll_and_echo();
+            let socket = state.sockets.get_mut::<tcp::Socket>(handle);
+            socket.recv_slice(buf).unwrap_or(0)
+        };
+        self.notify_rx_available();
+        Ok(n)
     }
 
     /// Current TCP state of the given socket. Mostly useful for
@@ -648,16 +745,19 @@ impl SmoltcpBackend {
     /// connection: the reaper in `poll_and_echo` scans every poll
     /// and `remove`s any client socket that reached `Closed`.
     pub fn close_socket(&self, handle: SocketHandle) {
-        let mut state = self
-            .inner
-            .lock()
-            .expect("smoltcp backend state mutex poisoned");
-        // `close()` enqueues a FIN. From the peer's point of view
-        // the connection is still half-open; smoltcp finishes the
-        // four-way handshake on its own and the reaper takes over
-        // from `Closed`.
-        state.sockets.get_mut::<tcp::Socket>(handle).close();
-        state.poll_and_echo();
+        {
+            let mut state = self
+                .inner
+                .lock()
+                .expect("smoltcp backend state mutex poisoned");
+            // `close()` enqueues a FIN. From the peer's point of view
+            // the connection is still half-open; smoltcp finishes the
+            // four-way handshake on its own and the reaper takes over
+            // from `Closed`.
+            state.sockets.get_mut::<tcp::Socket>(handle).close();
+            state.poll_and_echo();
+        } // mutex guard dropped here
+        self.notify_rx_available();
     }
 
     /// Push a frame directly into the outbound-to-guest queue,
@@ -845,11 +945,20 @@ pub(crate) struct SmoltRxToken {
 }
 
 impl RxToken for SmoltRxToken {
-    fn consume<R, F>(mut self, f: F) -> R
+    // smoltcp 0.14 changed the RxToken trait: `consume` now hands
+    // the closure an immutable `&[u8]` (the caller only inspects
+    // the frame), not the `&mut [u8]` that 0.11 passed. The
+    // smoltcp 0.11 → 0.14 bump in PR #287 didn't update this impl,
+    // which left `cargo test --features smoltcp-backend` broken on
+    // main (the lib `cargo build` still succeeded because the
+    // feature isn't in the default set, so CI missed it). Fixed
+    // alongside the rx_waker hook so the waker tests can actually
+    // run.
+    fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
-        f(&mut self.frame)
+        f(&self.frame)
     }
 }
 
@@ -882,12 +991,112 @@ impl<'a> TxToken for SmoltTxToken<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    /// Build a backend wired to a shared counter the test can read
+    /// back, plus the counter itself for assertions. Factored so
+    /// every rx_waker test uses the same wiring and the per-test
+    /// body stays focused on which method fires the wake.
+    fn backend_with_counting_waker(cfg: BackendConfig) -> (SmoltcpBackend, Arc<AtomicUsize>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&counter);
+        let waker: RxWaker = Arc::new(move || {
+            c.fetch_add(1, Ordering::Relaxed);
+        });
+        (
+            SmoltcpBackend::with_config_and_rx_waker(cfg, waker),
+            counter,
+        )
+    }
 
     #[test]
     fn new_backend_has_empty_queues() {
         let bk = SmoltcpBackend::new();
         assert_eq!(bk.queue_depths(), (0, 0));
+    }
+
+    #[test]
+    fn default_backend_has_a_noop_rx_waker() {
+        // `new()` has to return a backend whose host-side methods
+        // don't panic when the backend-local tests (which don't
+        // supply a waker) call them. Smoke test: open a client
+        // socket and close it without any custom waker. If the
+        // default waker weren't a safe no-op the test would panic.
+        let bk = SmoltcpBackend::new();
+        let handle = bk.open_client_socket(IpEndpoint::new(IpAddress::v4(169, 254, 0, 2), 80));
+        bk.close_socket(handle);
+    }
+
+    #[test]
+    fn rx_waker_fires_on_open_client_socket() {
+        let (bk, counter) = backend_with_counting_waker(BackendConfig {
+            // no echo listener — keep the backend focused on the
+            // host-side-originated path this test exercises.
+            listen_port: 0,
+            ..BackendConfig::default()
+        });
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        let _h = bk.open_client_socket(IpEndpoint::new(IpAddress::v4(169, 254, 0, 2), 80));
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "open_client_socket should fire the rx_waker exactly once"
+        );
+    }
+
+    #[test]
+    fn rx_waker_fires_on_socket_send_recv_close() {
+        let (bk, counter) = backend_with_counting_waker(BackendConfig {
+            listen_port: 0,
+            ..BackendConfig::default()
+        });
+        let handle = bk.open_client_socket(IpEndpoint::new(IpAddress::v4(169, 254, 0, 2), 80));
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        // Each host-side method fires the waker exactly once per
+        // call, independently of whether the call actually produced
+        // new guest-bound frames. The VMM consumer coalesces.
+        let _ = bk.socket_send(handle, b"hello");
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+
+        let mut buf = [0u8; 16];
+        let _ = bk.socket_recv(handle, &mut buf);
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+
+        bk.close_socket(handle);
+        assert_eq!(counter.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn rx_waker_runs_outside_backend_mutex() {
+        // A deliberately paranoid waker: re-enter the backend via
+        // `queue_depths()` (which locks `self.inner`). If the
+        // waker were fired while the backend mutex was still held
+        // the lock would be contended by the same thread → either
+        // deadlock (std::sync::Mutex) or poison. Either way the
+        // test wouldn't return. Running to completion is proof
+        // enough.
+        let backend_slot: Arc<Mutex<Option<Arc<SmoltcpBackend>>>> = Arc::new(Mutex::new(None));
+        let slot_for_waker = Arc::clone(&backend_slot);
+        let waker: RxWaker = Arc::new(move || {
+            if let Some(bk) = slot_for_waker.lock().unwrap().as_ref() {
+                // Round-trip through the backend — must not block.
+                let _ = bk.queue_depths();
+            }
+        });
+        let bk = Arc::new(SmoltcpBackend::with_config_and_rx_waker(
+            BackendConfig {
+                listen_port: 0,
+                ..BackendConfig::default()
+            },
+            waker,
+        ));
+        *backend_slot.lock().unwrap() = Some(Arc::clone(&bk));
+        let _h = bk.open_client_socket(IpEndpoint::new(IpAddress::v4(169, 254, 0, 2), 80));
+        // Reaching here means the waker ran without re-entering the
+        // held mutex.
     }
 
     #[test]
