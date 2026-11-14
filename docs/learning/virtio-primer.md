@@ -368,17 +368,36 @@ kvm_set_user_memory_region(vm, &MemorySlot {
 });
 ```
 
-**Перевод = сложение**:
-```rust
-fn gpa_to_hva(gpa: u64) -> *const u8 {
-    unsafe { guest_ram_base.add(gpa as usize) }
-}
+**Перевод = проверка диапазона и сложение**. Для показанного региона
+с GPA base = 0 нужно проверить весь буфер, включая переполнение суммы:
 
-// guest_ram_base = 0x7f2000_000000
-// gpa            = 0x40001000
-// HVA            = 0x7f2000_000000 + 0x40001000
-//                = 0x7f2040_001000
-```
+    /// # Safety
+    /// guest_ram_base — начало живой аллокации длиной guest_ram_len байт;
+    /// её размер не превышает isize::MAX. Полученный указатель можно
+    /// использовать только пока эта аллокация существует.
+    unsafe fn gpa_to_hva(
+        guest_ram_base: *mut u8,
+        guest_ram_len: usize,
+        gpa: u64,
+        len: usize,
+    ) -> Option<*mut u8> {
+        let offset = usize::try_from(gpa).ok()?;
+        let end = offset.checked_add(len)?;
+        if end > guest_ram_len {
+            return None;
+        }
+        Some(unsafe { guest_ram_base.add(offset) })
+    }
+
+    // guest_ram_base = 0x7f2000_000000, guest_ram_len = 128 * 1024 * 1024
+    // GPA 0x1000, len = 16 → HVA 0x7f2000_001000
+    // GPA 0x40001000, len = 16 → None
+
+Пара GPA/HVA в общей схеме выше — отдельный условный пример:
+GPA `0x40001000` не помещается в этот 128 MiB регион. При нескольких
+регионах сначала находят регион, содержащий весь буфер, затем прибавляют
+к его HVA base смещение `gpa - region_gpa_base`. Проверка границ сама
+по себе не решает синхронизацию доступа к общей памяти.
 
 Если ты в Java когда-нибудь работал с `ByteBuffer` и offset-ами —
 та же логика.
