@@ -176,19 +176,18 @@ fi
 #
 # `tools/initramfs/build-initramfs.sh` separately references the
 # unsuffixed path `cache/linux-${KERNEL_VERSION}` as a sibling source
-# of `usr/gen_init_cpio.c`. We maintain that as a compatibility
-# symlink pointing at the tiny profile's source tree — only when the
-# tiny profile has actually been built. Keeps that tool working
-# without forcing it to learn about profiles today.
+# of `usr/gen_init_cpio.c`. Maintain that as a compatibility symlink
+# when the legacy path does not already exist, keeping that tool
+# working without forcing it to learn about profiles today.
 # ----------------------------------------------------------------------
 if [[ ! -d "${SRC_DIR}" ]]; then
   echo "${LOG_TAG}: extracting ${TARBALL} into ${SRC_DIR}"
   mkdir -p "${SRC_DIR}"
   tar -C "${SRC_DIR}" --strip-components=1 -xJf "${TARBALL}"
 fi
-if [[ "${KERNEL_PROFILE}" == "tiny" ]]; then
-  readonly LEGACY_SRC_LINK="${CACHE}/linux-${KERNEL_VERSION}"
-  ln -sfn "linux-${KERNEL_VERSION}-tiny" "${LEGACY_SRC_LINK}"
+readonly LEGACY_SRC_LINK="${CACHE}/linux-${KERNEL_VERSION}"
+if [[ ! -e "${LEGACY_SRC_LINK}" ]]; then
+  ln -sfn "linux-${KERNEL_VERSION}-${KERNEL_PROFILE}" "${LEGACY_SRC_LINK}"
 fi
 
 # ----------------------------------------------------------------------
