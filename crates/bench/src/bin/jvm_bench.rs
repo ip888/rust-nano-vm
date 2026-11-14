@@ -31,7 +31,7 @@
 //! compile time:
 //!
 //!     cargo run -p bench --release --features kvm --bin nanovm-jvm-bench -- \
-//!         --kernel    tools/kvm-images/cache/vmlinux \
+//!         --kernel    <path-to-bzImage> \
 //!         --initramfs tools/java-rootfs/cache/initramfs.cpio.gz \
 //!         --memory-mib 2048 \
 //!         --snapshot-at both \
@@ -40,6 +40,19 @@
 //! Without `--features kvm` the binary builds (so it lands in the
 //! default workspace checks) but refuses to run — same posture as
 //! `nanovm-fork-bench`.
+//!
+//! ## Kernel path caveat (TODO)
+//!
+//! `--kernel` expects a **Linux bzImage** (the protected-mode x86
+//! boot format). `tools/kvm-images/fetch.sh` currently drops a
+//! Firecracker-compatible **ELF `vmlinux`** at
+//! `tools/kvm-images/cache/vmlinux`, which the vm-kvm loader
+//! rejects with "Invalid bzImage". `tools/kernel/build-tiny-kernel.sh`
+//! produces a bzImage but its `tinyconfig` profile lacks virtio-net
+//! / TCP / tmpfs / HW_RANDOM — enough for the vm-kvm boot test, not
+//! for a running JVM. A production "JVM kernel profile" (adds the
+//! above) is the remaining blocker on M1 Petclinic end-to-end and
+//! lives in roadmap item #1.
 
 #[cfg(not(feature = "kvm"))]
 fn main() {
