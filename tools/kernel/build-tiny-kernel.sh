@@ -167,10 +167,28 @@ fi
 
 # ----------------------------------------------------------------------
 # Step 2: extract (if not already extracted).
+#
+# The tarball unpacks a top-level `linux-${KERNEL_VERSION}/` dir by
+# default, but we want the source in `${SRC_DIR}` which is the
+# profile-qualified `linux-${KERNEL_VERSION}-${profile}/`.
+# `--strip-components=1` drops that top-level dir and lands files
+# directly under `${SRC_DIR}`.
+#
+# `tools/initramfs/build-initramfs.sh` separately references the
+# unsuffixed path `cache/linux-${KERNEL_VERSION}` as a sibling source
+# of `usr/gen_init_cpio.c`. We maintain that as a compatibility
+# symlink pointing at the tiny profile's source tree — only when the
+# tiny profile has actually been built. Keeps that tool working
+# without forcing it to learn about profiles today.
 # ----------------------------------------------------------------------
 if [[ ! -d "${SRC_DIR}" ]]; then
-  echo "${LOG_TAG}: extracting ${TARBALL}"
-  tar -C "${CACHE}" -xJf "${TARBALL}"
+  echo "${LOG_TAG}: extracting ${TARBALL} into ${SRC_DIR}"
+  mkdir -p "${SRC_DIR}"
+  tar -C "${SRC_DIR}" --strip-components=1 -xJf "${TARBALL}"
+fi
+if [[ "${KERNEL_PROFILE}" == "tiny" ]]; then
+  readonly LEGACY_SRC_LINK="${CACHE}/linux-${KERNEL_VERSION}"
+  ln -sfn "linux-${KERNEL_VERSION}-tiny" "${LEGACY_SRC_LINK}"
 fi
 
 # ----------------------------------------------------------------------

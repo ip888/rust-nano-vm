@@ -35,6 +35,17 @@ CONFIG_BINFMT_ELF=y
 CONFIG_BINFMT_SCRIPT=y
 CONFIG_ELFCORE=y
 
+# ------- core userspace syscalls JVM / glibc depend on ---------------
+# `make tinyconfig` turns these off; the JVM can't run without them
+# and neither can glibc.
+# - FUTEX: the backing primitive for pthread mutexes and condvars.
+#   Without it any contended `std::sync::Mutex` in glibc hangs; Java
+#   monitors go the same way.
+# - EPOLL: Java NIO's `Selector` on Linux. `java.nio.channels.Selector`
+#   falls back to no-op without it and HTTP server loops spin.
+CONFIG_FUTEX=y
+CONFIG_EPOLL=y
+
 # ------- x86_64 boot --------------------------------------------------
 CONFIG_64BIT=y
 # HZ_100 keeps the timer interrupt rate low; JVM latency-sensitive
@@ -120,7 +131,11 @@ CONFIG_PROC_SYSCTL=y
 CONFIG_SYSFS=y
 
 # TMPFS is Linux's standard /tmp. Java's File.createTempFile and the
-# JIT's code cache occasionally hit it.
+# JIT's code cache occasionally hit it. TMPFS silently depends on
+# SHMEM — without `CONFIG_SHMEM=y` the `make olddefconfig` step
+# drops TMPFS back to n, and the `/tmp` mount in
+# `tools/java-rootfs/init.sh` fails at boot with "No such device".
+CONFIG_SHMEM=y
 CONFIG_TMPFS=y
 CONFIG_TMPFS_POSIX_ACL=y
 
