@@ -321,19 +321,20 @@ MMIO-регистр = тот же "эндпоинт", только адрес ч
 
 ### Цепочка
 
-```
-Guest виртуальный адрес
-    ↓ guest-овские page tables (управляет guest kernel)
-Guest физический адрес (GPA)
-    ↓ Extended Page Tables (управляет KVM, аппаратно)
-Host виртуальный адрес (HVA)
-    ↓ host-овские page tables (управляет host kernel)
-Реальная RAM (HPA)
-```
+    Guest виртуальный адрес
+        ↓ guest-овские page tables (управляет guest kernel)
+    Guest физический адрес (GPA)
+        ↓ EPT/NPT (настраивает KVM, использует CPU)
+    Реальная RAM (HPA)
 
-Guest думает что пишет "по физическому адресу `0x40001000`". На
-самом деле это GPA. KVM автоматически переводит в HVA, оттуда в
-настоящую RAM.
+    Отдельный путь для доступа VMM к той же RAM:
+    Host виртуальный адрес (HVA)
+        ↓ host-овские page tables (управляет host kernel)
+    Та же RAM (HPA)
+
+При исполнении guest-а CPU переводит GPA напрямую в HPA через EPT/NPT.
+HVA — отдельный view host-процесса на те же backing pages, а не
+промежуточный этап аппаратного перевода guest-адреса.
 
 ### Один физический байт, два view
 
