@@ -16,14 +16,14 @@
 # in both FROM references so `docker buildx` fails closed on a bad
 # override.
 
-ARG DEBIAN_DIGEST=sha256:PLACEHOLDER_PIN_BEFORE_MERGE
+ARG DEBIAN_DIGEST=sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 ARG PETCLINIC_MS_REPO=https://github.com/spring-petclinic/spring-petclinic-microservices.git
 ARG PETCLINIC_MS_CONFIG_REPO=https://github.com/spring-petclinic/spring-petclinic-microservices-config.git
 # Pin to specific commits on `main` before merging any release track.
 # Sentinels make the build fail loudly if left unpinned in a shipping
 # build.
-ARG PETCLINIC_MS_REF=PLACEHOLDER_PIN_BEFORE_MERGE
-ARG PETCLINIC_MS_CONFIG_REF=PLACEHOLDER_PIN_BEFORE_MERGE
+ARG PETCLINIC_MS_REF=e8b747ab522721076cacb5cf688eb8a54ba8c5c9
+ARG PETCLINIC_MS_CONFIG_REF=323993ce2519c6d02df63e08bf4458d123d3b611
 ARG JDK_TARBALL=jdk-21.0.5_linux-x64_bin.tar.gz
 
 # ---- stage 1: build the seven microservice jars ----------------------
@@ -100,6 +100,7 @@ RUN chmod +x /sbin/init /tier-launcher.sh /warmup.sh \
 # Same device-node fix as the M1 rootfs (docker export drops the
 # runtime /dev mount; PID 1's stdio needs /dev/console at boot).
 RUN mkdir -p /dev \
+ && rm -f /dev/console /dev/null /dev/zero /dev/tty /dev/random /dev/urandom \
  && mknod -m 600 /dev/console c 5 1 \
  && mknod -m 666 /dev/null    c 1 3 \
  && mknod -m 666 /dev/zero    c 1 5 \

@@ -17,12 +17,12 @@
 # interpolate `${DEBIAN_DIGEST}` so an override via
 # `--build-arg DEBIAN_DIGEST=sha256:...` takes effect everywhere.
 
-ARG DEBIAN_DIGEST=sha256:PLACEHOLDER_PIN_BEFORE_MERGE
+ARG DEBIAN_DIGEST=sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 ARG PETCLINIC_REPO=https://github.com/spring-projects/spring-petclinic.git
 # Commit on `main` from spring-projects/spring-petclinic. Pin to a real
 # hash before merging so a rebuild is reproducible; the sentinel below
 # fails the build loudly if left unpinned.
-ARG PETCLINIC_REF=PLACEHOLDER_PIN_BEFORE_MERGE
+ARG PETCLINIC_REF=500158f732419217507c7656904b8e6aa1bcc0d6
 ARG JDK_TARBALL=jdk-21.0.5_linux-x64_bin.tar.gz
 
 # ---- stage 1: build the Petclinic jar --------------------------------
@@ -91,6 +91,7 @@ RUN chmod +x /sbin/init /warmup.sh \
 # devtmpfs to pick up dynamic nodes, but the baseline entries have to
 # exist before PID 1 runs.
 RUN mkdir -p /dev \
+ && rm -f /dev/console /dev/null /dev/zero /dev/tty /dev/random /dev/urandom \
  && mknod -m 600 /dev/console c 5 1 \
  && mknod -m 666 /dev/null    c 1 3 \
  && mknod -m 666 /dev/zero    c 1 5 \
