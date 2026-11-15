@@ -173,6 +173,18 @@ struct KvmVmRuntime {
     /// into the guest.
     #[cfg(feature = "virtio-net-smoltcp")]
     net_smoltcp: Option<std::sync::Arc<virtio_net::SmoltcpBackend>>,
+    /// Owner of the host-RX wake background thread spawned by
+    /// [`NetBackend::with_smoltcp_backend`]. The thread consumes the
+    /// smoltcp `RxWaker` events (SYNs / reply frames queued by
+    /// host-side code that the guest hasn't explicitly asked for
+    /// yet) and drains the guest-RX virtqueue on its behalf. Held
+    /// here as an `Arc` so dropping the runtime shuts the thread
+    /// down cleanly; see [`NetWakeDriver::drop`] for the exit
+    /// protocol. Field is read only via its `Drop` impl, hence the
+    /// `#[allow(dead_code)]` hint.
+    #[cfg(feature = "virtio-net-smoltcp")]
+    #[allow(dead_code)]
+    net_wake_driver: Option<std::sync::Arc<virtio_net_dev::NetWakeDriver>>,
 }
 
 /// The host side of the virtio-vsock device, shared between the
@@ -1177,16 +1189,16 @@ impl KvmHypervisor {
         // without widening its type to the feature-gated struct —
         // simpler to populate the two fields side-by-side.
         #[cfg(feature = "virtio-net-smoltcp")]
-        let (net, net_smoltcp) = match (net, cfg.net_backend) {
+        let (net, net_smoltcp, net_wake_driver) = match (net, cfg.net_backend) {
             (None, vm_core::NetBackendChoice::Smoltcp) => {
-                let (nb, smoltcp) = virtio_net_dev::NetBackend::with_smoltcp_backend(
+                let (nb, smoltcp, wake_driver) = virtio_net_dev::NetBackend::with_smoltcp_backend(
                     DEFAULT_MAC,
                     boot_plan.guest_mem.clone(),
                     Arc::clone(&vm_fd),
                 );
-                (Some(nb), Some(smoltcp))
+                (Some(nb), Some(smoltcp), Some(wake_driver))
             }
-            (nb, _) => (nb, None),
+            (nb, _) => (nb, None, None),
         };
 
         Ok(KvmVmRuntime {
@@ -1199,6 +1211,8 @@ impl KvmHypervisor {
             net,
             #[cfg(feature = "virtio-net-smoltcp")]
             net_smoltcp,
+            #[cfg(feature = "virtio-net-smoltcp")]
+            net_wake_driver,
         })
     }
 
@@ -1248,6 +1262,8 @@ impl KvmHypervisor {
             net: None,
             #[cfg(feature = "virtio-net-smoltcp")]
             net_smoltcp: None,
+            #[cfg(feature = "virtio-net-smoltcp")]
+            net_wake_driver: None,
         })
     }
 
@@ -1453,6 +1469,8 @@ impl KvmHypervisor {
             net: None,
             #[cfg(feature = "virtio-net-smoltcp")]
             net_smoltcp: None,
+            #[cfg(feature = "virtio-net-smoltcp")]
+            net_wake_driver: None,
         };
         Ok((runtime, vcpu))
     }
