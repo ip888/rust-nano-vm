@@ -167,10 +167,27 @@ fi
 
 # ----------------------------------------------------------------------
 # Step 2: extract (if not already extracted).
+#
+# The tarball unpacks a top-level `linux-${KERNEL_VERSION}/` dir by
+# default, but we want the source in `${SRC_DIR}` which is the
+# profile-qualified `linux-${KERNEL_VERSION}-${profile}/`.
+# `--strip-components=1` drops that top-level dir and lands files
+# directly under `${SRC_DIR}`.
+#
+# `tools/initramfs/build-initramfs.sh` separately references the
+# unsuffixed path `cache/linux-${KERNEL_VERSION}` as a sibling source
+# of `usr/gen_init_cpio.c`. Maintain that as a compatibility symlink
+# when the legacy path does not already exist, keeping that tool
+# working without forcing it to learn about profiles today.
 # ----------------------------------------------------------------------
 if [[ ! -d "${SRC_DIR}" ]]; then
-  echo "${LOG_TAG}: extracting ${TARBALL}"
-  tar -C "${CACHE}" -xJf "${TARBALL}"
+  echo "${LOG_TAG}: extracting ${TARBALL} into ${SRC_DIR}"
+  mkdir -p "${SRC_DIR}"
+  tar -C "${SRC_DIR}" --strip-components=1 -xJf "${TARBALL}"
+fi
+readonly LEGACY_SRC_LINK="${CACHE}/linux-${KERNEL_VERSION}"
+if [[ ! -e "${LEGACY_SRC_LINK}" ]]; then
+  ln -sfn "linux-${KERNEL_VERSION}-${KERNEL_PROFILE}" "${LEGACY_SRC_LINK}"
 fi
 
 # ----------------------------------------------------------------------
