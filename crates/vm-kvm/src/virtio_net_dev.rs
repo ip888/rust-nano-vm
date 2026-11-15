@@ -55,7 +55,7 @@
 
 #![cfg(feature = "kvm")]
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(feature = "virtio-net-smoltcp")]
 use std::{
     sync::Condvar,
@@ -227,6 +227,10 @@ pub(crate) struct NetBackend {
     /// then only `QueueNotify` writes per packet — virtqueue drains
     /// are the hot path and they don't nest.
     device: Arc<Mutex<VirtioNetDevice>>,
+    /// Serializes MMIO writes that can replace or disable a queue
+    /// configuration with the full drain operation, including used
+    /// ring updates and interrupt delivery.
+    drain_gate: Arc<Mutex<()>>,
     /// Per-queue cursors (`last_seen_avail` for TX and RX). The
     /// virtio-net queue consumer carries this state between calls to
     /// `process_tx` / `process_rx`. Stored behind a `Mutex` because
@@ -260,6 +264,12 @@ pub(crate) struct NetQueueCursors {
     pub rx: QueueCursor,
 }
 
+fn lock_drain_gate(drain_gate: &Mutex<()>) -> MutexGuard<'_, ()> {
+    drain_gate
+        .lock()
+        .expect("vm-kvm: virtio-net drain mutex poisoned")
+}
+
 impl NetBackend {
     /// Construct a NetBackend around `device_backend` with the given
     /// MAC address. The MAC is advertised to the guest driver via
@@ -276,6 +286,7 @@ impl NetBackend {
         let device = VirtioNetDevice::with_backend_arc(device_backend, mac);
         Self {
             device: Arc::new(Mutex::new(device)),
+            drain_gate: Arc::new(Mutex::new(())),
             cursors: Arc::new(Mutex::new(NetQueueCursors::default())),
             guest_mem,
             vm_fd,
@@ -372,6 +383,7 @@ impl NetBackend {
         let wake_driver = Arc::new(NetWakeDriver::spawn(
             state,
             Arc::clone(&backend.device),
+            Arc::clone(&backend.drain_gate),
             Arc::clone(&backend.cursors),
             backend.guest_mem.clone(),
             Arc::clone(&backend.vm_fd),
@@ -401,6 +413,7 @@ impl NetBackend {
     /// this). A write that only mutates feature-negotiation /
     /// config-space state returns `None`.
     pub fn write(&self, offset: u64, data: &[u8]) -> Option<u32> {
+        let _drain_gate = lock_drain_gate(&self.drain_gate);
         let mut buf = [0u8; 8];
         for (i, b) in data.iter().take(buf.len()).enumerate() {
             buf[i] = *b;
@@ -422,16 +435,19 @@ impl NetBackend {
     ///
     /// The lock order here matters:
     ///
-    /// 1. Lock the device to snapshot the queue config + clone the
+    /// 1. Lock the drain gate, shared with MMIO writes. This prevents
+    ///    queue disable/reset from returning while a drain uses the
+    ///    old queue configuration.
+    /// 2. Lock the device to snapshot the queue config + clone the
     ///    backend Arc (both cheap). Release.
-    /// 2. Lock the cursors mutex (also cheap).
-    /// 3. Call `process_tx` or `process_rx` with the shared
+    /// 3. Lock the cursors mutex (also cheap).
+    /// 4. Call `process_tx` or `process_rx` with the shared
     ///    backend handle. Backend calls may do blocking syscalls
-    ///    (TAP write / smoltcp socket read), which is why step 1
+    ///    (TAP write / smoltcp socket read), which is why step 2
     ///    released the device lock before this.
-    /// 4. If stats say we should raise, re-lock the device to flip
+    /// 5. If stats say we should raise, re-lock the device to flip
     ///    the VRING bit in the transport's InterruptStatus register.
-    /// 5. Pulse the KVM IRQ line (level-triggered: assert, deassert).
+    /// 6. Pulse the KVM IRQ line (level-triggered: assert, deassert).
     ///
     /// Unknown `queue_idx` → no-op. The guest driver only has two
     /// legitimate queues; anything else is a buggy or malicious
@@ -439,6 +455,7 @@ impl NetBackend {
     pub fn drain_queue(&self, queue_idx: u32) -> VmResult<()> {
         Self::drain_queue_impl(
             &self.device,
+            &self.drain_gate,
             &self.cursors,
             &self.guest_mem,
             &self.vm_fd,
@@ -447,15 +464,16 @@ impl NetBackend {
         )
     }
 
-    /// Same drain logic as [`drain_queue`] but takes the four shared
-    /// handles (`device`, `cursors`, `guest_mem`, `vm_fd`) and the
-    /// `irq` number by reference instead of through `&self`. Lets the
+    /// Same drain logic as [`drain_queue`] but takes the shared
+    /// handles (`device`, `drain_gate`, `cursors`, `guest_mem`,
+    /// `vm_fd`) and the `irq` number by reference. This lets the
     /// smoltcp wake thread (see [`NetWakeDriver`]) drive RX drains
-    /// without having to hold a full `NetBackend` clone — which
-    /// would create a reference cycle via the
-    /// [`KvmHypervisor::net_wake_driver`] field.
+    /// without holding a full `NetBackend` clone, which would create
+    /// a reference cycle via the [`KvmHypervisor::net_wake_driver`]
+    /// field.
     pub(crate) fn drain_queue_impl(
         device: &Arc<Mutex<VirtioNetDevice>>,
+        drain_gate: &Arc<Mutex<()>>,
         cursors: &Arc<Mutex<NetQueueCursors>>,
         guest_mem: &GuestMemoryMmap,
         vm_fd: &Arc<VmFd>,
@@ -463,6 +481,8 @@ impl NetBackend {
         queue_idx: u32,
     ) -> VmResult<()> {
         use virtio_net::{process_rx, process_tx, RX_QUEUE_INDEX, TX_QUEUE_INDEX};
+
+        let _drain_gate = lock_drain_gate(drain_gate);
 
         // --- Step 1: snapshot inside device lock, then release ------
         let (queue_cfg, backend) = {
@@ -638,6 +658,7 @@ impl NetWakeDriver {
     fn spawn(
         state: Arc<WakeState>,
         device: Arc<Mutex<VirtioNetDevice>>,
+        drain_gate: Arc<Mutex<()>>,
         cursors: Arc<Mutex<NetQueueCursors>>,
         guest_mem: GuestMemoryMmap,
         vm_fd: Arc<VmFd>,
@@ -654,6 +675,7 @@ impl NetWakeDriver {
                     // drain anyway.
                     let _ = NetBackend::drain_queue_impl(
                         &device,
+                        &drain_gate,
                         &cursors,
                         &guest_mem,
                         &vm_fd,
@@ -845,6 +867,38 @@ mod tests {
     fn window_offset_rejects_addresses_past_window_end() {
         assert_eq!(window_offset(NET_MMIO_BASE + NET_MMIO_SIZE), None);
         assert_eq!(window_offset(NET_MMIO_BASE + NET_MMIO_SIZE + 100), None);
+    }
+
+    #[test]
+    fn queue_reset_waits_for_active_drain() {
+        use std::sync::mpsc;
+
+        let drain_gate = Arc::new(Mutex::new(()));
+        let (drain_started_tx, drain_started_rx) = mpsc::channel();
+        let (finish_drain_tx, finish_drain_rx) = mpsc::channel();
+        let drain_gate_for_thread = Arc::clone(&drain_gate);
+        let drain_thread = std::thread::spawn(move || {
+            let _guard = lock_drain_gate(&drain_gate_for_thread);
+            drain_started_tx.send(()).unwrap();
+            finish_drain_rx.recv().unwrap();
+        });
+
+        drain_started_rx.recv().unwrap();
+        let (reset_started_tx, reset_started_rx) = mpsc::channel();
+        let (reset_done_tx, reset_done_rx) = mpsc::channel();
+        let reset_gate = Arc::clone(&drain_gate);
+        let reset_thread = std::thread::spawn(move || {
+            reset_started_tx.send(()).unwrap();
+            let _guard = lock_drain_gate(&reset_gate);
+            reset_done_tx.send(()).unwrap();
+        });
+
+        reset_started_rx.recv().unwrap();
+        assert!(reset_done_rx.try_recv().is_err());
+        finish_drain_tx.send(()).unwrap();
+        reset_done_rx.recv().unwrap();
+        drain_thread.join().unwrap();
+        reset_thread.join().unwrap();
     }
 
     #[test]
