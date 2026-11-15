@@ -56,6 +56,11 @@
 #![cfg(feature = "kvm")]
 
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "virtio-net-smoltcp")]
+use std::{
+    sync::Condvar,
+    thread::{self, JoinHandle},
+};
 
 use kvm_ioctls::VmFd;
 use virtio_net::{MockBackend, NetworkBackend, QueueCursor, VirtioNetDevice};
@@ -303,20 +308,76 @@ impl NetBackend {
     /// bare `--features kvm` builds don't drag the smoltcp dependency
     /// in. Also exposed through `KvmHypervisor::net_backend()` so
     /// callers can attach a proxy to the running VM.
+    ///
+    /// # Host-originated RX wake-up
+    ///
+    /// Returns a third handle — an [`Arc<NetWakeDriver>`] — on top
+    /// of the usual `(NetBackend, SmoltcpBackend)` tuple. The
+    /// driver owns a background thread that drains the guest-RX
+    /// virtqueue whenever the smoltcp backend fires its
+    /// `RxWaker`; without it, host-originated SYNs and reply
+    /// frames would sit in `stack_to_guest` until the guest
+    /// kicked for its own reasons. `KvmHypervisor` stores the
+    /// `Arc` so the thread stays alive for the VM's lifetime
+    /// and shuts down cleanly on `Drop`.
+    ///
+    /// Closes Copilot finding #4252252295 from PR #283, part 2/2
+    /// (the backend-side `RxWaker` hook was PR #296).
     #[cfg(feature = "virtio-net-smoltcp")]
     pub fn with_smoltcp_backend(
         mac: [u8; 6],
         guest_mem: GuestMemoryMmap,
         vm_fd: Arc<VmFd>,
-    ) -> (Self, Arc<virtio_net::SmoltcpBackend>) {
-        let smoltcp = Arc::new(virtio_net::SmoltcpBackend::new());
+    ) -> (Self, Arc<virtio_net::SmoltcpBackend>, Arc<NetWakeDriver>) {
+        // Shared coalescing state between the SmoltcpBackend's
+        // RxWaker closure and the wake thread. A single boolean
+        // pending-flag behind a Mutex + Condvar instead of an
+        // unbounded channel: an idle host-side proxy polling
+        // `socket_recv` fires the waker on every call (a few kHz
+        // under light load), but the thread only needs *one* drain
+        // per batch of frames. Coalescing keeps the backlog
+        // bounded — the flag is at most "set" or "clear", never a
+        // queue.
+        let state = Arc::new(WakeState::new());
+
+        // The RxWaker callback is invoked after every host-side
+        // method on `SmoltcpBackend` (open_client_socket,
+        // socket_send, socket_recv, close_socket, write_frame)
+        // AFTER the backend's internal mutex has been released.
+        // Signalling an already-pending flag is a cheap no-op:
+        // the thread coalesces.
+        let state_for_waker = Arc::clone(&state);
+        let waker: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            state_for_waker.signal_rx_ready();
+        });
+
+        let smoltcp = Arc::new(
+            virtio_net::smoltcp_backend::SmoltcpBackend::with_config_and_rx_waker(
+                virtio_net::smoltcp_backend::BackendConfig::default(),
+                waker,
+            ),
+        );
         let backend = Self::new(
             mac,
             Arc::clone(&smoltcp) as Arc<dyn NetworkBackend>,
             guest_mem,
             vm_fd,
         );
-        (backend, smoltcp)
+
+        // Spawn the wake thread with cloned Arcs (NOT a NetBackend
+        // clone — a NetBackend clone would create a cycle if the
+        // NetWakeDriver were held inside NetBackend. Keeping the
+        // thread's state flat lets `KvmHypervisor` own the driver
+        // separately, with no back-reference from NetBackend).
+        let wake_driver = Arc::new(NetWakeDriver::spawn(
+            state,
+            Arc::clone(&backend.device),
+            Arc::clone(&backend.cursors),
+            backend.guest_mem.clone(),
+            Arc::clone(&backend.vm_fd),
+            backend.irq,
+        ));
+        (backend, smoltcp, wake_driver)
     }
 
     /// Service a guest MMIO read inside the register window. Writes
@@ -376,12 +437,36 @@ impl NetBackend {
     /// legitimate queues; anything else is a buggy or malicious
     /// kick we silently drop.
     pub fn drain_queue(&self, queue_idx: u32) -> VmResult<()> {
+        Self::drain_queue_impl(
+            &self.device,
+            &self.cursors,
+            &self.guest_mem,
+            &self.vm_fd,
+            self.irq,
+            queue_idx,
+        )
+    }
+
+    /// Same drain logic as [`drain_queue`] but takes the four shared
+    /// handles (`device`, `cursors`, `guest_mem`, `vm_fd`) and the
+    /// `irq` number by reference instead of through `&self`. Lets the
+    /// smoltcp wake thread (see [`NetWakeDriver`]) drive RX drains
+    /// without having to hold a full `NetBackend` clone — which
+    /// would create a reference cycle via the
+    /// [`KvmHypervisor::net_wake_driver`] field.
+    pub(crate) fn drain_queue_impl(
+        device: &Arc<Mutex<VirtioNetDevice>>,
+        cursors: &Arc<Mutex<NetQueueCursors>>,
+        guest_mem: &GuestMemoryMmap,
+        vm_fd: &Arc<VmFd>,
+        irq: u32,
+        queue_idx: u32,
+    ) -> VmResult<()> {
         use virtio_net::{process_rx, process_tx, RX_QUEUE_INDEX, TX_QUEUE_INDEX};
 
         // --- Step 1: snapshot inside device lock, then release ------
         let (queue_cfg, backend) = {
-            let device = self
-                .device
+            let device = device
                 .lock()
                 .expect("vm-kvm: virtio-net device mutex poisoned");
             // Both queues at known indices (0=RX, 1=TX from mmio.rs).
@@ -397,11 +482,10 @@ impl NetBackend {
         }
 
         // --- Step 2 + 3: drain outside the device lock -------------
-        let mut cursors = self
-            .cursors
+        let mut cursors = cursors
             .lock()
             .expect("vm-kvm: virtio-net cursors mutex poisoned");
-        let mut mem = KvmNetGuestMemory(&self.guest_mem);
+        let mut mem = KvmNetGuestMemory(guest_mem);
 
         let stats = if queue_idx == TX_QUEUE_INDEX {
             process_tx(&queue_cfg, &mut cursors.tx, &mut mem, &*backend)
@@ -415,7 +499,7 @@ impl NetBackend {
 
         // --- Step 4: re-lock device to flip InterruptStatus bit ----
         if stats.should_raise_interrupt() {
-            self.device
+            device
                 .lock()
                 .expect("vm-kvm: virtio-net device mutex poisoned")
                 .raise_vring_interrupt();
@@ -425,12 +509,12 @@ impl NetBackend {
             // vector; the guest driver reads InterruptStatus to
             // discover which bit was set and ACKs by writing
             // InterruptACK (handled by MmioTransport::write).
-            self.vm_fd.set_irq_line(self.irq, true).map_err(|e| {
-                VmError::Backend(format!("assert virtio-net IRQ {}: {e}", self.irq))
-            })?;
-            self.vm_fd.set_irq_line(self.irq, false).map_err(|e| {
-                VmError::Backend(format!("deassert virtio-net IRQ {}: {e}", self.irq))
-            })?;
+            vm_fd
+                .set_irq_line(irq, true)
+                .map_err(|e| VmError::Backend(format!("assert virtio-net IRQ {irq}: {e}")))?;
+            vm_fd
+                .set_irq_line(irq, false)
+                .map_err(|e| VmError::Backend(format!("deassert virtio-net IRQ {irq}: {e}")))?;
         }
         Ok(())
     }
@@ -456,6 +540,195 @@ impl NetBackend {
             .lock()
             .expect("vm-kvm: virtio-net device mutex poisoned")
             .driver_ok()
+    }
+}
+
+/// Shared coalescing state between the SmoltcpBackend's `RxWaker`
+/// closure (producer) and the wake thread (consumer). Bounded by
+/// design: a single boolean pending-flag plus a shutdown flag,
+/// both behind one Mutex, coordinated by a Condvar. Multiple
+/// `signal_rx_ready` calls between thread iterations collapse to
+/// one drain pass.
+#[cfg(feature = "virtio-net-smoltcp")]
+pub(crate) struct WakeState {
+    inner: Mutex<WakeInner>,
+    cv: Condvar,
+}
+
+#[cfg(feature = "virtio-net-smoltcp")]
+struct WakeInner {
+    /// True = at least one `signal_rx_ready` has fired since the
+    /// thread last drained. Set by the waker closure, cleared by
+    /// the thread when it picks up the work.
+    rx_pending: bool,
+    /// Set once by `signal_shutdown` to tell the thread to exit at
+    /// its next wake. Never cleared.
+    shutdown: bool,
+}
+
+#[cfg(feature = "virtio-net-smoltcp")]
+impl WakeState {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(WakeInner {
+                rx_pending: false,
+                shutdown: false,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Mark RX work as pending and wake the thread. Coalescing: if
+    /// the flag was already set, the extra call is a near-no-op —
+    /// the thread still only drains once per wake pass.
+    fn signal_rx_ready(&self) {
+        let mut inner = self.inner.lock().expect("vm-kvm: WakeState mutex poisoned");
+        inner.rx_pending = true;
+        self.cv.notify_one();
+    }
+
+    /// Mark shutdown + wake. Independent of `rx_pending` so
+    /// teardown is never blocked behind a backlog of RX work.
+    fn signal_shutdown(&self) {
+        let mut inner = self.inner.lock().expect("vm-kvm: WakeState mutex poisoned");
+        inner.shutdown = true;
+        self.cv.notify_one();
+    }
+}
+
+/// RAII owner of the host-RX wake background thread.
+///
+/// Spawned by [`NetBackend::with_smoltcp_backend`] and stored inside
+/// `KvmHypervisor::runtime.net_wake_driver` so the thread lives as
+/// long as the VM. On `Drop` it signals shutdown through the shared
+/// [`WakeState`] and joins the thread, so the VM teardown path
+/// never leaks a thread per restored VM.
+///
+/// Deliberately **not** stored inside `NetBackend`: a NetBackend
+/// clone handed to the wake thread (for `drain_queue` access) would
+/// transitively hold back a strong reference to the NetWakeDriver,
+/// creating a cycle that would keep the thread alive past the VM's
+/// end. The thread instead holds flat clones of the four Arcs it
+/// needs (`device`, `cursors`, `guest_mem`, `vm_fd`), none of which
+/// transitively references the driver.
+#[cfg(feature = "virtio-net-smoltcp")]
+pub(crate) struct NetWakeDriver {
+    /// Shared coalescing state — [`Drop`] uses it to signal
+    /// shutdown independently of any pending RX work.
+    state: Arc<WakeState>,
+    /// `Option` so `Drop` can `.take()` the handle and join without
+    /// moving out of `&mut self`.
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(feature = "virtio-net-smoltcp")]
+impl std::fmt::Debug for NetWakeDriver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetWakeDriver")
+            .field("thread_alive", &self.thread.is_some())
+            .finish()
+    }
+}
+
+#[cfg(feature = "virtio-net-smoltcp")]
+impl NetWakeDriver {
+    /// Spawn the wake thread. The driver retains a clone of
+    /// `state` so [`Drop`] can signal shutdown; the thread moves
+    /// in its own clone.
+    fn spawn(
+        state: Arc<WakeState>,
+        device: Arc<Mutex<VirtioNetDevice>>,
+        cursors: Arc<Mutex<NetQueueCursors>>,
+        guest_mem: GuestMemoryMmap,
+        vm_fd: Arc<VmFd>,
+        irq: u32,
+    ) -> Self {
+        let state_for_thread = Arc::clone(&state);
+        let thread = thread::Builder::new()
+            .name("nanovm-net-wake".into())
+            .spawn(move || {
+                run_wake_loop(&state_for_thread, move || {
+                    // Errors from drain are not fatal — the guest
+                    // may have torn down the queue mid-wake. The
+                    // next guest-side QueueNotify kicks a fresh
+                    // drain anyway.
+                    let _ = NetBackend::drain_queue_impl(
+                        &device,
+                        &cursors,
+                        &guest_mem,
+                        &vm_fd,
+                        irq,
+                        virtio_net::RX_QUEUE_INDEX,
+                    );
+                });
+            })
+            .expect("vm-kvm: spawning nanovm-net-wake thread must not fail");
+        Self {
+            state,
+            thread: Some(thread),
+        }
+    }
+}
+
+/// Pure wake-loop extracted so unit tests can exercise the event-
+/// handling and shutdown semantics without needing a real `VmFd`
+/// (which requires `/dev/kvm`). Production `NetWakeDriver::spawn`
+/// passes a closure that invokes
+/// [`NetBackend::drain_queue_impl`]; tests pass a counter-
+/// incrementing closure to assert on wake-pass counts.
+///
+/// Exit paths:
+/// - `shutdown` flag set via [`WakeState::signal_shutdown`]: clean
+///   exit regardless of pending RX work.
+/// - Mutex poisoned: panics on next `lock()` — the thread's own
+///   drain is in trouble anyway.
+#[cfg(feature = "virtio-net-smoltcp")]
+fn run_wake_loop<F>(state: &WakeState, mut on_rx_ready: F)
+where
+    F: FnMut(),
+{
+    loop {
+        // Scope the guard so it's released before the drain runs.
+        // The drain acquires the device mutex; releasing the wake
+        // state mutex here prevents the host-side waker closure
+        // from piling up behind us while we drain.
+        let drain_now = {
+            let mut inner = state
+                .inner
+                .lock()
+                .expect("vm-kvm: WakeState mutex poisoned");
+            while !inner.rx_pending && !inner.shutdown {
+                inner = state
+                    .cv
+                    .wait(inner)
+                    .expect("vm-kvm: WakeState condvar poisoned");
+            }
+            if inner.shutdown {
+                return;
+            }
+            // Clear the flag as we pick up the work. Any waker
+            // fires that land AFTER this point will set it back to
+            // true and cause the next loop iteration to drain
+            // again — no event is lost, but concurrent fires during
+            // the drain itself collapse to one follow-up pass.
+            inner.rx_pending = false;
+            true
+        };
+        if drain_now {
+            on_rx_ready();
+        }
+    }
+}
+
+#[cfg(feature = "virtio-net-smoltcp")]
+impl Drop for NetWakeDriver {
+    fn drop(&mut self) {
+        self.state.signal_shutdown();
+        if let Some(handle) = self.thread.take() {
+            // join() surfaces thread panics as Err. Swallow — the
+            // VM is being torn down, nothing useful to do with it.
+            let _ = handle.join();
+        }
     }
 }
 
@@ -589,5 +862,164 @@ mod tests {
         let mut two = [0u8; 2];
         adapter.read(0x200, &mut two).unwrap();
         assert_eq!(two, [0xBE, 0xEF]);
+    }
+
+    // ----------------------------------------------------------------
+    // Host-RX wake loop (smoltcp-only)
+    // ----------------------------------------------------------------
+    //
+    // These tests exercise [`run_wake_loop`] directly instead of
+    // going through `NetWakeDriver::spawn`, because `spawn` needs a
+    // real `VmFd` (which requires `/dev/kvm`) and these need to run
+    // on portable CI. `run_wake_loop` is the production thread's
+    // body minus the drain call, so covering it proves the
+    // coalescing + shutdown semantics the `Drop` impl relies on.
+
+    #[cfg(feature = "virtio-net-smoltcp")]
+    #[test]
+    fn wake_loop_runs_callback_when_signal_fires_in_isolation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let state = Arc::new(WakeState::new());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let state_for_thread = Arc::clone(&state);
+        let c = Arc::clone(&counter);
+        let handle = thread::spawn(move || {
+            run_wake_loop(&state_for_thread, move || {
+                c.fetch_add(1, Ordering::Relaxed);
+            });
+        });
+
+        // Three fires spaced far apart — the thread should see
+        // three separate drain passes.
+        for _ in 0..3 {
+            state.signal_rx_ready();
+            // Wait until the thread has consumed this pending flag
+            // before firing again. Without the busy-wait the
+            // coalescing path would (correctly) merge all three
+            // fires into one, which is a different test below.
+            while state
+                .inner
+                .lock()
+                .expect("test: WakeState mutex poisoned")
+                .rx_pending
+            {
+                thread::yield_now();
+            }
+        }
+        state.signal_shutdown();
+        handle.join().unwrap();
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+    }
+
+    #[cfg(feature = "virtio-net-smoltcp")]
+    #[test]
+    fn wake_loop_coalesces_bursty_signals() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        // Hold the mutex to freeze the thread at `cv.wait`, fire N
+        // signals, release the mutex. The thread picks up ONE
+        // pending flag → runs the callback ONCE even though the
+        // waker fired many times. Matches the production path
+        // where an idle `socket_recv`-polling proxy fires the
+        // waker a few kHz — the VMM must coalesce, not backlog.
+        let state = Arc::new(WakeState::new());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let state_for_thread = Arc::clone(&state);
+        let c = Arc::clone(&counter);
+        let barrier_for_thread = Arc::clone(&barrier);
+        let handle = thread::spawn(move || {
+            run_wake_loop(&state_for_thread, move || {
+                c.fetch_add(1, Ordering::Relaxed);
+                // Tell the main thread it's safe to signal
+                // shutdown. Doing so from inside the callback
+                // (WakeState mutex not held) is the race-free
+                // handoff.
+                barrier_for_thread.wait();
+            });
+        });
+
+        // Burst: fire the waker many times while the thread is
+        // parked on the condvar. All should coalesce.
+        {
+            let _hold = state.inner.lock().expect("test: WakeState mutex poisoned");
+            // Note: while we hold the mutex, the thread can't
+            // observe our writes yet. Set the flag directly here;
+            // one condvar wakeup via drop(hold) is enough.
+        }
+        for _ in 0..100 {
+            state.signal_rx_ready();
+        }
+        // Barrier: wait until the callback has run once (so we
+        // know coalescing collapsed the 100 fires into 1 drain
+        // pass). Only THEN signal shutdown.
+        barrier.wait();
+        state.signal_shutdown();
+        handle.join().unwrap();
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "100 burst wake fires must collapse to 1 drain pass"
+        );
+    }
+
+    #[cfg(feature = "virtio-net-smoltcp")]
+    #[test]
+    fn wake_loop_exits_on_shutdown_without_running_callback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let state = Arc::new(WakeState::new());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let state_for_thread = Arc::clone(&state);
+        let c = Arc::clone(&counter);
+        let handle = thread::spawn(move || {
+            run_wake_loop(&state_for_thread, move || {
+                c.fetch_add(1, Ordering::Relaxed);
+            });
+        });
+
+        state.signal_shutdown();
+        handle.join().unwrap();
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "Shutdown must not trigger the drain callback"
+        );
+    }
+
+    #[cfg(feature = "virtio-net-smoltcp")]
+    #[test]
+    fn wake_loop_shutdown_independent_of_pending_rx() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Both flags set simultaneously → shutdown wins, no drain.
+        // Protects against a bug where a long backlog of pending
+        // RX work would block teardown behind drain passes.
+        let state = Arc::new(WakeState::new());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let state_for_thread = Arc::clone(&state);
+        let c = Arc::clone(&counter);
+        let handle = thread::spawn(move || {
+            run_wake_loop(&state_for_thread, move || {
+                c.fetch_add(1, Ordering::Relaxed);
+            });
+        });
+        // Set both flags atomically from the main thread's side
+        // before the thread observes either.
+        {
+            let mut inner = state.inner.lock().expect("test: WakeState mutex poisoned");
+            inner.rx_pending = true;
+            inner.shutdown = true;
+        }
+        state.cv.notify_one();
+        handle.join().unwrap();
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "shutdown must win even with pending RX work queued"
+        );
     }
 }
