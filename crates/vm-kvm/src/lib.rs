@@ -1709,6 +1709,23 @@ impl Hypervisor for KvmHypervisor {
                      (device-state capture lands in a later slice)",
                 ));
             }
+            #[cfg(feature = "virtio-net-smoltcp")]
+            if vm.runtime.net_wake_driver.is_some() {
+                // The host-RX wake thread can write guest RAM
+                // (RX buffers, used ring) and raise interrupts
+                // concurrently with the snapshot capture. Freezing
+                // only the vCPU is not enough: the wake thread
+                // would race with `dump_memory` and produce a torn
+                // snapshot. Full pause/quiesce of the wake driver
+                // is a non-trivial addition (Milestone 1.5 along
+                // with virtio-net snapshot-restore). Until then
+                // refuse the operation explicitly instead of
+                // silently corrupting the snapshot.
+                return Err(VmError::Unsupported(
+                    "vm-kvm: snapshot of a VM with the smoltcp net backend active is not yet \
+                     supported (wake-thread quiesce lands with virtio-net snapshot-restore)",
+                ));
+            }
             if vm.state != VmState::Running {
                 return Err(VmError::Backend(
                     "vm-kvm: snapshot requires a Running VM".into(),

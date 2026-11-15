@@ -838,13 +838,25 @@ impl NetworkBackend for SmoltcpBackend {
     /// smoltcp parses it, updates ARP cache / TCP state, and
     /// potentially queues a reply frame (which `read_frame` will
     /// pop on the next call from the virtio RX fill path).
+    ///
+    /// Fires the [`RxWaker`] on exit (outside the backend mutex)
+    /// because `poll_and_echo` can push TCP replies (SYN/ACK, ACK,
+    /// RST) into `stack_to_guest` purely as a consequence of
+    /// processing the guest-produced frame. Without the wake, those
+    /// replies would sit in the queue until the guest kicked RX for
+    /// an unrelated reason — e.g. the classic ARP-reply-then-SYN
+    /// stall where the vCPU drains only TX and `wait_for_handshake`
+    /// never sees progress.
     fn write_frame(&self, frame: &[u8]) -> Result<()> {
-        let mut state = self
-            .inner
-            .lock()
-            .expect("smoltcp backend state mutex poisoned");
-        state.device.guest_to_stack.push_back(frame.to_vec());
-        state.poll_and_echo();
+        {
+            let mut state = self
+                .inner
+                .lock()
+                .expect("smoltcp backend state mutex poisoned");
+            state.device.guest_to_stack.push_back(frame.to_vec());
+            state.poll_and_echo();
+        } // mutex guard dropped here
+        self.notify_rx_available();
         Ok(())
     }
 }
@@ -1067,6 +1079,34 @@ mod tests {
 
         bk.close_socket(handle);
         assert_eq!(counter.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn rx_waker_fires_on_write_frame() {
+        // `write_frame` is the NetworkBackend-trait entry the VMM
+        // uses to hand guest-produced frames to smoltcp. smoltcp's
+        // internal poll (ARP cache update, TCP state advance) can
+        // queue reply frames into `stack_to_guest` as a side
+        // effect — those must also trigger the wake path, otherwise
+        // the guest's ARP reply advances ARP state host-side, the
+        // SYN reply lands in `stack_to_guest`, and the handshake
+        // hangs until an unrelated guest RX kick.
+        let (bk, counter) = backend_with_counting_waker(BackendConfig {
+            listen_port: 0,
+            ..BackendConfig::default()
+        });
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        // 42 bytes of arbitrary garbage — the frame won't parse,
+        // but `write_frame` fires the waker regardless. The poll
+        // pass that runs on bad input is a no-op; the wake still
+        // propagates.
+        bk.write_frame(&[0u8; 42]).unwrap();
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "write_frame should fire the rx_waker exactly once"
+        );
     }
 
     #[test]
