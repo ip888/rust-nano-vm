@@ -12,42 +12,52 @@
 # want (the host sees the panic on stdio and knows the guest is
 # unrecoverable, no zombie).
 
-# ---- escape-hatch tty via explicit mknod -----------------------------
+# ---- rebuild /dev/console directly -----------------------------------
 # `docker export` strips character-device TYPE from `mknod`-created
-# nodes, so `/dev/console` in the cpio is a zero-byte regular file.
-# The previous round (`cc00dc0`) tried `mount -t devtmpfs none /dev`
-# + `exec 1>/dev/console 2>/dev/console` — the panic exit code
-# changed from 7 to 1, proving the new code runs, but serial output
-# stayed empty. Either the devtmpfs mount silently failed, or the
-# fd reopen is landing on the same shadowed file.
+# nodes, so the `/dev/console` the kernel opened for PID 1's stdio
+# is a zero-byte regular file. The previous round (PR #300) tried to
+# sidestep it by `mknod`-ing a fresh path `/ttyS0_diag` and writing
+# markers there — ZERO markers reached serial on live run
+# (`0d7a28d`), which means either coreutils' `mknod` is missing from
+# debian:12-slim, or the write to major 4/minor 64 doesn't reach the
+# UART for some reason.
 #
-# This stage bypasses /dev entirely. `mknod /ttyS0_diag c 4 64` is a
-# fresh path, so docker-export's stripping doesn't apply; major 4
-# minor 64 is ttyS0 (the UART the kernel already uses for console
-# output). PID 1 is root with CAP_MKNOD, so the syscall works.
+# Directly reconstructing `/dev/console` has one big advantage: if
+# `mknod` works at all, the kernel's own printk flow (which is still
+# writing to the UART via its internal handle, independent of
+# userspace fds) will be joined by our rebound stdio on the same
+# device, and we'll see our echoes interleaved with kernel log.
+# If we see NOTHING again after this change → `mknod` binary isn't
+# in the image. Next step then is `apt install busybox-static` in
+# the Dockerfile.
 #
-# We stage markers so a silent failure anywhere gives a different
-# "last marker seen" to localize. This is TEMPORARY diagnostic; once
-# we know where it dies, it gets replaced with a clean mknod of
-# /dev/console itself + normal flow.
-mknod /ttyS0_diag c 4 64 2>/dev/null
-echo "[init-diag 1] entered init.sh" > /ttyS0_diag 2>/dev/null
+# `rm -f` first because the existing shadowed regular file prevents
+# `mknod` from succeeding at the same path with EEXIST.
+rm -f /dev/console 2>/dev/null
+mknod /dev/console c 5 1 2>/dev/null
+chmod 622 /dev/console 2>/dev/null
 
-mount_rc=0
-mount -t devtmpfs none /dev 2>/dev/null || mount_rc=$?
-echo "[init-diag 2] devtmpfs mount rc=$mount_rc" > /ttyS0_diag 2>/dev/null
+# Reopen stdout/stderr on the now-restored char device. The fds the
+# kernel inherited for us still point at the old regular file; this
+# replaces them with handles on the real char device.
+exec 1>/dev/console 2>/dev/console
+echo "[init-diag 1] stdio rebound to rebuilt /dev/console"
 
-{ echo "[init-diag 3] /dev inventory:"; ls -la /dev/console /dev/ttyS0 2>&1; } \
-    > /ttyS0_diag 2>/dev/null
-
-# Rebind init's stdout/stderr onto the escape-hatch tty so any
-# subsequent `set -eu` failure surfaces on serial instead of
-# vanishing into the shadowed console file.
-exec 1>/ttyS0_diag 2>/ttyS0_diag
-echo "[init-diag 4] fds rebound to /ttyS0_diag"
+# Also rebuild /dev/null et al so `2>/dev/null` further down works.
+# Any one of these failing silently is fine; the rebuilds are
+# best-effort.
+rm -f /dev/null /dev/zero /dev/random /dev/urandom /dev/tty /dev/ttyS0 2>/dev/null
+mknod -m 666 /dev/null    c 1 3  2>/dev/null
+mknod -m 666 /dev/zero    c 1 5  2>/dev/null
+mknod -m 666 /dev/random  c 1 8  2>/dev/null
+mknod -m 666 /dev/urandom c 1 9  2>/dev/null
+mknod -m 666 /dev/tty     c 5 0  2>/dev/null
+mknod -m 622 /dev/ttyS0   c 4 64 2>/dev/null
+echo "[init-diag 2] /dev inventory (which mknod'd):"
+ls -la /dev/console /dev/ttyS0 /dev/null /dev/kmsg 2>&1 || true
 
 set -eu
-echo "[init-diag 5] set -eu active, continuing"
+echo "[init-diag 3] set -eu active, continuing"
 
 # ---- basic pseudo-filesystems ----------------------------------------
 # Each mount is guarded by an idempotency check so the same init works
@@ -71,20 +81,20 @@ try_mount() {
         echo "[init] note: could not mount $fstype at $target (unprivileged?)" >&2
     }
 }
-try_mount proc     /proc; echo "[init-diag 6a] try_mount proc OK"
-try_mount sysfs    /sys;  echo "[init-diag 6b] try_mount sysfs OK"
-try_mount devtmpfs /dev;  echo "[init-diag 6c] try_mount devtmpfs OK"
-try_mount tmpfs    /tmp;  echo "[init-diag 6d] try_mount tmpfs /tmp OK"
-try_mount tmpfs    /run;  echo "[init-diag 6e] try_mount tmpfs /run OK"
+try_mount proc     /proc; echo "[init-diag 4a] try_mount proc OK"
+try_mount sysfs    /sys;  echo "[init-diag 4b] try_mount sysfs OK"
+try_mount devtmpfs /dev;  echo "[init-diag 4c] try_mount devtmpfs OK"
+try_mount tmpfs    /tmp;  echo "[init-diag 4d] try_mount tmpfs /tmp OK"
+try_mount tmpfs    /run;  echo "[init-diag 4e] try_mount tmpfs /run OK"
 
 # ---- loopback --------------------------------------------------------
 # `ip link set lo up` needs CAP_NET_ADMIN. Under unprivileged Docker it
 # fails; we tolerate that because Petclinic's warmup driver hits
 # 127.0.0.1 which routes over lo — under Docker the kernel bring-up
 # already happened at container start, so nothing to do.
-echo "[init-diag 7] before: ip link set lo up"
+echo "[init-diag 5] before: ip link set lo up"
 ip link set lo up 2>/dev/null || true
-echo "[init-diag 8] after: ip link set lo up"
+echo "[init-diag 6] after: ip link set lo up"
 
 # ---- JVM launch ------------------------------------------------------
 #
@@ -106,15 +116,29 @@ JAVA_OPTS="\
     --add-opens java.base/java.lang=ALL-UNNAMED \
 "
 
-echo "[init-diag 9] JAVA_OPTS set"
+echo "[init-diag 7] JAVA_OPTS set"
+echo "[init-diag 7a] checking /opt/jdk-21/bin/java exists:"
+ls -la /opt/jdk-21/bin/java 2>&1 || true
+echo "[init-diag 7b] checking /opt/petclinic.jar exists:"
+ls -la /opt/petclinic.jar 2>&1 || true
+
 echo "[init] launching JVM: java $JAVA_OPTS -jar /opt/petclinic.jar" >&2
 /opt/jdk-21/bin/java $JAVA_OPTS -jar /opt/petclinic.jar \
     --server.port=8080 \
     > /tmp/petclinic.log 2>&1 &
 JVM_PID=$!
-echo "[init-diag 10] JVM backgrounded, pid=$JVM_PID"
+echo "[init-diag 8] JVM backgrounded, pid=$JVM_PID"
 echo "[init] JVM pid=$JVM_PID" >&2
 
+# Give the JVM a moment to produce any launch error, then dump the log
+# so we see what happened before warmup.sh's `kill -0` check fires
+# `exit 1`.
+sleep 2
+echo "[init-diag 8a] /tmp/petclinic.log tail after 2s:"
+tail -30 /tmp/petclinic.log 2>&1 || true
+echo "[init-diag 8b] is JVM alive?"
+kill -0 "$JVM_PID" 2>&1 && echo "YES pid=$JVM_PID" || echo "NO, dead"
+
 # ---- hand off to warmup driver ---------------------------------------
-echo "[init-diag 11] exec'ing /warmup.sh"
+echo "[init-diag 9] exec'ing /warmup.sh"
 exec /warmup.sh "$JVM_PID"
