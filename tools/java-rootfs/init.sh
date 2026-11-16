@@ -12,49 +12,42 @@
 # want (the host sees the panic on stdio and knows the guest is
 # unrecoverable, no zombie).
 
-# ---- rebuild /dev/console directly -----------------------------------
+# ---- rebuild /dev/console directly via busybox-static ----------------
 # `docker export` strips character-device TYPE from `mknod`-created
 # nodes, so the `/dev/console` the kernel opened for PID 1's stdio
-# is a zero-byte regular file. The previous round (PR #300) tried to
-# sidestep it by `mknod`-ing a fresh path `/ttyS0_diag` and writing
-# markers there — ZERO markers reached serial on live run
-# (`0d7a28d`), which means either coreutils' `mknod` is missing from
-# debian:12-slim, or the write to major 4/minor 64 doesn't reach the
-# UART for some reason.
-#
-# Directly reconstructing `/dev/console` has one big advantage: if
-# `mknod` works at all, the kernel's own printk flow (which is still
-# writing to the UART via its internal handle, independent of
-# userspace fds) will be joined by our rebound stdio on the same
-# device, and we'll see our echoes interleaved with kernel log.
-# If we see NOTHING again after this change → `mknod` binary isn't
-# in the image. Next step then is `apt install busybox-static` in
-# the Dockerfile.
+# is a zero-byte regular file. PR #303 tried coreutils' mknod to
+# rebuild it — ZERO markers reached serial, so either `mknod` wasn't
+# in debian:12-slim, or PATH resolution in the kernel-execv'd dash
+# couldn't find it. This round uses `busybox-static` (installed via
+# the Dockerfile) at its absolute path `/bin/busybox` — bulletproof.
 #
 # `rm -f` first because the existing shadowed regular file prevents
 # `mknod` from succeeding at the same path with EEXIST.
+BB=/bin/busybox
 rm -f /dev/console 2>/dev/null
-mknod /dev/console c 5 1 2>/dev/null
-chmod 622 /dev/console 2>/dev/null
+$BB mknod /dev/console c 5 1 2>/dev/null
+$BB chmod 622 /dev/console 2>/dev/null
 
 # Reopen stdout/stderr on the now-restored char device. The fds the
 # kernel inherited for us still point at the old regular file; this
 # replaces them with handles on the real char device.
 exec 1>/dev/console 2>/dev/console
-echo "[init-diag 1] stdio rebound to rebuilt /dev/console"
+echo "[init-diag 1] stdio rebound via busybox mknod of /dev/console"
 
 # Also rebuild /dev/null et al so `2>/dev/null` further down works.
-# Any one of these failing silently is fine; the rebuilds are
-# best-effort.
-rm -f /dev/null /dev/zero /dev/random /dev/urandom /dev/tty /dev/ttyS0 2>/dev/null
-mknod -m 666 /dev/null    c 1 3  2>/dev/null
-mknod -m 666 /dev/zero    c 1 5  2>/dev/null
-mknod -m 666 /dev/random  c 1 8  2>/dev/null
-mknod -m 666 /dev/urandom c 1 9  2>/dev/null
-mknod -m 666 /dev/tty     c 5 0  2>/dev/null
-mknod -m 622 /dev/ttyS0   c 4 64 2>/dev/null
-echo "[init-diag 2] /dev inventory (which mknod'd):"
-ls -la /dev/console /dev/ttyS0 /dev/null /dev/kmsg 2>&1 || true
+rm -f /dev/null /dev/zero /dev/random /dev/urandom /dev/tty /dev/ttyS0 /dev/kmsg 2>/dev/null
+$BB mknod /dev/null    c 1 3  2>/dev/null; $BB chmod 666 /dev/null
+$BB mknod /dev/zero    c 1 5  2>/dev/null; $BB chmod 666 /dev/zero
+$BB mknod /dev/random  c 1 8  2>/dev/null; $BB chmod 666 /dev/random
+$BB mknod /dev/urandom c 1 9  2>/dev/null; $BB chmod 666 /dev/urandom
+$BB mknod /dev/tty     c 5 0  2>/dev/null; $BB chmod 666 /dev/tty
+$BB mknod /dev/ttyS0   c 4 64 2>/dev/null; $BB chmod 622 /dev/ttyS0
+$BB mknod /dev/kmsg    c 1 11 2>/dev/null; $BB chmod 644 /dev/kmsg
+echo "[init-diag 2] /dev inventory after busybox mknod:"
+$BB ls -la /dev/console /dev/ttyS0 /dev/null /dev/kmsg /bin/busybox 2>&1 || true
+
+echo "[init-diag 2a] confirming busybox and coreutils mknod binaries:"
+$BB ls -la /bin/busybox /bin/mknod /usr/bin/mknod 2>&1 || true
 
 set -eu
 echo "[init-diag 3] set -eu active, continuing"

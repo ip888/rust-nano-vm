@@ -67,9 +67,18 @@ RUN /opt/jdk-21/bin/java -Xshare:dump
 FROM debian:12-slim@${DEBIAN_DIGEST}
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        ca-certificates curl iproute2 procps \
+        ca-certificates curl iproute2 procps busybox-static \
  && rm -rf /var/lib/apt/lists/* \
  && rm -rf /usr/share/doc /usr/share/man /usr/share/locale
+
+# `busybox-static` ships `/bin/busybox` — a statically-linked single
+# binary with built-in applets (mknod, mount, ls, cat, …). We use it
+# in init.sh as a bulletproof fallback when the normal coreutils
+# executables aren't resolving. `/bin/busybox mknod` definitely
+# works regardless of PATH, usrmerge symlink state, or whether the
+# coreutils binaries ended up being stripped somewhere along the
+# pipeline.
+RUN ls -la /bin/busybox /usr/bin/busybox 2>&1 | tee /dev/null
 COPY --from=jdk-extract         /opt/jdk-21     /opt/jdk-21
 COPY --from=petclinic-builder   /petclinic.jar  /opt/petclinic.jar
 COPY init.sh    /sbin/init
