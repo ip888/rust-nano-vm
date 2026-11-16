@@ -12,32 +12,42 @@
 # want (the host sees the panic on stdio and knows the guest is
 # unrecoverable, no zombie).
 
-# ---- devtmpfs mount MUST be first ------------------------------------
-# `docker export`, which `build.sh` uses to produce the cpio archive,
-# strips the character-device TYPE from device nodes created by
-# `mknod` in the image: the Dockerfile's `/dev/console c 5 1` ends up
-# in the archive as a zero-byte regular file (mode 0755). The kernel
-# opens that file for init's stdio before exec, so every write(2) the
-# shell makes to fd 0/1/2 lands in the file (succeeds silently) and
-# nothing reaches ttyS0 — the guest looks dead even when init is
-# running fine. Mounting devtmpfs over /dev shadows the broken node
-# tree with the kernel's real device nodes. CONFIG_DEVTMPFS_MOUNT=y
-# SHOULD auto-mount here, but the first live run on a Broadwell
-# Broadwell host (see Nov 16 session) proved it doesn't fire — likely
-# because initramfs's /dev is non-empty and the kernel skips the
-# auto-mount in that case. Do it explicitly before anything else.
+# ---- escape-hatch tty via explicit mknod -----------------------------
+# `docker export` strips character-device TYPE from `mknod`-created
+# nodes, so `/dev/console` in the cpio is a zero-byte regular file.
+# The previous round (`cc00dc0`) tried `mount -t devtmpfs none /dev`
+# + `exec 1>/dev/console 2>/dev/console` — the panic exit code
+# changed from 7 to 1, proving the new code runs, but serial output
+# stayed empty. Either the devtmpfs mount silently failed, or the
+# fd reopen is landing on the same shadowed file.
 #
-# `|| true` because once the fix lands some kernel configs may have
-# auto-mounted already — a second mount over an existing one would
-# fail with EBUSY, which is harmless here.
-mount -t devtmpfs none /dev 2>/dev/null || true
+# This stage bypasses /dev entirely. `mknod /ttyS0_diag c 4 64` is a
+# fresh path, so docker-export's stripping doesn't apply; major 4
+# minor 64 is ttyS0 (the UART the kernel already uses for console
+# output). PID 1 is root with CAP_MKNOD, so the syscall works.
+#
+# We stage markers so a silent failure anywhere gives a different
+# "last marker seen" to localize. This is TEMPORARY diagnostic; once
+# we know where it dies, it gets replaced with a clean mknod of
+# /dev/console itself + normal flow.
+mknod /ttyS0_diag c 4 64 2>/dev/null
+echo "[init-diag 1] entered init.sh" > /ttyS0_diag 2>/dev/null
 
-# Reopen init's own stderr + stdout onto the now-real /dev/console.
-# Without this, the fds the kernel inherited still point at the
-# shadowed regular file; `echo` writes would still vanish.
-exec 1>/dev/console 2>/dev/console
+mount_rc=0
+mount -t devtmpfs none /dev 2>/dev/null || mount_rc=$?
+echo "[init-diag 2] devtmpfs mount rc=$mount_rc" > /ttyS0_diag 2>/dev/null
+
+{ echo "[init-diag 3] /dev inventory:"; ls -la /dev/console /dev/ttyS0 2>&1; } \
+    > /ttyS0_diag 2>/dev/null
+
+# Rebind init's stdout/stderr onto the escape-hatch tty so any
+# subsequent `set -eu` failure surfaces on serial instead of
+# vanishing into the shadowed console file.
+exec 1>/ttyS0_diag 2>/ttyS0_diag
+echo "[init-diag 4] fds rebound to /ttyS0_diag"
 
 set -eu
+echo "[init-diag 5] set -eu active, continuing"
 
 # ---- basic pseudo-filesystems ----------------------------------------
 # Each mount is guarded by an idempotency check so the same init works
@@ -61,18 +71,20 @@ try_mount() {
         echo "[init] note: could not mount $fstype at $target (unprivileged?)" >&2
     }
 }
-try_mount proc     /proc
-try_mount sysfs    /sys
-try_mount devtmpfs /dev
-try_mount tmpfs    /tmp
-try_mount tmpfs    /run
+try_mount proc     /proc; echo "[init-diag 6a] try_mount proc OK"
+try_mount sysfs    /sys;  echo "[init-diag 6b] try_mount sysfs OK"
+try_mount devtmpfs /dev;  echo "[init-diag 6c] try_mount devtmpfs OK"
+try_mount tmpfs    /tmp;  echo "[init-diag 6d] try_mount tmpfs /tmp OK"
+try_mount tmpfs    /run;  echo "[init-diag 6e] try_mount tmpfs /run OK"
 
 # ---- loopback --------------------------------------------------------
 # `ip link set lo up` needs CAP_NET_ADMIN. Under unprivileged Docker it
 # fails; we tolerate that because Petclinic's warmup driver hits
 # 127.0.0.1 which routes over lo — under Docker the kernel bring-up
 # already happened at container start, so nothing to do.
+echo "[init-diag 7] before: ip link set lo up"
 ip link set lo up 2>/dev/null || true
+echo "[init-diag 8] after: ip link set lo up"
 
 # ---- JVM launch ------------------------------------------------------
 #
@@ -94,12 +106,15 @@ JAVA_OPTS="\
     --add-opens java.base/java.lang=ALL-UNNAMED \
 "
 
+echo "[init-diag 9] JAVA_OPTS set"
 echo "[init] launching JVM: java $JAVA_OPTS -jar /opt/petclinic.jar" >&2
 /opt/jdk-21/bin/java $JAVA_OPTS -jar /opt/petclinic.jar \
     --server.port=8080 \
     > /tmp/petclinic.log 2>&1 &
 JVM_PID=$!
+echo "[init-diag 10] JVM backgrounded, pid=$JVM_PID"
 echo "[init] JVM pid=$JVM_PID" >&2
 
 # ---- hand off to warmup driver ---------------------------------------
+echo "[init-diag 11] exec'ing /warmup.sh"
 exec /warmup.sh "$JVM_PID"
