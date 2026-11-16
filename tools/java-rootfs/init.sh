@@ -12,6 +12,31 @@
 # want (the host sees the panic on stdio and knows the guest is
 # unrecoverable, no zombie).
 
+# ---- devtmpfs mount MUST be first ------------------------------------
+# `docker export`, which `build.sh` uses to produce the cpio archive,
+# strips the character-device TYPE from device nodes created by
+# `mknod` in the image: the Dockerfile's `/dev/console c 5 1` ends up
+# in the archive as a zero-byte regular file (mode 0755). The kernel
+# opens that file for init's stdio before exec, so every write(2) the
+# shell makes to fd 0/1/2 lands in the file (succeeds silently) and
+# nothing reaches ttyS0 — the guest looks dead even when init is
+# running fine. Mounting devtmpfs over /dev shadows the broken node
+# tree with the kernel's real device nodes. CONFIG_DEVTMPFS_MOUNT=y
+# SHOULD auto-mount here, but the first live run on a Broadwell
+# Broadwell host (see Nov 16 session) proved it doesn't fire — likely
+# because initramfs's /dev is non-empty and the kernel skips the
+# auto-mount in that case. Do it explicitly before anything else.
+#
+# `|| true` because once the fix lands some kernel configs may have
+# auto-mounted already — a second mount over an existing one would
+# fail with EBUSY, which is harmless here.
+mount -t devtmpfs none /dev 2>/dev/null || true
+
+# Reopen init's own stderr + stdout onto the now-real /dev/console.
+# Without this, the fds the kernel inherited still point at the
+# shadowed regular file; `echo` writes would still vanish.
+exec 1>/dev/console 2>/dev/console
+
 set -eu
 
 # ---- basic pseudo-filesystems ----------------------------------------
