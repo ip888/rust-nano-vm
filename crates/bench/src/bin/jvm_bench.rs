@@ -150,7 +150,14 @@ mod inner {
 
         /// Seconds to wait for the guest to reach `COLD_MARKER`
         /// (needed for `--snapshot-at cold` and, indirectly, `both`).
-        #[arg(long, default_value_t = 30)]
+        ///
+        /// Default 180 s: on a slow reference host (1.6 GHz
+        /// Broadwell, 1 vCPU), Spring Petclinic cold-start takes
+        /// 30-60 s just to bind :8080. The first in-house run
+        /// (Nov 16 session) timed out at the earlier 30 s default
+        /// before Spring was ready. Guest-side `warmup.sh` matches
+        /// this default for `COLD_WAIT_SECS`.
+        #[arg(long, default_value_t = 180)]
         pub cold_marker_secs: u64,
 
         /// Seconds to wait for the guest to reach `READY_MARKER`

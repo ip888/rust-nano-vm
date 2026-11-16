@@ -28,10 +28,20 @@ WARMUP_URLS="http://127.0.0.1:8080/vets \
              http://127.0.0.1:8080/owners \
              http://127.0.0.1:8080/owners/find"
 
-READY_WAIT_SECS="${READY_WAIT_SECS:-60}"
+READY_WAIT_SECS="${READY_WAIT_SECS:-120}"
 READY_STEP=1
 WARMUP_SECS="${WARMUP_SECS:-30}"
-COLD_WAIT_SECS="${COLD_WAIT_SECS:-30}"
+# On 1.6 GHz Broadwell with 1 vCPU (our reference host), Spring
+# Petclinic cold-start takes 30-60 s just to bind :8080, before
+# /actuator/health is 200. A 30 s guest-side wait tripped the
+# FATAL `TCP socket never opened` branch on the first live run
+# (serial tail cut at `[warmup] waiting up to 30s` because the
+# host side killed the VM at --cold-marker-secs=30 before the
+# guest even finished its loop). Match the generous host default
+# that nanovm-jvm-bench's --cold-marker-secs now takes; Spring
+# binding faster on quicker hosts simply makes the loop exit
+# earlier.
+COLD_WAIT_SECS="${COLD_WAIT_SECS:-180}"
 
 # ---- 0. wait for the JVM to actually be running (TCP socket open) ----
 #
