@@ -2,9 +2,10 @@
 
 > Sub-second cold-start and fork for enterprise Java workloads.
 > KVM-based microVM snapshot/restore + MAP_PRIVATE fork-many.
-> **Restore in 2.5 ms (p50). 50 microVMs in 472 ms. 172 KiB per fork
-> via copy-on-write. Independent of your database, your JDK vendor,
-> and your cloud.** ([measured benchmarks](BENCHMARKS.md))
+> **Spring Petclinic restore: 3 ms (p50) — 20 000× faster than a
+> fresh 67 s boot of the same workload. 172 KiB host memory per
+> fork via copy-on-write. Independent of your database, your JDK
+> vendor, and your cloud.** ([measured benchmarks](BENCHMARKS.md))
 
 [![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0_OR_MIT-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.94+-orange.svg)](rust-toolchain.toml)
@@ -19,8 +20,9 @@ copies from it in milliseconds using MAP_PRIVATE copy-on-write memory.
 The primitives are DB-agnostic and framework-agnostic. The current
 enterprise product line targets **JVM cold-start**:
 
-- **Spring Boot cold-start: 8–30 s → ~200 ms** — snapshot a warmed
-  ApplicationContext, fork on demand.
+- **Spring Boot cold-start: 67 s → 3 ms** — measured on Spring
+  Petclinic (section 4 of BENCHMARKS.md). Snapshot a warmed
+  ApplicationContext after JIT, fork on demand.
 - **CI integration-test boot: 10–60 s per test class → ~200 ms** — fork the
   warmed context per `@SpringBootTest` class.
 - **Kubernetes HPA scale-out** (Horizontal Pod Autoscaler): sub-second
@@ -45,10 +47,36 @@ Aurora, CloudSQL, Azure SQL, DynamoDB, Snowflake.
 ## Measured performance
 
 Reproducible on any Linux + KVM host; the numbers below are from an
-Intel Broadwell @ 1.6 GHz laptop (2015-era hardware, 128 MiB guest).
+Intel Broadwell @ 1.6 GHz laptop (2015-era hardware, 1 vCPU).
 Modern Xeon / Ryzen will run faster — treat these as the floor.
 
-### Cold boot vs restore (100 runs each, refreshed 2026-11-10)
+### Spring Petclinic end-to-end (2026-11-16, first live JVM workload)
+
+Real target workload: Spring Boot 3.x + JDK 21 + ZGC in a 2 GiB
+guest. Fresh boot of the same workload takes 67 s on this host
+(2.6 s kernel + 32 s Spring init to `:8080` + 30 s JIT warmup).
+Warm-snapshot restore:
+
+```
+warm restore (20 forks after 3-fork warmup discard):
+  min   2.38 ms
+  p50   3.37 ms
+  p95   3.60 ms
+  p99   3.64 ms
+  mean  2.99 ms
+  failures: 0/20
+
+time-to-ready speed-up (p50):  ~20 000×  (67 s → 3.37 ms)
+```
+
+Variance is tight — p99 is 8 % above p50. Cold snapshot restore
+mean is 30.4 s on the current harness **because the cold snapshot
+is captured pre-JIT**, so a fork from it has to redo the 30 s
+warmup loop before the guest signals ready; the fork itself still
+costs 2-7 ms. That measurement detail is documented and
+scheduled to be refined in a follow-up.
+
+### Tinyconfig microVM — cold boot vs restore (100 runs each, 2026-11-10)
 
 ```
 cold boot latency:   min 380 ms   p50 381 ms   mean ~390 ms
@@ -86,11 +114,21 @@ Full methodology, caveats, and reproduction instructions:
 Rebuild the numbers yourself:
 
 ```sh
+# Tinyconfig microVM: cold boot, restore, parallel fork-many.
 NANOVM_INIT=agent tools/initramfs/build-initramfs.sh
 cargo run -p bench --release --features kvm --bin nanovm-boot-bench -- \
     --mode both --runs 10
 cargo run -p bench --release --features kvm --bin nanovm-parallel-fork-bench -- \
     --forks 50
+
+# Spring Petclinic (JVM workload, needs docker + buildx for the rootfs):
+SKIP_EXT4=1 tools/java-rootfs/build.sh
+mkdir -p ~/nanovm-snapshots
+TMPDIR=~/nanovm-snapshots \
+    cargo run -p bench --release --features kvm --bin nanovm-jvm-bench -- \
+    --kernel tools/kernel/cache/bzImage-jvm \
+    --initramfs tools/java-rootfs/cache/initramfs.cpio.gz \
+    --memory-mib 2048 --snapshot-at both --forks 20
 ```
 
 ## Platform support
@@ -154,9 +192,11 @@ portable CI (no `/dev/kvm`, no root, no nested virt).
 
 ## Roadmap (public tier)
 
-1. **Spring Petclinic proof-of-concept** — reference demo: snapshot a
-   warmed Spring Boot app, fork ×10, each fork answers HTTP <200 ms
-   after start.
+1. ✅ **Spring Petclinic proof-of-concept** — reference demo:
+   snapshot a warmed Spring Boot app, fork ×20, each fork hits
+   `NANOVM_PETCLINIC_READY` in 3 ms (p50). Done
+   **2026-11-16**; see BENCHMARKS.md §4 and the
+   `nanovm-jvm-bench` binary.
 2. **Java SDK** — gRPC-based, generated from `.proto`. Publishable to
    Maven Central.
 3. **Testcontainers-Java driver** — DB-agnostic drop-in that lets an
