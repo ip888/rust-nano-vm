@@ -58,8 +58,17 @@ while [ "$elapsed" -lt "$COLD_WAIT_SECS" ]; do
     fi
     # curl exit 7 = connection refused. Any other exit (including
     # success or protocol error) means the socket accepted.
-    curl -sS -o /dev/null --max-time 1 http://127.0.0.1:8080/ 2>/dev/null
-    rc=$?
+    #
+    # The `|| rc=$?` pattern is essential here: `set -e` at the top
+    # of this script would otherwise kill the shell on curl's 7
+    # before we could capture $? on the next line. The `||` branch
+    # suppresses the set-e trigger AND captures the real exit code
+    # into `rc` in one step. Without this guard the loop never iterates
+    # and PID 1 exits 7 (the classic silent-warmup bug that masked all
+    # of our dev-node triage: the real failure was always here, not
+    # in the kernel-console routing).
+    rc=0
+    curl -sS -o /dev/null --max-time 1 http://127.0.0.1:8080/ 2>/dev/null || rc=$?
     if [ "$rc" != 7 ]; then
         echo "[warmup] JVM TCP socket open after ${elapsed}s" >&2
         break
