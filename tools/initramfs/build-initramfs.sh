@@ -92,9 +92,13 @@ case "${VARIANT}" in
     ;;
   net-echo)
     OUT="${CACHE}/initramfs-net-echo.cpio"
-    # Locate the host's busybox-static binary. The Linux shebang
-    # `#!/bin/busybox sh` relies on this file being inside the
-    # cpio at /bin/busybox, statically linked and executable.
+    # Locate the host's busybox-static binary. We don't exec it
+    # directly via `#!/bin/busybox sh` shebang — that path was
+    # observed to exit init 1 within 2 ms with zero output on
+    # Omarchy 6.12 even though the same binary + script run fine
+    # on the host. Instead the `/init` ELF wrapper (compiled from
+    # init-net-echo.c) execve's busybox directly, same code path
+    # as the agent variant's static-musl Rust binary.
     BUSYBOX="${NANOVM_BUSYBOX_STATIC:-}"
     if [[ -z "${BUSYBOX}" ]]; then
       for cand in /bin/busybox /usr/bin/busybox /usr/local/bin/busybox; do
@@ -120,23 +124,40 @@ case "${VARIANT}" in
     fi
     echo "initramfs: variant=net-echo — using busybox at ${BUSYBOX}"
 
-    # Shell init: diagnostic-rich. Every command preceded by an
-    # `echo [stage N]` so a failure between stages localises to
-    # the last visible marker. First rev showed zero output on the
-    # Omarchy host — we need to know whether the shell even reaches
-    # the first write. Once the stage-marker chain confirms where
-    # things fall over, this trims back to the minimal production
-    # init in a follow-up.
-    INIT_SRC="${CACHE}/net-echo-init.sh"
-    cat > "${INIT_SRC}" <<'INITSCRIPT'
-#!/bin/busybox sh
-# Guest-side /init for the virtio-net smoltcp data-path test.
-#
-# DIAGNOSTIC MODE: a staged marker chain. The host-side test only
-# matches on NANOVM_NET_ECHO_READY, but the `[stage N]` markers
-# around it tell us which command stalls when the test fails.
+    # The /init itself is an ELF wrapper (init-net-echo.c). It
+    # prints a wrapper-alive marker then execve's /bin/busybox
+    # directly. Same code path as the agent variant's ELF /init —
+    # avoids the kernel's binfmt_script shebang recursion that
+    # observably breaks on this stack (zero output, exit 1 in 2 ms).
+    INIT_WRAPPER_SRC="${HERE}/init-net-echo.c"
+    INIT_WRAPPER_BIN="${CACHE}/init-net-echo"
+    if [[ ! -f "${INIT_WRAPPER_SRC}" ]]; then
+      echo "initramfs: ${INIT_WRAPPER_SRC} missing" >&2
+      exit 1
+    fi
+    echo "initramfs: compiling init-net-echo wrapper (static, non-PIE)"
+    gcc -static -no-pie -Os -s -o "${INIT_WRAPPER_BIN}" "${INIT_WRAPPER_SRC}"
+    INIT_BIN="${INIT_WRAPPER_BIN}"
+    # Short-circuit uses INIT_SRC newer-than check. Point it at
+    # the C source so editing init-net-echo.c forces a cpio rebuild.
+    INIT_SRC="${INIT_WRAPPER_SRC}"
 
-echo "[stage 1] shell entered (busybox sh is alive)"
+    # Companion shell script that the wrapper execve's. Diagnostic-
+    # rich: every subcommand has a preceding `echo [stage N]` so a
+    # failure between stages localises to the last visible marker
+    # on serial.
+    INIT_SCRIPT_SRC="${CACHE}/net-echo-init.sh"
+    cat > "${INIT_SCRIPT_SRC}" <<'INITSCRIPT'
+# Guest-side /init.sh for the virtio-net smoltcp data-path test.
+#
+# Launched by /init (the ELF wrapper from init-net-echo.c):
+#     execve("/bin/busybox", ["sh", "/init.sh"], NULL)
+#
+# DIAGNOSTIC MODE: staged marker chain around the real work. If
+# any command hangs or crashes, the last visible `[stage N]` on
+# serial names it.
+
+echo "[stage 1] busybox sh applet alive, running /init.sh"
 BB=/bin/busybox
 
 echo "[stage 2] /bin/busybox: $($BB ls -la /bin/busybox 2>&1 | head -1)"
@@ -164,17 +185,13 @@ $BB ip addr show 2>&1 || echo "  (ip addr show failed)"
 # substring before attaching TcpProxy.
 echo "NANOVM_NET_ECHO_READY"
 
-# Test the `-e` applet feature of this busybox build. If missing,
-# nc rejects the option and exits — the marker above still gets
-# the test past its wait, but the proxy round-trip will fail.
 echo "[stage 10] busybox nc --help (brief):"
 $BB nc --help 2>&1 | head -5 || echo "  (nc --help failed)"
 
 echo "[stage 11] exec nc listener:"
 exec $BB nc -lk -p 8080 -e $BB cat
 INITSCRIPT
-    chmod +x "${INIT_SRC}"
-    INIT_BIN="${INIT_SRC}"
+    chmod +x "${INIT_SCRIPT_SRC}"
     ;;
   *)
     echo "initramfs: unknown NANOVM_INIT='${VARIANT}'" >&2
@@ -216,17 +233,20 @@ nod /dev/zero 0666 0 0 c 1 5
 file /init ${INIT_BIN} 0755 0 0
 EOF
 
-# net-echo needs busybox inside the cpio at /bin/busybox (resolved
-# by the `#!/bin/busybox sh` shebang on /init), plus /bin + /proc +
-# /sys directories so init's mount commands land in real mount
-# points rather than ENOENT. Add them AFTER the base entries so a
-# test-variant archive stays byte-identical to before.
+# net-echo needs:
+#   - /bin/busybox (the static binary; the ELF wrapper at /init
+#     execve's it directly)
+#   - /init.sh (the shell script the wrapper hands to busybox sh)
+#   - /bin, /proc, /sys directories
+# Added AFTER the base entries so a test-variant archive stays
+# byte-identical to before.
 if [[ "${VARIANT}" == "net-echo" ]]; then
   cat >> "${CPIO_LIST}" <<EOF
 dir /bin 0755 0 0
 dir /proc 0755 0 0
 dir /sys 0755 0 0
 file /bin/busybox ${BUSYBOX} 0755 0 0
+file /init.sh ${INIT_SCRIPT_SRC} 0755 0 0
 EOF
 fi
 
