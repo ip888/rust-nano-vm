@@ -171,7 +171,13 @@ fn host_to_guest_tcp_round_trip() {
     let hv = KvmHypervisor::new().expect("open /dev/kvm");
     let cfg = VmConfig {
         vcpus: 1,
-        memory_mib: 64,
+        // 128 MiB mirrors the sibling `virtio_net_smoltcp_boot` test
+        // + `agent_init_boot`. 64 MiB was marginal — busybox + nc +
+        // transient `ip` subprocesses don't need much, but a tight
+        // memory envelope can OOM the kernel silently at execve
+        // time with no userspace output, which was indistinguishable
+        // from the `init died exit 1` symptom.
+        memory_mib: 128,
         kernel: Some(kernel),
         initrd: Some(initrd),
         net_backend: NetBackendChoice::Smoltcp,
