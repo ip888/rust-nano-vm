@@ -340,11 +340,17 @@ mod inner {
         }
     }
 
-    /// One snapshot's fork loop. Returns per-fork latencies (measured
-    /// samples only — warmup samples discarded). When
-    /// `wait_ready_in_fork` is true, each fork is followed by a wait
-    /// for `READY_MARKER` in the child's serial output; the reported
-    /// latency covers both restore and wait.
+    /// One snapshot's fork loop. Each fork is timed twice:
+    /// `restore_lat` is the raw `hv.restore()` cost (the honest
+    /// fork-cost metric), and `total_lat` adds the per-fork wait
+    /// for `READY_MARKER` when `wait_ready_in_fork` is true. For
+    /// warm forks the two are identical; for cold forks the guest
+    /// still has to redo its warmup after the restore, so the
+    /// delta is the guest-side JIT warmup time.
+    ///
+    /// Returns a [`PhasePair`] carrying both PhaseStats so the
+    /// final cross-phase summary can present the honest restore-
+    /// cost comparison alongside the time-to-ready comparison.
     #[allow(clippy::too_many_arguments)]
     fn bench_snapshot(
         hv: &KvmHypervisor,
@@ -355,11 +361,12 @@ mod inner {
         progress_every: usize,
         wait_ready_secs: u64,
         wait_ready_in_fork: bool,
-    ) -> Result<PhaseStats> {
+    ) -> Result<PhasePair> {
         println!("\n=== {label} phase: {forks} measured forks (+{warmup} warmup) ===",);
 
         let total_iters = forks + warmup;
-        let mut samples: Vec<Duration> = Vec::with_capacity(forks);
+        let mut restore_samples: Vec<Duration> = Vec::with_capacity(forks);
+        let mut total_samples: Vec<Duration> = Vec::with_capacity(forks);
         let phase_start = Instant::now();
 
         for i in 0..total_iters {
@@ -378,7 +385,8 @@ mod inner {
             };
 
             if i >= warmup {
-                samples.push(total_lat);
+                restore_samples.push(restore_lat);
+                total_samples.push(total_lat);
             }
             finalize(hv, fork.id);
 
@@ -394,9 +402,33 @@ mod inner {
         }
 
         let total = phase_start.elapsed();
-        let stats = PhaseStats::from_samples(label.into(), samples, total);
-        stats.print_report();
-        Ok(stats)
+        let restore_stats = PhaseStats::from_samples(
+            format!("{label} (restore only — honest fork cost)"),
+            restore_samples,
+            total,
+        );
+        let total_stats = PhaseStats::from_samples(
+            format!("{label} (restore + wait-for-ready)"),
+            total_samples,
+            total,
+        );
+        restore_stats.print_report();
+        total_stats.print_report();
+        Ok(PhasePair {
+            restore: restore_stats,
+            total: total_stats,
+        })
+    }
+
+    /// Pair of per-phase statistics: the raw `restore()` cost and
+    /// the time to a ready guest. `warm`-mode phases have the two
+    /// identical by construction (the guest is already ready at
+    /// snapshot time, so `wait_for_marker` returns immediately);
+    /// `cold`-mode phases have `total` > `restore` by the guest's
+    /// JIT warmup time.
+    pub(crate) struct PhasePair {
+        restore: PhaseStats,
+        total: PhaseStats,
     }
 
     /// Poll the guest's serial output until `marker` appears or the
@@ -525,8 +557,13 @@ mod inner {
         sorted[idx.min(sorted.len() - 1)]
     }
 
-    fn print_comparison(cold: &PhaseStats, warm: &PhaseStats) {
-        println!("\n=== cold vs warm summary ===");
+    fn print_comparison(cold: &PhasePair, warm: &PhasePair) {
+        // Section 1: honest fork cost. This is the apples-to-apples
+        // restore()-only comparison — warm and cold measure the same
+        // thing, so a near-1.0× speedup here is CORRECT and important.
+        // It proves the MAP_PRIVATE fork mechanism costs the same
+        // regardless of guest-side state at snapshot time.
+        println!("\n=== cold vs warm — honest fork cost (restore only) ===");
         println!("| metric | cold | warm | speedup |");
         println!("|--------|------|------|---------|");
         let row = |name: &str, c: Duration, w: Duration| {
@@ -535,15 +572,46 @@ mod inner {
             } else {
                 0.0
             };
+            println!("| {name:<6} | {c:?} | {w:?} | {speedup:.2}x |");
+        };
+        row("p50", cold.restore.p50, warm.restore.p50);
+        row("p95", cold.restore.p95, warm.restore.p95);
+        row("p99", cold.restore.p99, warm.restore.p99);
+        row("mean", cold.restore.mean, warm.restore.mean);
+        println!(
+            "\nnote: both columns measure `hv.restore()` wall-clock only. \
+             This is the honest fork-mechanism cost; expect ~1x speedup \
+             because the fork itself is the same MAP_PRIVATE operation \
+             regardless of snapshot age."
+        );
+
+        // Section 2: time-to-ready (what a product user actually sees).
+        // Here the speedup IS large because the warm snapshot captures
+        // a JIT-warmed JVM — the forked child is immediately serving.
+        // The cold snapshot captures the JVM just after it bound :8080,
+        // so each forked child redoes 30 s of JIT warmup before READY.
+        println!("\n=== cold vs warm — time-to-ready (product metric) ===");
+        println!("| metric | cold | warm | speedup |");
+        println!("|--------|------|------|---------|");
+        let row2 = |name: &str, c: Duration, w: Duration| {
+            let speedup = if w.as_nanos() > 0 {
+                c.as_secs_f64() / w.as_secs_f64()
+            } else {
+                0.0
+            };
             println!("| {name:<6} | {c:?} | {w:?} | {speedup:.1}x |");
         };
-        row("p50", cold.p50, warm.p50);
-        row("p95", cold.p95, warm.p95);
-        row("p99", cold.p99, warm.p99);
-        row("mean", cold.mean, warm.mean);
+        row2("p50", cold.total.p50, warm.total.p50);
+        row2("p95", cold.total.p95, warm.total.p95);
+        row2("p99", cold.total.p99, warm.total.p99);
+        row2("mean", cold.total.mean, warm.total.mean);
         println!(
-            "\nnote: cold latency = restore + wait-for-{READY_MARKER}; \
-             warm latency = restore only (guest was already ready at snapshot)."
+            "\nnote: time-to-ready = `hv.restore()` + wait-for-{READY_MARKER}. \
+             Warm snapshots signal READY immediately on restore; cold \
+             snapshots force each forked child to rerun the 30 s JIT \
+             warmup loop. The huge speedup is the SNAPSHOT-STATE value, \
+             not the fork-mechanism value. Both are real but measure \
+             different things."
         );
     }
 }
