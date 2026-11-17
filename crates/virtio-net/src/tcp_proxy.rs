@@ -67,7 +67,8 @@
 //! sibling [`crate::smoltcp_backend`]).
 
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -97,21 +98,29 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// splits a single `recv_slice` across two iterations.
 const BRIDGE_BUFFER_BYTES: usize = 4096;
 
+/// How long the accept loop in [`TcpProxy::serve`] sleeps between
+/// `WouldBlock` polls of the non-blocking listener. The listener
+/// has to be non-blocking so the stop flag is observable in bounded
+/// time; 10 ms is enough latency to stop promptly, little enough
+/// CPU to be free under idle load.
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Bridge between a kernel-level TCP connection and a smoltcp
 /// client-mode socket on a [`SmoltcpBackend`].
 ///
 /// Owns an [`Arc`] to the backend so the same proxy can bridge
-/// many simultaneous connections (one per spawned thread, in a
-/// future commit) without each one needing its own backend copy.
+/// many simultaneous connections (one per spawned thread) without
+/// each one needing its own backend copy.
 ///
-/// # TODO (TcpListener accept-loop wrapper — follow-up PR)
+/// Two entry points:
 ///
-/// Today only `bridge_connection(stream)` is public — the caller
-/// is responsible for accepting external TCP connections. The
-/// production path promised in the module docs ("`TcpListener`
-/// bound on `:443`, spawn one bridge per accepted stream") isn't
-/// wired yet. Lands with the vm-kvm host-port mapping work in a
-/// later PR. Tracked as Copilot finding #4252252398 on PR #283.
+/// - [`bridge_connection`](Self::bridge_connection) handles ONE
+///   already-accepted stream. Useful when the caller owns the
+///   listener (tests, custom accept policies).
+/// - [`serve`](Self::serve) runs the production accept loop on a
+///   caller-provided [`TcpListener`]: spawn-per-connection, stop
+///   flag for clean shutdown, per-connection errors isolated from
+///   the loop.
 #[derive(Debug)]
 pub struct TcpProxy {
     /// Shared handle to the smoltcp stack this proxy forwards
@@ -176,6 +185,79 @@ impl TcpProxy {
         // socket for TIME_WAIT bookkeeping.
         self.backend.close_socket(handle);
         result
+    }
+
+    /// Production accept loop: take ownership of `listener`, accept
+    /// connections, spawn one bridge thread per accepted stream.
+    /// Blocks until `stop` is set or the listener's `accept` fails
+    /// unrecoverably.
+    ///
+    /// The listener is switched to non-blocking so the stop flag is
+    /// checked every [`ACCEPT_POLL_INTERVAL`] (~10 ms) — this is the
+    /// price for cooperative shutdown without a second socket to
+    /// kick ourselves on. A blocking listener would wedge until the
+    /// next connection; `shutdown()` on a `TcpListener` isn't
+    /// portable across OSes (works on Linux via `shutdown(SHUT_RDWR)`
+    /// on the raw fd, but std doesn't expose it).
+    ///
+    /// # Per-connection error policy
+    ///
+    /// Each spawned bridge thread's result is **logged by caller
+    /// contract**, not propagated — one malformed client doesn't
+    /// tear down the whole accept loop. Finished threads are reaped
+    /// each iteration so the thread list doesn't grow unbounded
+    /// under long-running proxies.
+    ///
+    /// # Panics
+    ///
+    /// Never — the spawned threads' panics are isolated by the std
+    /// thread model. Callers reaping panicked threads via
+    /// `JoinHandle::join` get an `Err(Box<dyn Any>)` back.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on clean stop-flag shutdown after all in-flight
+    /// bridges have been joined. `Err` only on a fatal listener
+    /// error (EBADF, EINVAL — the listener's fd is gone).
+    pub fn serve(self: Arc<Self>, listener: TcpListener, stop: Arc<AtomicBool>) -> Result<()> {
+        listener.set_nonblocking(true)?;
+        let mut threads: Vec<thread::JoinHandle<Result<()>>> = Vec::new();
+
+        loop {
+            // Observe the stop flag BEFORE each accept attempt so a
+            // flag set during the previous sleep terminates the loop
+            // in at most one iteration.
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+
+            match listener.accept() {
+                Ok((stream, _peer_addr)) => {
+                    let proxy = Arc::clone(&self);
+                    let handle = thread::spawn(move || proxy.bridge_connection(stream));
+                    threads.push(handle);
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(ACCEPT_POLL_INTERVAL);
+                }
+                Err(e) => return Err(VirtioNetError::Io(e)),
+            }
+
+            // Reap finished bridge threads so the vector doesn't
+            // grow linearly in total-ever-accepted. Each kept thread
+            // is one handle (<1 KiB); OOM would take millions of
+            // long-lived connections, but the retain keeps the
+            // hot-path cost bounded.
+            threads.retain(|h| !h.is_finished());
+        }
+
+        // Final reap. Each bridge returns on its own when either
+        // side closes; we don't force-kill them (TcpStream has no
+        // kill API portable across OSes).
+        for handle in threads {
+            let _ = handle.join();
+        }
+        Ok(())
     }
 
     /// Block until the smoltcp client socket reaches `Established`
@@ -475,6 +557,106 @@ mod tests {
         );
 
         stop.store(true, Ordering::Relaxed);
+        shuttle.join().expect("frame shuttle must not panic");
+    }
+
+    #[test]
+    fn tcp_proxy_serve_accepts_multiple_clients_and_stops_on_flag() {
+        // Same two-backend + frame-shuttle setup as the single-
+        // connection test. Backend A is the host proxy; Backend B
+        // is the fake guest with the echo listener.
+        let host_backend = Arc::new(SmoltcpBackend::with_config(BackendConfig {
+            listen_port: 0,
+            ..BackendConfig::default()
+        }));
+        let guest_backend = Arc::new(SmoltcpBackend::with_config(BackendConfig {
+            host_ipv4: DEFAULT_GUEST_IPV4,
+            host_mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
+            gateway_ipv4: DEFAULT_HOST_IPV4,
+            listen_port: DEFAULT_LISTEN_PORT,
+        }));
+
+        let shuttle_stop = Arc::new(AtomicBool::new(false));
+        let shuttle = spawn_frame_shuttle(
+            host_backend.clone(),
+            guest_backend.clone(),
+            shuttle_stop.clone(),
+        );
+
+        // Bind OS listener on an ephemeral port BEFORE spawning the
+        // accept loop so client connects know the port.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let listen_addr: SocketAddr = listener.local_addr().expect("local_addr");
+
+        let proxy = Arc::new(TcpProxy::new(
+            host_backend.clone(),
+            IpEndpoint::new(
+                IpAddress::v4(
+                    DEFAULT_GUEST_IPV4[0],
+                    DEFAULT_GUEST_IPV4[1],
+                    DEFAULT_GUEST_IPV4[2],
+                    DEFAULT_GUEST_IPV4[3],
+                ),
+                DEFAULT_LISTEN_PORT,
+            ),
+        ));
+
+        let serve_stop = Arc::new(AtomicBool::new(false));
+        let serve_proxy = Arc::clone(&proxy);
+        let serve_stop_handle = Arc::clone(&serve_stop);
+        let serve_thread = thread::spawn(move || serve_proxy.serve(listener, serve_stop_handle));
+
+        // Three sequential clients — serve() should accept each,
+        // spawn a per-connection bridge, round-trip the echo.
+        const PAYLOADS: &[&[u8]] = &[
+            b"first client via serve()\n",
+            b"second client - different payload\n",
+            b"third client - proving the loop keeps running\n",
+        ];
+
+        for payload in PAYLOADS {
+            let mut client = TcpStream::connect(listen_addr)
+                .expect("client connect to proxy accept-loop listener");
+            client
+                .set_read_timeout(Some(StdDuration::from_secs(5)))
+                .expect("set read timeout");
+
+            client.write_all(payload).expect("client write payload");
+
+            let mut received = Vec::with_capacity(payload.len());
+            let mut buf = [0u8; 128];
+            while received.len() < payload.len() {
+                let n = client.read(&mut buf).expect("client read echo");
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
+            }
+
+            client
+                .shutdown(std::net::Shutdown::Write)
+                .expect("shutdown write");
+            drop(client);
+
+            assert_eq!(
+                &received[..payload.len()],
+                *payload,
+                "echoed payload must match for one of {} serial clients",
+                PAYLOADS.len()
+            );
+        }
+
+        // Signal the accept loop to stop. Within one
+        // `ACCEPT_POLL_INTERVAL` the loop observes the flag, reaps
+        // any in-flight bridge threads, and returns.
+        serve_stop.store(true, Ordering::Relaxed);
+        let serve_result = serve_thread.join().expect("serve thread must not panic");
+        assert!(
+            serve_result.is_ok(),
+            "serve returned error on clean shutdown: {serve_result:?}"
+        );
+
+        shuttle_stop.store(true, Ordering::Relaxed);
         shuttle.join().expect("frame shuttle must not panic");
     }
 }
