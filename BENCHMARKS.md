@@ -198,6 +198,23 @@ fork from it has to redo the 30 s `warmup.sh` loop to reach
 JIT'd state, so every fork from it hits `NANOVM_PETCLINIC_READY`
 within milliseconds of restore.
 
+`nanovm-jvm-bench` prints TWO tables in cold vs warm mode:
+
+- **"Honest fork cost (restore only)"** — the raw `hv.restore()`
+  wall-clock. Warm and cold come out near-identical here (~3 ms)
+  because the MAP_PRIVATE fork is the same syscall regardless of
+  snapshot state. A ~1× speedup in this table is the correct
+  signal that the fork mechanism is doing its job.
+- **"Time-to-ready (product metric)"** — `hv.restore()` + wait
+  for `NANOVM_PETCLINIC_READY` in the forked child. This is the
+  ~20 000× figure users feel: warm forks signal READY instantly;
+  cold forks rerun the 30 s JIT warmup inside the child.
+
+The two tables answer different questions. The fork-cost table
+says "how fast can we clone a running JVM?" (~3 ms). The time-to-
+ready table says "how fast can we scale out a warmed service?"
+(instant from a warm snapshot vs 30 s from cold).
+
 ### Speed-up vs. a fresh Spring Petclinic boot
 
 | metric | fresh boot | warm restore | speed-up |
@@ -220,11 +237,14 @@ handler path.
 
 1. **Cold measurement is methodological, not a limitation.** Cold
    snapshot captures Spring at the moment the port opens, pre-
-   warmup. A truer "cold restore" would mean "fork from cold
-   snapshot + first HTTP response"; that's ~2-7 ms + one HTTP
-   round-trip in an unwarmed JVM (probably 50-200 ms with C1
-   compile pressure). Bench harness methodology refinement is
-   tracked for a follow-up PR.
+   warmup. The "time-to-ready" column measures fork + 30 s
+   warmup-rerun inside the child; the "honest fork cost" column
+   isolates the raw `restore()` wall-clock. A truer "cold +
+   first-byte latency" metric would mean "fork + first HTTP
+   response" (~2-7 ms + one C1-compiled round-trip, probably
+   50-200 ms total) — that needs the Finding C / vm-kvm host-port-
+   mapping work to land first, since it requires the host to
+   actually hit the guest's `:8080` across virtio-net.
 2. **Single JVM vendor.** Oracle JDK 21.0.5 only. Corretto, Temurin,
    Azul Zing numbers will differ, especially on CDS behavior.
 3. **Minimal workload.** Petclinic is a canonical Spring Boot demo
