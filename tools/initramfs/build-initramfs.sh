@@ -120,41 +120,57 @@ case "${VARIANT}" in
     fi
     echo "initramfs: variant=net-echo — using busybox at ${BUSYBOX}"
 
-    # Shell init: bring eth0 up on the smoltcp backend's link-local
-    # subnet, print a marker to serial, then hand off to
-    # `busybox nc` as a TCP echo listener. `-l -k -p 8080 -e cat`
-    # keeps the socket alive across connections and streams every
-    # byte back verbatim through busybox's cat applet.
+    # Shell init: diagnostic-rich. Every command preceded by an
+    # `echo [stage N]` so a failure between stages localises to
+    # the last visible marker. First rev showed zero output on the
+    # Omarchy host — we need to know whether the shell even reaches
+    # the first write. Once the stage-marker chain confirms where
+    # things fall over, this trims back to the minimal production
+    # init in a follow-up.
     INIT_SRC="${CACHE}/net-echo-init.sh"
     cat > "${INIT_SRC}" <<'INITSCRIPT'
 #!/bin/busybox sh
 # Guest-side /init for the virtio-net smoltcp data-path test.
-# Minimal: bring up loopback + eth0 with the host-expected IP,
-# echo a readiness marker to the serial console, then run
-# `nc -lk -p 8080 -e cat` so every connection gets its bytes
-# mirrored back.
+#
+# DIAGNOSTIC MODE: a staged marker chain. The host-side test only
+# matches on NANOVM_NET_ECHO_READY, but the `[stage N]` markers
+# around it tell us which command stalls when the test fails.
 
+echo "[stage 1] shell entered (busybox sh is alive)"
 BB=/bin/busybox
 
-$BB mount -t proc  proc  /proc  2>/dev/null || :
-$BB mount -t sysfs sysfs /sys   2>/dev/null || :
+echo "[stage 2] /bin/busybox: $($BB ls -la /bin/busybox 2>&1 | head -1)"
+echo "[stage 2b] /dev contents: $($BB ls /dev 2>&1)"
 
-# Bring loopback up (some kernel paths require it even when we
-# don't bind on it) and eth0 up on the link-local subnet the
-# SmoltcpBackend uses for its host side.
-$BB ip link set lo   up
-$BB ip link set eth0 up
-$BB ip addr add 169.254.0.2/24 dev eth0
+echo "[stage 3] mount proc:"
+$BB mount -t proc  proc  /proc  2>&1 || echo "  (mount proc failed, ignoring)"
+echo "[stage 4] mount sys:"
+$BB mount -t sysfs sysfs /sys   2>&1 || echo "  (mount sys failed, ignoring)"
+
+echo "[stage 5] ip link show (pre-up):"
+$BB ip link show 2>&1 || echo "  (ip link show failed)"
+
+echo "[stage 6] ip link set lo up:"
+$BB ip link set lo up 2>&1 || echo "  (lo up failed, ignoring)"
+echo "[stage 7] ip link set eth0 up:"
+$BB ip link set eth0 up 2>&1 || echo "  (eth0 up failed, ignoring)"
+echo "[stage 8] ip addr add 169.254.0.2/24 dev eth0:"
+$BB ip addr add 169.254.0.2/24 dev eth0 2>&1 || echo "  (addr add failed, ignoring)"
+
+echo "[stage 9] ip addr show (post-up):"
+$BB ip addr show 2>&1 || echo "  (ip addr show failed)"
 
 # Readiness marker — the host-side test polls serial for this
-# before attaching TcpProxy, so the race between "guest boot
-# finished" and "host tries to open a TCP socket" closes
-# deterministically.
+# substring before attaching TcpProxy.
 echo "NANOVM_NET_ECHO_READY"
 
-# Listen on :8080 forever, echo back verbatim. `-e cat` is a
-# busybox-specific extension: on connect, busybox fork+exec's
-# cat with stdin/stdout wired to the accepted socket.
+# Test the `-e` applet feature of this busybox build. If missing,
+# nc rejects the option and exits — the marker above still gets
+# the test past its wait, but the proxy round-trip will fail.
+echo "[stage 10] busybox nc --help (brief):"
+$BB nc --help 2>&1 | head -5 || echo "  (nc --help failed)"
+
+echo "[stage 11] exec nc listener:"
 exec $BB nc -lk -p 8080 -e $BB cat
 INITSCRIPT
     chmod +x "${INIT_SRC}"
