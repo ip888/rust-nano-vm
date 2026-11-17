@@ -23,16 +23,15 @@
 //! `tools/kernel/build-tiny-kernel.sh` if your cached bzImage is
 //! older than sub-PR #C commit 4.
 //!
-//! # TODO (end-to-end data-path test — follow-up PR)
+//! # End-to-end data-path test — sibling file
 //!
-//! This test only verifies the virtio bring-up handshake reaches
-//! `DRIVER_OK` with the smoltcp backend wired in. It does **not**
-//! configure `eth0` inside the guest, run a guest TCP listener,
-//! bridge a host stream through [`TcpProxy`], or assert a real
-//! HTTP round trip. That needs a guest initramfs with a small TCP
-//! server (minimal Rust binary or a Spring Boot container) baked
-//! into fixtures. Tracked as Copilot finding #4252252446 on
-//! PR #283 for the follow-up PR / Milestone 1.5.
+//! This test verifies the virtio bring-up handshake only (status
+//! reaches `DRIVER_OK`). The companion file
+//! `virtio_net_smoltcp_data_path_boot.rs` covers the full
+//! external-TCP-client → TcpProxy → SmoltcpBackend → virtio-net
+//! ring → guest kernel → guest echo listener round trip; it
+//! uses the `NANOVM_INIT=net-echo` initramfs variant
+//! (`tools/initramfs/build-initramfs.sh`).
 //!
 //! Run with:
 //!
