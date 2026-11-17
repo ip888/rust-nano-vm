@@ -237,7 +237,17 @@ pub use queue::{
 #[cfg(feature = "smoltcp-backend")]
 pub mod smoltcp_backend;
 #[cfg(feature = "smoltcp-backend")]
-pub use smoltcp_backend::{SmoltcpBackend, DEFAULT_GUEST_IPV4, DEFAULT_HOST_IPV4};
+pub use smoltcp_backend::{
+    SmoltcpBackend, DEFAULT_GUEST_IPV4, DEFAULT_HOST_IPV4, DEFAULT_LISTEN_PORT,
+};
+
+// Re-export the smoltcp types that appear on `TcpProxy::new`'s
+// public signature so downstream crates (vm-kvm's integration
+// tests, future host-port-mapping code) don't need their own
+// direct dependency on the smoltcp crate just to construct an
+// `IpEndpoint`.
+#[cfg(feature = "smoltcp-backend")]
+pub use smoltcp::wire::{IpAddress, IpEndpoint};
 
 #[cfg(feature = "smoltcp-backend")]
 pub mod tcp_proxy;
