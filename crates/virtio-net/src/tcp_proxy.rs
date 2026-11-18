@@ -363,14 +363,22 @@ impl TcpProxy {
             }
             let mut did_work = false;
 
+            if self.backend.socket_state(handle) == tcp::State::Closed {
+                pending_to_smoltcp.clear();
+                return Ok(());
+            }
+
             // Direction 1a: flush any carry-over from a previous
             // partial write before pulling new bytes off the OS
             // stream. Protects the invariant "bytes handed to us by
             // the kernel never disappear."
             if !pending_to_smoltcp.is_empty() {
-                let w = self.backend.socket_send(handle, &pending_to_smoltcp)?;
+                let (socket_open, w) =
+                    self.flush_pending_to_smoltcp(handle, &mut pending_to_smoltcp)?;
+                if !socket_open {
+                    return Ok(());
+                }
                 if w > 0 {
-                    pending_to_smoltcp.drain(..w);
                     did_work = true;
                 }
             }
@@ -422,6 +430,10 @@ impl TcpProxy {
             // backlog drained, and smoltcp has nothing more pending
             // to deliver.
             let state = self.backend.socket_state(handle);
+            if state == tcp::State::Closed {
+                pending_to_smoltcp.clear();
+                return Ok(());
+            }
             if external_eof
                 && pending_to_smoltcp.is_empty()
                 && n == 0
@@ -435,14 +447,29 @@ impl TcpProxy {
 
             // Also exit cleanly if the guest closed its half, our
             // pending backlog is empty, and we've drained the RX.
-            if pending_to_smoltcp.is_empty() && n == 0 && state == tcp::State::Closed {
-                return Ok(());
-            }
-
             if !did_work {
                 thread::sleep(POLL_INTERVAL);
             }
         }
+    }
+
+    fn flush_pending_to_smoltcp(
+        &self,
+        handle: SocketHandle,
+        pending: &mut Vec<u8>,
+    ) -> Result<(bool, usize)> {
+        if self.backend.socket_state(handle) == tcp::State::Closed {
+            pending.clear();
+            return Ok((false, 0));
+        }
+        let written = self.backend.socket_send(handle, pending)?;
+        if written > 0 {
+            pending.drain(..written);
+        }
+        Ok((
+            self.backend.socket_state(handle) != tcp::State::Closed,
+            written,
+        ))
     }
 }
 
@@ -624,6 +651,40 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         shuttle.join().expect("frame shuttle must not panic");
+    }
+
+    #[test]
+    fn closed_socket_discards_pending_external_bytes_and_exits() {
+        let backend = Arc::new(SmoltcpBackend::with_config(BackendConfig {
+            listen_port: 0,
+            ..BackendConfig::default()
+        }));
+        let proxy = TcpProxy::new(
+            backend.clone(),
+            IpEndpoint::new(
+                IpAddress::v4(
+                    DEFAULT_GUEST_IPV4[0],
+                    DEFAULT_GUEST_IPV4[1],
+                    DEFAULT_GUEST_IPV4[2],
+                    DEFAULT_GUEST_IPV4[3],
+                ),
+                DEFAULT_LISTEN_PORT,
+            ),
+        );
+        let handle = backend.open_client_socket(proxy.guest_endpoint());
+        backend.close_socket(handle);
+        assert_eq!(backend.socket_state(handle), tcp::State::Closed);
+
+        let mut pending = b"unsendable external bytes".to_vec();
+        let (socket_open, written) = proxy
+            .flush_pending_to_smoltcp(handle, &mut pending)
+            .expect("flush pending bytes");
+        assert!(!socket_open);
+        assert_eq!(written, 0);
+        assert!(
+            pending.is_empty(),
+            "closed socket must discard pending bytes"
+        );
     }
 
     #[test]

@@ -41,6 +41,7 @@ mod inner {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -100,6 +101,66 @@ mod inner {
         http_first_byte: Duration,
     }
 
+    #[derive(Debug, Clone)]
+    struct Cancellation {
+        cancelled: Arc<AtomicBool>,
+        signal: Arc<std::sync::atomic::AtomicI32>,
+    }
+
+    impl Cancellation {
+        fn install() -> Result<Self> {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let signal = Arc::new(std::sync::atomic::AtomicI32::new(0));
+            let thread_cancelled = Arc::clone(&cancelled);
+            let thread_signal = Arc::clone(&signal);
+            std::thread::Builder::new()
+                .name("nanovm-demo-signals".into())
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build signal runtime");
+                    runtime.block_on(async {
+                        #[cfg(unix)]
+                        {
+                            let mut terminate = tokio::signal::unix::signal(
+                                tokio::signal::unix::SignalKind::terminate(),
+                            )
+                            .expect("install SIGTERM handler");
+                            tokio::select! {
+                                _ = tokio::signal::ctrl_c() => {
+                                    thread_signal.store(2, Ordering::SeqCst);
+                                }
+                                _ = terminate.recv() => {
+                                    thread_signal.store(15, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            tokio::signal::ctrl_c()
+                                .await
+                                .expect("install Ctrl-C handler");
+                            thread_signal.store(2, Ordering::SeqCst);
+                        }
+                        thread_cancelled.store(true, Ordering::SeqCst);
+                    });
+                })
+                .context("spawn signal listener")?;
+            Ok(Self { cancelled, signal })
+        }
+
+        fn check(&self) -> Result<()> {
+            if self.cancelled.load(Ordering::SeqCst) {
+                bail!(
+                    "interrupted by signal {}",
+                    self.signal.load(Ordering::SeqCst)
+                );
+            }
+            Ok(())
+        }
+    }
+
     struct Cleanup {
         fleet: Arc<ProcessFleet>,
         snapshot: Option<SnapshotId>,
@@ -136,6 +197,7 @@ mod inner {
     }
 
     pub(crate) fn run() -> Result<()> {
+        let cancellation = Cancellation::install()?;
         let args = Args::parse();
         validate_args(&args)?;
         let kernel = canonicalize_file(&args.kernel, "kernel")?;
@@ -184,19 +246,23 @@ mod inner {
 
         println!("nanovm-java-demo: booting golden Petclinic VM through ProcessFleet");
         let golden_boot = Instant::now();
+        cancellation.check()?;
         let golden = fleet.create_vm(&config).context("create golden VM")?;
         cleanup.track_vm(golden.id);
+        cancellation.check()?;
         fleet.start(golden.id).context("start golden VM")?;
         let golden_ready = wait_for_http(
             endpoint_for(&golden, READINESS_PORT)?,
             READINESS_PATH,
             Duration::from_secs(args.warmup_timeout_secs),
+            &cancellation,
         )
         .context("wait for warmed Petclinic snapshot readiness")?;
         let golden_http = wait_for_http(
             endpoint_for(&golden, PETCLINIC_PORT)?,
             PETCLINIC_PATH,
             Duration::from_secs(args.http_timeout_secs),
+            &cancellation,
         )
         .context("exercise Petclinic HTTP endpoint on golden VM")?;
         println!(
@@ -209,6 +275,7 @@ mod inner {
         );
 
         let snapshot_started = Instant::now();
+        cancellation.check()?;
         let snapshot = fleet
             .snapshot(golden.id)
             .context("snapshot warmed golden VM")?;
@@ -220,17 +287,20 @@ mod inner {
 
         let mut samples = Vec::with_capacity(args.forks);
         for index in 0..args.forks {
+            cancellation.check()?;
             let fork_started = Instant::now();
             let fork = fleet
                 .restore(snapshot)
                 .with_context(|| format!("restore fork #{}", index + 1))?;
             cleanup.track_vm(fork.id);
             let restore = fork_started.elapsed();
+            cancellation.check()?;
 
             let ready = wait_for_http(
                 endpoint_for(&fork, READINESS_PORT)?,
                 READINESS_PATH,
                 Duration::from_secs(args.http_timeout_secs),
+                &cancellation,
             )
             .with_context(|| format!("verify readiness of fork #{}", index + 1))?;
             let time_to_ready = fork_started.elapsed();
@@ -238,6 +308,7 @@ mod inner {
                 endpoint_for(&fork, PETCLINIC_PORT)?,
                 PETCLINIC_PATH,
                 Duration::from_secs(args.http_timeout_secs),
+                &cancellation,
             )
             .with_context(|| format!("verify Petclinic HTTP on fork #{}", index + 1))?;
             let sample = Sample {
@@ -297,11 +368,17 @@ mod inner {
             .ok_or_else(|| anyhow!("endpoint resolved to no addresses"))
     }
 
-    fn wait_for_http(address: SocketAddr, path: &str, timeout: Duration) -> Result<TimedHttp> {
+    fn wait_for_http(
+        address: SocketAddr,
+        path: &str,
+        timeout: Duration,
+        cancellation: &Cancellation,
+    ) -> Result<TimedHttp> {
         let started = Instant::now();
         let deadline = started + timeout;
         let mut last_error = String::from("server has not accepted a connection");
         loop {
+            cancellation.check()?;
             let now = Instant::now();
             if now >= deadline {
                 bail!(
@@ -309,9 +386,12 @@ mod inner {
                      last error: {last_error}"
                 );
             }
-            let connect_timeout = (deadline - now).min(Duration::from_secs(5));
-            match http_once(address, path, connect_timeout) {
+            match http_once(address, path, deadline, cancellation) {
                 Ok(status) if status == 200 => {
+                    cancellation.check()?;
+                    if Instant::now() > deadline {
+                        bail!("GET http://{address}{path} completed after its deadline");
+                    }
                     return Ok(TimedHttp {
                         status,
                         elapsed: started.elapsed(),
@@ -325,19 +405,48 @@ mod inner {
         }
     }
 
-    fn http_once(address: SocketAddr, path: &str, timeout: Duration) -> Result<u16> {
-        let mut stream = TcpStream::connect_timeout(&address, timeout)
+    fn http_once(
+        address: SocketAddr,
+        path: &str,
+        deadline: Instant,
+        cancellation: &Cancellation,
+    ) -> Result<u16> {
+        let remaining = || {
+            deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| anyhow!("HTTP deadline expired"))
+        };
+        cancellation.check()?;
+        let connect_timeout = remaining()?.min(Duration::from_millis(250));
+        let mut stream = TcpStream::connect_timeout(&address, connect_timeout)
             .with_context(|| format!("connect to {address}"))?;
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
+        let operation_timeout = remaining()?.min(Duration::from_millis(250));
+        stream.set_read_timeout(Some(operation_timeout))?;
+        stream.set_write_timeout(Some(operation_timeout))?;
         let request =
             format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        cancellation.check()?;
         stream.write_all(request.as_bytes())?;
 
         let mut response = Vec::with_capacity(1024);
         let mut buffer = [0_u8; 256];
         while response.len() < 16 * 1024 {
-            let count = stream.read(&mut buffer)?;
+            cancellation.check()?;
+            let read_timeout = remaining()?.min(Duration::from_millis(250));
+            stream.set_read_timeout(Some(read_timeout))?;
+            let count = match stream.read(&mut buffer) {
+                Ok(count) => count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Err(anyhow!("HTTP deadline expired: {error}"));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            cancellation.check()?;
             if count == 0 {
                 break;
             }
@@ -346,6 +455,10 @@ mod inner {
                 break;
             }
         }
+        if Instant::now() > deadline {
+            return Err(anyhow!("HTTP deadline expired while reading response"));
+        }
+        cancellation.check()?;
         parse_status_line(&response).ok_or_else(|| anyhow!("invalid or incomplete HTTP response"))
     }
 
@@ -376,6 +489,46 @@ mod inner {
         }
         let index = (((sorted.len() - 1) as f64) * percentile).round() as usize;
         sorted[index]
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{http_once, Cancellation};
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn http_once_rejects_response_after_absolute_deadline() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+            let address = listener.local_addr().expect("server address");
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = [0; 256];
+                let _ = std::io::Read::read(&mut stream, &mut request);
+                stream.write_all(b"HTTP/1.1 ").expect("write status prefix");
+                std::thread::sleep(Duration::from_millis(150));
+                let _ = stream.write_all(b"200 OK\r\nContent-Length: 0\r\n\r\n");
+            });
+
+            let cancellation = Cancellation {
+                cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                signal: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+            };
+            let error = http_once(
+                address,
+                "/",
+                Instant::now() + Duration::from_millis(50),
+                &cancellation,
+            )
+            .expect_err("late response must exceed absolute deadline");
+            assert!(
+                error.to_string().contains("deadline"),
+                "unexpected error: {error:#}"
+            );
+            server.join().expect("server thread");
+        }
     }
 }
 
