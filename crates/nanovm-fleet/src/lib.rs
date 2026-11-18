@@ -61,8 +61,8 @@ use std::time::Duration;
 
 use tokio::net::UnixStream;
 use vm_core::{
-    GuestExecRequest, GuestExecResult, Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError,
-    VmHandle, VmId, VmMeta, VmResult, VmState,
+    GuestExecRequest, GuestExecResult, Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmEndpoint,
+    VmError, VmHandle, VmId, VmMeta, VmResult, VmState,
 };
 use vmm_ipc::framing::{read_frame, write_frame};
 use vmm_ipc::{ErrorCode, Request, Response};
@@ -158,6 +158,8 @@ struct Worker {
     /// worker's internal `VmId::next()` (which it always does
     /// once a Restore-spawned worker is involved).
     worker_vm_id: Option<VmId>,
+    /// Last active endpoints reported by the worker.
+    endpoints: Vec<VmEndpoint>,
 }
 
 impl std::fmt::Debug for Worker {
@@ -166,6 +168,7 @@ impl std::fmt::Debug for Worker {
             .field("socket", &self.socket)
             .field("child_pid", &self.child.as_ref().map(|c| c.id()))
             .field("stream_open", &self.stream.is_some())
+            .field("endpoints", &self.endpoints)
             .finish()
     }
 }
@@ -376,6 +379,7 @@ impl ProcessFleet {
                 socket,
                 stream: Some(stream),
                 worker_vm_id: None,
+                endpoints: Vec::new(),
             }))),
             Err(e) => {
                 // Worker never came up. Kill the jailer (and by
@@ -575,6 +579,7 @@ impl Hypervisor for ProcessFleet {
         {
             let mut guard = slot.lock().expect("worker lock");
             guard.worker_vm_id = Some(handle.id);
+            guard.endpoints = handle.endpoints.clone();
         }
         let handle = VmHandle {
             id: vm_id,
@@ -600,7 +605,8 @@ impl Hypervisor for ProcessFleet {
         unwrap_response(resp, |r| match r {
             Response::Empty => Ok(()),
             other => Err(other),
-        })
+        })?;
+        Ok(())
     }
 
     fn state(&self, id: VmId) -> VmResult<VmState> {
@@ -677,6 +683,7 @@ impl Hypervisor for ProcessFleet {
         {
             let mut guard = new_slot.lock().expect("worker lock");
             guard.worker_vm_id = Some(handle.id);
+            guard.endpoints = handle.endpoints.clone();
         }
         let handle = VmHandle {
             id: new_vm_id,
@@ -727,10 +734,19 @@ impl Hypervisor for ProcessFleet {
         let mut handles = Vec::with_capacity(ids.len());
         for id in ids {
             let state = self.state(id).unwrap_or(VmState::Created);
+            let slot = self.worker_for(id)?;
+            let endpoints = slot.lock().expect("worker lock").endpoints.clone();
+            if state != VmState::Running && !endpoints.is_empty() {
+                slot.lock().expect("worker lock").endpoints.clear();
+            }
             handles.push(VmHandle {
                 id,
                 state,
-                endpoints: Vec::new(),
+                endpoints: if state == VmState::Running {
+                    endpoints
+                } else {
+                    Vec::new()
+                },
             });
         }
         Ok(handles)

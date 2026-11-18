@@ -38,8 +38,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use tokio_stream::StreamExt;
 use tower_http::trace::TraceLayer;
-use vm_core::{Hypervisor, SnapshotId, VmEndpoint, VmId};
+use vm_core::{Hypervisor, SnapshotId, VmEndpoint, VmId, VmState};
 
 use crate::api::{
     openapi_spec, CreateVmRequest, ExecRequest, ExecResponse, FilePathQuery, FileReadResponse,
@@ -55,6 +56,12 @@ use crate::ownership::OwnershipMap;
 use crate::request_id;
 use crate::time::rfc3339_now;
 use crate::warm_pool::WarmPool;
+
+#[derive(Clone)]
+struct VmEndpointState {
+    endpoints: Vec<VmEndpoint>,
+    lifecycle: Arc<tokio::sync::RwLock<()>>,
+}
 
 /// Per-token fork usage — the basis for usage-based billing on the fork API.
 #[derive(Debug, Default, Clone, Copy)]
@@ -77,7 +84,7 @@ pub struct AppState {
     /// VM endpoints returned by the backend. These are process-local because
     /// live VM workers are process-local too; durable recovery lands with the
     /// restart/reconciliation stage.
-    vm_endpoints: Arc<Mutex<HashMap<VmId, Vec<VmEndpoint>>>>,
+    vm_endpoints: Arc<Mutex<HashMap<VmId, VmEndpointState>>>,
     /// Client used to forward external HTTP through the VM's loopback proxy.
     http_client: reqwest::Client,
     /// Prometheus counters exposed at `/metrics`.
@@ -180,27 +187,81 @@ impl AppState {
     }
 
     fn record_endpoints(&self, handle: &vm_core::VmHandle) {
-        self.vm_endpoints
+        let mut endpoints = self
+            .vm_endpoints
             .lock()
-            .expect("vm endpoints mutex poisoned")
-            .insert(handle.id, handle.endpoints.clone());
+            .expect("vm endpoints mutex poisoned");
+        let state = endpoints
+            .entry(handle.id)
+            .or_insert_with(|| VmEndpointState {
+                endpoints: Vec::new(),
+                lifecycle: Arc::new(tokio::sync::RwLock::new(())),
+            });
+        state.endpoints = handle.endpoints.clone();
     }
 
-    fn forget_endpoints(&self, id: VmId) {
+    fn clear_endpoints(&self, id: VmId) {
+        if let Some(state) = self
+            .vm_endpoints
+            .lock()
+            .expect("vm endpoints mutex poisoned")
+            .get_mut(&id)
+        {
+            state.endpoints.clear();
+        }
+    }
+
+    fn forget_endpoint_state(&self, id: VmId) {
         self.vm_endpoints
             .lock()
             .expect("vm endpoints mutex poisoned")
             .remove(&id);
     }
 
-    fn endpoint(&self, id: VmId, guest_port: u16) -> Option<VmEndpoint> {
-        self.vm_endpoints
+    fn lifecycle_gate(&self, id: VmId) -> Arc<tokio::sync::RwLock<()>> {
+        let mut endpoints = self
+            .vm_endpoints
+            .lock()
+            .expect("vm endpoints mutex poisoned");
+        Arc::clone(
+            &endpoints
+                .entry(id)
+                .or_insert_with(|| VmEndpointState {
+                    endpoints: Vec::new(),
+                    lifecycle: Arc::new(tokio::sync::RwLock::new(())),
+                })
+                .lifecycle,
+        )
+    }
+
+    async fn endpoint_for_request(
+        &self,
+        id: VmId,
+        guest_port: u16,
+    ) -> Option<(VmEndpoint, tokio::sync::OwnedRwLockReadGuard<()>)> {
+        let state = self
+            .vm_endpoints
             .lock()
             .expect("vm endpoints mutex poisoned")
             .get(&id)?
-            .iter()
-            .find(|endpoint| endpoint.guest_port == guest_port)
-            .cloned()
+            .clone();
+        let guard = Arc::clone(&state.lifecycle).read_owned().await;
+        let endpoint = {
+            let endpoints = self
+                .vm_endpoints
+                .lock()
+                .expect("vm endpoints mutex poisoned");
+            let current = endpoints.get(&id)?;
+            if !Arc::ptr_eq(&state.lifecycle, &current.lifecycle) {
+                return None;
+            }
+            current
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.guest_port == guest_port)?
+                .clone()
+        };
+        Some((endpoint, guard))
     }
 
     /// Install the Stripe billing context. `None` disables
@@ -562,6 +623,14 @@ async fn create_vm(
     body: Result<Json<CreateVmRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<VmHandleDto>), ApiError> {
     let Json(req) = body?;
+    for forward in &req.port_forwards {
+        forward.validate().map_err(|message| {
+            ApiError::Bad(format!(
+                "invalid port forward for guest port {}: {message}",
+                forward.guest_port
+            ))
+        })?;
+    }
     // Server-side defaults (from `NANOVM_DEFAULT_*`) fill any field the
     // request left unset. For `kernel`/`rootfs` a set field wins over
     // the default; for `cmdline` an empty string is treated as "unset"
@@ -645,7 +714,16 @@ async fn start_vm(
     let Path(id) = id?;
     let vm_id = VmId(id);
     state.ownership.require_vm_access(vm_id, &org)?;
+    let lifecycle = state.lifecycle_gate(vm_id);
+    let _guard = lifecycle.write_owned().await;
     state.hypervisor.start(vm_id)?;
+    let handle = state
+        .hypervisor
+        .list_vms()?
+        .into_iter()
+        .find(|handle| handle.id == vm_id)
+        .ok_or_else(|| ApiError::InternalDyn(format!("VM {id} missing after start")))?;
+    state.record_endpoints(&handle);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -657,8 +735,17 @@ async fn stop_vm(
     let Path(id) = id?;
     let vm_id = VmId(id);
     state.ownership.require_vm_access(vm_id, &org)?;
+    let lifecycle = state.lifecycle_gate(vm_id);
+    let _guard = lifecycle.write_owned().await;
     state.hypervisor.stop(vm_id)?;
+    state.clear_endpoints(vm_id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct VmPortPath {
+    id: u64,
+    port: u16,
 }
 
 /// Proxy an arbitrary HTTP request through one guest port exposed by the VM.
@@ -669,18 +756,29 @@ async fn proxy_vm_http(
     State(state): State<AppState>,
     Extension(org): Extension<OrgId>,
     OriginalUri(uri): OriginalUri,
-    path: Result<Path<(u64, u16)>, PathRejection>,
+    path: Result<Path<VmPortPath>, PathRejection>,
     request: Request<Body>,
 ) -> Result<Response<Body>, ApiError> {
-    let Path((id, guest_port)) = path?;
+    let Path(VmPortPath {
+        id,
+        port: guest_port,
+    }) = path?;
     let vm_id = VmId(id);
     state.ownership.require_vm_access(vm_id, &org)?;
-    let endpoint = state
-        .endpoint(vm_id, guest_port)
+    let (endpoint, lifecycle) = state
+        .endpoint_for_request(vm_id, guest_port)
+        .await
         .ok_or_else(|| ApiError::NotFound {
             code: "vm_port_not_forwarded",
             message: format!("VM {id} does not forward guest TCP port {guest_port}"),
         })?;
+    if state.hypervisor.state(vm_id)? != VmState::Running {
+        state.clear_endpoints(vm_id);
+        return Err(ApiError::NotFound {
+            code: "vm_port_not_running",
+            message: format!("VM {id} is not running"),
+        });
+    }
 
     let prefix = format!("/v1/vms/{id}/ports/{guest_port}");
     let suffix = uri.path().strip_prefix(&prefix).ok_or_else(|| {
@@ -729,10 +827,10 @@ async fn proxy_vm_http(
         .map_err(|e| ApiError::InternalDyn(format!("guest HTTP proxy: {e}")))?;
     let status = upstream.status();
     let response_headers = upstream.headers().clone();
-    let bytes = upstream
-        .bytes()
-        .await
-        .map_err(|e| ApiError::InternalDyn(format!("guest HTTP response: {e}")))?;
+    let stream = upstream.bytes_stream().map(move |item| {
+        let _keep_alive = &lifecycle;
+        item
+    });
     let mut response = Response::builder().status(status);
     for (name, value) in &response_headers {
         if !matches!(
@@ -749,7 +847,7 @@ async fn proxy_vm_http(
         }
     }
     response
-        .body(Body::from(bytes))
+        .body(Body::from_stream(stream))
         .map_err(|e| ApiError::InternalDyn(format!("build guest HTTP response: {e}")))
 }
 
@@ -763,8 +861,10 @@ async fn destroy_vm(
     let Path(id) = id?;
     let vm_id = VmId(id);
     state.ownership.require_vm_access(vm_id, &org)?;
+    let lifecycle = state.lifecycle_gate(vm_id);
+    let _guard = lifecycle.write_owned().await;
     state.hypervisor.destroy(vm_id)?;
-    state.forget_endpoints(vm_id);
+    state.forget_endpoint_state(vm_id);
     state.ownership.forget_vm(vm_id);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1213,6 +1313,7 @@ async fn read_file(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tower::ServiceExt;
     use vm_core::VmConfig;
 
     #[tokio::test]
@@ -1241,20 +1342,23 @@ mod tests {
         });
 
         let hypervisor = Arc::new(vm_mock::MockHypervisor::new());
-        let handle = hypervisor
+        let mut handle = hypervisor
             .create_vm(&VmConfig::default())
             .expect("create VM");
+        hypervisor.start(handle.id).expect("start VM");
+        handle.state = VmState::Running;
         let state = AppState::new(hypervisor);
         let org = OrgId::default_org();
         state.ownership.record_vm(handle.id, org.clone());
-        state.vm_endpoints.lock().expect("endpoint lock").insert(
-            handle.id,
-            vec![VmEndpoint {
+        state.record_endpoints(&vm_core::VmHandle {
+            id: handle.id,
+            state: handle.state,
+            endpoints: vec![VmEndpoint {
                 guest_port: 8080,
                 host_address: "127.0.0.1".into(),
                 host_port: upstream_port,
             }],
-        );
+        });
 
         let uri: axum::http::Uri = format!("/v1/vms/{}/ports/8080/hello?x=1", handle.id.0)
             .parse()
@@ -1266,15 +1370,10 @@ mod tests {
             .header("authorization", "Bearer control-plane-secret")
             .body(Body::from("proxy-body"))
             .expect("build request");
-        let response = proxy_vm_http(
-            State(state),
-            Extension(org),
-            OriginalUri(uri),
-            Ok(Path((handle.id.0, 8080))),
-            request,
-        )
-        .await
-        .expect("proxy request");
+        let app = router()
+            .layer(Extension(Arc::new(crate::ApiTokens::default())))
+            .with_state(state);
+        let response = app.oneshot(request).await.expect("proxy request");
         assert_eq!(response.status(), StatusCode::CREATED);
         assert_eq!(
             response

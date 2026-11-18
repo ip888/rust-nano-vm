@@ -1083,9 +1083,20 @@ impl KvmHypervisor {
                     "vm-kvm: guest_port must be non-zero".to_owned(),
                 ));
             }
-            let listener = std::net::TcpListener::bind(format!(
-                "{}:{}",
-                forward.host_address, forward.host_port
+            let host_address: std::net::IpAddr = forward.host_address.parse().map_err(|e| {
+                VmError::Backend(format!(
+                    "vm-kvm: invalid host address {:?}: {e}",
+                    forward.host_address
+                ))
+            })?;
+            if !host_address.is_loopback() {
+                return Err(VmError::Backend(format!(
+                    "vm-kvm: refusing non-loopback port-forward address {host_address}"
+                )));
+            }
+            let listener = std::net::TcpListener::bind(std::net::SocketAddr::new(
+                host_address,
+                forward.host_port,
             ))
             .map_err(|e| {
                 VmError::Backend(format!(
@@ -1453,7 +1464,9 @@ impl KvmHypervisor {
             {
                 let vcpu = vm.vcpu.take().expect("checked is_some above");
                 vm.state = VmState::Stopped;
-                vm.last_run_error = Some(join_vcpu_thread(vcpu)?);
+                let last_run_error = join_vcpu_thread(vcpu);
+                Self::release_port_proxies(vm);
+                vm.last_run_error = Some(last_run_error?);
             }
         }
         Ok(())
@@ -1462,6 +1475,7 @@ impl KvmHypervisor {
     fn stop_vm(vm: &mut KvmVm, kick_signal: c_int) -> VmResult<()> {
         let Some(vcpu) = vm.vcpu.take() else {
             vm.state = VmState::Stopped;
+            Self::release_port_proxies(vm);
             return Ok(());
         };
         vcpu.control.stop.store(true, Ordering::SeqCst);
@@ -1470,10 +1484,30 @@ impl KvmHypervisor {
         vcpu.handle
             .kill(kick_signal)
             .map_err(|e| VmError::Backend(format!("kick vCPU thread: {e}")))?;
-        vm.last_run_error = Some(join_vcpu_thread(vcpu)?);
+        let last_run_error = join_vcpu_thread(vcpu);
         vm.state = VmState::Stopped;
+        Self::release_port_proxies(vm);
+        vm.last_run_error = Some(last_run_error?);
         Ok(())
     }
+
+    #[cfg(feature = "virtio-net-smoltcp")]
+    fn release_port_proxies(vm: &mut KvmVm) {
+        for proxy in &vm.runtime.port_proxies {
+            if let Some(forward) = vm
+                .config
+                .port_forwards
+                .iter_mut()
+                .find(|forward| forward.guest_port == proxy.endpoint.guest_port)
+            {
+                forward.host_port = proxy.endpoint.host_port;
+            }
+        }
+        vm.runtime.port_proxies.clear();
+    }
+
+    #[cfg(not(feature = "virtio-net-smoltcp"))]
+    fn release_port_proxies(_vm: &mut KvmVm) {}
 
     /// On-disk directory for a snapshot id, under the process temp dir.
     fn snapshot_dir(&self, id: SnapshotId) -> PathBuf {
@@ -1620,6 +1654,12 @@ impl KvmHypervisor {
                 );
                 backend.restore_state(state)?;
                 Some(backend)
+            }
+            (vm_core::NetBackendChoice::Smoltcp, _) => {
+                return Err(VmError::Unsupported(
+                    "vm-kvm: restoring a smoltcp network snapshot requires \
+                     the `virtio-net-smoltcp` feature",
+                ));
             }
             _ => None,
         };
@@ -1870,20 +1910,6 @@ impl Hypervisor for KvmHypervisor {
                 to: VmState::Stopped,
             }),
         };
-        #[cfg(feature = "virtio-net-smoltcp")]
-        if result.is_ok() {
-            for proxy in &vm.runtime.port_proxies {
-                if let Some(forward) = vm
-                    .config
-                    .port_forwards
-                    .iter_mut()
-                    .find(|forward| forward.guest_port == proxy.endpoint.guest_port)
-                {
-                    forward.host_port = proxy.endpoint.host_port;
-                }
-            }
-            vm.runtime.port_proxies.clear();
-        }
         result
     }
 

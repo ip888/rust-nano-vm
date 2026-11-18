@@ -396,6 +396,29 @@ async fn empty_token_set_disables_auth() {
 }
 
 #[tokio::test]
+async fn create_vm_rejects_non_loopback_port_forward() {
+    let (status, body) = send(
+        app(),
+        Method::POST,
+        "/v1/vms",
+        Some(json!({
+            "port_forwards": [{
+                "guest_port": 8080,
+                "host_address": "0.0.0.0",
+                "host_port": 0
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "bad_request");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("loopback"));
+}
+
+#[tokio::test]
 async fn missing_authorization_header_returns_401() {
     let app = app_with_tokens(ApiTokens::new(["s3cret"]));
     let (status, body) = send(app, Method::POST, "/v1/vms", Some(json!({}))).await;

@@ -55,6 +55,22 @@ pub(crate) struct PortForwardRequest {
     pub host_port: u16,
 }
 
+impl PortForwardRequest {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.guest_port == 0 {
+            return Err("guest_port must be non-zero".to_owned());
+        }
+        let address: std::net::IpAddr = self
+            .host_address
+            .parse()
+            .map_err(|_| "host_address must be a loopback IP address".to_owned())?;
+        if !address.is_loopback() {
+            return Err("host_address must be a loopback IP address".to_owned());
+        }
+        Ok(())
+    }
+}
+
 fn default_host_address() -> String {
     "127.0.0.1".to_owned()
 }

@@ -232,6 +232,14 @@ fn host_to_guest_tcp_round_trip() {
         "{}:{}",
         restored_endpoint.host_address, restored_endpoint.host_port
     ));
+    hv.stop(restored.id).expect("stop restored VM");
+    hv.start(restored.id).expect("restart restored VM");
+    wait_for_serial(&hv, restored.id, READY_MARKER, 15);
+    std::thread::sleep(Duration::from_secs(1));
+    let restarted_received = echo_round_trip(format!(
+        "{}:{}",
+        restored_endpoint.host_address, restored_endpoint.host_port
+    ));
 
     // Capture serial for the assertion message before teardown, so
     // a failure diagnosis isn't blocked on the VM being alive.
@@ -264,6 +272,10 @@ fn host_to_guest_tcp_round_trip() {
     assert_eq!(
         restored_received, PAYLOAD,
         "restored VM did not serve TCP through the reconstructed virtio-net device"
+    );
+    assert_eq!(
+        restarted_received, PAYLOAD,
+        "restarted VM did not release and recreate its TCP listener"
     );
     eprintln!(
         "virtio_net_smoltcp_data_path_boot: round-trip of {} bytes OK (full chain alive)",

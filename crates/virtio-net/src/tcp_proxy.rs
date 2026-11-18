@@ -306,7 +306,6 @@ impl TcpProxy {
         stop: Option<&Arc<AtomicBool>>,
     ) -> Result<()> {
         let start = Instant::now();
-        let mut probe = [0u8; 1];
         loop {
             if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
                 return Err(VirtioNetError::Io(io::Error::new(
@@ -334,7 +333,7 @@ impl TcpProxy {
             // the VMM after retransmissions or an ARP reply queue a fresh
             // outbound frame; checking socket_state alone never advances the
             // stack.
-            self.backend.socket_recv(handle, &mut probe)?;
+            self.backend.socket_recv(handle, &mut [])?;
             thread::sleep(POLL_INTERVAL);
         }
     }

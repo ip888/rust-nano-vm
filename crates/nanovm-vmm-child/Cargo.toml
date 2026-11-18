@@ -43,7 +43,7 @@ default = []
 # macOS / Windows / CI containers without KVM, useful for testing
 # the vmm-ipc wire loop end-to-end).
 kvm = ["dep:vm-kvm", "vm-kvm/kvm"]
-virtio-net-smoltcp = ["dep:vm-kvm", "vm-kvm/virtio-net-smoltcp"]
+virtio-net-smoltcp = ["kvm", "vm-kvm/virtio-net-smoltcp"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "net", "process", "macros", "rt-multi-thread", "time"] }
