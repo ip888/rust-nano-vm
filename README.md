@@ -121,14 +121,10 @@ cargo run -p bench --release --features kvm --bin nanovm-boot-bench -- \
 cargo run -p bench --release --features kvm --bin nanovm-parallel-fork-bench -- \
     --forks 50
 
-# Spring Petclinic (JVM workload, needs docker + buildx for the rootfs):
-SKIP_EXT4=1 tools/java-rootfs/build.sh
-mkdir -p ~/nanovm-snapshots
-TMPDIR=~/nanovm-snapshots \
-    cargo run -p bench --release --features kvm --bin nanovm-jvm-bench -- \
-    --kernel tools/kernel/cache/bzImage-jvm \
-    --initramfs tools/java-rootfs/cache/initramfs.cpio.gz \
-    --memory-mib 2048 --snapshot-at both --forks 20
+# Production Spring Petclinic flow: build artifacts, boot through the
+# KVM process fleet, snapshot a warmed VM, fork/restore, and verify
+# real HTTP on every fork.
+tools/java-demo/run.sh --forks 3
 ```
 
 ## Platform support

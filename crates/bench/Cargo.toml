@@ -25,9 +25,14 @@ path = "src/bin/boot_bench.rs"
 name = "nanovm-parallel-fork-bench"
 path = "src/bin/parallel_fork_bench.rs"
 
+[[bin]]
+name = "nanovm-java-demo"
+path = "src/bin/java_demo.rs"
+
 [dependencies]
 vm-core.workspace = true
 vm-kvm = { workspace = true }
+nanovm-fleet.workspace = true
 control-plane.workspace = true
 clap.workspace = true
 anyhow.workspace = true

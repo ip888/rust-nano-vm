@@ -698,7 +698,14 @@ impl SmoltcpBackend {
                 .inner
                 .lock()
                 .expect("smoltcp backend state mutex poisoned");
-            let socket = state.sockets.get_mut::<tcp::Socket>(handle);
+            state.poll_and_echo();
+            let Some(socket) = state.sockets.iter_mut().find_map(|(candidate, socket)| {
+                (candidate == handle).then_some(match socket {
+                    smoltcp::socket::Socket::Tcp(socket) => socket,
+                })
+            }) else {
+                return Ok(0);
+            };
             let w = socket.send_slice(data).unwrap_or(0);
             state.poll_and_echo();
             w
@@ -718,7 +725,13 @@ impl SmoltcpBackend {
                 .lock()
                 .expect("smoltcp backend state mutex poisoned");
             state.poll_and_echo();
-            let socket = state.sockets.get_mut::<tcp::Socket>(handle);
+            let Some(socket) = state.sockets.iter_mut().find_map(|(candidate, socket)| {
+                (candidate == handle).then_some(match socket {
+                    smoltcp::socket::Socket::Tcp(socket) => socket,
+                })
+            }) else {
+                return Ok(0);
+            };
             socket.recv_slice(buf).unwrap_or(0)
         };
         self.notify_rx_available();
@@ -733,7 +746,16 @@ impl SmoltcpBackend {
             .inner
             .lock()
             .expect("smoltcp backend state mutex poisoned");
-        s.sockets.get::<tcp::Socket>(handle).state()
+        let state = s
+            .sockets
+            .iter()
+            .find_map(|(candidate, socket)| {
+                (candidate == handle).then(|| match socket {
+                    smoltcp::socket::Socket::Tcp(socket) => socket.state(),
+                })
+            })
+            .unwrap_or(tcp::State::Closed);
+        state
     }
 
     /// Close our half of the connection and let the reaper remove
@@ -754,7 +776,14 @@ impl SmoltcpBackend {
             // the connection is still half-open; smoltcp finishes the
             // four-way handshake on its own and the reaper takes over
             // from `Closed`.
-            state.sockets.get_mut::<tcp::Socket>(handle).close();
+            let Some(socket) = state.sockets.iter_mut().find_map(|(candidate, socket)| {
+                (candidate == handle).then_some(match socket {
+                    smoltcp::socket::Socket::Tcp(socket) => socket,
+                })
+            }) else {
+                return;
+            };
+            socket.close();
             state.poll_and_echo();
         } // mutex guard dropped here
         self.notify_rx_available();
@@ -1044,6 +1073,19 @@ mod tests {
         // default waker weren't a safe no-op the test would panic.
         let bk = SmoltcpBackend::new();
         let handle = bk.open_client_socket(IpEndpoint::new(IpAddress::v4(169, 254, 0, 2), 80));
+        bk.close_socket(handle);
+    }
+
+    #[test]
+    fn client_socket_operations_are_safe_after_reap() {
+        let bk = SmoltcpBackend::new();
+        let handle = bk.open_client_socket(IpEndpoint::new(IpAddress::v4(169, 254, 0, 2), 80));
+        bk.close_socket(handle);
+
+        assert_eq!(bk.socket_state(handle), tcp::State::Closed);
+        assert_eq!(bk.socket_send(handle, b"late").expect("late send"), 0);
+        let mut buf = [0; 8];
+        assert_eq!(bk.socket_recv(handle, &mut buf).expect("late receive"), 0);
         bk.close_socket(handle);
     }
 

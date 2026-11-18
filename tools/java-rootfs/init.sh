@@ -74,10 +74,21 @@ try_mount tmpfs    /tmp
 try_mount tmpfs    /run
 echo "[init] filesystems mounted"
 
-# ---- loopback --------------------------------------------------------
-# `ip link set lo up` needs CAP_NET_ADMIN.
+# ---- loopback + smoltcp link ----------------------------------------
+# `ip link set lo up` needs CAP_NET_ADMIN. eth0 is backed by the
+# vm-kvm virtio-net device; the production demo deliberately uses the
+# same static link-local address expected by the smoltcp host backend.
 ip link set lo up 2>/dev/null || true
-echo "[init] loopback up"
+ip link set eth0 up
+ip addr add 169.254.0.2/24 dev eth0 2>/dev/null || true
+echo "[init] loopback and eth0 up (169.254.0.2/24)"
+
+# Readiness is a separate, tiny HTTP server so the host can distinguish
+# "Spring accepted a TCP connection" from "the full JIT warmup completed".
+# warmup.sh creates the served file immediately before the ready marker.
+/bin/busybox httpd -f -h /run -p 0.0.0.0:8081 &
+HTTPD_PID=$!
+echo "[init] readiness HTTP server pid=${HTTPD_PID}, port=8081"
 
 # ---- JVM launch ------------------------------------------------------
 JAVA_OPTS="\

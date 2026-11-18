@@ -146,6 +146,12 @@ struct Worker {
     child: Option<Child>,
     /// Socket path. Held for cleanup.
     socket: PathBuf,
+    /// Per-worker snapshot store and state directory. Keeping this
+    /// unique prevents process-local snapshot ids from colliding.
+    snapshot_dir: PathBuf,
+    /// Expected cgroup directory created by the production jailer.
+    /// Removed after the child exits; absent for stub jailers.
+    cgroup_dir: Option<PathBuf>,
     /// Open IPC stream to the worker. Closed in `destroy` (sends
     /// `Shutdown` + drops); the worker exits on EOF.
     stream: Option<UnixStream>,
@@ -166,6 +172,7 @@ impl std::fmt::Debug for Worker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Worker")
             .field("socket", &self.socket)
+            .field("snapshot_dir", &self.snapshot_dir)
             .field("child_pid", &self.child.as_ref().map(|c| c.id()))
             .field("stream_open", &self.stream.is_some())
             .field("endpoints", &self.endpoints)
@@ -187,6 +194,18 @@ impl Worker {
             self.child = None;
         }
         let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_dir_all(&self.snapshot_dir);
+        if let Some(cgroup_dir) = self.cgroup_dir.as_deref() {
+            match std::fs::remove_dir(cgroup_dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(
+                    path = %cgroup_dir.display(),
+                    error = %e,
+                    "could not remove worker cgroup"
+                ),
+            }
+        }
     }
 }
 
@@ -318,6 +337,30 @@ impl ProcessFleet {
         std::fs::create_dir_all(&self.config.socket_dir)
             .map_err(|e| VmError::Backend(format!("create socket_dir: {e}")))?;
         let socket = self.config.socket_dir.join(format!("vm-{}.sock", vm_id.0));
+        let snapshot_dir = self
+            .config
+            .socket_dir
+            .join(format!("vm-{}-snapshots", vm_id.0));
+        let cgroup_dir = self
+            .cgroup_parent_path()
+            .map(|parent| parent.join(format!("nanovm-vm-{}", vm_id.0)));
+        // A killed orchestrator cannot run `Worker::Drop`. Retry can
+        // safely remove an empty cgroup left by that worker; cgroup v2
+        // refuses `rmdir` while any process still belongs to it.
+        if let Some(cgroup_dir) = cgroup_dir.as_deref() {
+            match std::fs::remove_dir(cgroup_dir) {
+                Ok(()) => tracing::info!(
+                    path = %cgroup_dir.display(),
+                    "removed stale empty worker cgroup before spawn"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    path = %cgroup_dir.display(),
+                    error = %error,
+                    "stale worker cgroup could not be removed before spawn"
+                ),
+            }
+        }
         // Stale socket from a crashed predecessor would make the
         // worker's `bind` fail with EADDRINUSE. Best-effort
         // delete; ignore NotFound.
@@ -330,6 +373,7 @@ impl ProcessFleet {
             .arg(&socket)
             .arg("--vmm-child-binary")
             .arg(&self.config.vmm_child_binary)
+            .env("NANOVM_SNAPSHOT_DIR", &snapshot_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
@@ -377,6 +421,8 @@ impl ProcessFleet {
             Ok(stream) => Ok(Arc::new(Mutex::new(Worker {
                 child: Some(child),
                 socket,
+                snapshot_dir,
+                cgroup_dir,
                 stream: Some(stream),
                 worker_vm_id: None,
                 endpoints: Vec::new(),
@@ -389,8 +435,30 @@ impl ProcessFleet {
                 let _ = c.kill();
                 let _ = c.wait();
                 let _ = std::fs::remove_file(&socket);
+                let _ = std::fs::remove_dir_all(&snapshot_dir);
+                if let Some(cgroup_dir) = cgroup_dir.as_deref() {
+                    let _ = std::fs::remove_dir(cgroup_dir);
+                }
                 Err(e)
             }
+        }
+    }
+
+    fn cgroup_parent_path(&self) -> Option<PathBuf> {
+        const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+        let parent = self.config.cgroup_parent.clone().or_else(|| {
+            std::fs::read_to_string("/proc/self/cgroup")
+                .ok()
+                .and_then(|text| {
+                    text.lines()
+                        .find_map(|line| line.strip_prefix("0::"))
+                        .map(PathBuf::from)
+                })
+        })?;
+        if parent.starts_with(CGROUP_ROOT) {
+            Some(parent)
+        } else {
+            Some(Path::new(CGROUP_ROOT).join(parent.to_string_lossy().trim_start_matches('/')))
         }
     }
 
@@ -682,6 +750,19 @@ impl Hypervisor for ProcessFleet {
             Response::VmHandle(h) => Ok(h),
             other => Err(other),
         })?;
+        let delete_adopted =
+            self.dispatch_to_slot(&new_slot, Request::DeleteSnapshot { id: local_snap })?;
+        if let Err(error) = unwrap_response(delete_adopted, |r| match r {
+            Response::Empty => Ok(()),
+            other => Err(other),
+        }) {
+            tracing::warn!(
+                snapshot = local_snap.0,
+                worker = new_vm_id.0,
+                error = %error,
+                "restored VM is live but adopted snapshot cleanup failed"
+            );
+        }
         // Record the worker-internal id of the restored VM so
         // subsequent state/start/stop/destroy/etc translate
         // correctly. Without this every follow-up op would

@@ -6,9 +6,9 @@ Builds a Debian-slim–based rootfs containing:
   enterprise customer stack (Citibank et al.) standardises on.
 - **Spring Petclinic** single-jar variant, built from a pinned commit
   of `spring-projects/spring-petclinic`.
-- A minimal init (`/sbin/init` with a `/init` symlink) that launches
-  the JVM on boot and starts an in-guest warmup driver
-  (`warmup.sh`).
+- A minimal init (`/sbin/init` with a `/init` symlink) that configures
+  the smoltcp link, launches the JVM, and starts the in-guest warmup
+  and readiness HTTP services (`warmup.sh`).
 
 Two build artifacts land in `cache/`, both from the exact same
 staged filesystem:
@@ -88,7 +88,8 @@ TARGET_PLATFORM=linux/arm64 tools/java-rootfs/build.sh
 
 | Component | Pinned to | Verified with |
 |---|---|---|
-| Oracle JDK | `21.0.5` (`jdk-21.0.5_linux-x64_bin.tar.gz`) | `sha256` in `fetch.sh` (currently `SKIP`; fetch script refuses to run under `NANOVM_STRICT_PINS=1` until this flips to a real digest) |
+| Oracle JDK | `21.0.5` (`jdk-21.0.5_linux-x64_bin.tar.gz`) | SHA-256 in `fetch.sh`; strict pinning is enforced by the demo |
+| Petclinic builder | `eclipse-temurin:21-jdk@sha256:…` | Multi-platform image digest in `Dockerfile` |
 | Spring Petclinic | commit specified in `Dockerfile` `ARG PETCLINIC_REF` | Git checkout by commit hash — no CDN in the loop |
 | Debian base | `debian:12-slim@sha256:…` — `ARG DEBIAN_DIGEST` interpolated into both `FROM` lines | Digest — a bad pin fails the build at `docker buildx` time |
 
