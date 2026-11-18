@@ -40,7 +40,7 @@ use axum::{
 };
 use tokio_stream::StreamExt;
 use tower_http::trace::TraceLayer;
-use vm_core::{Hypervisor, SnapshotId, VmEndpoint, VmId, VmState};
+use vm_core::{Hypervisor, SnapshotId, VmConfig, VmEndpoint, VmId, VmState};
 
 use crate::api::{
     openapi_spec, CreateVmRequest, ExecRequest, ExecResponse, FilePathQuery, FileReadResponse,
@@ -623,14 +623,6 @@ async fn create_vm(
     body: Result<Json<CreateVmRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<VmHandleDto>), ApiError> {
     let Json(req) = body?;
-    for forward in &req.port_forwards {
-        forward.validate().map_err(|message| {
-            ApiError::Bad(format!(
-                "invalid port forward for guest port {}: {message}",
-                forward.guest_port
-            ))
-        })?;
-    }
     // Server-side defaults (from `NANOVM_DEFAULT_*`) fill any field the
     // request left unset. For `kernel`/`rootfs` a set field wins over
     // the default; for `cmdline` an empty string is treated as "unset"
@@ -638,7 +630,7 @@ async fn create_vm(
     // falls through to the default. See `VmConfigDefaults::apply_to`.
     // This is what makes `POST /v1/vms {}` succeed on a KVM image with
     // bundled kernel + rootfs.
-    let mut cfg: vm_core::VmConfig = req.into();
+    let mut cfg = VmConfig::try_from(req).map_err(ApiError::Bad)?;
     state.vm_defaults.apply_to(&mut cfg);
     let handle = state.hypervisor.create_vm(&cfg)?;
     state.ownership.record_vm(handle.id, org);

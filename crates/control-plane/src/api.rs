@@ -102,8 +102,18 @@ fn default_memory_mib() -> u64 {
     128
 }
 
-impl From<CreateVmRequest> for VmConfig {
-    fn from(r: CreateVmRequest) -> Self {
+impl TryFrom<CreateVmRequest> for VmConfig {
+    type Error = String;
+
+    fn try_from(r: CreateVmRequest) -> Result<Self, Self::Error> {
+        for forward in &r.port_forwards {
+            forward.validate().map_err(|message| {
+                format!(
+                    "invalid port forward for guest port {}: {message}",
+                    forward.guest_port
+                )
+            })?;
+        }
         let net_backend = r.net_backend.map(Into::into).unwrap_or_else(|| {
             if r.port_forwards.is_empty() {
                 NetBackendChoice::Mock
@@ -111,7 +121,7 @@ impl From<CreateVmRequest> for VmConfig {
                 NetBackendChoice::Smoltcp
             }
         });
-        VmConfig {
+        Ok(VmConfig {
             vcpus: r.vcpus,
             memory_mib: r.memory_mib,
             kernel: r.kernel,
@@ -131,7 +141,7 @@ impl From<CreateVmRequest> for VmConfig {
                     host_port: forward.host_port,
                 })
                 .collect(),
-        }
+        })
     }
 }
 
