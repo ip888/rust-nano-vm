@@ -229,6 +229,11 @@ type WorkerSlot = Arc<Mutex<Worker>>;
 /// VM lifetime in the public API).
 pub struct ProcessFleet {
     config: FleetConfig,
+    /// Exclusive directory owned by this fleet below
+    /// [`FleetConfig::snapshot_root`]. VM ids are process-local, so
+    /// using the shared root directly lets two fleets overwrite each
+    /// other's `vm-1` snapshot state.
+    snapshot_namespace: PathBuf,
     /// Map from VmId → live worker. Insertions happen on
     /// `create_vm` / `restore`; removals on `destroy` (which also
     /// kills the subprocess).
@@ -264,6 +269,18 @@ impl std::fmt::Debug for ProcessFleet {
     }
 }
 
+impl Drop for ProcessFleet {
+    fn drop(&mut self) {
+        if let Ok(mut workers) = self.workers.write() {
+            workers.clear();
+        }
+        if let Ok(mut pool) = self.warm_pool.lock() {
+            pool.clear();
+        }
+        let _ = std::fs::remove_dir(&self.snapshot_namespace);
+    }
+}
+
 impl ProcessFleet {
     /// Construct a fleet from a [`FleetConfig`]. Spawns its own
     /// multi-thread tokio runtime for IPC work; the caller doesn't
@@ -279,8 +296,10 @@ impl ProcessFleet {
             .enable_time()
             .thread_name("nanovm-fleet-ipc")
             .build()?;
+        let snapshot_namespace = create_snapshot_namespace(&config.snapshot_root)?;
         let fleet = Self {
             config,
+            snapshot_namespace,
             workers: RwLock::new(HashMap::new()),
             snapshot_owner: RwLock::new(HashMap::new()),
             next_vm_id: AtomicU64::new(1),
@@ -343,8 +362,7 @@ impl ProcessFleet {
             .map_err(|e| VmError::Backend(format!("create socket_dir: {e}")))?;
         let socket = self.config.socket_dir.join(format!("vm-{}.sock", vm_id.0));
         let snapshot_dir = self
-            .config
-            .snapshot_root
+            .snapshot_namespace
             .join(format!("vm-{}-snapshots", vm_id.0));
         let cgroup_dir = self
             .cgroup_parent_path()
@@ -526,6 +544,28 @@ impl ProcessFleet {
             .block_on(roundtrip_on(stream, req))
             .map_err(|e| VmError::Backend(format!("ipc: {e}")))?;
         Ok(resp)
+    }
+}
+
+static NEXT_SNAPSHOT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
+
+fn create_snapshot_namespace(root: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    loop {
+        let sequence = NEXT_SNAPSHOT_NAMESPACE.fetch_add(1, Ordering::Relaxed);
+        let namespace = root.join(format!(
+            "fleet-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&namespace) {
+            Ok(()) => return Ok(namespace),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -955,6 +995,26 @@ mod tests {
         assert!(cfg.default_cpu_quota_pct.is_none());
         assert!(cfg.cgroup_parent.is_none());
         assert!(cfg.spawn_timeout >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn independent_fleets_get_disjoint_snapshot_namespaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = FleetConfig {
+            snapshot_root: dir.path().join("snapshots"),
+            ..FleetConfig::default()
+        };
+        let first = ProcessFleet::new(config.clone()).expect("first fleet");
+        let second = ProcessFleet::new(config).expect("second fleet");
+
+        assert_ne!(
+            first.snapshot_namespace, second.snapshot_namespace,
+            "process-local VM ids must not share snapshot directories"
+        );
+        assert_eq!(
+            first.snapshot_namespace.parent(),
+            second.snapshot_namespace.parent()
+        );
     }
 
     #[test]
