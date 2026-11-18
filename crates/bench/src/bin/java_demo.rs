@@ -75,6 +75,8 @@ mod inner {
         pub vmm_child: PathBuf,
         #[arg(long, default_value = "/tmp/nanovm-java-demo")]
         pub socket_dir: PathBuf,
+        #[arg(long)]
+        pub snapshot_root: Option<PathBuf>,
         #[arg(long, default_value_t = 2048)]
         pub memory_mib: u64,
         #[arg(long, default_value_t = 3)]
@@ -206,12 +208,19 @@ mod inner {
         let vmm_child = canonicalize_file(&args.vmm_child, "vmm-child")?;
         std::fs::create_dir_all(&args.socket_dir)
             .with_context(|| format!("create socket directory {}", args.socket_dir.display()))?;
+        let snapshot_root = args
+            .snapshot_root
+            .clone()
+            .unwrap_or_else(|| args.socket_dir.join("snapshots"));
+        std::fs::create_dir_all(&snapshot_root)
+            .with_context(|| format!("create snapshot root {}", snapshot_root.display()))?;
 
         let fleet = Arc::new(
             ProcessFleet::new(FleetConfig {
                 jailer_binary: jailer,
                 vmm_child_binary: vmm_child,
                 socket_dir: args.socket_dir.clone(),
+                snapshot_root,
                 default_memory_limit_mib: None,
                 default_cpu_quota_pct: None,
                 cgroup_parent: args.cgroup_parent.clone(),
@@ -442,7 +451,10 @@ mod inner {
                         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                     ) =>
                 {
-                    return Err(anyhow!("HTTP deadline expired: {error}"));
+                    if Instant::now() >= deadline {
+                        return Err(anyhow!("HTTP deadline expired: {error}"));
+                    }
+                    continue;
                 }
                 Err(error) => return Err(error.into()),
             };
@@ -526,6 +538,40 @@ mod inner {
             assert!(
                 error.to_string().contains("deadline"),
                 "unexpected error: {error:#}"
+            );
+            server.join().expect("server thread");
+        }
+
+        #[test]
+        fn http_once_continues_reading_through_poll_timeouts() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+            let address = listener.local_addr().expect("server address");
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = [0; 256];
+                let _ = std::io::Read::read(&mut stream, &mut request);
+                stream
+                    .write_all(b"HTTP/1.1 20")
+                    .expect("write status prefix");
+                std::thread::sleep(Duration::from_millis(350));
+                stream
+                    .write_all(b"0 OK\r\nContent-Length: 0\r\n\r\n")
+                    .expect("finish response");
+            });
+            let cancellation = Cancellation {
+                cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                signal: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+            };
+
+            assert_eq!(
+                http_once(
+                    address,
+                    "/",
+                    Instant::now() + Duration::from_secs(1),
+                    &cancellation,
+                )
+                .expect("response should survive polling timeouts"),
+                200
             );
             server.join().expect("server thread");
         }

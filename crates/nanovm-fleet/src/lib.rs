@@ -82,6 +82,10 @@ pub struct FleetConfig {
     /// `<dir>/vm-<id>.sock`). Must exist and be writable by the
     /// control-plane process. Defaults to `/var/run/nanovm`.
     pub socket_dir: PathBuf,
+    /// Root directory for per-worker snapshot state. Kept separate from
+    /// [`Self::socket_dir`] because snapshots are multi-GiB artifacts and
+    /// `/var/run` is commonly backed by the much smaller tmpfs `/run`.
+    pub snapshot_root: PathBuf,
     /// Optional default per-VM memory cap (MiB). The jailer writes
     /// it into the new cgroup's `memory.max`. `None` skips the
     /// memory cap — useful for hosts that haven't enabled the
@@ -115,6 +119,7 @@ impl Default for FleetConfig {
             jailer_binary: PathBuf::from("/usr/local/bin/nanovm-jailer"),
             vmm_child_binary: PathBuf::from("/usr/local/bin/nanovm-vmm-child"),
             socket_dir: PathBuf::from("/var/run/nanovm"),
+            snapshot_root: PathBuf::from("/var/tmp/nanovm-fleet-snapshots"),
             default_memory_limit_mib: None,
             default_cpu_quota_pct: None,
             cgroup_parent: None,
@@ -339,7 +344,7 @@ impl ProcessFleet {
         let socket = self.config.socket_dir.join(format!("vm-{}.sock", vm_id.0));
         let snapshot_dir = self
             .config
-            .socket_dir
+            .snapshot_root
             .join(format!("vm-{}-snapshots", vm_id.0));
         let cgroup_dir = self
             .cgroup_parent_path()
@@ -944,6 +949,8 @@ mod tests {
         assert!(cfg.jailer_binary.is_absolute());
         assert!(cfg.vmm_child_binary.is_absolute());
         assert!(cfg.socket_dir.is_absolute());
+        assert!(cfg.snapshot_root.is_absolute());
+        assert_ne!(cfg.snapshot_root, cfg.socket_dir);
         assert!(cfg.default_memory_limit_mib.is_none());
         assert!(cfg.default_cpu_quota_pct.is_none());
         assert!(cfg.cgroup_parent.is_none());

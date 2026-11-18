@@ -90,6 +90,7 @@ fn make_fleet_with_warm(dir: &Path, warm_pool_size: usize) -> Arc<ProcessFleet> 
         jailer_binary: make_stub_jailer(dir),
         vmm_child_binary: vmm_child_binary(),
         socket_dir: dir.join("sockets"),
+        snapshot_root: dir.join("snapshots"),
         default_memory_limit_mib: None,
         default_cpu_quota_pct: None,
         cgroup_parent: None,

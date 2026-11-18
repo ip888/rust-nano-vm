@@ -102,6 +102,9 @@
 //!   `nanovm-vmm-child`. Default `/usr/local/bin/nanovm-vmm-child`.
 //! - `NANOVM_FLEET_SOCKET_DIR` — directory the fleet creates per-VM
 //!   Unix sockets in. Default `/var/run/nanovm`.
+//! - `NANOVM_FLEET_SNAPSHOT_ROOT` — directory for per-worker
+//!   multi-GiB snapshot backing files. Defaults under `/var/tmp`,
+//!   independently from the usually-tmpfs socket dir.
 //! - `NANOVM_FLEET_WARM_POOL_SIZE` — pre-spawned idle workers the
 //!   fleet keeps ready. `0` (default) disables; non-zero pre-pays
 //!   the spawn cost so `create_vm` is a socket-pop.
@@ -405,6 +408,11 @@ fn fleet_config_from_env() -> nanovm_fleet::FleetConfig {
     if let Ok(p) = std::env::var("NANOVM_FLEET_SOCKET_DIR") {
         if !p.is_empty() {
             cfg.socket_dir = PathBuf::from(p);
+        }
+    }
+    if let Ok(p) = std::env::var("NANOVM_FLEET_SNAPSHOT_ROOT") {
+        if !p.is_empty() {
+            cfg.snapshot_root = PathBuf::from(p);
         }
     }
     if let Ok(n) = std::env::var("NANOVM_FLEET_WARM_POOL_SIZE") {
