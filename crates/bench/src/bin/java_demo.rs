@@ -97,6 +97,12 @@ mod inner {
     }
 
     #[derive(Debug)]
+    struct HttpResponse {
+        status: u16,
+        first_byte_at: Instant,
+    }
+
+    #[derive(Debug)]
     struct Sample {
         restore: Duration,
         time_to_ready: Duration,
@@ -211,7 +217,7 @@ mod inner {
         let snapshot_root = args
             .snapshot_root
             .clone()
-            .unwrap_or_else(|| args.socket_dir.join("snapshots"));
+            .unwrap_or_else(|| FleetConfig::default().snapshot_root);
         std::fs::create_dir_all(&snapshot_root)
             .with_context(|| format!("create snapshot root {}", snapshot_root.display()))?;
 
@@ -396,18 +402,18 @@ mod inner {
                 );
             }
             match http_once(address, path, deadline, cancellation) {
-                Ok(status) if status == 200 => {
+                Ok(response) if response.status == 200 => {
                     cancellation.check()?;
                     if Instant::now() > deadline {
                         bail!("GET http://{address}{path} completed after its deadline");
                     }
                     return Ok(TimedHttp {
-                        status,
-                        elapsed: started.elapsed(),
+                        status: response.status,
+                        elapsed: response.first_byte_at.saturating_duration_since(started),
                         endpoint: address,
                     });
                 }
-                Ok(status) => last_error = format!("HTTP {status}"),
+                Ok(response) => last_error = format!("HTTP {}", response.status),
                 Err(error) => last_error = error.to_string(),
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -419,7 +425,7 @@ mod inner {
         path: &str,
         deadline: Instant,
         cancellation: &Cancellation,
-    ) -> Result<u16> {
+    ) -> Result<HttpResponse> {
         let remaining = || {
             deadline
                 .checked_duration_since(Instant::now())
@@ -439,6 +445,7 @@ mod inner {
 
         let mut response = Vec::with_capacity(1024);
         let mut buffer = [0_u8; 256];
+        let mut first_byte_at = None;
         while response.len() < 16 * 1024 {
             cancellation.check()?;
             let read_timeout = remaining()?.min(Duration::from_millis(250));
@@ -462,6 +469,7 @@ mod inner {
             if count == 0 {
                 break;
             }
+            first_byte_at.get_or_insert_with(Instant::now);
             response.extend_from_slice(&buffer[..count]);
             if response.windows(2).any(|window| window == b"\r\n") {
                 break;
@@ -471,7 +479,12 @@ mod inner {
             return Err(anyhow!("HTTP deadline expired while reading response"));
         }
         cancellation.check()?;
-        parse_status_line(&response).ok_or_else(|| anyhow!("invalid or incomplete HTTP response"))
+        let status = parse_status_line(&response)
+            .ok_or_else(|| anyhow!("invalid or incomplete HTTP response"))?;
+        Ok(HttpResponse {
+            status,
+            first_byte_at: first_byte_at.ok_or_else(|| anyhow!("empty HTTP response"))?,
+        })
     }
 
     fn print_report(samples: &[Sample]) {
@@ -544,6 +557,7 @@ mod inner {
 
         #[test]
         fn http_once_continues_reading_through_poll_timeouts() {
+            let started = Instant::now();
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
             let address = listener.local_addr().expect("server address");
             let server = std::thread::spawn(move || {
@@ -563,15 +577,17 @@ mod inner {
                 signal: Arc::new(std::sync::atomic::AtomicI32::new(0)),
             };
 
-            assert_eq!(
-                http_once(
-                    address,
-                    "/",
-                    Instant::now() + Duration::from_secs(1),
-                    &cancellation,
-                )
-                .expect("response should survive polling timeouts"),
-                200
+            let response = http_once(
+                address,
+                "/",
+                Instant::now() + Duration::from_secs(1),
+                &cancellation,
+            )
+            .expect("response should survive polling timeouts");
+            assert_eq!(response.status, 200);
+            assert!(
+                response.first_byte_at.duration_since(started) < Duration::from_millis(250),
+                "first-byte timing must precede the delayed status-line completion"
             );
             server.join().expect("server thread");
         }
