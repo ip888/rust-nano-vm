@@ -847,9 +847,35 @@ async fn proxy_vm_http(
     let status = upstream.status();
     let response_headers = upstream.headers().clone();
     let cancellation = Arc::clone(&cancel);
-    let stream = upstream
-        .bytes_stream()
-        .take_until((*cancellation).clone().cancelled_owned());
+    let upstream_stream = Box::pin(upstream.bytes_stream());
+    let stream = futures_util::stream::unfold(
+        (upstream_stream, cancellation, false),
+        |(mut upstream_stream, cancellation, ended)| async move {
+            if ended {
+                return None;
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    let error = std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "VM stopped before the guest response completed",
+                    );
+                    Some((Err(error), (upstream_stream, cancellation, true)))
+                }
+                item = upstream_stream.next() => match item {
+                    Some(Ok(bytes)) => Some((
+                        Ok(bytes),
+                        (upstream_stream, cancellation, false),
+                    )),
+                    Some(Err(error)) => Some((
+                        Err(std::io::Error::other(error)),
+                        (upstream_stream, cancellation, true),
+                    )),
+                    None => None,
+                },
+            }
+        },
+    );
     let mut response = Response::builder().status(status);
     for (name, value) in &response_headers {
         if !matches!(
@@ -1467,11 +1493,7 @@ mod tests {
             .body(Body::empty())
             .expect("build request");
         let response = app.oneshot(request).await.expect("streaming response");
-        let body = tokio::spawn(async move {
-            to_bytes(response.into_body(), 1024)
-                .await
-                .expect("cancelled response body")
-        });
+        let body = tokio::spawn(async move { to_bytes(response.into_body(), 1024).await });
 
         tokio::time::timeout(
             Duration::from_secs(1),
@@ -1480,11 +1502,14 @@ mod tests {
         .await
         .expect("stop must not wait for the response")
         .expect("stop VM");
-        let bytes = tokio::time::timeout(Duration::from_secs(1), body)
+        let body_result = tokio::time::timeout(Duration::from_secs(1), body)
             .await
             .expect("body cancellation must finish")
             .expect("body task");
-        assert!(bytes.is_empty() || &bytes[..] == b"hello");
+        assert!(
+            body_result.is_err(),
+            "VM cancellation must abort rather than silently truncate the response"
+        );
         server.abort();
     }
 }
