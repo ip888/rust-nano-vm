@@ -870,6 +870,7 @@ version = "0.0.3"
 dependencies = [
  "axum",
  "base64 0.23.1",
+ "futures-util",
  "getrandom 0.4.3",
  "hmac 0.13.0",
  "http-body-util",
@@ -884,6 +885,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tower",
  "tower-http 0.7.1",
  "tracing",

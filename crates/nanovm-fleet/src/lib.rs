@@ -542,6 +542,14 @@ fn framing_to_io(e: vmm_ipc::framing::FrameError) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
+fn visible_endpoints(state: VmState, endpoints: &[VmEndpoint]) -> Vec<VmEndpoint> {
+    if state == VmState::Running {
+        endpoints.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
 impl Hypervisor for ProcessFleet {
     fn create_vm(&self, cfg: &VmConfig) -> VmResult<VmHandle> {
         // Hot path: claim a pre-spawned worker. Cold path: spawn
@@ -736,17 +744,10 @@ impl Hypervisor for ProcessFleet {
             let state = self.state(id).unwrap_or(VmState::Created);
             let slot = self.worker_for(id)?;
             let endpoints = slot.lock().expect("worker lock").endpoints.clone();
-            if state != VmState::Running && !endpoints.is_empty() {
-                slot.lock().expect("worker lock").endpoints.clear();
-            }
             handles.push(VmHandle {
                 id,
                 state,
-                endpoints: if state == VmState::Running {
-                    endpoints
-                } else {
-                    Vec::new()
-                },
+                endpoints: visible_endpoints(state, &endpoints),
             });
         }
         Ok(handles)
@@ -842,6 +843,19 @@ impl Hypervisor for ProcessFleet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listing_stopped_vm_hides_but_does_not_clear_cached_endpoints() {
+        let endpoints = vec![VmEndpoint {
+            guest_port: 8080,
+            host_address: "127.0.0.1".into(),
+            host_port: 40000,
+        }];
+        assert!(visible_endpoints(VmState::Created, &endpoints).is_empty());
+        assert!(visible_endpoints(VmState::Stopped, &endpoints).is_empty());
+        assert_eq!(visible_endpoints(VmState::Running, &endpoints), endpoints);
+        assert_eq!(endpoints.len(), 1);
+    }
 
     #[test]
     fn fleet_config_default_has_safe_defaults() {
