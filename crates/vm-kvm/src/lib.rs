@@ -145,6 +145,20 @@ struct NetworkSnapshot {
 const NETWORK_SNAPSHOT_FILE: &str = "network.json";
 
 #[cfg(feature = "kvm")]
+fn hard_link_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(src, dst) {
+        Ok(()) => Ok(()),
+        Err(link_error) => match std::fs::copy(src, dst) {
+            Ok(_) => Ok(()),
+            Err(copy_error) => Err(std::io::Error::new(
+                copy_error.kind(),
+                format!("hard link failed ({link_error}); copy fallback failed: {copy_error}"),
+            )),
+        },
+    }
+}
+
+#[cfg(feature = "kvm")]
 #[derive(Debug)]
 struct KvmVm {
     config: VmConfig,
@@ -1511,8 +1525,9 @@ impl KvmHypervisor {
 
     /// On-disk directory for a snapshot id, under the process temp dir.
     fn snapshot_dir(&self, id: SnapshotId) -> PathBuf {
-        std::env::temp_dir()
-            .join("nanovm-snapshots")
+        std::env::var_os("NANOVM_SNAPSHOT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("nanovm-snapshots"))
             .join(id.0.to_string())
     }
 
@@ -2181,13 +2196,27 @@ impl Hypervisor for KvmHypervisor {
                     src.display()
                 )));
             }
-            std::fs::copy(&src, &dst).map_err(|e| {
-                VmError::Backend(format!(
-                    "vm-kvm: adopt: copy {} → {}: {e}",
-                    src.display(),
-                    dst.display()
-                ))
-            })?;
+            if src.file_name() == Some(std::ffi::OsStr::new(Manifest::FILE_NAME)) {
+                std::fs::copy(&src, &dst).map_err(|e| {
+                    VmError::Backend(format!(
+                        "vm-kvm: adopt: copy {} -> {}: {e}",
+                        src.display(),
+                        dst.display()
+                    ))
+                })?;
+            } else {
+                // Snapshot state is immutable after capture. Linking it
+                // keeps a fleet restore at metadata-copy cost while the
+                // restored VM maps the backing file MAP_PRIVATE. Fall
+                // back to a real copy for filesystems without hardlinks.
+                hard_link_or_copy(&src, &dst).map_err(|e| {
+                    VmError::Backend(format!(
+                        "vm-kvm: adopt: link-or-copy {} -> {}: {e}",
+                        src.display(),
+                        dst.display()
+                    ))
+                })?;
+            }
         }
 
         // The on-disk manifest was written by whatever produced the
@@ -2872,6 +2901,15 @@ fn pause_and_capture(vcpu: &VcpuFd, control: &VcpuControl, msr_indices: &[u32]) 
 #[cfg(feature = "kvm")]
 fn handle_io_out(port: u16, data: &[u8], serial_output: &Arc<Mutex<Vec<u8>>>) -> VmResult<()> {
     if port == SERIAL_PORT_BASE {
+        static SERIAL_STDERR: OnceLock<bool> = OnceLock::new();
+        let serial_stderr = SERIAL_STDERR.get_or_init(|| {
+            std::env::var_os("NANOVM_SERIAL_STDERR").is_some_and(|value| {
+                !matches!(value.to_str(), Some("") | Some("0") | Some("false"))
+            })
+        });
+        if *serial_stderr {
+            let _ = std::io::stderr().lock().write_all(data);
+        }
         serial_output
             .lock()
             .map_err(|_| VmError::Backend("vm-kvm: serial output mutex poisoned".into()))?
@@ -3194,6 +3232,37 @@ fn kvm_segment_from_gdt(entry: u64, table_index: u8) -> kvm_segment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(all(feature = "kvm", unix))]
+    fn snapshot_state_adopt_preserves_shared_inode_when_possible() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "nanovm-link-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create test directory");
+        let source = root.join("memory.cow");
+        let target = root.join("adopted-memory.cow");
+        std::fs::write(&source, b"snapshot state").expect("write source");
+
+        hard_link_or_copy(&source, &target).expect("adopt snapshot file");
+
+        assert_eq!(
+            std::fs::read(&target).expect("read adopted state"),
+            b"snapshot state"
+        );
+        assert_eq!(
+            std::fs::metadata(&source).expect("source metadata").ino(),
+            std::fs::metadata(&target).expect("target metadata").ino()
+        );
+        std::fs::remove_dir_all(root).expect("remove test directory");
+    }
 
     #[test]
     #[cfg(not(feature = "kvm"))]
