@@ -140,6 +140,10 @@ config:
   # Fleet-only knobs — ignored unless `backend == fleet`.
   fleet:
     socketDir: "/var/run/nanovm"
+    # Multi-GiB per-worker snapshot storage. The chart mounts an
+    # emptyDir here so read-only root filesystems still have writable,
+    # node-disk-backed storage distinct from the socket runtime dir.
+    snapshotRoot: "/var/lib/nanovm/fleet-snapshots"
     # Pre-spawned idle workers (0 disables; non-zero pre-pays the
     # spawn cost so create_vm is socket-pop-fast). Each idle worker
     # holds an open connection but no VM until `create_vm` claims it.
