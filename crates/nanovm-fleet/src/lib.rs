@@ -727,7 +727,11 @@ impl Hypervisor for ProcessFleet {
         let mut handles = Vec::with_capacity(ids.len());
         for id in ids {
             let state = self.state(id).unwrap_or(VmState::Created);
-            handles.push(VmHandle { id, state });
+            handles.push(VmHandle {
+                id,
+                state,
+                endpoints: Vec::new(),
+            });
         }
         Ok(handles)
     }

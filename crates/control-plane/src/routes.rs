@@ -28,18 +28,18 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use axum::{
-    body::Bytes,
+    body::{to_bytes, Body, Bytes},
     extract::{
         rejection::{JsonRejection, PathRejection},
-        Extension, Path, Query, State,
+        Extension, OriginalUri, Path, Query, State,
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Request, Response, StatusCode},
     middleware,
     routing::{get, post},
     Json, Router,
 };
 use tower_http::trace::TraceLayer;
-use vm_core::{Hypervisor, SnapshotId, VmId};
+use vm_core::{Hypervisor, SnapshotId, VmEndpoint, VmId};
 
 use crate::api::{
     openapi_spec, CreateVmRequest, ExecRequest, ExecResponse, FilePathQuery, FileReadResponse,
@@ -74,6 +74,12 @@ pub struct AppState {
     /// Per-token fork rate limiter. Shared `Arc` so handlers can poll
     /// without contending on `AppState`'s clone.
     fork_quota: Arc<crate::ForkQuota>,
+    /// VM endpoints returned by the backend. These are process-local because
+    /// live VM workers are process-local too; durable recovery lands with the
+    /// restart/reconciliation stage.
+    vm_endpoints: Arc<Mutex<HashMap<VmId, Vec<VmEndpoint>>>>,
+    /// Client used to forward external HTTP through the VM's loopback proxy.
+    http_client: reqwest::Client,
     /// Prometheus counters exposed at `/metrics`.
     metrics: Arc<crate::Metrics>,
     /// Pre-warmed fork pool. Default is a disabled pool (every fork
@@ -146,6 +152,11 @@ impl AppState {
             hypervisor,
             fork_usage: Arc::new(Mutex::new(HashMap::new())),
             fork_quota,
+            vm_endpoints: Arc::new(Mutex::new(HashMap::new())),
+            http_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("construct control-plane HTTP client"),
             metrics: Arc::new(crate::Metrics::new()),
             warm_pool,
             snapshot_store: None,
@@ -166,6 +177,30 @@ impl AppState {
     pub fn with_vm_defaults(mut self, defaults: crate::api::VmConfigDefaults) -> Self {
         self.vm_defaults = defaults;
         self
+    }
+
+    fn record_endpoints(&self, handle: &vm_core::VmHandle) {
+        self.vm_endpoints
+            .lock()
+            .expect("vm endpoints mutex poisoned")
+            .insert(handle.id, handle.endpoints.clone());
+    }
+
+    fn forget_endpoints(&self, id: VmId) {
+        self.vm_endpoints
+            .lock()
+            .expect("vm endpoints mutex poisoned")
+            .remove(&id);
+    }
+
+    fn endpoint(&self, id: VmId, guest_port: u16) -> Option<VmEndpoint> {
+        self.vm_endpoints
+            .lock()
+            .expect("vm endpoints mutex poisoned")
+            .get(&id)?
+            .iter()
+            .find(|endpoint| endpoint.guest_port == guest_port)
+            .cloned()
     }
 
     /// Install the Stripe billing context. `None` disables
@@ -297,6 +332,14 @@ pub fn router() -> Router<AppState> {
         .route("/vms/:id", get(get_vm).delete(destroy_vm))
         .route("/vms/:id/start", post(start_vm))
         .route("/vms/:id/stop", post(stop_vm))
+        .route(
+            "/vms/:id/ports/:port",
+            axum::routing::any(proxy_vm_http),
+        )
+        .route(
+            "/vms/:id/ports/:port/*path",
+            axum::routing::any(proxy_vm_http),
+        )
         .route("/vms/:id/snapshot", post(snapshot_vm))
         .route("/vms/:id/exec", post(exec_vm))
         .route(
@@ -530,6 +573,7 @@ async fn create_vm(
     state.vm_defaults.apply_to(&mut cfg);
     let handle = state.hypervisor.create_vm(&cfg)?;
     state.ownership.record_vm(handle.id, org);
+    state.record_endpoints(&handle);
     Ok((StatusCode::CREATED, Json(handle.into())))
 }
 
@@ -617,6 +661,98 @@ async fn stop_vm(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Proxy an arbitrary HTTP request through one guest port exposed by the VM.
+/// The internal listener remains loopback-only; callers reach it through the
+/// authenticated `/v1` boundary, so dynamic container ports never need to be
+/// published through Docker or Kubernetes.
+async fn proxy_vm_http(
+    State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
+    OriginalUri(uri): OriginalUri,
+    path: Result<Path<(u64, u16)>, PathRejection>,
+    request: Request<Body>,
+) -> Result<Response<Body>, ApiError> {
+    let Path((id, guest_port)) = path?;
+    let vm_id = VmId(id);
+    state.ownership.require_vm_access(vm_id, &org)?;
+    let endpoint = state
+        .endpoint(vm_id, guest_port)
+        .ok_or_else(|| ApiError::NotFound {
+            code: "vm_port_not_forwarded",
+            message: format!("VM {id} does not forward guest TCP port {guest_port}"),
+        })?;
+
+    let prefix = format!("/v1/vms/{id}/ports/{guest_port}");
+    let suffix = uri.path().strip_prefix(&prefix).ok_or_else(|| {
+        ApiError::InternalDyn("proxy request path did not match registered route".to_owned())
+    })?;
+    let suffix = if suffix.is_empty() { "/" } else { suffix };
+    let mut url = format!(
+        "http://{}:{}{}",
+        endpoint.host_address, endpoint.host_port, suffix
+    );
+    if let Some(query) = uri.query() {
+        url.push('?');
+        url.push_str(query);
+    }
+
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, 16 * 1024 * 1024)
+        .await
+        .map_err(|e| ApiError::Bad(format!("proxy request body: {e}")))?;
+    let mut headers = HeaderMap::new();
+    for (name, value) in &parts.headers {
+        if !matches!(
+            name.as_str(),
+            "authorization"
+                | "proxy-authorization"
+                | "host"
+                | "connection"
+                | "proxy-connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "upgrade"
+                | "te"
+                | "content-length"
+        ) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+
+    let upstream = state
+        .http_client
+        .request(parts.method, url)
+        .headers(headers)
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| ApiError::InternalDyn(format!("guest HTTP proxy: {e}")))?;
+    let status = upstream.status();
+    let response_headers = upstream.headers().clone();
+    let bytes = upstream
+        .bytes()
+        .await
+        .map_err(|e| ApiError::InternalDyn(format!("guest HTTP response: {e}")))?;
+    let mut response = Response::builder().status(status);
+    for (name, value) in &response_headers {
+        if !matches!(
+            name.as_str(),
+            "connection"
+                | "proxy-connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "upgrade"
+                | "te"
+                | "content-length"
+        ) {
+            response = response.header(name, value);
+        }
+    }
+    response
+        .body(Body::from(bytes))
+        .map_err(|e| ApiError::InternalDyn(format!("build guest HTTP response: {e}")))
+}
+
 async fn destroy_vm(
     State(state): State<AppState>,
     Extension(org): Extension<OrgId>,
@@ -628,6 +764,7 @@ async fn destroy_vm(
     let vm_id = VmId(id);
     state.ownership.require_vm_access(vm_id, &org)?;
     state.hypervisor.destroy(vm_id)?;
+    state.forget_endpoints(vm_id);
     state.ownership.forget_vm(vm_id);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -684,6 +821,7 @@ async fn restore_snapshot(
     state.ownership.require_snapshot_access(snap_id, &org)?;
     let handle = state.hypervisor.restore(snap_id)?;
     state.ownership.record_vm(handle.id, org);
+    state.record_endpoints(&handle);
     Ok((StatusCode::CREATED, Json(handle.into())))
 }
 
@@ -757,6 +895,7 @@ async fn fork_snapshot(
         state.hypervisor.restore(snap_id)?
     };
     state.ownership.record_vm(handle.id, org.clone());
+    state.record_endpoints(&handle);
     let fork_ms = started.elapsed().as_millis() as u64;
 
     let mut fork_count = 1u64;
@@ -1068,4 +1207,86 @@ async fn read_file(
     let Query(q) = query.map_err(|e| ApiError::Bad(e.to_string()))?;
     let content = state.hypervisor.read_file(vm_id, q.path)?;
     Ok(Json(FileReadResponse { content }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use vm_core::VmConfig;
+
+    #[tokio::test]
+    async fn proxy_vm_http_preserves_path_query_method_and_body() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let upstream_port = upstream.local_addr().expect("upstream address").port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.expect("accept upstream");
+            let mut request = vec![0; 4096];
+            let n = stream
+                .read(&mut request)
+                .await
+                .expect("read upstream request");
+            let request = String::from_utf8_lossy(&request[..n]);
+            assert!(request.starts_with("POST /hello?x=1 HTTP/1.1"));
+            assert!(request.contains("proxy-body"));
+            assert!(!request.to_ascii_lowercase().contains("authorization"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: 8\r\nconnection: close\r\n\r\n{\"ok\":1}",
+                )
+                .await
+                .expect("write upstream response");
+        });
+
+        let hypervisor = Arc::new(vm_mock::MockHypervisor::new());
+        let handle = hypervisor
+            .create_vm(&VmConfig::default())
+            .expect("create VM");
+        let state = AppState::new(hypervisor);
+        let org = OrgId::default_org();
+        state.ownership.record_vm(handle.id, org.clone());
+        state.vm_endpoints.lock().expect("endpoint lock").insert(
+            handle.id,
+            vec![VmEndpoint {
+                guest_port: 8080,
+                host_address: "127.0.0.1".into(),
+                host_port: upstream_port,
+            }],
+        );
+
+        let uri: axum::http::Uri = format!("/v1/vms/{}/ports/8080/hello?x=1", handle.id.0)
+            .parse()
+            .expect("parse proxy URI");
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri.clone())
+            .header("content-type", "text/plain")
+            .header("authorization", "Bearer control-plane-secret")
+            .body(Body::from("proxy-body"))
+            .expect("build request");
+        let response = proxy_vm_http(
+            State(state),
+            Extension(org),
+            OriginalUri(uri),
+            Ok(Path((handle.id.0, 8080))),
+            request,
+        )
+        .await
+        .expect("proxy request");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .expect("content type"),
+            "application/json"
+        );
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("read proxy response");
+        assert_eq!(&body[..], br#"{"ok":1}"#);
+        server.await.expect("upstream task");
+    }
 }

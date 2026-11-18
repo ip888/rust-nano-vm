@@ -134,7 +134,7 @@ config:
   #     cgroup and crash domain. Requires the KVM image (which ships
   #     the jailer + worker binaries) and a delegated parent cgroup
   #     (systemd Delegate=memory cpu, or root + manual delegation).
-  backend: "mock"
+  backend: "fleet"
   # Fleet-only knobs — ignored unless `backend == fleet`.
   fleet:
     socketDir: "/var/run/nanovm"

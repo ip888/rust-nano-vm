@@ -106,6 +106,7 @@ impl Hypervisor for MockHypervisor {
         Ok(VmHandle {
             id,
             state: VmState::Created,
+            endpoints: Vec::new(),
         })
     }
 
@@ -181,7 +182,11 @@ impl Hypervisor for MockHypervisor {
                 guest_root: guest_root_dir(id),
             },
         );
-        Ok(VmHandle { id, state })
+        Ok(VmHandle {
+            id,
+            state,
+            endpoints: Vec::new(),
+        })
     }
 
     fn destroy(&self, id: VmId) -> VmResult<()> {
@@ -201,6 +206,7 @@ impl Hypervisor for MockHypervisor {
             .map(|(id, vm)| VmHandle {
                 id: *id,
                 state: vm.state,
+                endpoints: Vec::new(),
             })
             .collect())
     }
@@ -806,14 +812,17 @@ mod tests {
             VmHandle {
                 id: a.id,
                 state: VmState::Created,
+                endpoints: Vec::new(),
             },
             VmHandle {
                 id: b.id,
                 state: VmState::Running,
+                endpoints: Vec::new(),
             },
             VmHandle {
                 id: c.id,
                 state: VmState::Stopped,
+                endpoints: Vec::new(),
             },
         ];
         expected.sort_by_key(|h| h.id);

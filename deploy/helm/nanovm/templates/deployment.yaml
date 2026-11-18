@@ -58,7 +58,7 @@ spec:
               value: {{ .Values.config.rustLog | quote }}
             - name: NANOVM_CONTROL_PLANE_ADDR
               value: "0.0.0.0:8080"
-            - name: NANOVM_FORK_QUOTA_PER_SEC
+            - name: NANOVM_FORK_RPS
               value: {{ .Values.config.forkQuotaPerSec | quote }}
             - name: NANOVM_AUDIT_LOG
               value: {{ .Values.config.auditPath | quote }}

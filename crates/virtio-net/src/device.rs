@@ -57,7 +57,7 @@
 
 use std::sync::Arc;
 
-use crate::{MmioTransport, NetworkBackend, QueueNotify};
+use crate::{MmioTransport, MmioTransportState, NetworkBackend, QueueNotify};
 
 /// A host-side virtio-net device wired to a [`NetworkBackend`].
 ///
@@ -103,6 +103,19 @@ impl VirtioNetDevice {
     /// Borrow the underlying transport (status, features, queue config).
     pub fn transport(&self) -> &MmioTransport {
         &self.transport
+    }
+
+    /// Capture mutable MMIO state for snapshot restore.
+    pub fn snapshot_transport_state(&self) -> MmioTransportState {
+        self.transport.snapshot_state()
+    }
+
+    /// Restore mutable MMIO state on a freshly constructed device.
+    pub fn restore_transport_state(
+        &mut self,
+        state: MmioTransportState,
+    ) -> Result<(), &'static str> {
+        self.transport.restore_state(state)
     }
 
     /// Borrow the backend (shared `Arc`). Returned as a `&dyn

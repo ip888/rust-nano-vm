@@ -244,11 +244,10 @@ pub const MAX_FRAME_LEN: usize = 1518;
 pub const MAX_CHAIN_BYTES: usize = MAX_FRAME_LEN + VIRTIO_NET_HDR_LEN;
 
 /// Minimum Ethernet frame bytes the device will push to the backend:
-/// 14-byte Ethernet header + at least 46 bytes of payload (per 802.3
-/// minimum). Below this we drop the frame — a conformant guest driver
-/// pads with zeros so we never see short frames in practice, but a
-/// bug or an attack could.
-pub const MIN_FRAME_LEN: usize = 14 + 46;
+/// 14-byte Ethernet header + the 28-byte ARP payload. Linux virtio-net
+/// legitimately emits unpadded 42-byte ARP frames; rejecting the 802.3
+/// wire minimum here prevents ARP resolution before TCP can start.
+pub const MIN_FRAME_LEN: usize = 14 + 28;
 
 /// Maximum virtqueue size the device will consent to operate on,
 /// mirroring [`crate::mmio::QUEUE_SIZE_MAX`]. A guest can program any
@@ -442,6 +441,11 @@ pub fn process_tx<M: GuestMemory>(
             let frame = &scratch[VIRTIO_NET_HDR_LEN..];
             backend.write_frame(frame)?;
             stats.frames_moved += 1;
+        } else if std::env::var_os("NANOVM_NET_TRACE").is_some() {
+            eprintln!(
+                "virtio-net: dropped TX chain head={head} valid={chain_valid} len={}",
+                scratch.len()
+            );
         }
         // The spec's used-elem format for TX writes 0 for `written_len`
         // because TX descriptors are device-readable only (nothing
@@ -793,7 +797,7 @@ mod tests {
         let (_dev, mock) = new_device();
 
         // Short frame: 12-byte header + 10 bytes payload — below the
-        // 60-byte Ethernet minimum we enforce. Must be dropped silently
+        // 42-byte Ethernet minimum we accept. Must be dropped silently
         // but the descriptor must come back on the used ring.
         let header = VirtioNetHdr::no_offload().to_bytes();
         let mut payload = Vec::new();
@@ -826,6 +830,42 @@ mod tests {
             1,
             "descriptor must still return to driver"
         );
+    }
+
+    #[test]
+    fn tx_accepts_unpadded_arp_frame() {
+        let mut raw = fresh_mem();
+        let mut mem = SliceGuestMemory::new(BASE, &mut raw);
+        let (_dev, mock) = new_device();
+
+        let header = VirtioNetHdr::no_offload().to_bytes();
+        let frame = vec![0xAB; MIN_FRAME_LEN];
+        let mut payload = Vec::from(header);
+        payload.extend_from_slice(&frame);
+        mem.write(BUF_BASE, &payload).unwrap();
+        write_desc(
+            &mut mem,
+            0,
+            Descriptor {
+                addr: BUF_BASE,
+                len: payload.len() as u32,
+                flags: 0,
+                next: 0,
+            },
+        );
+        write_avail_head(&mut mem, 0, 0);
+        set_avail_idx(&mut mem, 1);
+
+        let stats = process_tx(
+            &fresh_cfg(),
+            &mut QueueCursor::default(),
+            &mut mem,
+            &*mock as &dyn NetworkBackend,
+        )
+        .unwrap();
+
+        assert_eq!(stats.frames_moved, 1);
+        assert_eq!(mock.pop_tx().unwrap(), frame);
     }
 
     #[test]

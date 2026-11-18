@@ -264,6 +264,13 @@ pub(crate) struct NetQueueCursors {
     pub rx: QueueCursor,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct NetDeviceSnapshot {
+    transport: virtio_net::MmioTransportState,
+    tx_cursor: u16,
+    rx_cursor: u16,
+}
+
 fn lock_drain_gate(drain_gate: &Mutex<()>) -> MutexGuard<'_, ()> {
     drain_gate
         .lock()
@@ -306,6 +313,59 @@ impl NetBackend {
             guest_mem,
             vm_fd,
         )
+    }
+
+    /// Capture mutable virtio-net state while the queue drain gate is held.
+    fn snapshot_state_unlocked(&self) -> NetDeviceSnapshot {
+        let transport = self
+            .device
+            .lock()
+            .expect("vm-kvm: virtio-net device mutex poisoned")
+            .snapshot_transport_state();
+        let cursors = self
+            .cursors
+            .lock()
+            .expect("vm-kvm: virtio-net cursors mutex poisoned");
+        NetDeviceSnapshot {
+            transport,
+            tx_cursor: cursors.tx.last_seen_avail,
+            rx_cursor: cursors.rx.last_seen_avail,
+        }
+    }
+
+    /// Quiesce queue processing and capture its state atomically. The returned
+    /// guard must remain alive until guest-memory/device sidecars are written.
+    pub(crate) fn quiesce_for_snapshot(&self) -> (MutexGuard<'_, ()>, NetDeviceSnapshot) {
+        let gate = lock_drain_gate(&self.drain_gate);
+        let state = self.snapshot_state_unlocked();
+        (gate, state)
+    }
+
+    /// Apply captured device/cursor state to a freshly-created backend.
+    pub(crate) fn restore_state(&self, state: NetDeviceSnapshot) -> VmResult<()> {
+        let _gate = lock_drain_gate(&self.drain_gate);
+        let interrupt_asserted = {
+            let mut device = self
+                .device
+                .lock()
+                .expect("vm-kvm: virtio-net device mutex poisoned");
+            device
+                .restore_transport_state(state.transport)
+                .map_err(|e| VmError::Backend(format!("virtio-net restore: {e}")))?;
+            device.interrupt_asserted()
+        };
+        let mut cursors = self
+            .cursors
+            .lock()
+            .expect("vm-kvm: virtio-net cursors mutex poisoned");
+        cursors.tx.last_seen_avail = state.tx_cursor;
+        cursors.rx.last_seen_avail = state.rx_cursor;
+        if interrupt_asserted {
+            self.vm_fd.set_irq_line(self.irq, true).map_err(|e| {
+                VmError::Backend(format!("restore virtio-net IRQ {}: {e}", self.irq))
+            })?;
+        }
+        Ok(())
     }
 
     /// Convenience constructor that wires a userspace smoltcp TCP/IP
@@ -419,10 +479,20 @@ impl NetBackend {
             buf[i] = *b;
         }
         let value = u64::from_le_bytes(buf);
-        self.device
-            .lock()
-            .expect("vm-kvm: virtio-net device mutex poisoned")
-            .mmio_write(offset, data.len(), value)
+        let (notify, interrupt_asserted) = {
+            let mut device = self
+                .device
+                .lock()
+                .expect("vm-kvm: virtio-net device mutex poisoned");
+            let notify = device.mmio_write(offset, data.len(), value);
+            (notify, device.interrupt_asserted())
+        };
+        if !interrupt_asserted {
+            if let Err(error) = self.vm_fd.set_irq_line(self.irq, false) {
+                eprintln!("vm-kvm: deassert virtio-net IRQ {}: {error}", self.irq);
+            }
+        }
+        notify
     }
 
     /// Drain the queue the guest just kicked (`queue_idx` from a
@@ -515,6 +585,12 @@ impl NetBackend {
             process_rx(&queue_cfg, &mut cursors.rx, &mut mem, &*backend)
                 .map_err(|e| VmError::Backend(format!("virtio-net process_rx: {e}")))?
         };
+        if std::env::var_os("NANOVM_NET_TRACE").is_some() {
+            eprintln!(
+                "vm-kvm: queue={queue_idx} completed={} moved={}",
+                stats.completed_chains, stats.frames_moved
+            );
+        }
         drop(cursors);
 
         // --- Step 4: re-lock device to flip InterruptStatus bit ----
@@ -524,17 +600,14 @@ impl NetBackend {
                 .expect("vm-kvm: virtio-net device mutex poisoned")
                 .raise_vring_interrupt();
 
-            // --- Step 5: pulse the KVM IRQ line (level-triggered) --
-            // Assert, then deassert — the KVM edge triggers the IDT
-            // vector; the guest driver reads InterruptStatus to
-            // discover which bit was set and ACKs by writing
-            // InterruptACK (handled by MmioTransport::write).
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            // --- Step 5: assert the level-triggered KVM IRQ line ----
+            // Keep it asserted until the guest writes InterruptACK.
+            // Deasserting immediately races fast vCPUs: KVM can observe
+            // both transitions in one run slice and deliver no interrupt.
             vm_fd
                 .set_irq_line(irq, true)
                 .map_err(|e| VmError::Backend(format!("assert virtio-net IRQ {irq}: {e}")))?;
-            vm_fd
-                .set_irq_line(irq, false)
-                .map_err(|e| VmError::Backend(format!("deassert virtio-net IRQ {irq}: {e}")))?;
         }
         Ok(())
     }
@@ -673,7 +746,7 @@ impl NetWakeDriver {
                     // may have torn down the queue mid-wake. The
                     // next guest-side QueueNotify kicks a fresh
                     // drain anyway.
-                    let _ = NetBackend::drain_queue_impl(
+                    if let Err(error) = NetBackend::drain_queue_impl(
                         &device,
                         &drain_gate,
                         &cursors,
@@ -681,7 +754,9 @@ impl NetWakeDriver {
                         &vm_fd,
                         irq,
                         virtio_net::RX_QUEUE_INDEX,
-                    );
+                    ) {
+                        eprintln!("vm-kvm: virtio-net host RX drain failed: {error}");
+                    }
                 });
             })
             .expect("vm-kvm: spawning nanovm-net-wake thread must not fail");

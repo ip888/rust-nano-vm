@@ -66,6 +66,7 @@ async fn responses_round_trip_each_variant() {
         Response::VmHandle(VmHandle {
             id: VmId(7),
             state: VmState::Running,
+            endpoints: Vec::new(),
         }),
         Response::State {
             state: VmState::Stopped,

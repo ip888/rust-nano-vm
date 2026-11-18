@@ -157,6 +157,36 @@ Server-side defaults **only apply when the request field is unset**. For `kernel
 
 Since #148, `Dockerfile.kvm` bakes a Firecracker sample kernel + rootfs at `/usr/local/share/nanovm/` and sets `NANOVM_DEFAULT_KERNEL_PATH` / `NANOVM_DEFAULT_ROOTFS_PATH` so `docker run ghcr.io/ip888/nanovm-control-plane-kvm` boots a demo VM against `POST /v1/vms {}` out of the box. Override at runtime with `-v /host/img:/img -e NANOVM_DEFAULT_KERNEL_PATH=/img/vmlinux …` or Helm `extraVolumes` + `env`.
 
+## Forwarding a guest HTTP service
+
+Request a guest port when creating a VM:
+
+```json
+{
+  "memory_mib": 2048,
+  "port_forwards": [
+    { "guest_port": 8080, "host_address": "127.0.0.1", "host_port": 0 }
+  ]
+}
+```
+
+Supplying `port_forwards` selects the smoltcp userspace network backend
+automatically. `host_port: 0` asks the OS for an available loopback port.
+The create/fork response returns that allocated endpoint, and the same
+mapping is reconstructed for snapshot restores.
+
+External clients should use the authenticated control-plane proxy rather
+than publishing each VM's dynamic port:
+
+```text
+GET  /v1/vms/{id}/ports/8080/actuator/health
+POST /v1/vms/{id}/ports/8080/api/orders?validate=true
+```
+
+The second path is determined by the guest service URL; `/api/orders` in
+this example follows the fixed `/ports/8080` proxy prefix. The proxy
+preserves the HTTP method, headers, request body, path, and query string.
+
 ## Honest non-features
 
 - **No auto-scaling.** The control plane is stateful (VM ids, snapshot ids, ownership map are all in-memory today). A multi-replica deployment is HA-blast-radius only — pin clients to one replica via session affinity if you need stable ids.

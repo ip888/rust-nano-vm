@@ -187,7 +187,7 @@ mod reg {
 /// Per-virtqueue configuration the driver programs through the MMIO
 /// registers. The transport just records these; the queue consumer
 /// (sub-PR #B.2) reads them to locate the rings in guest memory.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QueueConfig {
     /// Number of descriptors the driver chose (`QueueNum`). 0 until set.
     pub size: u32,
@@ -220,6 +220,28 @@ pub struct QueueNotify(pub u32);
 /// MTU, so a driver reading past the status word doesn't fall off the
 /// end of the config space.
 pub const CONFIG_SIZE: usize = 12;
+
+/// Serializable mutable MMIO state required to resume a configured
+/// virtio-net device after snapshot restore.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MmioTransportState {
+    /// Currently selected half of the device feature register.
+    pub device_features_sel: u32,
+    /// Features accepted by the guest driver.
+    pub driver_features: u64,
+    /// Currently selected half of the driver feature register.
+    pub driver_features_sel: u32,
+    /// Virtio device status register.
+    pub status: u32,
+    /// Currently selected queue index.
+    pub queue_sel: u32,
+    /// Guest-programmed queue geometry for every virtqueue.
+    pub queues: Vec<QueueConfig>,
+    /// Pending interrupt reason bits.
+    pub interrupt_status: u32,
+    /// Device configuration generation counter.
+    pub config_generation: u32,
+}
 
 /// virtio-MMIO transport register block for a virtio-net device.
 ///
@@ -294,6 +316,39 @@ impl MmioTransport {
     /// Current device status register value.
     pub fn status(&self) -> u32 {
         self.status
+    }
+
+    /// Capture the mutable register model while the guest and queue drains
+    /// are quiesced.
+    pub fn snapshot_state(&self) -> MmioTransportState {
+        MmioTransportState {
+            device_features_sel: self.device_features_sel,
+            driver_features: self.driver_features,
+            driver_features_sel: self.driver_features_sel,
+            status: self.status,
+            queue_sel: self.queue_sel,
+            queues: self.queues.clone(),
+            interrupt_status: self.interrupt_status,
+            config_generation: self.config_generation,
+        }
+    }
+
+    /// Restore mutable MMIO state after constructing a fresh network
+    /// transport. Queue count must match this device model.
+    pub fn restore_state(&mut self, state: MmioTransportState) -> Result<(), &'static str> {
+        if state.queues.len() != self.queues.len() {
+            return Err("virtio-net snapshot queue count mismatch");
+        }
+        self.device_features_sel = state.device_features_sel;
+        self.driver_features = state.driver_features;
+        self.driver_features_sel = state.driver_features_sel;
+        self.status = state.status;
+        self.queue_sel = state.queue_sel;
+        self.queues = state.queues;
+        self.interrupt_status = state.interrupt_status;
+        self.config_generation = state.config_generation;
+        self.pending_notify = None;
+        Ok(())
     }
 
     /// `true` once the driver has set `DRIVER_OK` (device is live).

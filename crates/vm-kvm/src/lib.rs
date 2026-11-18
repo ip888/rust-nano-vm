@@ -36,6 +36,8 @@ pub use seccomp::install_default_filter;
 #[cfg(feature = "kvm")]
 pub use cgroups::install_default_limits;
 
+#[cfg(feature = "kvm")]
+use vm_core::VmEndpoint;
 use vm_core::{
     GuestExecRequest, GuestExecResult, Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError,
     VmHandle, VmId, VmMeta, VmResult, VmState,
@@ -127,7 +129,20 @@ struct Inner {
 struct SnapshotEntry {
     dir: PathBuf,
     meta: SnapshotMeta,
+    network: Option<virtio_net_dev::NetDeviceSnapshot>,
+    config: VmConfig,
 }
+
+#[cfg(feature = "kvm")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct NetworkSnapshot {
+    net_backend: vm_core::NetBackendChoice,
+    port_forwards: Vec<vm_core::PortForward>,
+    device: virtio_net_dev::NetDeviceSnapshot,
+}
+
+#[cfg(feature = "kvm")]
+const NETWORK_SNAPSHOT_FILE: &str = "network.json";
 
 #[cfg(feature = "kvm")]
 #[derive(Debug)]
@@ -185,6 +200,33 @@ struct KvmVmRuntime {
     #[cfg(feature = "virtio-net-smoltcp")]
     #[allow(dead_code)]
     net_wake_driver: Option<std::sync::Arc<virtio_net_dev::NetWakeDriver>>,
+    /// Production host-side TCP proxies owned by the VM runtime. Their stop
+    /// flags and listener threads are tied to VM lifecycle.
+    #[cfg(feature = "virtio-net-smoltcp")]
+    port_proxies: Vec<PortProxy>,
+}
+
+#[cfg(all(feature = "kvm", feature = "virtio-net-smoltcp"))]
+#[derive(Debug)]
+struct PortProxy {
+    endpoint: VmEndpoint,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(all(feature = "kvm", feature = "virtio-net-smoltcp"))]
+impl Drop for PortProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            if std::thread::current().id() == thread.thread().id() {
+                return;
+            }
+            if let Err(error) = thread.join() {
+                eprintln!("vm-kvm: virtio-net proxy thread panicked: {error:?}");
+            }
+        }
+    }
 }
 
 /// The host side of the virtio-vsock device, shared between the
@@ -1007,6 +1049,90 @@ impl KvmHypervisor {
             .map_err(|_| VmError::Backend("vm-kvm: hypervisor state mutex poisoned".into()))
     }
 
+    #[cfg(feature = "virtio-net-smoltcp")]
+    fn runtime_endpoints(runtime: &KvmVmRuntime) -> Vec<VmEndpoint> {
+        runtime
+            .port_proxies
+            .iter()
+            .map(|proxy| proxy.endpoint.clone())
+            .collect()
+    }
+
+    #[cfg(not(feature = "virtio-net-smoltcp"))]
+    fn runtime_endpoints(_runtime: &KvmVmRuntime) -> Vec<VmEndpoint> {
+        Vec::new()
+    }
+
+    #[cfg(feature = "virtio-net-smoltcp")]
+    fn build_port_proxies(
+        cfg: &VmConfig,
+        backend: &Option<Arc<virtio_net::SmoltcpBackend>>,
+    ) -> VmResult<Vec<PortProxy>> {
+        if cfg.port_forwards.is_empty() {
+            return Ok(Vec::new());
+        }
+        let backend = backend.as_ref().ok_or_else(|| {
+            VmError::Backend(
+                "vm-kvm: port forwarding requires NetBackendChoice::Smoltcp".to_owned(),
+            )
+        })?;
+        let mut proxies = Vec::with_capacity(cfg.port_forwards.len());
+        for forward in &cfg.port_forwards {
+            if forward.guest_port == 0 {
+                return Err(VmError::Backend(
+                    "vm-kvm: guest_port must be non-zero".to_owned(),
+                ));
+            }
+            let listener = std::net::TcpListener::bind(format!(
+                "{}:{}",
+                forward.host_address, forward.host_port
+            ))
+            .map_err(|e| {
+                VmError::Backend(format!(
+                    "vm-kvm: bind port proxy {}:{}: {e}",
+                    forward.host_address, forward.host_port
+                ))
+            })?;
+            let local = listener
+                .local_addr()
+                .map_err(|e| VmError::Backend(format!("vm-kvm: read bound proxy address: {e}")))?;
+            let endpoint = VmEndpoint {
+                guest_port: forward.guest_port,
+                host_address: local.ip().to_string(),
+                host_port: local.port(),
+            };
+            let guest_endpoint = virtio_net::IpEndpoint::new(
+                virtio_net::IpAddress::Ipv4(virtio_net::DEFAULT_GUEST_IPV4.into()),
+                forward.guest_port,
+            );
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let proxy = Arc::new(virtio_net::TcpProxy::new(
+                Arc::clone(backend),
+                guest_endpoint,
+            ));
+            let thread = thread::Builder::new()
+                .name(format!("nanovm-proxy-{}", endpoint.host_port))
+                .spawn(move || {
+                    if let Err(error) = proxy.serve(listener, thread_stop) {
+                        eprintln!("vm-kvm: virtio-net TCP proxy exited: {error}");
+                    }
+                })
+                .map_err(|e| {
+                    VmError::Backend(format!(
+                        "vm-kvm: spawn proxy thread for host port {}: {e}",
+                        endpoint.host_port
+                    ))
+                })?;
+            proxies.push(PortProxy {
+                endpoint,
+                stop,
+                thread: Some(thread),
+            });
+        }
+        Ok(proxies)
+    }
+
     fn build_runtime(&self, cfg: &VmConfig) -> VmResult<KvmVmRuntime> {
         if cfg.snapshot_dir.is_some() {
             return Err(VmError::Unsupported(
@@ -1200,6 +1326,8 @@ impl KvmHypervisor {
             }
             (nb, _) => (nb, None, None),
         };
+        #[cfg(feature = "virtio-net-smoltcp")]
+        let port_proxies = Self::build_port_proxies(cfg, &net_smoltcp)?;
 
         Ok(KvmVmRuntime {
             vm_fd,
@@ -1213,6 +1341,8 @@ impl KvmHypervisor {
             net_smoltcp,
             #[cfg(feature = "virtio-net-smoltcp")]
             net_wake_driver,
+            #[cfg(feature = "virtio-net-smoltcp")]
+            port_proxies,
         })
     }
 
@@ -1264,6 +1394,8 @@ impl KvmHypervisor {
             net_smoltcp: None,
             #[cfg(feature = "virtio-net-smoltcp")]
             net_wake_driver: None,
+            #[cfg(feature = "virtio-net-smoltcp")]
+            port_proxies: Vec::new(),
         })
     }
 
@@ -1350,6 +1482,23 @@ impl KvmHypervisor {
             .join(id.0.to_string())
     }
 
+    fn read_network_snapshot(dir: &Path) -> VmResult<Option<NetworkSnapshot>> {
+        let path = dir.join(NETWORK_SNAPSHOT_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+                VmError::Backend(format!(
+                    "vm-kvm: parse network snapshot {}: {e}",
+                    path.display()
+                ))
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(VmError::Backend(format!(
+                "vm-kvm: read network snapshot {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+
     /// Request a pause, kick the vCPU out of `KVM_RUN`, and wait for the
     /// thread to park with its captured state. Returns that state; the
     /// caller must call [`resume_vcpu`](Self::resume_vcpu) afterwards.
@@ -1397,7 +1546,13 @@ impl KvmHypervisor {
     /// Rebuild a VM from a snapshot directory: fresh `VmFd` + irqchip/PIT,
     /// guest RAM loaded from the memory image, machine + vCPU state restored.
     /// Returns the runtime and the configured `VcpuFd` ready to run.
-    fn restore_runtime(&self, manifest: &Manifest, dir: &Path) -> VmResult<(KvmVmRuntime, VcpuFd)> {
+    fn restore_runtime(
+        &self,
+        manifest: &Manifest,
+        dir: &Path,
+        cfg: &VmConfig,
+        network_state: Option<virtio_net_dev::NetDeviceSnapshot>,
+    ) -> VmResult<(KvmVmRuntime, VcpuFd)> {
         // Lazy CoW mapping: pages fault in from the snapshot file as the
         // guest touches them, and writes go to private anonymous copies.
         // N restores of the same snapshot share the read pages via the
@@ -1454,6 +1609,44 @@ impl KvmHypervisor {
             initrd_load_addr: None,
             cmdline,
         };
+        const DEFAULT_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        #[cfg(not(feature = "virtio-net-smoltcp"))]
+        let net = match (cfg.net_backend, network_state) {
+            (vm_core::NetBackendChoice::Mock, Some(state)) => {
+                let backend = virtio_net_dev::NetBackend::with_mock_backend(
+                    DEFAULT_MAC,
+                    boot_plan.guest_mem.clone(),
+                    Arc::clone(&vm_fd),
+                );
+                backend.restore_state(state)?;
+                Some(backend)
+            }
+            _ => None,
+        };
+        #[cfg(feature = "virtio-net-smoltcp")]
+        let (net, net_smoltcp, net_wake_driver) = match (cfg.net_backend, network_state) {
+            (vm_core::NetBackendChoice::Mock, Some(state)) => {
+                let backend = virtio_net_dev::NetBackend::with_mock_backend(
+                    DEFAULT_MAC,
+                    boot_plan.guest_mem.clone(),
+                    Arc::clone(&vm_fd),
+                );
+                backend.restore_state(state)?;
+                (Some(backend), None, None)
+            }
+            (vm_core::NetBackendChoice::Smoltcp, Some(state)) => {
+                let (backend, smoltcp, wake) = virtio_net_dev::NetBackend::with_smoltcp_backend(
+                    DEFAULT_MAC,
+                    boot_plan.guest_mem.clone(),
+                    Arc::clone(&vm_fd),
+                );
+                backend.restore_state(state)?;
+                (Some(backend), Some(smoltcp), Some(wake))
+            }
+            _ => (None, None, None),
+        };
+        #[cfg(feature = "virtio-net-smoltcp")]
+        let port_proxies = Self::build_port_proxies(cfg, &net_smoltcp)?;
         let runtime = KvmVmRuntime {
             vm_fd,
             boot_plan,
@@ -1461,16 +1654,13 @@ impl KvmHypervisor {
             serial_output: Arc::new(Mutex::new(Vec::new())),
             real_mode: false,
             vsock: None,
-            // Snapshot-restore path reconstructs devices separately
-            // from the device-model init that `build_runtime` runs;
-            // for now the restored VM comes up without a net device.
-            // Preserving virtio-net state across snapshot/restore is
-            // a sub-PR of its own in Milestone 1.5.
-            net: None,
+            net,
             #[cfg(feature = "virtio-net-smoltcp")]
-            net_smoltcp: None,
+            net_smoltcp,
             #[cfg(feature = "virtio-net-smoltcp")]
-            net_wake_driver: None,
+            net_wake_driver,
+            #[cfg(feature = "virtio-net-smoltcp")]
+            port_proxies,
         };
         Ok((runtime, vcpu))
     }
@@ -1635,11 +1825,13 @@ impl Hypervisor for KvmHypervisor {
             vcpu: None,
             last_run_error: None,
         };
+        let endpoints = Self::runtime_endpoints(&vm.runtime);
         let mut inner = self.lock_inner()?;
         inner.vms.insert(id, vm);
         Ok(VmHandle {
             id,
             state: VmState::Created,
+            endpoints,
         })
     }
 
@@ -1670,14 +1862,29 @@ impl Hypervisor for KvmHypervisor {
         let mut inner = self.lock_inner()?;
         Self::reap_finished_vcpus(&mut inner)?;
         let vm = inner.vms.get_mut(&id).ok_or(VmError::UnknownVm(id))?;
-        match vm.state {
+        let result = match vm.state {
             VmState::Running => Self::stop_vm(vm, self.kick_signal),
             other => Err(VmError::InvalidTransition {
                 id,
                 from: other,
                 to: VmState::Stopped,
             }),
+        };
+        #[cfg(feature = "virtio-net-smoltcp")]
+        if result.is_ok() {
+            for proxy in &vm.runtime.port_proxies {
+                if let Some(forward) = vm
+                    .config
+                    .port_forwards
+                    .iter_mut()
+                    .find(|forward| forward.guest_port == proxy.endpoint.guest_port)
+                {
+                    forward.host_port = proxy.endpoint.host_port;
+                }
+            }
+            vm.runtime.port_proxies.clear();
         }
+        result
     }
 
     fn state(&self, id: VmId) -> VmResult<VmState> {
@@ -1696,7 +1903,7 @@ impl Hypervisor for KvmHypervisor {
         let snap_id = SnapshotId::next();
         let dir = self.snapshot_dir(snap_id);
 
-        let meta = {
+        let (meta, network, config) = {
             let vm = inner.vms.get(&id).ok_or(VmError::UnknownVm(id))?;
             if vm.runtime.real_mode {
                 return Err(VmError::Unsupported(
@@ -1707,23 +1914,6 @@ impl Hypervisor for KvmHypervisor {
                 return Err(VmError::Unsupported(
                     "vm-kvm: snapshot of a VM with a vsock device is not yet supported \
                      (device-state capture lands in a later slice)",
-                ));
-            }
-            #[cfg(feature = "virtio-net-smoltcp")]
-            if vm.runtime.net_wake_driver.is_some() {
-                // The host-RX wake thread can write guest RAM
-                // (RX buffers, used ring) and raise interrupts
-                // concurrently with the snapshot capture. Freezing
-                // only the vCPU is not enough: the wake thread
-                // would race with `dump_memory` and produce a torn
-                // snapshot. Full pause/quiesce of the wake driver
-                // is a non-trivial addition (Milestone 1.5 along
-                // with virtio-net snapshot-restore). Until then
-                // refuse the operation explicitly instead of
-                // silently corrupting the snapshot.
-                return Err(VmError::Unsupported(
-                    "vm-kvm: snapshot of a VM with the smoltcp net backend active is not yet \
-                     supported (wake-thread quiesce lands with virtio-net snapshot-restore)",
                 ));
             }
             if vm.state != VmState::Running {
@@ -1738,6 +1928,15 @@ impl Hypervisor for KvmHypervisor {
 
             // Pause the vCPU and take its self-captured architectural state.
             let vcpu_state = self.pause_and_take_state(thread)?;
+            // The vCPU is parked. Quiesce virtio-net queue processing too:
+            // the RX wake thread can otherwise modify guest rings/RAM while
+            // the memory image is dumped.
+            let net_quiesced = vm
+                .runtime
+                .net
+                .as_ref()
+                .map(|net| net.quiesce_for_snapshot());
+            let network = net_quiesced.as_ref().map(|(_, state)| state.clone());
             // The vCPU is parked: capture machine + memory consistently.
             let machine = vmstate::MachineState::capture(&vm.runtime.vm_fd);
             let mem_bytes = vm.runtime.boot_plan.memory_size_bytes();
@@ -1761,46 +1960,90 @@ impl Hypervisor for KvmHypervisor {
                 )?;
                 vcpu_state.write_to_dir(&dir)?;
                 machine?.write_to_dir(&dir)?;
+                if let Some(device) = network.as_ref() {
+                    let network_snapshot = NetworkSnapshot {
+                        net_backend: vm.config.net_backend,
+                        port_forwards: vm
+                            .config
+                            .port_forwards
+                            .iter()
+                            .cloned()
+                            .map(|mut forward| {
+                                // Restored forks must not collide with the
+                                // source VM's fixed host listener. The fork
+                                // response returns its newly allocated port.
+                                forward.host_port = 0;
+                                forward
+                            })
+                            .collect(),
+                        device: device.clone(),
+                    };
+                    let bytes = serde_json::to_vec_pretty(&network_snapshot).map_err(|e| {
+                        VmError::Backend(format!("vm-kvm: serialize network state: {e}"))
+                    })?;
+                    std::fs::write(dir.join(NETWORK_SNAPSHOT_FILE), bytes).map_err(|e| {
+                        VmError::Backend(format!("vm-kvm: write network state: {e}"))
+                    })?;
+                }
                 Ok(())
             })();
 
             self.resume_vcpu(thread);
             write_result?;
 
-            SnapshotMeta {
-                id: snap_id,
-                vcpu_count: vm.config.vcpus,
-                memory_bytes: mem_bytes,
-                page_size: PAGE_SIZE as u32,
-                kernel_cmdline: cmdline,
-            }
+            (
+                SnapshotMeta {
+                    id: snap_id,
+                    vcpu_count: vm.config.vcpus,
+                    memory_bytes: mem_bytes,
+                    page_size: PAGE_SIZE as u32,
+                    kernel_cmdline: cmdline,
+                },
+                network,
+                vm.config.clone(),
+            )
         };
 
-        inner.snapshots.insert(snap_id, SnapshotEntry { dir, meta });
+        inner.snapshots.insert(
+            snap_id,
+            SnapshotEntry {
+                dir,
+                meta,
+                network,
+                config,
+            },
+        );
         Ok(snap_id)
     }
 
     fn restore(&self, snap: SnapshotId) -> VmResult<VmHandle> {
-        let (dir, meta) = {
+        let (dir, meta, network, source_config) = {
             let inner = self.lock_inner()?;
             let entry = inner
                 .snapshots
                 .get(&snap)
                 .ok_or(VmError::UnknownSnapshot(snap))?;
-            (entry.dir.clone(), entry.meta.clone())
+            (
+                entry.dir.clone(),
+                entry.meta.clone(),
+                entry.network.clone(),
+                entry.config.clone(),
+            )
         };
         let manifest = Manifest::read_from_dir(&dir)
             .map_err(|e| VmError::Backend(format!("vm-kvm: read snapshot manifest: {e}")))?;
         // Reconstruct the VM and resume it from the captured rip.
-        let (runtime, vcpu) = self.restore_runtime(&manifest, &dir)?;
+        let mut config = source_config;
+        config.vcpus = meta.vcpu_count;
+        config.memory_mib = meta.memory_bytes / (1024 * 1024);
+        config.cmdline = meta.kernel_cmdline.clone();
+        for forward in &mut config.port_forwards {
+            forward.host_port = 0;
+        }
+        let (runtime, vcpu) = self.restore_runtime(&manifest, &dir, &config, network)?;
         let id = VmId::next();
         let thread = self.spawn_vcpu_thread(id, vcpu, &runtime);
-        let config = VmConfig {
-            vcpus: meta.vcpu_count,
-            memory_mib: meta.memory_bytes / (1024 * 1024),
-            cmdline: meta.kernel_cmdline.clone(),
-            ..VmConfig::default()
-        };
+        let endpoints = Self::runtime_endpoints(&runtime);
         let mut inner = self.lock_inner()?;
         inner.vms.insert(
             id,
@@ -1815,6 +2058,7 @@ impl Hypervisor for KvmHypervisor {
         Ok(VmHandle {
             id,
             state: VmState::Running,
+            endpoints,
         })
     }
 
@@ -1837,6 +2081,7 @@ impl Hypervisor for KvmHypervisor {
             .map(|(id, vm)| VmHandle {
                 id: *id,
                 state: vm.state,
+                endpoints: Self::runtime_endpoints(&vm.runtime),
             })
             .collect())
     }
@@ -1940,10 +2185,39 @@ impl Hypervisor for KvmHypervisor {
             page_size: manifest.page_size,
             kernel_cmdline: manifest.kernel_cmdline.clone(),
         };
+        let network_snapshot = Self::read_network_snapshot(&target)?;
+        let (network, config) = match network_snapshot {
+            Some(snapshot) => (
+                Some(snapshot.device),
+                VmConfig {
+                    vcpus: manifest.vcpu_count,
+                    memory_mib: manifest.memory_bytes / (1024 * 1024),
+                    cmdline: manifest.kernel_cmdline.clone(),
+                    net_backend: snapshot.net_backend,
+                    port_forwards: snapshot.port_forwards,
+                    ..VmConfig::default()
+                },
+            ),
+            None => (
+                None,
+                VmConfig {
+                    vcpus: manifest.vcpu_count,
+                    memory_mib: manifest.memory_bytes / (1024 * 1024),
+                    cmdline: manifest.kernel_cmdline.clone(),
+                    ..VmConfig::default()
+                },
+            ),
+        };
         let mut inner = self.lock_inner()?;
-        inner
-            .snapshots
-            .insert(new_id, SnapshotEntry { dir: target, meta });
+        inner.snapshots.insert(
+            new_id,
+            SnapshotEntry {
+                dir: target,
+                meta,
+                network,
+                config,
+            },
+        );
         Ok(new_id)
     }
 

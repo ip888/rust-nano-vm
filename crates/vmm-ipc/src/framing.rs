@@ -118,6 +118,7 @@ mod tests {
         let resp = Response::VmHandle(VmHandle {
             id: VmId(1),
             state: VmState::Running,
+            endpoints: Vec::new(),
         });
         let mut buf = Vec::<u8>::new();
         write_frame(&mut buf, &resp).await.unwrap();

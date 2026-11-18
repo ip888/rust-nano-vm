@@ -111,6 +111,46 @@ pub struct VmConfig {
     /// `virtio-net-smoltcp` feature; other backends currently ignore
     /// this field.
     pub net_backend: NetBackendChoice,
+    /// Guest TCP ports to expose through host-side proxy listeners.
+    /// `host_port = 0` asks the host to allocate an ephemeral port.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub port_forwards: Vec<PortForward>,
+}
+
+/// A guest TCP port requested by the VM configuration.
+///
+/// The host-side proxy binds only the configured [`Self::host_address`].
+/// Binding `127.0.0.1` is the safe default; callers that need external
+/// reachability must use the control plane or ingress as the exposure
+/// boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PortForward {
+    /// TCP port listened on inside the guest.
+    pub guest_port: u16,
+    /// Host address on which the proxy listens.
+    #[cfg_attr(feature = "serde", serde(default = "default_host_address"))]
+    pub host_address: String,
+    /// Host TCP port. `0` requests an ephemeral port from the OS.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub host_port: u16,
+}
+
+#[cfg(feature = "serde")]
+fn default_host_address() -> String {
+    "127.0.0.1".to_owned()
+}
+
+/// A bound host endpoint for a forwarded guest port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct VmEndpoint {
+    /// TCP port listened on inside the guest.
+    pub guest_port: u16,
+    /// Host address the proxy bound.
+    pub host_address: String,
+    /// Allocated host TCP port.
+    pub host_port: u16,
 }
 
 /// Which virtio-net transport backend to attach to the guest's
@@ -155,6 +195,7 @@ impl Default for VmConfig {
             vsock_cid: None,
             snapshot_dir: None,
             net_backend: NetBackendChoice::default(),
+            port_forwards: Vec::new(),
         }
     }
 }
@@ -182,6 +223,9 @@ pub struct VmHandle {
     pub id: VmId,
     /// Observed state at issue time.
     pub state: VmState,
+    /// Host endpoints currently bound for this VM.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub endpoints: Vec<VmEndpoint>,
 }
 
 /// Errors returned by [`Hypervisor`] implementations.

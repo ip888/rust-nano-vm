@@ -192,6 +192,6 @@ If they only had runtime keys (no env entry), use `DELETE /v1/keys/{id}` per key
 ## Common gotchas
 
 - **Per-org metrics show `default` instead of `acme`.** The bootstrap token wasn't `acme:tok` — it landed in the default org. Re-add as `acme:tok` and redeploy.
-- **429 fork_quota_exceeded right after onboarding.** Default per-token quota is conservative. Tune via `NANOVM_FORK_QUOTA_PER_SEC` env / chart `config.forkQuotaPerSec`.
+- **429 fork_quota_exceeded right after onboarding.** Default per-token quota is conservative. Tune via `NANOVM_FORK_RPS` env / chart `config.forkQuotaPerSec`.
 - **/v1/usage/by-org returns an empty array for a brand-new tenant.** The metric is populated lazily on first fork. Have them fire one before checking.
 - **`/v1/keys` returns 401 when the tenant has only a runtime token.** They lost it on a restart (in-memory only). Mint them a fresh bootstrap via Step 1a until persistence ships.

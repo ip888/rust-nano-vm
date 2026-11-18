@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use vm_core::{NetBackendChoice, SnapshotId, VmConfig, VmHandle, VmId, VmState};
+use vm_core::{NetBackendChoice, PortForward, SnapshotId, VmConfig, VmHandle, VmId, VmState};
 
 /// Body of `POST /v1/vms`. All fields are optional; missing fields fall back
 /// to the same defaults as [`VmConfig::default`].
@@ -41,6 +41,22 @@ pub(crate) struct CreateVmRequest {
     /// with a stderr warning.
     #[serde(default)]
     pub net_backend: Option<NetBackendRequest>,
+    /// Guest TCP ports exposed through process-local host proxies.
+    #[serde(default)]
+    pub port_forwards: Vec<PortForwardRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PortForwardRequest {
+    pub guest_port: u16,
+    #[serde(default = "default_host_address")]
+    pub host_address: String,
+    #[serde(default)]
+    pub host_port: u16,
+}
+
+fn default_host_address() -> String {
+    "127.0.0.1".to_owned()
 }
 
 /// Wire-format alias for [`NetBackendChoice`]. Lives on the DTO so
@@ -72,6 +88,13 @@ fn default_memory_mib() -> u64 {
 
 impl From<CreateVmRequest> for VmConfig {
     fn from(r: CreateVmRequest) -> Self {
+        let net_backend = r.net_backend.map(Into::into).unwrap_or_else(|| {
+            if r.port_forwards.is_empty() {
+                NetBackendChoice::Mock
+            } else {
+                NetBackendChoice::Smoltcp
+            }
+        });
         VmConfig {
             vcpus: r.vcpus,
             memory_mib: r.memory_mib,
@@ -82,7 +105,16 @@ impl From<CreateVmRequest> for VmConfig {
             cmdline: r.cmdline,
             vsock_cid: r.vsock_cid,
             snapshot_dir: r.snapshot_dir,
-            net_backend: r.net_backend.map(Into::into).unwrap_or_default(),
+            net_backend,
+            port_forwards: r
+                .port_forwards
+                .into_iter()
+                .map(|forward| PortForward {
+                    guest_port: forward.guest_port,
+                    host_address: forward.host_address,
+                    host_port: forward.host_port,
+                })
+                .collect(),
         }
     }
 }
@@ -183,6 +215,14 @@ pub(crate) struct VmHandleDto {
     /// Human-readable display form (e.g. `vm-0000000000000042`).
     pub display: String,
     pub state: VmStateDto,
+    pub endpoints: Vec<VmEndpointDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct VmEndpointDto {
+    pub guest_port: u16,
+    pub host_address: String,
+    pub host_port: u16,
 }
 
 impl From<VmHandle> for VmHandleDto {
@@ -191,6 +231,15 @@ impl From<VmHandle> for VmHandleDto {
             id: h.id.0,
             display: h.id.to_string(),
             state: h.state.into(),
+            endpoints: h
+                .endpoints
+                .into_iter()
+                .map(|endpoint| VmEndpointDto {
+                    guest_port: endpoint.guest_port,
+                    host_address: endpoint.host_address,
+                    host_port: endpoint.host_port,
+                })
+                .collect(),
         }
     }
 }
@@ -683,6 +732,31 @@ pub fn openapi_spec() -> Value {
                     "responses": { "204": { "description": "Stopped" } }
                 }
             },
+            "/v1/vms/{id}/ports/{port}/{path}": {
+                "get": {
+                    "summary": "Proxy an HTTP request to a forwarded guest port",
+                    "description": "The path/query suffix after /ports/{port} is forwarded unchanged to the guest service. POST, PUT, PATCH, DELETE, HEAD, and OPTIONS use the same route.",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/VmIdPath" },
+                        {
+                            "name": "port",
+                            "in": "path",
+                            "required": true,
+                            "schema": { "type": "integer", "minimum": 1, "maximum": 65535 }
+                        },
+                        {
+                            "name": "path",
+                            "in": "path",
+                            "required": true,
+                            "schema": { "type": "string" }
+                        }
+                    ],
+                    "responses": {
+                        "200": { "description": "Guest HTTP response" },
+                        "404": { "description": "Guest port is not forwarded" }
+                    }
+                }
+            },
             "/v1/vms/{id}/snapshot": {
                 "post": {
                     "summary": "Create snapshot",
@@ -983,7 +1057,12 @@ pub fn openapi_spec() -> Value {
                         "rootfs": { "type": "string" },
                         "cmdline": { "type": "string" },
                         "vsock_cid": { "type": "integer", "minimum": 1 },
-                        "snapshot_dir": { "type": "string" }
+                        "snapshot_dir": { "type": "string" },
+                        "net_backend": { "type": "string", "enum": ["mock", "smoltcp"] },
+                        "port_forwards": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/PortForwardRequest" }
+                        }
                     }
                 },
                 "VmStateDto": {
@@ -992,11 +1071,33 @@ pub fn openapi_spec() -> Value {
                 },
                 "VmHandleDto": {
                     "type": "object",
-                    "required": ["id", "display", "state"],
+                    "required": ["id", "display", "state", "endpoints"],
                     "properties": {
                         "id": { "type": "integer" },
                         "display": { "type": "string" },
-                        "state": { "$ref": "#/components/schemas/VmStateDto" }
+                        "state": { "$ref": "#/components/schemas/VmStateDto" },
+                        "endpoints": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/VmEndpoint" }
+                        }
+                    }
+                },
+                "PortForwardRequest": {
+                    "type": "object",
+                    "required": ["guest_port"],
+                    "properties": {
+                        "guest_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+                        "host_address": { "type": "string", "default": "127.0.0.1" },
+                        "host_port": { "type": "integer", "minimum": 0, "maximum": 65535, "default": 0 }
+                    }
+                },
+                "VmEndpoint": {
+                    "type": "object",
+                    "required": ["guest_port", "host_address", "host_port"],
+                    "properties": {
+                        "guest_port": { "type": "integer" },
+                        "host_address": { "type": "string" },
+                        "host_port": { "type": "integer" }
                     }
                 },
                 "VmListEntry": {
