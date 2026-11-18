@@ -12,10 +12,10 @@
 #    exactly `NANOVM_PETCLINIC_READY` on a line by itself — a follow-up
 #    milestone will switch this to a vsock signal for lower latency,
 #    but console-tail keeps the initial scaffold simple.
-# 4. `wait` on the JVM so PID 1 (this script) exits when the JVM exits.
-#    The kernel then panics — which is the intended failure mode: the
-#    host sees the panic on stdio and knows the guest is unrecoverable,
-#    no zombie.
+# 4. Poll the JVM PID so PID 1 (this script) exits when the JVM exits.
+#    `init.sh` uses `exec` to become this script, so the new shell no
+#    longer owns the job table entry required by `wait`; using `wait`
+#    here returns 127 immediately and incorrectly kills a healthy VM.
 #
 # Usage: /warmup.sh <jvm-pid>
 
@@ -148,14 +148,28 @@ fi
 # ---- 3. ready marker -------------------------------------------------
 # The host's bench binary tails guest stdio for this exact string. Do
 # NOT format-change without updating the host side.
+printf '%s\n' ready > /run/nanovm-ready
 echo "NANOVM_PETCLINIC_READY"
 
-# ---- 4. wait on JVM so the guest kernel panics on JVM death ----------
-# `wait <pid>` is safe for a child process even from PID 1: since this
-# script `exec`ed here from /sbin/init, the JVM is our direct child.
-# When the JVM exits (crash or clean shutdown), we exit; PID 1 exit
-# → kernel panic on the guest → host sees it on stdio.
+# ---- 4. supervise JVM so the guest kernel panics on JVM death --------
+# After `exec`, the kernel still considers the JVM a child of PID 1,
+# but the replacement shell has lost the original shell's job table.
+# `wait "$JVM_PID"` therefore returns 127 ("not a child") even while
+# the JVM is healthy. `kill -0` remains valid and gives us the intended
+# supervision without relying on shell-local bookkeeping.
 if [ -n "$JVM_PID" ]; then
-    wait "$JVM_PID" || true
-    echo "[warmup] JVM (pid=$JVM_PID) exited; init returning" >&2
+    while kill -0 "$JVM_PID" 2>/dev/null; do
+        if [ -r "/proc/$JVM_PID/stat" ]; then
+            jvm_state="$(
+                /bin/busybox awk '{ print $3 }' "/proc/$JVM_PID/stat" 2>/dev/null || true
+            )"
+            [ "$jvm_state" = "Z" ] && break
+        else
+            break
+        fi
+        sleep 1
+    done
+    echo "[warmup] JVM (pid=$JVM_PID) is no longer running; init returning" >&2
+    echo "[warmup] JVM log tail:" >&2
+    /bin/busybox tail -n 80 /tmp/petclinic.log >&2 || true
 fi

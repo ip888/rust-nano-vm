@@ -681,6 +681,7 @@ dependencies = [
  "anyhow",
  "clap",
  "control-plane",
+ "nanovm-fleet",
  "tokio",
  "vm-core",
  "vm-kvm",

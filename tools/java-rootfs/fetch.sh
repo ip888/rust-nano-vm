@@ -7,13 +7,8 @@
 #
 # ## SHA-256 pinning is required for release builds
 #
-# The `JDK_SHA` below defaults to `SKIP` for the initial scaffold so a
-# reviewer can exercise the fetch path without needing the real digest
-# in hand. Any release-track build MUST pin the real digest and reject
-# `SKIP`. This is enforced by `NANOVM_STRICT_PINS=1` at the top of the
-# script — set it in CI / the shipping build so an accidental
-# unpinned merge fails loudly rather than shipping an unverified
-# Oracle blob into the rootfs.
+# The release build pins the exact Oracle archive. `NANOVM_STRICT_PINS=1`
+# still fails closed if this value is ever changed back to `SKIP`.
 #
 # Capture the real digest with:
 #
@@ -30,13 +25,13 @@
 
 set -eu
 
-SCHEMA_VERSION=1
+SCHEMA_VERSION=2
 
 # Pinned to a specific point release rather than "latest" so a rebuild
 # a year from now yields byte-identical output.
 JDK_VERSION="21.0.5"
 JDK_URL="https://download.oracle.com/java/21/archive/jdk-${JDK_VERSION}_linux-x64_bin.tar.gz"
-JDK_SHA="SKIP"
+JDK_SHA="9c2f7c39e0d5b296ce50e563740694b2ebfe4a620415d1b2b848ba47bebceb47"
 
 if [ $# -ne 1 ]; then
     printf 'usage: %s <target-dir>\n' "$0" >&2
@@ -59,6 +54,15 @@ fetch_verify() {
     url="$1"
     expected="$2"
     dest="$3"
+    if [ -f "$dest" ]; then
+        actual=$(sha256sum "$dest" | awk '{print $1}')
+        if [ "$expected" = "SKIP" ] || [ "$actual" = "$expected" ]; then
+            printf '✓ cached %s\n' "$dest" >&2
+            return 0
+        fi
+        printf '! cached checksum mismatch, replacing %s\n' "$dest" >&2
+        rm -f "$dest"
+    fi
     printf '➜ fetching %s\n' "$url" >&2
     if ! curl -fSL --retry 3 --retry-delay 2 -o "$dest.tmp" "$url"; then
         printf '✗ failed to fetch %s\n' "$url" >&2

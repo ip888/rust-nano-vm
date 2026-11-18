@@ -82,6 +82,10 @@ pub struct FleetConfig {
     /// `<dir>/vm-<id>.sock`). Must exist and be writable by the
     /// control-plane process. Defaults to `/var/run/nanovm`.
     pub socket_dir: PathBuf,
+    /// Root directory for per-worker snapshot state. Kept separate from
+    /// [`Self::socket_dir`] because snapshots are multi-GiB artifacts and
+    /// `/var/run` is commonly backed by the much smaller tmpfs `/run`.
+    pub snapshot_root: PathBuf,
     /// Optional default per-VM memory cap (MiB). The jailer writes
     /// it into the new cgroup's `memory.max`. `None` skips the
     /// memory cap — useful for hosts that haven't enabled the
@@ -115,6 +119,7 @@ impl Default for FleetConfig {
             jailer_binary: PathBuf::from("/usr/local/bin/nanovm-jailer"),
             vmm_child_binary: PathBuf::from("/usr/local/bin/nanovm-vmm-child"),
             socket_dir: PathBuf::from("/var/run/nanovm"),
+            snapshot_root: PathBuf::from("/var/tmp/nanovm-fleet-snapshots"),
             default_memory_limit_mib: None,
             default_cpu_quota_pct: None,
             cgroup_parent: None,
@@ -146,6 +151,12 @@ struct Worker {
     child: Option<Child>,
     /// Socket path. Held for cleanup.
     socket: PathBuf,
+    /// Per-worker snapshot store and state directory. Keeping this
+    /// unique prevents process-local snapshot ids from colliding.
+    snapshot_dir: PathBuf,
+    /// Expected cgroup directory created by the production jailer.
+    /// Removed after the child exits; absent for stub jailers.
+    cgroup_dir: Option<PathBuf>,
     /// Open IPC stream to the worker. Closed in `destroy` (sends
     /// `Shutdown` + drops); the worker exits on EOF.
     stream: Option<UnixStream>,
@@ -166,6 +177,7 @@ impl std::fmt::Debug for Worker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Worker")
             .field("socket", &self.socket)
+            .field("snapshot_dir", &self.snapshot_dir)
             .field("child_pid", &self.child.as_ref().map(|c| c.id()))
             .field("stream_open", &self.stream.is_some())
             .field("endpoints", &self.endpoints)
@@ -187,6 +199,18 @@ impl Worker {
             self.child = None;
         }
         let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_dir_all(&self.snapshot_dir);
+        if let Some(cgroup_dir) = self.cgroup_dir.as_deref() {
+            match std::fs::remove_dir(cgroup_dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(
+                    path = %cgroup_dir.display(),
+                    error = %e,
+                    "could not remove worker cgroup"
+                ),
+            }
+        }
     }
 }
 
@@ -205,6 +229,11 @@ type WorkerSlot = Arc<Mutex<Worker>>;
 /// VM lifetime in the public API).
 pub struct ProcessFleet {
     config: FleetConfig,
+    /// Exclusive directory owned by this fleet below
+    /// [`FleetConfig::snapshot_root`]. VM ids are process-local, so
+    /// using the shared root directly lets two fleets overwrite each
+    /// other's `vm-1` snapshot state.
+    snapshot_namespace: PathBuf,
     /// Map from VmId → live worker. Insertions happen on
     /// `create_vm` / `restore`; removals on `destroy` (which also
     /// kills the subprocess).
@@ -240,6 +269,18 @@ impl std::fmt::Debug for ProcessFleet {
     }
 }
 
+impl Drop for ProcessFleet {
+    fn drop(&mut self) {
+        if let Ok(mut workers) = self.workers.write() {
+            workers.clear();
+        }
+        if let Ok(mut pool) = self.warm_pool.lock() {
+            pool.clear();
+        }
+        let _ = std::fs::remove_dir(&self.snapshot_namespace);
+    }
+}
+
 impl ProcessFleet {
     /// Construct a fleet from a [`FleetConfig`]. Spawns its own
     /// multi-thread tokio runtime for IPC work; the caller doesn't
@@ -255,8 +296,10 @@ impl ProcessFleet {
             .enable_time()
             .thread_name("nanovm-fleet-ipc")
             .build()?;
+        let snapshot_namespace = create_snapshot_namespace(&config.snapshot_root)?;
         let fleet = Self {
             config,
+            snapshot_namespace,
             workers: RwLock::new(HashMap::new()),
             snapshot_owner: RwLock::new(HashMap::new()),
             next_vm_id: AtomicU64::new(1),
@@ -318,6 +361,29 @@ impl ProcessFleet {
         std::fs::create_dir_all(&self.config.socket_dir)
             .map_err(|e| VmError::Backend(format!("create socket_dir: {e}")))?;
         let socket = self.config.socket_dir.join(format!("vm-{}.sock", vm_id.0));
+        let snapshot_dir = self
+            .snapshot_namespace
+            .join(format!("vm-{}-snapshots", vm_id.0));
+        let cgroup_dir = self
+            .cgroup_parent_path()
+            .map(|parent| parent.join(format!("nanovm-vm-{}", vm_id.0)));
+        // A killed orchestrator cannot run `Worker::Drop`. Retry can
+        // safely remove an empty cgroup left by that worker; cgroup v2
+        // refuses `rmdir` while any process still belongs to it.
+        if let Some(cgroup_dir) = cgroup_dir.as_deref() {
+            match std::fs::remove_dir(cgroup_dir) {
+                Ok(()) => tracing::info!(
+                    path = %cgroup_dir.display(),
+                    "removed stale empty worker cgroup before spawn"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    path = %cgroup_dir.display(),
+                    error = %error,
+                    "stale worker cgroup could not be removed before spawn"
+                ),
+            }
+        }
         // Stale socket from a crashed predecessor would make the
         // worker's `bind` fail with EADDRINUSE. Best-effort
         // delete; ignore NotFound.
@@ -330,6 +396,7 @@ impl ProcessFleet {
             .arg(&socket)
             .arg("--vmm-child-binary")
             .arg(&self.config.vmm_child_binary)
+            .env("NANOVM_SNAPSHOT_DIR", &snapshot_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
@@ -377,6 +444,8 @@ impl ProcessFleet {
             Ok(stream) => Ok(Arc::new(Mutex::new(Worker {
                 child: Some(child),
                 socket,
+                snapshot_dir,
+                cgroup_dir,
                 stream: Some(stream),
                 worker_vm_id: None,
                 endpoints: Vec::new(),
@@ -389,8 +458,30 @@ impl ProcessFleet {
                 let _ = c.kill();
                 let _ = c.wait();
                 let _ = std::fs::remove_file(&socket);
+                let _ = std::fs::remove_dir_all(&snapshot_dir);
+                if let Some(cgroup_dir) = cgroup_dir.as_deref() {
+                    let _ = std::fs::remove_dir(cgroup_dir);
+                }
                 Err(e)
             }
+        }
+    }
+
+    fn cgroup_parent_path(&self) -> Option<PathBuf> {
+        const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+        let parent = self.config.cgroup_parent.clone().or_else(|| {
+            std::fs::read_to_string("/proc/self/cgroup")
+                .ok()
+                .and_then(|text| {
+                    text.lines()
+                        .find_map(|line| line.strip_prefix("0::"))
+                        .map(PathBuf::from)
+                })
+        })?;
+        if parent.starts_with(CGROUP_ROOT) {
+            Some(parent)
+        } else {
+            Some(Path::new(CGROUP_ROOT).join(parent.to_string_lossy().trim_start_matches('/')))
         }
     }
 
@@ -453,6 +544,28 @@ impl ProcessFleet {
             .block_on(roundtrip_on(stream, req))
             .map_err(|e| VmError::Backend(format!("ipc: {e}")))?;
         Ok(resp)
+    }
+}
+
+static NEXT_SNAPSHOT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
+
+fn create_snapshot_namespace(root: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    loop {
+        let sequence = NEXT_SNAPSHOT_NAMESPACE.fetch_add(1, Ordering::Relaxed);
+        let namespace = root.join(format!(
+            "fleet-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&namespace) {
+            Ok(()) => return Ok(namespace),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -682,6 +795,19 @@ impl Hypervisor for ProcessFleet {
             Response::VmHandle(h) => Ok(h),
             other => Err(other),
         })?;
+        let delete_adopted =
+            self.dispatch_to_slot(&new_slot, Request::DeleteSnapshot { id: local_snap })?;
+        if let Err(error) = unwrap_response(delete_adopted, |r| match r {
+            Response::Empty => Ok(()),
+            other => Err(other),
+        }) {
+            tracing::warn!(
+                snapshot = local_snap.0,
+                worker = new_vm_id.0,
+                error = %error,
+                "restored VM is live but adopted snapshot cleanup failed"
+            );
+        }
         // Record the worker-internal id of the restored VM so
         // subsequent state/start/stop/destroy/etc translate
         // correctly. Without this every follow-up op would
@@ -863,10 +989,32 @@ mod tests {
         assert!(cfg.jailer_binary.is_absolute());
         assert!(cfg.vmm_child_binary.is_absolute());
         assert!(cfg.socket_dir.is_absolute());
+        assert!(cfg.snapshot_root.is_absolute());
+        assert_ne!(cfg.snapshot_root, cfg.socket_dir);
         assert!(cfg.default_memory_limit_mib.is_none());
         assert!(cfg.default_cpu_quota_pct.is_none());
         assert!(cfg.cgroup_parent.is_none());
         assert!(cfg.spawn_timeout >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn independent_fleets_get_disjoint_snapshot_namespaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = FleetConfig {
+            snapshot_root: dir.path().join("snapshots"),
+            ..FleetConfig::default()
+        };
+        let first = ProcessFleet::new(config.clone()).expect("first fleet");
+        let second = ProcessFleet::new(config).expect("second fleet");
+
+        assert_ne!(
+            first.snapshot_namespace, second.snapshot_namespace,
+            "process-local VM ids must not share snapshot directories"
+        );
+        assert_eq!(
+            first.snapshot_namespace.parent(),
+            second.snapshot_namespace.parent()
+        );
     }
 
     #[test]

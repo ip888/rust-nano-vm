@@ -90,6 +90,8 @@ spec:
             {{- with .Values.config.fleet }}
             - name: NANOVM_FLEET_SOCKET_DIR
               value: {{ .socketDir | default "/var/run/nanovm" | quote }}
+            - name: NANOVM_FLEET_SNAPSHOT_ROOT
+              value: {{ .snapshotRoot | default "/var/lib/nanovm/fleet-snapshots" | quote }}
             - name: NANOVM_FLEET_WARM_POOL_SIZE
               value: {{ .warmPoolSize | default 0 | quote }}
             {{- if .memoryLimitMib }}
@@ -124,6 +126,12 @@ spec:
             - name: dev-kvm
               mountPath: /dev/kvm
             {{- end }}
+            {{- if eq (default "mock" .Values.config.backend) "fleet" }}
+            - name: fleet-sockets
+              mountPath: {{ .Values.config.fleet.socketDir | default "/var/run/nanovm" | quote }}
+            - name: fleet-snapshots
+              mountPath: {{ .Values.config.fleet.snapshotRoot | default "/var/lib/nanovm/fleet-snapshots" | quote }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -145,4 +153,10 @@ spec:
           hostPath:
             path: /dev/kvm
             type: CharDevice
+        {{- end }}
+        {{- if eq (default "mock" .Values.config.backend) "fleet" }}
+        - name: fleet-sockets
+          emptyDir: {}
+        - name: fleet-snapshots
+          emptyDir: {}
         {{- end }}

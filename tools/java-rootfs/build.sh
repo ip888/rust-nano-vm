@@ -27,6 +27,7 @@
 #   PETCLINIC_REF       Git ref/commit to build. Defaults to the Dockerfile
 #                       sentinel — pin before release.
 #   DEBIAN_DIGEST       Sha256 digest for debian:12-slim. Same story.
+#   TEMURIN_DIGEST      Sha256 digest for the Petclinic build image.
 #   DOCKER_BIN          Path to docker (defaults to `docker`).
 #   ROOTFS_MB           Ext4 size in MiB (default 450).
 #   SKIP_EXT4=1         Skip the ext4 pack (needs root for the loopback
@@ -78,6 +79,9 @@ if [[ -n "${PETCLINIC_REF:-}" ]]; then
 fi
 if [[ -n "${DEBIAN_DIGEST:-}" ]]; then
     BUILD_ARGS+=("--build-arg" "DEBIAN_DIGEST=${DEBIAN_DIGEST}")
+fi
+if [[ -n "${TEMURIN_DIGEST:-}" ]]; then
+    BUILD_ARGS+=("--build-arg" "TEMURIN_DIGEST=${TEMURIN_DIGEST}")
 fi
 
 echo "➜ docker buildx build --platform ${TARGET_PLATFORM} ${IMAGE_TAG}"
@@ -140,7 +144,5 @@ else
 fi
 
 echo
-echo "Next: reuse vmlinux from tools/kvm-images/ and boot with the"
-echo "KVM backend, passing initramfs.cpio.gz to VmConfig.initrd. See"
-echo "docs/prototypes/petclinic.md for the demo run once the"
-echo "nanovm-jvm-bench binary lands (Milestone 1 PR #269)."
+echo "Next: run tools/java-demo/run.sh to boot through the production"
+echo "KVM fleet, snapshot the warmed VM, and verify HTTP on each fork."

@@ -18,6 +18,7 @@
 # `--build-arg DEBIAN_DIGEST=sha256:...` takes effect everywhere.
 
 ARG DEBIAN_DIGEST=sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+ARG TEMURIN_DIGEST=sha256:db5cc6341a1d7bc40cdb51e1f0d9824f3bb2cc8107d29da421dc4df7d11f05f1
 ARG PETCLINIC_REPO=https://github.com/spring-projects/spring-petclinic.git
 # Commit on `main` from spring-projects/spring-petclinic. Pin to a real
 # hash before merging so a rebuild is reproducible; the sentinel below
@@ -26,7 +27,7 @@ ARG PETCLINIC_REF=500158f732419217507c7656904b8e6aa1bcc0d6
 ARG JDK_TARBALL=jdk-21.0.5_linux-x64_bin.tar.gz
 
 # ---- stage 1: build the Petclinic jar --------------------------------
-FROM eclipse-temurin:21-jdk AS petclinic-builder
+FROM eclipse-temurin:21-jdk@${TEMURIN_DIGEST} AS petclinic-builder
 ARG PETCLINIC_REPO
 ARG PETCLINIC_REF
 RUN apt-get update \
