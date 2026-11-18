@@ -1917,15 +1917,14 @@ impl Hypervisor for KvmHypervisor {
         let mut inner = self.lock_inner()?;
         Self::reap_finished_vcpus(&mut inner)?;
         let vm = inner.vms.get_mut(&id).ok_or(VmError::UnknownVm(id))?;
-        let result = match vm.state {
+        match vm.state {
             VmState::Running => Self::stop_vm(vm, self.kick_signal),
             other => Err(VmError::InvalidTransition {
                 id,
                 from: other,
                 to: VmState::Stopped,
             }),
-        };
-        result
+        }
     }
 
     fn state(&self, id: VmId) -> VmResult<VmState> {
