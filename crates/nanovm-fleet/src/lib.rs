@@ -61,8 +61,8 @@ use std::time::Duration;
 
 use tokio::net::UnixStream;
 use vm_core::{
-    GuestExecRequest, GuestExecResult, Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmError,
-    VmHandle, VmId, VmMeta, VmResult, VmState,
+    GuestExecRequest, GuestExecResult, Hypervisor, SnapshotId, SnapshotMeta, VmConfig, VmEndpoint,
+    VmError, VmHandle, VmId, VmMeta, VmResult, VmState,
 };
 use vmm_ipc::framing::{read_frame, write_frame};
 use vmm_ipc::{ErrorCode, Request, Response};
@@ -158,6 +158,8 @@ struct Worker {
     /// worker's internal `VmId::next()` (which it always does
     /// once a Restore-spawned worker is involved).
     worker_vm_id: Option<VmId>,
+    /// Last active endpoints reported by the worker.
+    endpoints: Vec<VmEndpoint>,
 }
 
 impl std::fmt::Debug for Worker {
@@ -166,6 +168,7 @@ impl std::fmt::Debug for Worker {
             .field("socket", &self.socket)
             .field("child_pid", &self.child.as_ref().map(|c| c.id()))
             .field("stream_open", &self.stream.is_some())
+            .field("endpoints", &self.endpoints)
             .finish()
     }
 }
@@ -376,6 +379,7 @@ impl ProcessFleet {
                 socket,
                 stream: Some(stream),
                 worker_vm_id: None,
+                endpoints: Vec::new(),
             }))),
             Err(e) => {
                 // Worker never came up. Kill the jailer (and by
@@ -538,6 +542,14 @@ fn framing_to_io(e: vmm_ipc::framing::FrameError) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
+fn visible_endpoints(state: VmState, endpoints: &[VmEndpoint]) -> Vec<VmEndpoint> {
+    if state == VmState::Running {
+        endpoints.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
 impl Hypervisor for ProcessFleet {
     fn create_vm(&self, cfg: &VmConfig) -> VmResult<VmHandle> {
         // Hot path: claim a pre-spawned worker. Cold path: spawn
@@ -575,6 +587,7 @@ impl Hypervisor for ProcessFleet {
         {
             let mut guard = slot.lock().expect("worker lock");
             guard.worker_vm_id = Some(handle.id);
+            guard.endpoints = handle.endpoints.clone();
         }
         let handle = VmHandle {
             id: vm_id,
@@ -600,7 +613,8 @@ impl Hypervisor for ProcessFleet {
         unwrap_response(resp, |r| match r {
             Response::Empty => Ok(()),
             other => Err(other),
-        })
+        })?;
+        Ok(())
     }
 
     fn state(&self, id: VmId) -> VmResult<VmState> {
@@ -677,6 +691,7 @@ impl Hypervisor for ProcessFleet {
         {
             let mut guard = new_slot.lock().expect("worker lock");
             guard.worker_vm_id = Some(handle.id);
+            guard.endpoints = handle.endpoints.clone();
         }
         let handle = VmHandle {
             id: new_vm_id,
@@ -727,7 +742,13 @@ impl Hypervisor for ProcessFleet {
         let mut handles = Vec::with_capacity(ids.len());
         for id in ids {
             let state = self.state(id).unwrap_or(VmState::Created);
-            handles.push(VmHandle { id, state });
+            let slot = self.worker_for(id)?;
+            let endpoints = slot.lock().expect("worker lock").endpoints.clone();
+            handles.push(VmHandle {
+                id,
+                state,
+                endpoints: visible_endpoints(state, &endpoints),
+            });
         }
         Ok(handles)
     }
@@ -822,6 +843,19 @@ impl Hypervisor for ProcessFleet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listing_stopped_vm_hides_but_does_not_clear_cached_endpoints() {
+        let endpoints = vec![VmEndpoint {
+            guest_port: 8080,
+            host_address: "127.0.0.1".into(),
+            host_port: 40000,
+        }];
+        assert!(visible_endpoints(VmState::Created, &endpoints).is_empty());
+        assert!(visible_endpoints(VmState::Stopped, &endpoints).is_empty());
+        assert_eq!(visible_endpoints(VmState::Running, &endpoints), endpoints);
+        assert_eq!(endpoints.len(), 1);
+    }
 
     #[test]
     fn fleet_config_default_has_safe_defaults() {

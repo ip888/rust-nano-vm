@@ -827,6 +827,9 @@ impl NetworkBackend for SmoltcpBackend {
         match state.device.stack_to_guest.pop_front() {
             None => Ok(0),
             Some(frame) => {
+                if std::env::var_os("NANOVM_NET_TRACE").is_some() {
+                    eprintln!("virtio-net: host→guest frame {} bytes", frame.len());
+                }
                 let n = frame.len().min(buf.len());
                 buf[..n].copy_from_slice(&frame[..n]);
                 Ok(n)
@@ -848,6 +851,9 @@ impl NetworkBackend for SmoltcpBackend {
     /// stall where the vCPU drains only TX and `wait_for_handshake`
     /// never sees progress.
     fn write_frame(&self, frame: &[u8]) -> Result<()> {
+        if std::env::var_os("NANOVM_NET_TRACE").is_some() {
+            eprintln!("virtio-net: guest→host frame {} bytes", frame.len());
+        }
         {
             let mut state = self
                 .inner

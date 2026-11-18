@@ -161,6 +161,14 @@ impl TcpProxy {
     /// concurrently on the same `TcpProxy` because the shared
     /// backend serialises per-socket state under its one `Mutex`.
     pub fn bridge_connection(&self, stream: TcpStream) -> Result<()> {
+        self.bridge_connection_inner(stream, None)
+    }
+
+    fn bridge_connection_inner(
+        &self,
+        stream: TcpStream,
+        stop: Option<&Arc<AtomicBool>>,
+    ) -> Result<()> {
         // Non-blocking on the OS side so the main poll loop can
         // interleave external reads with smoltcp recv. Without
         // this, `read` would park the thread forever waiting on
@@ -171,13 +179,13 @@ impl TcpProxy {
         let handle = self.backend.open_client_socket(self.guest_endpoint);
 
         // Phase 1 — wait for the guest to accept our SYN.
-        if let Err(e) = self.wait_for_handshake(handle) {
+        if let Err(e) = self.wait_for_handshake(handle, stop) {
             self.backend.close_socket(handle);
             return Err(e);
         }
 
         // Phase 2 — shuttle bytes until either side closes.
-        let result = self.pump_bytes(stream, handle);
+        let result = self.pump_bytes(stream, handle, stop);
 
         // Idempotent: close_socket on an already-closed handle is
         // harmless. We still close explicitly on the success path
@@ -234,7 +242,9 @@ impl TcpProxy {
             match listener.accept() {
                 Ok((stream, _peer_addr)) => {
                     let proxy = Arc::clone(&self);
-                    let handle = thread::spawn(move || proxy.bridge_connection(stream));
+                    let stop = Arc::clone(&stop);
+                    let handle =
+                        thread::spawn(move || proxy.bridge_connection_inner(stream, Some(&stop)));
                     threads.push(handle);
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -248,14 +258,40 @@ impl TcpProxy {
             // is one handle (<1 KiB); OOM would take millions of
             // long-lived connections, but the retain keeps the
             // hot-path cost bounded.
-            threads.retain(|h| !h.is_finished());
+            let mut active = Vec::with_capacity(threads.len());
+            for handle in threads {
+                if handle.is_finished() {
+                    match handle.join() {
+                        Ok(Err(error)) => {
+                            eprintln!("virtio-net: TCP proxy connection failed: {error}");
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "virtio-net: TCP proxy connection thread panicked: {error:?}"
+                            );
+                        }
+                        Ok(Ok(())) => {}
+                    }
+                } else {
+                    active.push(handle);
+                }
+            }
+            threads = active;
         }
 
         // Final reap. Each bridge returns on its own when either
         // side closes; we don't force-kill them (TcpStream has no
         // kill API portable across OSes).
         for handle in threads {
-            let _ = handle.join();
+            match handle.join() {
+                Ok(Err(error)) => {
+                    eprintln!("virtio-net: TCP proxy connection failed during shutdown: {error}");
+                }
+                Err(error) => {
+                    eprintln!("virtio-net: TCP proxy connection thread panicked: {error:?}");
+                }
+                Ok(Ok(())) => {}
+            }
         }
         Ok(())
     }
@@ -264,9 +300,19 @@ impl TcpProxy {
     /// or we hit the handshake timeout. The guest may still fail
     /// us by sending a RST — that lands the socket in `Closed`,
     /// which we treat as `ConnectionRefused`.
-    fn wait_for_handshake(&self, handle: SocketHandle) -> Result<()> {
+    fn wait_for_handshake(
+        &self,
+        handle: SocketHandle,
+        stop: Option<&Arc<AtomicBool>>,
+    ) -> Result<()> {
         let start = Instant::now();
         loop {
+            if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err(VirtioNetError::Io(io::Error::new(
+                    ErrorKind::Interrupted,
+                    "proxy stopped during TCP handshake",
+                )));
+            }
             match self.backend.socket_state(handle) {
                 tcp::State::Established => return Ok(()),
                 tcp::State::Closed => {
@@ -283,6 +329,11 @@ impl TcpProxy {
                     "guest did not complete TCP handshake within timeout",
                 )));
             }
+            // Drive smoltcp's poll/timer path while waiting. This also wakes
+            // the VMM after retransmissions or an ARP reply queue a fresh
+            // outbound frame; checking socket_state alone never advances the
+            // stack.
+            self.backend.socket_recv(handle, &mut [])?;
             thread::sleep(POLL_INTERVAL);
         }
     }
@@ -296,12 +347,20 @@ impl TcpProxy {
     /// couldn't accept yet. Keeping them here (rather than returning
     /// an error on partial `socket_send`) is essential: the OS
     /// socket won't redeliver bytes it already copied to us.
-    fn pump_bytes(&self, mut stream: TcpStream, handle: SocketHandle) -> Result<()> {
+    fn pump_bytes(
+        &self,
+        mut stream: TcpStream,
+        handle: SocketHandle,
+        stop: Option<&Arc<AtomicBool>>,
+    ) -> Result<()> {
         let mut buf = [0u8; BRIDGE_BUFFER_BYTES];
         let mut pending_to_smoltcp: Vec<u8> = Vec::new();
         let mut external_eof = false;
 
         loop {
+            if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Ok(());
+            }
             let mut did_work = false;
 
             // Direction 1a: flush any carry-over from a previous
@@ -355,7 +414,7 @@ impl TcpProxy {
             // reader doesn't tear the bridge down.
             let n = self.backend.socket_recv(handle, &mut buf)?;
             if n > 0 {
-                write_all_nonblocking(&mut stream, &buf[..n])?;
+                write_all_nonblocking(&mut stream, &buf[..n], stop)?;
                 did_work = true;
             }
 
@@ -392,7 +451,11 @@ impl TcpProxy {
 /// caller instead of waiting, which doesn't fit our pump loop —
 /// we'd rather sleep a tick and retry than tear the connection
 /// down over a transiently-full kernel send buffer.
-fn write_all_nonblocking(stream: &mut TcpStream, mut data: &[u8]) -> Result<()> {
+fn write_all_nonblocking(
+    stream: &mut TcpStream,
+    mut data: &[u8],
+    stop: Option<&Arc<AtomicBool>>,
+) -> Result<()> {
     while !data.is_empty() {
         match stream.write(data) {
             Ok(0) => {
@@ -405,6 +468,9 @@ fn write_all_nonblocking(stream: &mut TcpStream, mut data: &[u8]) -> Result<()> 
                 data = &data[n..];
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    return Ok(());
+                }
                 thread::sleep(POLL_INTERVAL);
             }
             Err(e) => return Err(VirtioNetError::Io(e)),

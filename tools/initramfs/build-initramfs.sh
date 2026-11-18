@@ -14,13 +14,10 @@
 #                           (used by tests/agent_init_boot.rs — proves
 #                           the agent launches inside the guest).
 #
-#   NANOVM_INIT=net-echo  → /init is a shell script that brings eth0
-#                           up on the smoltcp link-local address
-#                           (169.254.0.2/24), then starts a TCP echo
-#                           listener on :8080 via `busybox nc`.
-#                           Uses busybox-static from the host (install
-#                           via `apt install busybox-static`, or point
-#                           NANOVM_BUSYBOX_STATIC at a local copy).
+#   NANOVM_INIT=net-echo  → /init is a static C program that configures
+#                           eth0 on the smoltcp link-local address
+#                           (169.254.0.2/24) and runs a TCP echo
+#                           listener on :8080.
 #                           Output: cache/initramfs-net-echo.cpio
 #                           (used by tests/virtio_net_smoltcp_data_path_boot.rs
 #                           — proves the Host→Guest TCP path via
@@ -92,89 +89,9 @@ case "${VARIANT}" in
     ;;
   net-echo)
     OUT="${CACHE}/initramfs-net-echo.cpio"
-    # Locate the host's busybox-static binary. The Linux shebang
-    # `#!/bin/busybox sh` relies on this file being inside the
-    # cpio at /bin/busybox, statically linked and executable.
-    BUSYBOX="${NANOVM_BUSYBOX_STATIC:-}"
-    if [[ -z "${BUSYBOX}" ]]; then
-      for cand in /bin/busybox /usr/bin/busybox /usr/local/bin/busybox; do
-        if [[ -x "${cand}" ]]; then
-          BUSYBOX="${cand}"
-          break
-        fi
-      done
-    fi
-    if [[ -z "${BUSYBOX}" || ! -x "${BUSYBOX}" ]]; then
-      echo "initramfs: variant=net-echo needs busybox-static" >&2
-      echo "initramfs:   Debian/Ubuntu: apt install busybox-static" >&2
-      echo "initramfs:   Or set NANOVM_BUSYBOX_STATIC=/path/to/busybox" >&2
-      exit 1
-    fi
-    # Reject a dynamically-linked busybox: the tinyconfig guest has
-    # no /lib/ld-musl or /lib/x86_64-linux-gnu, so a dynamic binary
-    # faceplants at exec with ENOENT on the interpreter.
-    if ! file "${BUSYBOX}" | grep -q 'statically linked'; then
-      echo "initramfs: ${BUSYBOX} is not statically linked" >&2
-      echo "initramfs: the guest has no ld.so; install busybox-static (not busybox)" >&2
-      exit 1
-    fi
-    echo "initramfs: variant=net-echo — using busybox at ${BUSYBOX}"
-
-    # Shell init: diagnostic-rich. Every command preceded by an
-    # `echo [stage N]` so a failure between stages localises to
-    # the last visible marker. First rev showed zero output on the
-    # Omarchy host — we need to know whether the shell even reaches
-    # the first write. Once the stage-marker chain confirms where
-    # things fall over, this trims back to the minimal production
-    # init in a follow-up.
-    INIT_SRC="${CACHE}/net-echo-init.sh"
-    cat > "${INIT_SRC}" <<'INITSCRIPT'
-#!/bin/busybox sh
-# Guest-side /init for the virtio-net smoltcp data-path test.
-#
-# DIAGNOSTIC MODE: a staged marker chain. The host-side test only
-# matches on NANOVM_NET_ECHO_READY, but the `[stage N]` markers
-# around it tell us which command stalls when the test fails.
-
-echo "[stage 1] shell entered (busybox sh is alive)"
-BB=/bin/busybox
-
-echo "[stage 2] /bin/busybox: $($BB ls -la /bin/busybox 2>&1 | head -1)"
-echo "[stage 2b] /dev contents: $($BB ls /dev 2>&1)"
-
-echo "[stage 3] mount proc:"
-$BB mount -t proc  proc  /proc  2>&1 || echo "  (mount proc failed, ignoring)"
-echo "[stage 4] mount sys:"
-$BB mount -t sysfs sysfs /sys   2>&1 || echo "  (mount sys failed, ignoring)"
-
-echo "[stage 5] ip link show (pre-up):"
-$BB ip link show 2>&1 || echo "  (ip link show failed)"
-
-echo "[stage 6] ip link set lo up:"
-$BB ip link set lo up 2>&1 || echo "  (lo up failed, ignoring)"
-echo "[stage 7] ip link set eth0 up:"
-$BB ip link set eth0 up 2>&1 || echo "  (eth0 up failed, ignoring)"
-echo "[stage 8] ip addr add 169.254.0.2/24 dev eth0:"
-$BB ip addr add 169.254.0.2/24 dev eth0 2>&1 || echo "  (addr add failed, ignoring)"
-
-echo "[stage 9] ip addr show (post-up):"
-$BB ip addr show 2>&1 || echo "  (ip addr show failed)"
-
-# Readiness marker — the host-side test polls serial for this
-# substring before attaching TcpProxy.
-echo "NANOVM_NET_ECHO_READY"
-
-# Test the `-e` applet feature of this busybox build. If missing,
-# nc rejects the option and exits — the marker above still gets
-# the test past its wait, but the proxy round-trip will fail.
-echo "[stage 10] busybox nc --help (brief):"
-$BB nc --help 2>&1 | head -5 || echo "  (nc --help failed)"
-
-echo "[stage 11] exec nc listener:"
-exec $BB nc -lk -p 8080 -e $BB cat
-INITSCRIPT
-    chmod +x "${INIT_SRC}"
-    INIT_BIN="${INIT_SRC}"
+    INIT_SRC="${HERE}/init-net-echo.c"
+    INIT_BIN="${CACHE}/init-net-echo"
+    gcc -static -no-pie -Os -s -Wall -Wextra -o "${INIT_BIN}" "${INIT_SRC}"
     ;;
   *)
     echo "initramfs: unknown NANOVM_INIT='${VARIANT}'" >&2
@@ -184,7 +101,7 @@ INITSCRIPT
 esac
 
 # ---- short-circuit ---------------------------------------------------
-if [[ -f "${OUT}" && "${OUT}" -nt "${INIT_SRC}" ]]; then
+if [[ "${VARIANT}" != "net-echo" && -f "${OUT}" && "${OUT}" -nt "${INIT_SRC}" ]]; then
   echo "initramfs: ${OUT} is up to date ('rm ${OUT}' forces a rebuild)"
   exit 0
 fi
@@ -215,20 +132,6 @@ nod /dev/null 0666 0 0 c 1 3
 nod /dev/zero 0666 0 0 c 1 5
 file /init ${INIT_BIN} 0755 0 0
 EOF
-
-# net-echo needs busybox inside the cpio at /bin/busybox (resolved
-# by the `#!/bin/busybox sh` shebang on /init), plus /bin + /proc +
-# /sys directories so init's mount commands land in real mount
-# points rather than ENOENT. Add them AFTER the base entries so a
-# test-variant archive stays byte-identical to before.
-if [[ "${VARIANT}" == "net-echo" ]]; then
-  cat >> "${CPIO_LIST}" <<EOF
-dir /bin 0755 0 0
-dir /proc 0755 0 0
-dir /sys 0755 0 0
-file /bin/busybox ${BUSYBOX} 0755 0 0
-EOF
-fi
 
 # ---- generate the cpio ----------------------------------------------
 echo "initramfs: generating ${OUT}"

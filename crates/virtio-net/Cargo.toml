@@ -26,6 +26,7 @@ readme = "README.md"
 # is a value returned from a function. `thiserror` makes those values
 # ergonomic to define. Zero runtime cost, all comptime macro.
 thiserror.workspace = true
+serde.workspace = true
 
 # `libc` — raw C-level libc bindings. We need it because opening
 # /dev/net/tun involves a TUNSETIFF ioctl whose request number and

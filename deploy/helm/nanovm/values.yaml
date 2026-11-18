@@ -134,6 +134,8 @@ config:
   #     cgroup and crash domain. Requires the KVM image (which ships
   #     the jailer + worker binaries) and a delegated parent cgroup
   #     (systemd Delegate=memory cpu, or root + manual delegation).
+  # Keep the fleet backend opt-in until the chart provisions a writable
+  # socket directory and delegated cgroup tree.
   backend: "mock"
   # Fleet-only knobs — ignored unless `backend == fleet`.
   fleet:

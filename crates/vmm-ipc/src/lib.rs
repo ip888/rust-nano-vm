@@ -421,6 +421,7 @@ mod tests {
             Response::VmHandle(VmHandle {
                 id: VmId(1),
                 state: VmState::Running,
+                endpoints: Vec::new(),
             }),
             Response::State {
                 state: VmState::Created,

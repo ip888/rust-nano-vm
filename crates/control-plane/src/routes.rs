@@ -28,18 +28,19 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use axum::{
-    body::Bytes,
+    body::{to_bytes, Body, Bytes},
     extract::{
         rejection::{JsonRejection, PathRejection},
-        Extension, Path, Query, State,
+        Extension, OriginalUri, Path, Query, State,
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Request, Response, StatusCode},
     middleware,
     routing::{get, post},
     Json, Router,
 };
+use futures_util::StreamExt;
 use tower_http::trace::TraceLayer;
-use vm_core::{Hypervisor, SnapshotId, VmId};
+use vm_core::{Hypervisor, SnapshotId, VmConfig, VmEndpoint, VmId, VmState};
 
 use crate::api::{
     openapi_spec, CreateVmRequest, ExecRequest, ExecResponse, FilePathQuery, FileReadResponse,
@@ -55,6 +56,14 @@ use crate::ownership::OwnershipMap;
 use crate::request_id;
 use crate::time::rfc3339_now;
 use crate::warm_pool::WarmPool;
+
+#[derive(Clone)]
+struct VmEndpointState {
+    endpoints: Vec<VmEndpoint>,
+    active: bool,
+    cancel: Arc<tokio_util::sync::CancellationToken>,
+    operation: Arc<tokio::sync::Mutex<()>>,
+}
 
 /// Per-token fork usage — the basis for usage-based billing on the fork API.
 #[derive(Debug, Default, Clone, Copy)]
@@ -74,6 +83,12 @@ pub struct AppState {
     /// Per-token fork rate limiter. Shared `Arc` so handlers can poll
     /// without contending on `AppState`'s clone.
     fork_quota: Arc<crate::ForkQuota>,
+    /// VM endpoints returned by the backend. These are process-local because
+    /// live VM workers are process-local too; durable recovery lands with the
+    /// restart/reconciliation stage.
+    vm_endpoints: Arc<Mutex<HashMap<VmId, VmEndpointState>>>,
+    /// Client used to forward external HTTP through the VM's loopback proxy.
+    http_client: reqwest::Client,
     /// Prometheus counters exposed at `/metrics`.
     metrics: Arc<crate::Metrics>,
     /// Pre-warmed fork pool. Default is a disabled pool (every fork
@@ -146,6 +161,11 @@ impl AppState {
             hypervisor,
             fork_usage: Arc::new(Mutex::new(HashMap::new())),
             fork_quota,
+            vm_endpoints: Arc::new(Mutex::new(HashMap::new())),
+            http_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("construct control-plane HTTP client"),
             metrics: Arc::new(crate::Metrics::new()),
             warm_pool,
             snapshot_store: None,
@@ -166,6 +186,95 @@ impl AppState {
     pub fn with_vm_defaults(mut self, defaults: crate::api::VmConfigDefaults) -> Self {
         self.vm_defaults = defaults;
         self
+    }
+
+    fn record_endpoints(&self, handle: &vm_core::VmHandle) {
+        let mut endpoints = self
+            .vm_endpoints
+            .lock()
+            .expect("vm endpoints mutex poisoned");
+        let state = endpoints
+            .entry(handle.id)
+            .or_insert_with(|| VmEndpointState {
+                endpoints: Vec::new(),
+                active: false,
+                cancel: Arc::new(tokio_util::sync::CancellationToken::new()),
+                operation: Arc::new(tokio::sync::Mutex::new(())),
+            });
+        state.endpoints = handle.endpoints.clone();
+        state.active = handle.state == VmState::Running;
+        state.cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+    }
+
+    fn deactivate_endpoints(&self, id: VmId) {
+        if let Some(state) = self
+            .vm_endpoints
+            .lock()
+            .expect("vm endpoints mutex poisoned")
+            .get_mut(&id)
+        {
+            state.active = false;
+            state.cancel.cancel();
+        }
+    }
+
+    fn reactivate_endpoints(&self, id: VmId) {
+        if let Some(state) = self
+            .vm_endpoints
+            .lock()
+            .expect("vm endpoints mutex poisoned")
+            .get_mut(&id)
+        {
+            state.active = true;
+            state.cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        }
+    }
+
+    fn forget_endpoint_state(&self, id: VmId) {
+        self.vm_endpoints
+            .lock()
+            .expect("vm endpoints mutex poisoned")
+            .remove(&id);
+    }
+
+    fn lifecycle_operation(&self, id: VmId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut endpoints = self
+            .vm_endpoints
+            .lock()
+            .expect("vm endpoints mutex poisoned");
+        Arc::clone(
+            &endpoints
+                .entry(id)
+                .or_insert_with(|| VmEndpointState {
+                    endpoints: Vec::new(),
+                    active: false,
+                    cancel: Arc::new(tokio_util::sync::CancellationToken::new()),
+                    operation: Arc::new(tokio::sync::Mutex::new(())),
+                })
+                .operation,
+        )
+    }
+
+    fn endpoint_for_request(
+        &self,
+        id: VmId,
+        guest_port: u16,
+    ) -> Option<(VmEndpoint, Arc<tokio_util::sync::CancellationToken>)> {
+        let state = self
+            .vm_endpoints
+            .lock()
+            .expect("vm endpoints mutex poisoned")
+            .get(&id)?
+            .clone();
+        if !state.active {
+            return None;
+        }
+        let endpoint = state
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.guest_port == guest_port)?
+            .clone();
+        Some((endpoint, state.cancel))
     }
 
     /// Install the Stripe billing context. `None` disables
@@ -297,6 +406,14 @@ pub fn router() -> Router<AppState> {
         .route("/vms/:id", get(get_vm).delete(destroy_vm))
         .route("/vms/:id/start", post(start_vm))
         .route("/vms/:id/stop", post(stop_vm))
+        .route(
+            "/vms/:id/ports/:port",
+            axum::routing::any(proxy_vm_http),
+        )
+        .route(
+            "/vms/:id/ports/:port/*path",
+            axum::routing::any(proxy_vm_http),
+        )
         .route("/vms/:id/snapshot", post(snapshot_vm))
         .route("/vms/:id/exec", post(exec_vm))
         .route(
@@ -526,10 +643,11 @@ async fn create_vm(
     // falls through to the default. See `VmConfigDefaults::apply_to`.
     // This is what makes `POST /v1/vms {}` succeed on a KVM image with
     // bundled kernel + rootfs.
-    let mut cfg: vm_core::VmConfig = req.into();
+    let mut cfg = VmConfig::try_from(req).map_err(ApiError::Bad)?;
     state.vm_defaults.apply_to(&mut cfg);
     let handle = state.hypervisor.create_vm(&cfg)?;
     state.ownership.record_vm(handle.id, org);
+    state.record_endpoints(&handle);
     Ok((StatusCode::CREATED, Json(handle.into())))
 }
 
@@ -601,7 +719,10 @@ async fn start_vm(
     let Path(id) = id?;
     let vm_id = VmId(id);
     state.ownership.require_vm_access(vm_id, &org)?;
+    let lifecycle = state.lifecycle_operation(vm_id);
+    let _guard = lifecycle.lock_owned().await;
     state.hypervisor.start(vm_id)?;
+    state.reactivate_endpoints(vm_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -613,8 +734,166 @@ async fn stop_vm(
     let Path(id) = id?;
     let vm_id = VmId(id);
     state.ownership.require_vm_access(vm_id, &org)?;
-    state.hypervisor.stop(vm_id)?;
+    let lifecycle = state.lifecycle_operation(vm_id);
+    let _guard = lifecycle.lock_owned().await;
+    state.deactivate_endpoints(vm_id);
+    if let Err(error) = state.hypervisor.stop(vm_id) {
+        state.reactivate_endpoints(vm_id);
+        return Err(error.into());
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct VmPortPath {
+    id: u64,
+    port: u16,
+}
+
+fn guest_proxy_url(
+    endpoint: &VmEndpoint,
+    suffix: &str,
+    query: Option<&str>,
+) -> Result<String, ApiError> {
+    let address: std::net::IpAddr = endpoint
+        .host_address
+        .parse()
+        .map_err(|error| ApiError::InternalDyn(format!("invalid VM endpoint address: {error}")))?;
+    let socket = std::net::SocketAddr::new(address, endpoint.host_port);
+    let mut url = format!("http://{socket}{suffix}");
+    if let Some(query) = query {
+        url.push('?');
+        url.push_str(query);
+    }
+    Ok(url)
+}
+
+/// Proxy an arbitrary HTTP request through one guest port exposed by the VM.
+/// The internal listener remains loopback-only; callers reach it through the
+/// authenticated `/v1` boundary, so dynamic container ports never need to be
+/// published through Docker or Kubernetes.
+async fn proxy_vm_http(
+    State(state): State<AppState>,
+    Extension(org): Extension<OrgId>,
+    OriginalUri(uri): OriginalUri,
+    path: Result<Path<VmPortPath>, PathRejection>,
+    request: Request<Body>,
+) -> Result<Response<Body>, ApiError> {
+    let Path(VmPortPath {
+        id,
+        port: guest_port,
+    }) = path?;
+    let vm_id = VmId(id);
+    state.ownership.require_vm_access(vm_id, &org)?;
+    let (endpoint, cancel) = state
+        .endpoint_for_request(vm_id, guest_port)
+        .ok_or_else(|| ApiError::NotFound {
+            code: "vm_port_not_forwarded",
+            message: format!("VM {id} does not forward guest TCP port {guest_port}"),
+        })?;
+    if state.hypervisor.state(vm_id)? != VmState::Running {
+        state.deactivate_endpoints(vm_id);
+        return Err(ApiError::NotFound {
+            code: "vm_port_not_running",
+            message: format!("VM {id} is not running"),
+        });
+    }
+
+    let prefix = format!("/v1/vms/{id}/ports/{guest_port}");
+    let suffix = uri.path().strip_prefix(&prefix).ok_or_else(|| {
+        ApiError::InternalDyn("proxy request path did not match registered route".to_owned())
+    })?;
+    let suffix = if suffix.is_empty() { "/" } else { suffix };
+    let url = guest_proxy_url(&endpoint, suffix, uri.query())?;
+
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, 16 * 1024 * 1024)
+        .await
+        .map_err(|e| ApiError::Bad(format!("proxy request body: {e}")))?;
+    let mut headers = HeaderMap::new();
+    for (name, value) in &parts.headers {
+        if !matches!(
+            name.as_str(),
+            "authorization"
+                | "proxy-authorization"
+                | "host"
+                | "connection"
+                | "proxy-connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "upgrade"
+                | "te"
+                | "content-length"
+        ) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+
+    let send = state
+        .http_client
+        .request(parts.method, url)
+        .headers(headers)
+        .body(body)
+        .send();
+    let upstream = tokio::select! {
+        result = send => result.map_err(|e| ApiError::InternalDyn(format!("guest HTTP proxy: {e}")))?,
+        _ = cancel.cancelled() => {
+            return Err(ApiError::NotFound {
+                code: "vm_port_stopped",
+                message: format!("VM {id} stopped during the request"),
+            });
+        }
+    };
+    let status = upstream.status();
+    let response_headers = upstream.headers().clone();
+    let cancellation = Arc::clone(&cancel);
+    let upstream_stream = Box::pin(upstream.bytes_stream());
+    let stream = futures_util::stream::unfold(
+        (upstream_stream, cancellation, false),
+        |(mut upstream_stream, cancellation, ended)| async move {
+            if ended {
+                return None;
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    let error = std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "VM stopped before the guest response completed",
+                    );
+                    Some((Err(error), (upstream_stream, cancellation, true)))
+                }
+                item = upstream_stream.next() => match item {
+                    Some(Ok(bytes)) => Some((
+                        Ok(bytes),
+                        (upstream_stream, cancellation, false),
+                    )),
+                    Some(Err(error)) => Some((
+                        Err(std::io::Error::other(error)),
+                        (upstream_stream, cancellation, true),
+                    )),
+                    None => None,
+                },
+            }
+        },
+    );
+    let mut response = Response::builder().status(status);
+    for (name, value) in &response_headers {
+        if !matches!(
+            name.as_str(),
+            "connection"
+                | "proxy-connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "upgrade"
+                | "te"
+                | "content-length"
+        ) {
+            response = response.header(name, value);
+        }
+    }
+    response
+        .body(Body::from_stream(stream))
+        .map_err(|e| ApiError::InternalDyn(format!("build guest HTTP response: {e}")))
 }
 
 async fn destroy_vm(
@@ -627,7 +906,14 @@ async fn destroy_vm(
     let Path(id) = id?;
     let vm_id = VmId(id);
     state.ownership.require_vm_access(vm_id, &org)?;
-    state.hypervisor.destroy(vm_id)?;
+    let lifecycle = state.lifecycle_operation(vm_id);
+    let _guard = lifecycle.lock_owned().await;
+    state.deactivate_endpoints(vm_id);
+    if let Err(error) = state.hypervisor.destroy(vm_id) {
+        state.reactivate_endpoints(vm_id);
+        return Err(error.into());
+    }
+    state.forget_endpoint_state(vm_id);
     state.ownership.forget_vm(vm_id);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -684,6 +970,7 @@ async fn restore_snapshot(
     state.ownership.require_snapshot_access(snap_id, &org)?;
     let handle = state.hypervisor.restore(snap_id)?;
     state.ownership.record_vm(handle.id, org);
+    state.record_endpoints(&handle);
     Ok((StatusCode::CREATED, Json(handle.into())))
 }
 
@@ -757,6 +1044,7 @@ async fn fork_snapshot(
         state.hypervisor.restore(snap_id)?
     };
     state.ownership.record_vm(handle.id, org.clone());
+    state.record_endpoints(&handle);
     let fork_ms = started.elapsed().as_millis() as u64;
 
     let mut fork_count = 1u64;
@@ -1068,4 +1356,160 @@ async fn read_file(
     let Query(q) = query.map_err(|e| ApiError::Bad(e.to_string()))?;
     let content = state.hypervisor.read_file(vm_id, q.path)?;
     Ok(Json(FileReadResponse { content }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tower::ServiceExt;
+    use vm_core::VmConfig;
+
+    #[tokio::test]
+    async fn proxy_vm_http_preserves_path_query_method_and_body() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let upstream_port = upstream.local_addr().expect("upstream address").port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.expect("accept upstream");
+            let mut request = vec![0; 4096];
+            let n = stream
+                .read(&mut request)
+                .await
+                .expect("read upstream request");
+            let request = String::from_utf8_lossy(&request[..n]);
+            assert!(request.starts_with("POST /hello?x=1 HTTP/1.1"));
+            assert!(request.contains("proxy-body"));
+            assert!(!request.to_ascii_lowercase().contains("authorization"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: 8\r\nconnection: close\r\n\r\n{\"ok\":1}",
+                )
+                .await
+                .expect("write upstream response");
+        });
+
+        let hypervisor = Arc::new(vm_mock::MockHypervisor::new());
+        let mut handle = hypervisor
+            .create_vm(&VmConfig::default())
+            .expect("create VM");
+        hypervisor.start(handle.id).expect("start VM");
+        handle.state = VmState::Running;
+        let state = AppState::new(hypervisor);
+        let org = OrgId::default_org();
+        state.ownership.record_vm(handle.id, org.clone());
+        state.record_endpoints(&vm_core::VmHandle {
+            id: handle.id,
+            state: handle.state,
+            endpoints: vec![VmEndpoint {
+                guest_port: 8080,
+                host_address: "127.0.0.1".into(),
+                host_port: upstream_port,
+            }],
+        });
+
+        let uri: axum::http::Uri = format!("/v1/vms/{}/ports/8080/hello?x=1", handle.id.0)
+            .parse()
+            .expect("parse proxy URI");
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri.clone())
+            .header("content-type", "text/plain")
+            .header("authorization", "Bearer control-plane-secret")
+            .body(Body::from("proxy-body"))
+            .expect("build request");
+        let app = router()
+            .layer(Extension(Arc::new(crate::ApiTokens::default())))
+            .with_state(state);
+        let response = app.oneshot(request).await.expect("proxy request");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .expect("content type"),
+            "application/json"
+        );
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("read proxy response");
+        assert_eq!(&body[..], br#"{"ok":1}"#);
+        server.await.expect("upstream task");
+    }
+
+    #[test]
+    fn guest_proxy_url_brackets_ipv6_loopback() {
+        let endpoint = VmEndpoint {
+            guest_port: 8080,
+            host_address: "::1".into(),
+            host_port: 49152,
+        };
+        assert_eq!(
+            guest_proxy_url(&endpoint, "/health", Some("full=1")).unwrap(),
+            "http://[::1]:49152/health?full=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_a_long_lived_guest_response_without_waiting() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let upstream_port = upstream.local_addr().expect("upstream address").port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.expect("accept upstream");
+            let mut request = vec![0; 2048];
+            let n = stream.read(&mut request).await.expect("read request");
+            assert!(n > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n")
+                .await
+                .expect("write streaming response");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let hypervisor = Arc::new(vm_mock::MockHypervisor::new());
+        let mut handle = hypervisor
+            .create_vm(&VmConfig::default())
+            .expect("create VM");
+        hypervisor.start(handle.id).expect("start VM");
+        handle.state = VmState::Running;
+        handle.endpoints.push(VmEndpoint {
+            guest_port: 8080,
+            host_address: "127.0.0.1".into(),
+            host_port: upstream_port,
+        });
+        let state = AppState::new(hypervisor);
+        let org = OrgId::default_org();
+        state.ownership.record_vm(handle.id, org.clone());
+        state.record_endpoints(&handle);
+        let app = router()
+            .layer(Extension(Arc::new(crate::ApiTokens::default())))
+            .with_state(state.clone());
+        let request = Request::builder()
+            .uri(format!("/v1/vms/{}/ports/8080/events", handle.id.0))
+            .body(Body::empty())
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("streaming response");
+        let body = tokio::spawn(async move { to_bytes(response.into_body(), 1024).await });
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            stop_vm(State(state.clone()), Extension(org), Ok(Path(handle.id.0))),
+        )
+        .await
+        .expect("stop must not wait for the response")
+        .expect("stop VM");
+        let body_result = tokio::time::timeout(Duration::from_secs(1), body)
+            .await
+            .expect("body cancellation must finish")
+            .expect("body task");
+        assert!(
+            body_result.is_err(),
+            "VM cancellation must abort rather than silently truncate the response"
+        );
+        server.abort();
+    }
 }

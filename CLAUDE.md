@@ -72,8 +72,11 @@ the user explicitly asks to check.
   needs to be green without `/dev/kvm` so portable CI works.
 - Real-KVM integration tests under `crates/vm-kvm/tests/*_boot.rs`
   follow a skip-when-fixtures-missing pattern. New ones should match it.
-- Feature branches must use the `claude/<topic>` prefix per the session's
-  branch-naming requirement.
+- Feature branches must use concise, descriptive names that reflect the
+  deliverable, such as `production-http-lifecycle`, `snapshot-recovery`,
+  `java-sdk`, or `testcontainers-driver`. Do not use an assistant-name
+  prefix such as `claude/`; use `feat/` or `fix/` only when it improves
+  clarity.
 - Target platforms (v1): Linux + KVM on x86_64 (Intel VT-x, AMD-V).
   OpenShift and vanilla Kubernetes are first-class deployment targets.
   ARM64 (aarch64) is a v2 goal; the KVM backend is x86-specific today.

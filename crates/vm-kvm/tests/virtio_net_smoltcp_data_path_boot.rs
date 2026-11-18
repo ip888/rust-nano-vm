@@ -22,10 +22,10 @@
 //!        │
 //!        ▼
 //!   guest TCP/IP stack (static eth0 = 169.254.0.2/24, brought up
-//!                       by the net-echo /init via busybox `ip`)
-//!        │  accept
+//!                       by the net-echo /init via ioctl)
+//!   │  accept + echo
 //!        ▼
-//!   `busybox nc -lk -p 8080 -e cat`  (echoes every byte back)
+//!   static C echo server on :8080
 //! ```
 //!
 //! …and verifies the host sees byte-for-byte the same payload the
@@ -41,7 +41,7 @@
 //!
 //! Follows the vm-kvm "skip when fixtures missing" pattern:
 //!
-//!   NANOVM_TEST_KERNEL          (default: tools/kernel/cache/bzImage)
+//!   NANOVM_TEST_KERNEL          (default: tools/kernel/cache/bzImage-jvm)
 //!   NANOVM_TEST_INITRAMFS_NET   (default:
 //!                                tools/initramfs/cache/initramfs-net-echo.cpio)
 //!
@@ -50,9 +50,9 @@
 //! ```sh
 //! # Kernel — same tinyconfig + net fragment the existing smoltcp
 //! # bring-up test uses.
-//! tools/kernel/build-tiny-kernel.sh
+//! KERNEL_PROFILE=jvm tools/kernel/build-tiny-kernel.sh
 //!
-//! # Guest initramfs with `busybox nc` echo listener as /init.
+//! # Guest initramfs with a static C echo listener as /init.
 //! NANOVM_INIT=net-echo tools/initramfs/build-initramfs.sh
 //! ```
 //!
@@ -66,19 +66,16 @@
 #![cfg(all(feature = "kvm", feature = "virtio-net-smoltcp"))]
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
-use virtio_net::{IpAddress, IpEndpoint, TcpProxy, DEFAULT_GUEST_IPV4, DEFAULT_LISTEN_PORT};
-use vm_core::{Hypervisor, NetBackendChoice, VmConfig, VmId};
+use virtio_net::DEFAULT_LISTEN_PORT;
+use vm_core::{Hypervisor, NetBackendChoice, PortForward, VmConfig, VmId};
 use vm_kvm::KvmHypervisor;
 
 /// Substring the guest `/init` prints when eth0 is configured and
-/// the `busybox nc` echo listener is about to take over PID 1.
+/// the static echo listener has bound its guest TCP socket.
 /// Polling for this closes the "guest still booting" race before
 /// the host attaches TcpProxy.
 const READY_MARKER: &str = "NANOVM_NET_ECHO_READY";
@@ -143,12 +140,32 @@ fn wait_for_serial(hv: &KvmHypervisor, vm: VmId, needle: &str, max_secs: u64) {
     }
 }
 
+fn echo_round_trip(address: impl std::net::ToSocketAddrs) -> Vec<u8> {
+    let mut client = TcpStream::connect(address).expect("connect to VM port proxy");
+    client
+        .set_read_timeout(Some(Duration::from_secs(TEST_DEADLINE_SECS)))
+        .expect("set read timeout");
+    client.write_all(PAYLOAD).expect("client write payload");
+
+    let mut received = Vec::with_capacity(PAYLOAD.len());
+    let mut buf = [0u8; 128];
+    while received.len() < PAYLOAD.len() {
+        let n = client.read(&mut buf).expect("client read echo from proxy");
+        if n == 0 {
+            break;
+        }
+        received.extend_from_slice(&buf[..n]);
+    }
+    let _ = client.shutdown(std::net::Shutdown::Write);
+    received
+}
+
 #[test]
 fn host_to_guest_tcp_round_trip() {
-    let Some(kernel) = resolve("NANOVM_TEST_KERNEL", "tools/kernel/cache/bzImage") else {
+    let Some(kernel) = resolve("NANOVM_TEST_KERNEL", "tools/kernel/cache/bzImage-jvm") else {
         eprintln!(
             "virtio_net_smoltcp_data_path_boot: skipping — \
-             run tools/kernel/build-tiny-kernel.sh first."
+             run KERNEL_PROFILE=jvm tools/kernel/build-tiny-kernel.sh first."
         );
         return;
     };
@@ -172,15 +189,17 @@ fn host_to_guest_tcp_round_trip() {
     let cfg = VmConfig {
         vcpus: 1,
         // 128 MiB mirrors the sibling `virtio_net_smoltcp_boot` test
-        // + `agent_init_boot`. 64 MiB was marginal — busybox + nc +
-        // transient `ip` subprocesses don't need much, but a tight
-        // memory envelope can OOM the kernel silently at execve
-        // time with no userspace output, which was indistinguishable
-        // from the `init died exit 1` symptom.
+        // + `agent_init_boot`. 64 MiB was marginal for the kernel plus
+        // a statically linked init fixture.
         memory_mib: 128,
         kernel: Some(kernel),
         initrd: Some(initrd),
         net_backend: NetBackendChoice::Smoltcp,
+        port_forwards: vec![PortForward {
+            guest_port: DEFAULT_LISTEN_PORT,
+            host_address: "127.0.0.1".into(),
+            host_port: 0,
+        }],
         cmdline: "console=ttyS0,115200 panic=-1 rdinit=/init".into(),
         ..VmConfig::default()
     };
@@ -188,76 +207,39 @@ fn host_to_guest_tcp_round_trip() {
     let handle = hv.create_vm(&cfg).expect("create_vm");
     hv.start(handle.id).expect("start");
 
-    // Grab the backend handle up front — if this returns None the
-    // test is pointless, and failing here beats a confusing TCP
-    // timeout further down.
-    let smoltcp = hv
-        .net_smoltcp_backend(handle.id)
-        .expect("net_smoltcp_backend lookup")
-        .expect("smoltcp backend must be attached when NetBackendChoice::Smoltcp was selected");
-
     // Wait for the guest `/init` to finish bringing eth0 up and
     // print its readiness marker. 15 s is loose enough for a slow
-    // laptop kernel boot (~2 s) plus busybox `ip` latency.
+    // laptop kernel boot (~2 s) plus network-interface bring-up.
     wait_for_serial(&hv, handle.id, READY_MARKER, 15);
+    // The marker is emitted immediately before exec'ing nc; allow the
+    // listener syscall to complete before the first SYN.
+    std::thread::sleep(Duration::from_secs(1));
 
-    // Bind the external listener. Ephemeral port keeps the test
-    // parallel-safe (CI matrix can run several of these at once
-    // without the OS stepping on itself).
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind external ephemeral port");
-    let listen_addr = listener.local_addr().expect("local_addr");
+    let endpoint = handle
+        .endpoints
+        .first()
+        .expect("VM must expose the requested endpoint");
+    let listen_addr = format!("{}:{}", endpoint.host_address, endpoint.host_port);
+    let received = echo_round_trip(listen_addr.as_str());
 
-    // The guest echo listener is on 169.254.0.2:8080 — same subnet
-    // the smoltcp backend considers its gateway, same port its
-    // `nc -l` is bound to.
-    let guest_endpoint = IpEndpoint::new(
-        IpAddress::v4(
-            DEFAULT_GUEST_IPV4[0],
-            DEFAULT_GUEST_IPV4[1],
-            DEFAULT_GUEST_IPV4[2],
-            DEFAULT_GUEST_IPV4[3],
-        ),
-        DEFAULT_LISTEN_PORT,
-    );
-    let proxy = Arc::new(TcpProxy::new(Arc::clone(&smoltcp), guest_endpoint));
-    let serve_stop = Arc::new(AtomicBool::new(false));
-    let serve_proxy = Arc::clone(&proxy);
-    let serve_stop_handle = Arc::clone(&serve_stop);
-    let serve_thread = thread::spawn(move || {
-        serve_proxy
-            .serve(listener, serve_stop_handle)
-            .expect("TcpProxy::serve returned an error")
-    });
-
-    // Connect from the test thread → external listener → proxy →
-    // guest echo. Short read timeout fails fast when any seam in
-    // the chain silently wedges.
-    let mut client =
-        TcpStream::connect(listen_addr).expect("external client connect to proxy listener");
-    client
-        .set_read_timeout(Some(Duration::from_secs(TEST_DEADLINE_SECS)))
-        .expect("set read timeout");
-
-    client.write_all(PAYLOAD).expect("client write payload");
-
-    // `busybox nc -e cat` streams every input byte straight back,
-    // so we expect the full payload mirrored. Loop to tolerate
-    // short reads across TCP segment boundaries.
-    let mut received = Vec::with_capacity(PAYLOAD.len());
-    let mut buf = [0u8; 128];
-    while received.len() < PAYLOAD.len() {
-        let n = client.read(&mut buf).expect("client read echo from proxy");
-        if n == 0 {
-            break;
-        }
-        received.extend_from_slice(&buf[..n]);
-    }
-
-    // Half-close our write side so the proxy knows we're done; its
-    // smoltcp socket then FINs the guest side, `nc` exits, the
-    // bridge thread returns Ok.
-    let _ = client.shutdown(std::net::Shutdown::Write);
-    drop(client);
+    let snapshot = hv.snapshot(handle.id).expect("snapshot active network VM");
+    let restored = hv.restore(snapshot).expect("restore network VM");
+    let restored_endpoint = restored
+        .endpoints
+        .first()
+        .expect("restored VM must expose the requested endpoint");
+    let restored_received = echo_round_trip(format!(
+        "{}:{}",
+        restored_endpoint.host_address, restored_endpoint.host_port
+    ));
+    hv.stop(restored.id).expect("stop restored VM");
+    hv.start(restored.id).expect("restart restored VM");
+    wait_for_serial(&hv, restored.id, READY_MARKER, 15);
+    std::thread::sleep(Duration::from_secs(1));
+    let restarted_received = echo_round_trip(format!(
+        "{}:{}",
+        restored_endpoint.host_address, restored_endpoint.host_port
+    ));
 
     // Capture serial for the assertion message before teardown, so
     // a failure diagnosis isn't blocked on the VM being alive.
@@ -266,10 +248,7 @@ fn host_to_guest_tcp_round_trip() {
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
 
-    serve_stop.store(true, Ordering::Relaxed);
-    serve_thread.join().expect("serve thread must not panic");
-
-    let _ = hv.stop(handle.id);
+    let _ = hv.destroy(restored.id);
     let _ = hv.destroy(handle.id);
 
     assert_eq!(
@@ -289,6 +268,14 @@ fn host_to_guest_tcp_round_trip() {
             }
             &serial[start..]
         },
+    );
+    assert_eq!(
+        restored_received, PAYLOAD,
+        "restored VM did not serve TCP through the reconstructed virtio-net device"
+    );
+    assert_eq!(
+        restarted_received, PAYLOAD,
+        "restarted VM did not release and recreate its TCP listener"
     );
     eprintln!(
         "virtio_net_smoltcp_data_path_boot: round-trip of {} bytes OK (full chain alive)",
