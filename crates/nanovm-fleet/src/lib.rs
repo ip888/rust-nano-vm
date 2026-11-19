@@ -523,7 +523,7 @@ impl ProcessFleet {
             let guard = slot.lock().expect("worker lock");
             guard
                 .worker_vm_id
-                .ok_or_else(|| VmError::Backend("worker id not yet assigned for this VM".into()))?
+                .ok_or(VmError::UnknownVm(orchestrator_id))?
         };
         let req = build(worker_id);
         self.dispatch_to_slot(&slot, req)
@@ -846,6 +846,9 @@ impl Hypervisor for ProcessFleet {
 
     fn destroy(&self, id: VmId) -> VmResult<()> {
         let slot = self.worker_for(id)?;
+        if slot.lock().expect("worker lock").worker_vm_id.is_none() {
+            return Err(VmError::UnknownVm(id));
+        }
         // Cooperative shutdown — best-effort. The Worker's Drop
         // SIGKILLs if this doesn't land in time. Translate to the
         // worker-internal id before asking it to destroy.

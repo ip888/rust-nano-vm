@@ -74,6 +74,10 @@ pub enum StoreError {
     /// Snapshot id is not present in the backend.
     #[error("snapshot id {0} not found in store")]
     NotFound(SnapshotIdNum),
+    /// The durable key is already occupied. Snapshots are immutable once
+    /// published so a new guest can never overlay another snapshot's sidecars.
+    #[error("snapshot id {0} is already present in the store")]
+    Conflict(SnapshotIdNum),
 
     /// Local filesystem or transport-layer I/O failure.
     #[error("snapshot store io: {0}")]
@@ -110,7 +114,8 @@ pub enum StoreError {
 pub trait SnapshotStore: Send + Sync + std::fmt::Debug {
     /// Upload every regular snapshot artifact in `src_dir` (manifest,
     /// backing file, and backend/device sidecars) under `snap_id`.
-    /// Re-putting the same id overwrites those artifacts.
+    /// An occupied id is rejected before any artifact is written; durable
+    /// snapshot identities are immutable.
     fn put(&self, snap_id: SnapshotIdNum, src_dir: &Path) -> Result<(), StoreError>;
 
     /// Download the snapshot with id `snap_id` into the directory
@@ -185,26 +190,35 @@ pub(crate) fn validate_downloaded_snapshot(
 impl SnapshotStore for FsSnapshotStore {
     fn put(&self, snap_id: SnapshotIdNum, src_dir: &Path) -> Result<(), StoreError> {
         let dst = self.snap_dir(snap_id);
-        fs::create_dir_all(&dst)?;
-
         // Read manifest first so we know which backing file to copy.
         let mut manifest = Manifest::read_from_dir(src_dir)?;
         manifest.snapshot_id = snap_id;
-
-        // Copy manifest.json verbatim (re-serialize so the on-disk
-        // bytes are normalized regardless of what's on src).
-        manifest.write_to_dir(&dst)?;
-
-        for entry in fs::read_dir(src_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file()
-                || entry.file_name() == std::ffi::OsStr::new(Manifest::FILE_NAME)
-            {
-                continue;
+        fs::create_dir_all(self.root.as_path())?;
+        match fs::create_dir(&dst) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(StoreError::Conflict(snap_id));
             }
-            fs::copy(entry.path(), dst.join(entry.file_name()))?;
+            Err(error) => return Err(error.into()),
         }
-        Ok(())
+
+        let result = (|| -> Result<(), StoreError> {
+            manifest.write_to_dir(&dst)?;
+            for entry in fs::read_dir(src_dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file()
+                    || entry.file_name() == std::ffi::OsStr::new(Manifest::FILE_NAME)
+                {
+                    continue;
+                }
+                fs::copy(entry.path(), dst.join(entry.file_name()))?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&dst);
+        }
+        result
     }
 
     fn get(&self, snap_id: SnapshotIdNum, dst_dir: &Path) -> Result<(), StoreError> {
@@ -487,6 +501,20 @@ mod tests {
         assert!(matches!(err, StoreError::NotFound(99)), "got {err:?}");
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&dst);
+    }
+
+    #[test]
+    fn fs_store_rejects_occupied_durable_id() {
+        let root = tmp_dir("conflict");
+        let store = FsSnapshotStore::new(&root);
+        let src = tmp_dir("conflict-src");
+        make_src_snapshot(&src, 4);
+        store.put(4, &src).unwrap();
+
+        let error = store.put(4, &src).unwrap_err();
+        assert!(matches!(error, StoreError::Conflict(4)), "got {error:?}");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
     }
 
     #[test]

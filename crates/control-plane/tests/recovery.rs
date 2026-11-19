@@ -93,6 +93,18 @@ async fn control_plane_restart_recreates_vms_snapshots_and_ownership() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {exported}");
+    let (status, conflict) = send(
+        first.clone(),
+        Method::POST,
+        &format!("/v1/snapshots/{snapshot_id}/export"),
+        Some(json!({"as_snapshot_id": 7001})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "immutable store keys must not be overlaid: {conflict}"
+    );
     let (status, restored) = send(
         first,
         Method::POST,

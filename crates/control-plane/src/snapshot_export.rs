@@ -201,6 +201,12 @@ fn store_err_to_api(err: snapshot::StoreError, uri: &str) -> ApiError {
         StoreError::Auth(msg) => ApiError::Unauthorized(format!("snapshot store auth: {msg}")),
         StoreError::BadUri(msg) => ApiError::Bad(format!("snapshot store uri: {msg}")),
         StoreError::Format(e) => ApiError::Bad(format!("snapshot store format: {e}")),
+        StoreError::Conflict(id) => ApiError::Conflict {
+            code: "snapshot_store_conflict",
+            message: format!(
+                "snapshot store key {id} is already occupied; choose a new as_snapshot_id"
+            ),
+        },
         // Network and IO failures bubble up as 5xx — they're
         // operational rather than client-fixable.
         StoreError::Network(msg) => ApiError::InternalDyn(format!("snapshot store network: {msg}")),

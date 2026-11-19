@@ -25,7 +25,7 @@ use crate::routes::AppState;
 /// data volume. Multi-replica coordination is deliberately out of scope.
 pub const ENV_STATE_PATH: &str = "NANOVM_RECOVERY_STATE_PATH";
 
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,7 +50,7 @@ impl From<VmState> for DesiredVmState {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum VmOrigin {
     Cold { config: VmConfig },
-    Snapshot { snapshot_id: u64 },
+    Snapshot { snapshot_intent: String },
 }
 
 enum VmRecoverySource {
@@ -61,6 +61,7 @@ enum VmRecoverySource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VmIntent {
+    runtime_id: u64,
     owner: String,
     desired_state: DesiredVmState,
     origin: VmOrigin,
@@ -68,7 +69,11 @@ struct VmIntent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotIntent {
+    runtime_id: Option<u64>,
     owner: String,
+    /// `false` retains this snapshot only as recovery input for dependent VMs;
+    /// it is not part of the public snapshot inventory after reconciliation.
+    public: bool,
     /// Id used as the durable-store key. `None` means this local snapshot was
     /// never exported and therefore cannot be rebuilt after a process exit.
     durable_store_id: Option<u64>,
@@ -79,13 +84,19 @@ struct RecoveryState {
     #[serde(default = "state_version")]
     version: u32,
     #[serde(default)]
-    vms: BTreeMap<u64, VmIntent>,
+    vms: BTreeMap<String, VmIntent>,
     #[serde(default)]
-    snapshots: BTreeMap<u64, SnapshotIntent>,
+    snapshots: BTreeMap<String, SnapshotIntent>,
+    #[serde(default = "next_intent_sequence")]
+    next_intent_id: u64,
 }
 
 const fn state_version() -> u32 {
     STATE_VERSION
+}
+
+const fn next_intent_sequence() -> u64 {
+    1
 }
 
 impl Default for RecoveryState {
@@ -94,6 +105,7 @@ impl Default for RecoveryState {
             version: STATE_VERSION,
             vms: BTreeMap::new(),
             snapshots: BTreeMap::new(),
+            next_intent_id: next_intent_sequence(),
         }
     }
 }
@@ -170,14 +182,17 @@ impl RecoveryStore {
         owner: &OrgId,
     ) -> Result<(), RecoveryError> {
         self.mutate(|file| {
+            let intent_id = allocate_intent_id(file, "vm");
             file.vms.insert(
-                id.0,
+                intent_id,
                 VmIntent {
+                    runtime_id: id.0,
                     owner: owner.as_str().to_owned(),
                     desired_state: state.into(),
                     origin: VmOrigin::Cold { config },
                 },
             );
+            Ok(())
         })
     }
 
@@ -189,30 +204,54 @@ impl RecoveryStore {
         owner: &OrgId,
     ) -> Result<(), RecoveryError> {
         self.mutate(|state_file| {
+            let snapshot_intent = state_file
+                .snapshots
+                .iter()
+                .find(|(_, intent)| intent.runtime_id == Some(source_snapshot.0))
+                .map(|(id, _)| id.clone())
+                .ok_or_else(|| {
+                    RecoveryError::Invalid(format!(
+                        "cannot persist VM {}: source snapshot {} has no durable intent",
+                        id.0, source_snapshot.0
+                    ))
+                })?;
+            let intent_id = allocate_intent_id(state_file, "vm");
             state_file.vms.insert(
-                id.0,
+                intent_id,
                 VmIntent {
+                    runtime_id: id.0,
                     owner: owner.as_str().to_owned(),
                     desired_state: state.into(),
-                    origin: VmOrigin::Snapshot {
-                        snapshot_id: source_snapshot.0,
-                    },
+                    origin: VmOrigin::Snapshot { snapshot_intent },
                 },
             );
+            Ok(())
         })
     }
 
     pub(crate) fn set_vm_state(&self, id: VmId, state: VmState) -> Result<(), RecoveryError> {
         self.mutate(|file| {
-            if let Some(intent) = file.vms.get_mut(&id.0) {
+            if let Some(intent) = file.vms.values_mut().find(|v| v.runtime_id == id.0) {
                 intent.desired_state = state.into();
             }
+            Ok(())
         })
     }
 
     pub(crate) fn forget_vm(&self, id: VmId) -> Result<(), RecoveryError> {
-        self.mutate(|state| {
-            state.vms.remove(&id.0);
+        self.mutate(|file| {
+            file.vms.retain(|_, intent| intent.runtime_id != id.0);
+            let retained: HashSet<String> = file
+                .vms
+                .values()
+                .filter_map(|intent| match &intent.origin {
+                    VmOrigin::Snapshot { snapshot_intent } => Some(snapshot_intent.clone()),
+                    VmOrigin::Cold { .. } => None,
+                })
+                .collect();
+            file.snapshots
+                .retain(|intent_id, intent| intent.public || retained.contains(intent_id));
+            Ok(())
         })
     }
 
@@ -222,13 +261,17 @@ impl RecoveryStore {
         owner: &OrgId,
     ) -> Result<(), RecoveryError> {
         self.mutate(|file| {
+            let intent_id = allocate_intent_id(file, "snapshot");
             file.snapshots.insert(
-                id.0,
+                intent_id,
                 SnapshotIntent {
+                    runtime_id: Some(id.0),
                     owner: owner.as_str().to_owned(),
+                    public: true,
                     durable_store_id: None,
                 },
             );
+            Ok(())
         })
     }
 
@@ -238,22 +281,57 @@ impl RecoveryStore {
         durable_id: SnapshotId,
     ) -> Result<(), RecoveryError> {
         self.mutate(|file| {
-            if let Some(intent) = file.snapshots.get_mut(&local_id.0) {
+            if let Some(intent) = file
+                .snapshots
+                .values_mut()
+                .find(|intent| intent.runtime_id == Some(local_id.0))
+            {
                 intent.durable_store_id = Some(durable_id.0);
             }
+            Ok(())
         })
     }
 
     pub(crate) fn forget_snapshot(&self, id: SnapshotId) -> Result<(), RecoveryError> {
-        self.mutate(|state| {
-            state.snapshots.remove(&id.0);
+        self.mutate(|file| {
+            let Some(intent_id) = file
+                .snapshots
+                .iter()
+                .find(|(_, intent)| intent.runtime_id == Some(id.0))
+                .map(|(id, _)| id.clone())
+            else {
+                return Ok(());
+            };
+            let has_dependents = file.vms.values().any(|vm| {
+                matches!(
+                    &vm.origin,
+                    VmOrigin::Snapshot { snapshot_intent } if snapshot_intent == &intent_id
+                )
+            });
+            if has_dependents {
+                let intent = file
+                    .snapshots
+                    .get_mut(&intent_id)
+                    .expect("snapshot intent found above");
+                intent.runtime_id = None;
+                intent.public = false;
+            } else {
+                file.snapshots.remove(&intent_id);
+            }
+            Ok(())
         })
     }
 
-    fn mutate(&self, apply: impl FnOnce(&mut RecoveryState)) -> Result<(), RecoveryError> {
+    fn mutate(
+        &self,
+        apply: impl FnOnce(&mut RecoveryState) -> Result<(), RecoveryError>,
+    ) -> Result<(), RecoveryError> {
         let mut state = self.state.lock().map_err(|_| RecoveryError::Poisoned)?;
         let before = state.clone();
-        apply(&mut state);
+        if let Err(error) = apply(&mut state) {
+            *state = before;
+            return Err(error);
+        }
         if let Err(error) = persist(&self.path, &state) {
             *state = before;
             return Err(error);
@@ -267,6 +345,12 @@ impl RecoveryStore {
         *state = recovered;
         Ok(())
     }
+}
+
+fn allocate_intent_id(state: &mut RecoveryState, kind: &str) -> String {
+    let sequence = state.next_intent_id;
+    state.next_intent_id = state.next_intent_id.saturating_add(1);
+    format!("{kind}-{sequence:020}")
 }
 
 fn persist(path: &Path, state: &RecoveryState) -> Result<(), RecoveryError> {
@@ -382,12 +466,15 @@ pub(crate) fn reconcile(
         .map_err(|_| RecoveryError::Poisoned)?
         .clone();
     let mut recovered = RecoveryState {
-        version: STATE_VERSION,
+        next_intent_id: loaded.next_intent_id,
         ..RecoveryState::default()
     };
     let mut report = RecoveryReport::default();
-    let mut snapshot_ids = BTreeMap::new();
-    let mut snapshot_decisions = BTreeMap::new();
+    let mut snapshot_ids: BTreeMap<String, SnapshotId> = BTreeMap::new();
+    let mut snapshot_decisions: BTreeMap<String, RecoveryOutcome> = BTreeMap::new();
+    let mut transient_snapshots = Vec::new();
+    let mut vm_owners = BTreeMap::new();
+    let mut snapshot_owners = BTreeMap::new();
 
     let available_snapshots: Result<HashSet<u64>, String> = match state.snapshot_store() {
         Some(snapshot_store) => snapshot_store
@@ -397,20 +484,23 @@ pub(crate) fn reconcile(
         None => Err("no durable snapshot store configured".to_owned()),
     };
 
-    for (previous_id, intent) in &loaded.snapshots {
+    for (intent_id, intent) in &loaded.snapshots {
+        let previous_id = intent
+            .runtime_id
+            .or(intent.durable_store_id)
+            .unwrap_or_default();
         let Some(durable_id) = intent.durable_store_id else {
             let outcome = RecoveryOutcome {
                 kind: RecoveryKind::Snapshot,
-                previous_id: *previous_id,
+                previous_id,
                 current_id: None,
                 decision: RecoveryDecision::Unrecoverable,
                 reason: "snapshot was never exported to a durable store".to_owned(),
             };
-            snapshot_decisions.insert(*previous_id, outcome.clone());
+            snapshot_decisions.insert(intent_id.clone(), outcome.clone());
             recovered
                 .snapshots
-                .entry(*previous_id)
-                .or_insert_with(|| intent.clone());
+                .insert(intent_id.clone(), intent.clone());
             report.outcomes.push(outcome);
             continue;
         };
@@ -418,16 +508,15 @@ pub(crate) fn reconcile(
         if let Err(error) = &available_snapshots {
             let outcome = RecoveryOutcome {
                 kind: RecoveryKind::Snapshot,
-                previous_id: *previous_id,
+                previous_id,
                 current_id: None,
                 decision: RecoveryDecision::Unrecoverable,
                 reason: format!("snapshot store inventory failed: {error}"),
             };
-            snapshot_decisions.insert(*previous_id, outcome.clone());
+            snapshot_decisions.insert(intent_id.clone(), outcome.clone());
             recovered
                 .snapshots
-                .entry(*previous_id)
-                .or_insert_with(|| intent.clone());
+                .insert(intent_id.clone(), intent.clone());
             report.outcomes.push(outcome);
             continue;
         }
@@ -437,16 +526,15 @@ pub(crate) fn reconcile(
         {
             let outcome = RecoveryOutcome {
                 kind: RecoveryKind::Snapshot,
-                previous_id: *previous_id,
+                previous_id,
                 current_id: None,
                 decision: RecoveryDecision::Expired,
                 reason: format!("durable snapshot {durable_id} is no longer in the store"),
             };
-            snapshot_decisions.insert(*previous_id, outcome.clone());
+            snapshot_decisions.insert(intent_id.clone(), outcome.clone());
             recovered
                 .snapshots
-                .entry(*previous_id)
-                .or_insert_with(|| intent.clone());
+                .insert(intent_id.clone(), intent.clone());
             report.outcomes.push(outcome);
             continue;
         }
@@ -482,49 +570,56 @@ pub(crate) fn reconcile(
         match adopted {
             Ok(local_id) => {
                 let owner = OrgId::new(&intent.owner);
-                state.ownership().record_snapshot(local_id, owner);
-                if local_id.0 != *previous_id {
-                    state.ownership().forget_snapshot(SnapshotId(*previous_id));
-                }
-                snapshot_ids.insert(*previous_id, local_id);
-                snapshot_decisions.insert(
-                    *previous_id,
-                    RecoveryOutcome {
-                        kind: RecoveryKind::Snapshot,
-                        previous_id: *previous_id,
-                        current_id: Some(local_id.0),
-                        decision: RecoveryDecision::Recreated,
-                        reason: "adopted from the durable snapshot store".to_owned(),
-                    },
-                );
-                recovered.snapshots.insert(local_id.0, intent.clone());
-                report.outcomes.push(RecoveryOutcome {
+                snapshot_ids.insert(intent_id.clone(), local_id);
+                let current_id = if intent.public {
+                    snapshot_owners.insert(local_id, owner);
+                    Some(local_id.0)
+                } else {
+                    transient_snapshots.push(local_id);
+                    None
+                };
+                let outcome = RecoveryOutcome {
                     kind: RecoveryKind::Snapshot,
-                    previous_id: *previous_id,
-                    current_id: Some(local_id.0),
+                    previous_id,
+                    current_id,
                     decision: RecoveryDecision::Recreated,
-                    reason: "adopted from the durable snapshot store".to_owned(),
-                });
+                    reason: if intent.public {
+                        "adopted from the durable snapshot store".to_owned()
+                    } else {
+                        "temporarily adopted as retained VM recovery input".to_owned()
+                    },
+                };
+                snapshot_decisions.insert(intent_id.clone(), outcome.clone());
+                let mut recovered_intent = intent.clone();
+                recovered_intent.runtime_id = if intent.public {
+                    Some(local_id.0)
+                } else {
+                    None
+                };
+                recovered
+                    .snapshots
+                    .insert(intent_id.clone(), recovered_intent);
+                report.outcomes.push(outcome);
             }
             Err((decision, error)) => {
                 let outcome = RecoveryOutcome {
                     kind: RecoveryKind::Snapshot,
-                    previous_id: *previous_id,
+                    previous_id,
                     current_id: None,
                     decision,
                     reason: format!("durable snapshot adoption failed: {error}"),
                 };
-                snapshot_decisions.insert(*previous_id, outcome.clone());
+                snapshot_decisions.insert(intent_id.clone(), outcome.clone());
                 recovered
                     .snapshots
-                    .entry(*previous_id)
-                    .or_insert_with(|| intent.clone());
+                    .insert(intent_id.clone(), intent.clone());
                 report.outcomes.push(outcome);
             }
         }
     }
 
-    for (previous_id, intent) in &loaded.vms {
+    for (intent_id, intent) in &loaded.vms {
+        let previous_id = intent.runtime_id;
         let origin = match &intent.origin {
             VmOrigin::Cold { config } => {
                 let mut config = config.clone();
@@ -533,21 +628,21 @@ pub(crate) fn reconcile(
                 }
                 VmRecoverySource::Cold(config)
             }
-            VmOrigin::Snapshot { snapshot_id } => {
-                if let Some(local_id) = snapshot_ids.get(snapshot_id) {
+            VmOrigin::Snapshot { snapshot_intent } => {
+                if let Some(local_id) = snapshot_ids.get(snapshot_intent) {
                     VmRecoverySource::Snapshot(*local_id)
-                } else if let Some(outcome) = snapshot_decisions.get(snapshot_id) {
+                } else if let Some(outcome) = snapshot_decisions.get(snapshot_intent) {
                     VmRecoverySource::Failed(
                         outcome.decision,
                         format!(
-                            "source snapshot {snapshot_id} was not recovered: {}",
+                            "source snapshot intent {snapshot_intent} was not recovered: {}",
                             outcome.reason
                         ),
                     )
                 } else {
                     VmRecoverySource::Failed(
                         RecoveryDecision::Unrecoverable,
-                        format!("source snapshot {snapshot_id} is absent from durable intent"),
+                        format!("source snapshot intent {snapshot_intent} is absent"),
                     )
                 }
             }
@@ -575,39 +670,64 @@ pub(crate) fn reconcile(
 
         if let Some(handle) = handle {
             let owner = OrgId::new(&intent.owner);
-            state.ownership().record_vm(handle.id, owner);
-            if handle.id.0 != *previous_id {
-                state.ownership().forget_vm(VmId(*previous_id));
-            }
+            vm_owners.insert(handle.id, owner);
             state.record_recovered_endpoints(&handle);
-            recovered.vms.insert(
-                handle.id.0,
-                VmIntent {
-                    owner: intent.owner.clone(),
-                    desired_state: intent.desired_state.clone(),
-                    origin: remap_origin(&intent.origin, &snapshot_ids),
-                },
-            );
+            let mut recovered_intent = intent.clone();
+            recovered_intent.runtime_id = handle.id.0;
+            recovered.vms.insert(intent_id.clone(), recovered_intent);
             report.outcomes.push(RecoveryOutcome {
                 kind: RecoveryKind::Vm,
-                previous_id: *previous_id,
+                previous_id,
                 current_id: Some(handle.id.0),
                 decision,
                 reason,
             });
         } else {
-            recovered
-                .vms
-                .entry(*previous_id)
-                .or_insert_with(|| intent.clone());
+            recovered.vms.insert(intent_id.clone(), intent.clone());
             report.outcomes.push(RecoveryOutcome {
                 kind: RecoveryKind::Vm,
-                previous_id: *previous_id,
+                previous_id,
                 current_id: None,
                 decision,
                 reason,
             });
         }
+    }
+
+    for snapshot in transient_snapshots {
+        state
+            .hypervisor()
+            .delete_snapshot(snapshot)
+            .map_err(|error| {
+                RecoveryError::Invalid(format!(
+                    "could not remove transient recovery snapshot {snapshot}: {error}"
+                ))
+            })?;
+    }
+
+    let recovered_vm_ids: HashSet<_> = vm_owners.keys().copied().collect();
+    for intent in loaded.vms.values() {
+        let old_id = VmId(intent.runtime_id);
+        if !recovered_vm_ids.contains(&old_id) {
+            state.ownership().forget_vm(old_id);
+        }
+    }
+    for (id, owner) in vm_owners {
+        state.ownership().record_vm(id, owner);
+    }
+
+    let recovered_snapshot_ids: HashSet<_> = snapshot_owners.keys().copied().collect();
+    for old_id in loaded
+        .snapshots
+        .values()
+        .filter_map(|intent| intent.runtime_id)
+    {
+        if !recovered_snapshot_ids.contains(&SnapshotId(old_id)) {
+            state.ownership().forget_snapshot(SnapshotId(old_id));
+        }
+    }
+    for (id, owner) in snapshot_owners {
+        state.ownership().record_snapshot(id, owner);
     }
 
     store.replace_after_recovery(recovered)?;
@@ -663,20 +783,6 @@ fn recover_desired_state(
     )
 }
 
-fn remap_origin(origin: &VmOrigin, snapshots: &BTreeMap<u64, SnapshotId>) -> VmOrigin {
-    match origin {
-        VmOrigin::Cold { config } => VmOrigin::Cold {
-            config: config.clone(),
-        },
-        VmOrigin::Snapshot { snapshot_id } => VmOrigin::Snapshot {
-            snapshot_id: snapshots
-                .get(snapshot_id)
-                .map(|id| id.0)
-                .unwrap_or(*snapshot_id),
-        },
-    }
-}
-
 fn recovery_temp_dir(snapshot_id: u64) -> PathBuf {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
@@ -709,8 +815,24 @@ mod tests {
 
         let reopened = RecoveryStore::open(&path).unwrap();
         let state = reopened.state.lock().unwrap();
-        assert_eq!(state.vms[&7].owner, "acme");
-        assert_eq!(state.snapshots[&11].durable_store_id, Some(101));
+        assert_eq!(
+            state
+                .vms
+                .values()
+                .find(|intent| intent.runtime_id == 7)
+                .unwrap()
+                .owner,
+            "acme"
+        );
+        assert_eq!(
+            state
+                .snapshots
+                .values()
+                .find(|intent| intent.runtime_id == Some(11))
+                .unwrap()
+                .durable_store_id,
+            Some(101)
+        );
     }
 
     #[test]
@@ -847,6 +969,34 @@ mod tests {
 
         assert_eq!(report.expired(), 2);
         assert_eq!(report.unrecoverable(), 0);
+    }
+
+    #[test]
+    fn deleted_public_snapshot_remains_as_stable_vm_recovery_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::open(temp.path().join("state.json")).unwrap();
+        let owner = OrgId::new("acme");
+        store.record_snapshot(SnapshotId(9), &owner).unwrap();
+        store
+            .mark_snapshot_durable(SnapshotId(9), SnapshotId(109))
+            .unwrap();
+        store
+            .record_snapshot_vm(VmId(5), SnapshotId(9), VmState::Running, &owner)
+            .unwrap();
+        store.forget_snapshot(SnapshotId(9)).unwrap();
+
+        let state = store.state.lock().unwrap();
+        let snapshot = state.snapshots.values().next().unwrap();
+        assert!(!snapshot.public);
+        assert_eq!(snapshot.runtime_id, None);
+        assert_eq!(snapshot.durable_store_id, Some(109));
+        assert!(state.vms.values().any(|vm| {
+            matches!(
+                &vm.origin,
+                VmOrigin::Snapshot { snapshot_intent }
+                    if state.snapshots.contains_key(snapshot_intent)
+            )
+        }));
     }
 
     fn outcome(previous_id: u64, decision: RecoveryDecision) -> RecoveryOutcome {

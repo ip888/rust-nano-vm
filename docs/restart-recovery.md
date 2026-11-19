@@ -54,7 +54,8 @@ Reconciliation runs before the control plane starts accepting traffic:
 
 1. Inventory and verify the durable snapshot store.
 2. Download and adopt each exported snapshot into a fresh backend process.
-3. Revalidate the manifest's id against the durable-store key.
+3. Revalidate the manifest's id against the durable-store key and require
+   all backend state sidecars needed by KVM adoption.
 4. Recreate cold VMs from their stored configs or restore snapshot-backed
    VMs from the newly adopted snapshot.
 5. Apply the desired lifecycle state.
@@ -62,8 +63,11 @@ Reconciliation runs before the control plane starts accepting traffic:
 7. Atomically replace the journal with the fresh backend ids.
 
 A snapshot only becomes recoverable after a successful
-`POST /v1/snapshots/{id}/export`. A local snapshot that was never exported is
-reported as unrecoverable instead of being represented as restored data.
+`POST /v1/snapshots/{id}/export`. Durable store ids are immutable: a second
+publication to the same id returns `409 snapshot_store_conflict` rather than
+mixing old sidecars with a new guest. Choose a new `as_snapshot_id` for a new
+artifact. A local snapshot that was never exported is reported as
+unrecoverable instead of being represented as restored data.
 
 ## Decisions and operator action
 
@@ -85,9 +89,15 @@ artifact cannot prevent independent cold VMs from recovering.
 - A fresh endpoint is required after restart; never publish or cache the old
   loopback host port.
 - VM stop/start intent is persisted after the backend transition.
-- VM/snapshot destroy removes the corresponding journal intent.
+- VM destroy removes the VM journal intent and prunes any private snapshot
+  intent no longer referenced by another VM.
 - Export records the exact durable-store key, including `as_snapshot_id`.
 - Import records both ownership and the source durable-store key.
+
+Deleting a snapshot that still backs a live VM removes it from the public
+inventory but retains its internal durable-store intent. Recovery adopts that
+artifact transiently, recreates dependent VMs, and removes the temporary
+local snapshot before serving traffic.
 
 Snapshot retention is operator-controlled. Do not delete a durable snapshot
 while a live VM still declares it as its restart source unless that VM may be

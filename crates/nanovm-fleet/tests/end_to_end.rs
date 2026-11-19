@@ -207,6 +207,10 @@ fn adopted_snapshot_survives_original_worker_destroy() {
 
     let adopted = fleet.snapshot_adopt(&export_dir).expect("adopt");
     assert_eq!(fleet.list_vms().unwrap().len(), 1, "keeper is not a VM");
+    assert!(matches!(
+        fleet.destroy(vm_core::VmId(2)).unwrap_err(),
+        vm_core::VmError::UnknownVm(_)
+    ));
     fleet.destroy(vm.id).expect("destroy original worker");
     assert!(fleet.list_vms().unwrap().is_empty());
 

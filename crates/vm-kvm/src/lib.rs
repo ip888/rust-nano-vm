@@ -80,7 +80,7 @@ use linux_loader::loader::bootparam::{boot_params, setup_header};
 #[cfg(feature = "kvm")]
 use linux_loader::loader::{load_cmdline, BzImage, KernelLoader};
 #[cfg(feature = "kvm")]
-use snapshot::Manifest;
+use snapshot::{BackingFileHeader, Manifest, BACKING_HDR_LEN, MEMORY_DATA_OFFSET};
 #[cfg(feature = "kvm")]
 use vm_memory::mmap::MmapRegion;
 #[cfg(feature = "kvm")]
@@ -143,6 +143,8 @@ struct NetworkSnapshot {
 
 #[cfg(feature = "kvm")]
 const NETWORK_SNAPSHOT_FILE: &str = "network.json";
+#[cfg(feature = "kvm")]
+const VM_CONFIG_FILE: &str = "vm-config.json";
 
 #[cfg(feature = "kvm")]
 fn hard_link_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -156,6 +158,38 @@ fn hard_link_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
             )),
         },
     }
+}
+
+#[cfg(feature = "kvm")]
+fn validate_adoptable_snapshot(dir: &Path, manifest: &Manifest) -> VmResult<()> {
+    let mut backing = File::open(manifest.backing_file_path(dir))
+        .map_err(|e| VmError::Backend(format!("vm-kvm: adopt: open memory backing: {e}")))?;
+    let mut bytes = [0_u8; BACKING_HDR_LEN];
+    backing
+        .read_exact(&mut bytes)
+        .map_err(|e| VmError::Backend(format!("vm-kvm: adopt: read memory header: {e}")))?;
+    let header = BackingFileHeader::from_bytes(&bytes)
+        .map_err(|e| VmError::Backend(format!("vm-kvm: adopt: invalid memory header: {e}")))?;
+    if header.memory_bytes != manifest.memory_bytes || header.page_size != manifest.page_size {
+        return Err(VmError::Backend(
+            "vm-kvm: adopt: memory header disagrees with manifest".to_owned(),
+        ));
+    }
+    let required_len = MEMORY_DATA_OFFSET
+        .checked_add(manifest.memory_bytes)
+        .ok_or_else(|| VmError::Backend("vm-kvm: adopt: backing length overflow".to_owned()))?;
+    let actual_len = backing
+        .metadata()
+        .map_err(|e| VmError::Backend(format!("vm-kvm: adopt: memory metadata: {e}")))?
+        .len();
+    if actual_len < required_len {
+        return Err(VmError::Backend(format!(
+            "vm-kvm: adopt: memory backing is truncated (have {actual_len}, need {required_len})"
+        )));
+    }
+    vmstate::VcpuState::read_from_dir(dir)?;
+    vmstate::MachineState::read_from_dir(dir)?;
+    Ok(())
 }
 
 #[cfg(feature = "kvm")]
@@ -1993,6 +2027,10 @@ impl Hypervisor for KvmHypervisor {
                 manifest
                     .write_to_dir(&dir)
                     .map_err(|e| VmError::Backend(format!("vm-kvm: write manifest: {e}")))?;
+                let config_bytes = serde_json::to_vec_pretty(&vm.config)
+                    .map_err(|e| VmError::Backend(format!("vm-kvm: serialize config: {e}")))?;
+                std::fs::write(dir.join(VM_CONFIG_FILE), config_bytes)
+                    .map_err(|e| VmError::Backend(format!("vm-kvm: write config: {e}")))?;
                 dump_memory(
                     &vm.runtime.boot_plan.guest_mem,
                     mem_bytes,
@@ -2169,6 +2207,7 @@ impl Hypervisor for KvmHypervisor {
                 dir.display()
             ))
         })?;
+        validate_adoptable_snapshot(dir, &manifest)?;
         let new_id = SnapshotId::next();
         let target = self.snapshot_dir(new_id);
 
@@ -2239,28 +2278,38 @@ impl Hypervisor for KvmHypervisor {
             page_size: manifest.page_size,
             kernel_cmdline: manifest.kernel_cmdline.clone(),
         };
+        let mut base_config = match std::fs::read(dir.join(VM_CONFIG_FILE)) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| VmError::Backend(format!("vm-kvm: adopt: parse vm config: {e}")))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => VmConfig::default(),
+            Err(error) => {
+                return Err(VmError::Backend(format!(
+                    "vm-kvm: adopt: read vm config: {error}"
+                )));
+            }
+        };
+        base_config.vcpus = manifest.vcpu_count;
+        base_config.memory_mib = manifest.memory_bytes / (1024 * 1024);
+        base_config.cmdline.clone_from(&manifest.kernel_cmdline);
+        base_config.snapshot_dir = None;
+        for forward in &mut base_config.port_forwards {
+            forward.host_port = 0;
+        }
         let network_snapshot = Self::read_network_snapshot(&target)?;
         let (network, config) = match network_snapshot {
-            Some(snapshot) => (
-                Some(snapshot.device),
-                VmConfig {
-                    vcpus: manifest.vcpu_count,
-                    memory_mib: manifest.memory_bytes / (1024 * 1024),
-                    cmdline: manifest.kernel_cmdline.clone(),
-                    net_backend: snapshot.net_backend,
-                    port_forwards: snapshot.port_forwards,
-                    ..VmConfig::default()
-                },
-            ),
-            None => (
-                None,
-                VmConfig {
-                    vcpus: manifest.vcpu_count,
-                    memory_mib: manifest.memory_bytes / (1024 * 1024),
-                    cmdline: manifest.kernel_cmdline.clone(),
-                    ..VmConfig::default()
-                },
-            ),
+            Some(snapshot) => {
+                base_config.net_backend = snapshot.net_backend;
+                base_config.port_forwards = snapshot
+                    .port_forwards
+                    .into_iter()
+                    .map(|mut forward| {
+                        forward.host_port = 0;
+                        forward
+                    })
+                    .collect();
+                (Some(snapshot.device), base_config)
+            }
+            None => (None, base_config),
         };
         let mut inner = self.lock_inner()?;
         inner.snapshots.insert(
@@ -3261,6 +3310,29 @@ mod tests {
             std::fs::metadata(&target).expect("target metadata").ino()
         );
         std::fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
+    #[cfg(all(feature = "kvm", unix))]
+    fn adopt_rejects_snapshot_missing_kvm_state_before_copy() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanovm-adopt-validation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create snapshot directory");
+        let manifest = Manifest::new(7, 4096, 4096, 1);
+        manifest.write_to_dir(&dir).expect("write manifest");
+
+        let error = validate_adoptable_snapshot(&dir, &manifest).unwrap_err();
+        assert!(
+            error.to_string().contains("memory backing"),
+            "unexpected error: {error}"
+        );
+        std::fs::remove_dir_all(dir).expect("remove snapshot directory");
     }
 
     #[test]

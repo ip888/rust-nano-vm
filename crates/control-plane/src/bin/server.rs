@@ -310,7 +310,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "billing")]
     let state = state.with_billing(billing_ctx);
 
-    let recovery_report = state.reconcile_restart()?;
+    let recovery_state = state.clone();
+    let recovery_report = tokio::task::spawn_blocking(move || recovery_state.reconcile_restart())
+        .await
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })??;
     for outcome in &recovery_report.outcomes {
         match outcome.decision {
             control_plane::RecoveryDecision::Recreated => info!(

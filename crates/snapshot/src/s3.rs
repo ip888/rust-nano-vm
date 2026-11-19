@@ -38,6 +38,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::primitives::ByteStream;
@@ -60,6 +61,7 @@ pub struct S3SnapshotStore {
     bucket: String,
     prefix: String,
     runtime: Runtime,
+    publication: Mutex<()>,
 }
 
 impl std::fmt::Debug for S3SnapshotStore {
@@ -128,6 +130,7 @@ impl S3SnapshotStore {
             bucket,
             prefix,
             runtime,
+            publication: Mutex::new(()),
         })
     }
 
@@ -156,6 +159,10 @@ impl S3SnapshotStore {
 
 impl SnapshotStore for S3SnapshotStore {
     fn put(&self, snap_id: SnapshotIdNum, src_dir: &Path) -> Result<(), StoreError> {
+        let _publication = self
+            .publication
+            .lock()
+            .map_err(|_| StoreError::Network("snapshot publication lock poisoned".to_owned()))?;
         let mut manifest = Manifest::read_from_dir(src_dir)?;
         manifest.snapshot_id = snap_id;
         let manifest_bytes = manifest.to_json_pretty()?;
@@ -170,8 +177,21 @@ impl SnapshotStore for S3SnapshotStore {
             }
             artifacts.push(entry);
         }
+        let snapshot_prefix = self.snap_prefix(snap_id);
 
-        self.runtime.block_on(async {
+        let published = self.runtime.block_on(async {
+            let existing = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&snapshot_prefix)
+                .max_keys(1)
+                .send()
+                .await
+                .map_err(|e| sdk_to_store_err("check snapshot key", e))?;
+            if !existing.contents().is_empty() || !existing.common_prefixes().is_empty() {
+                return Err(StoreError::Conflict(snap_id));
+            }
             // Manifest is small; ship as a single PutObject from
             // memory. Backing file may be hundreds of MiB; stream
             // it from disk via `ByteStream::from_path`. The SDK
@@ -203,8 +223,15 @@ impl SnapshotStore for S3SnapshotStore {
                     .map_err(|e| sdk_to_store_err("put snapshot artifact", e))?;
             }
             Ok::<_, StoreError>(())
-        })?;
-        Ok(())
+        });
+        match published {
+            Ok(()) => Ok(()),
+            Err(StoreError::Conflict(id)) => Err(StoreError::Conflict(id)),
+            Err(error) => {
+                let _ = self.delete(snap_id);
+                Err(error)
+            }
+        }
     }
 
     fn get(&self, snap_id: SnapshotIdNum, dst_dir: &Path) -> Result<(), StoreError> {
