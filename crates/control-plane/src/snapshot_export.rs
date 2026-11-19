@@ -76,6 +76,8 @@ pub(crate) async fn export_snapshot(
     let snap = SnapshotId(id);
     // Cross-org access check before doing anything expensive.
     state.ownership().require_snapshot_access(snap, &org)?;
+    let operation = state.snapshot_operation(snap);
+    let _guard = operation.lock_owned().await;
     let Json(req) = body.unwrap_or(Json(ExportRequest::default()));
     let store = state
         .snapshot_store()

@@ -2296,6 +2296,11 @@ impl Hypervisor for KvmHypervisor {
             forward.host_port = 0;
         }
         let network_snapshot = Self::read_network_snapshot(&target)?;
+        if base_config.kernel.is_some() && network_snapshot.is_none() {
+            return Err(VmError::Backend(
+                "vm-kvm: adopt: Linux snapshot is missing network.json".to_owned(),
+            ));
+        }
         let (network, config) = match network_snapshot {
             Some(snapshot) => {
                 base_config.net_backend = snapshot.net_backend;

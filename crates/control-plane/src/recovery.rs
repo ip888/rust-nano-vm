@@ -61,7 +61,7 @@ enum VmRecoverySource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VmIntent {
-    runtime_id: u64,
+    runtime_id: Option<u64>,
     owner: String,
     desired_state: DesiredVmState,
     origin: VmOrigin,
@@ -186,7 +186,7 @@ impl RecoveryStore {
             file.vms.insert(
                 intent_id,
                 VmIntent {
-                    runtime_id: id.0,
+                    runtime_id: Some(id.0),
                     owner: owner.as_str().to_owned(),
                     desired_state: state.into(),
                     origin: VmOrigin::Cold { config },
@@ -219,7 +219,7 @@ impl RecoveryStore {
             state_file.vms.insert(
                 intent_id,
                 VmIntent {
-                    runtime_id: id.0,
+                    runtime_id: Some(id.0),
                     owner: owner.as_str().to_owned(),
                     desired_state: state.into(),
                     origin: VmOrigin::Snapshot { snapshot_intent },
@@ -231,7 +231,7 @@ impl RecoveryStore {
 
     pub(crate) fn set_vm_state(&self, id: VmId, state: VmState) -> Result<(), RecoveryError> {
         self.mutate(|file| {
-            if let Some(intent) = file.vms.values_mut().find(|v| v.runtime_id == id.0) {
+            if let Some(intent) = file.vms.values_mut().find(|v| v.runtime_id == Some(id.0)) {
                 intent.desired_state = state.into();
             }
             Ok(())
@@ -240,7 +240,7 @@ impl RecoveryStore {
 
     pub(crate) fn forget_vm(&self, id: VmId) -> Result<(), RecoveryError> {
         self.mutate(|file| {
-            file.vms.retain(|_, intent| intent.runtime_id != id.0);
+            file.vms.retain(|_, intent| intent.runtime_id != Some(id.0));
             let retained: HashSet<String> = file
                 .vms
                 .values()
@@ -498,9 +498,9 @@ pub(crate) fn reconcile(
                 reason: "snapshot was never exported to a durable store".to_owned(),
             };
             snapshot_decisions.insert(intent_id.clone(), outcome.clone());
-            recovered
-                .snapshots
-                .insert(intent_id.clone(), intent.clone());
+            let mut retained = intent.clone();
+            retained.runtime_id = None;
+            recovered.snapshots.insert(intent_id.clone(), retained);
             report.outcomes.push(outcome);
             continue;
         };
@@ -514,9 +514,9 @@ pub(crate) fn reconcile(
                 reason: format!("snapshot store inventory failed: {error}"),
             };
             snapshot_decisions.insert(intent_id.clone(), outcome.clone());
-            recovered
-                .snapshots
-                .insert(intent_id.clone(), intent.clone());
+            let mut retained = intent.clone();
+            retained.runtime_id = None;
+            recovered.snapshots.insert(intent_id.clone(), retained);
             report.outcomes.push(outcome);
             continue;
         }
@@ -532,9 +532,9 @@ pub(crate) fn reconcile(
                 reason: format!("durable snapshot {durable_id} is no longer in the store"),
             };
             snapshot_decisions.insert(intent_id.clone(), outcome.clone());
-            recovered
-                .snapshots
-                .insert(intent_id.clone(), intent.clone());
+            let mut retained = intent.clone();
+            retained.runtime_id = None;
+            recovered.snapshots.insert(intent_id.clone(), retained);
             report.outcomes.push(outcome);
             continue;
         }
@@ -610,16 +610,16 @@ pub(crate) fn reconcile(
                     reason: format!("durable snapshot adoption failed: {error}"),
                 };
                 snapshot_decisions.insert(intent_id.clone(), outcome.clone());
-                recovered
-                    .snapshots
-                    .insert(intent_id.clone(), intent.clone());
+                let mut retained = intent.clone();
+                retained.runtime_id = None;
+                recovered.snapshots.insert(intent_id.clone(), retained);
                 report.outcomes.push(outcome);
             }
         }
     }
 
     for (intent_id, intent) in &loaded.vms {
-        let previous_id = intent.runtime_id;
+        let previous_id = intent.runtime_id.unwrap_or_default();
         let origin = match &intent.origin {
             VmOrigin::Cold { config } => {
                 let mut config = config.clone();
@@ -673,7 +673,7 @@ pub(crate) fn reconcile(
             vm_owners.insert(handle.id, owner);
             state.record_recovered_endpoints(&handle);
             let mut recovered_intent = intent.clone();
-            recovered_intent.runtime_id = handle.id.0;
+            recovered_intent.runtime_id = Some(handle.id.0);
             recovered.vms.insert(intent_id.clone(), recovered_intent);
             report.outcomes.push(RecoveryOutcome {
                 kind: RecoveryKind::Vm,
@@ -683,7 +683,9 @@ pub(crate) fn reconcile(
                 reason,
             });
         } else {
-            recovered.vms.insert(intent_id.clone(), intent.clone());
+            let mut retained = intent.clone();
+            retained.runtime_id = None;
+            recovered.vms.insert(intent_id.clone(), retained);
             report.outcomes.push(RecoveryOutcome {
                 kind: RecoveryKind::Vm,
                 previous_id,
@@ -707,13 +709,22 @@ pub(crate) fn reconcile(
 
     let recovered_vm_ids: HashSet<_> = vm_owners.keys().copied().collect();
     for intent in loaded.vms.values() {
-        let old_id = VmId(intent.runtime_id);
+        let Some(old_runtime_id) = intent.runtime_id else {
+            continue;
+        };
+        let old_id = VmId(old_runtime_id);
         if !recovered_vm_ids.contains(&old_id) {
-            state.ownership().forget_vm(old_id);
+            state
+                .ownership()
+                .try_forget_vm(old_id)
+                .map_err(|error| RecoveryError::Invalid(error.to_string()))?;
         }
     }
     for (id, owner) in vm_owners {
-        state.ownership().record_vm(id, owner);
+        state
+            .ownership()
+            .try_record_vm(id, &owner)
+            .map_err(|error| RecoveryError::Invalid(error.to_string()))?;
     }
 
     let recovered_snapshot_ids: HashSet<_> = snapshot_owners.keys().copied().collect();
@@ -723,11 +734,17 @@ pub(crate) fn reconcile(
         .filter_map(|intent| intent.runtime_id)
     {
         if !recovered_snapshot_ids.contains(&SnapshotId(old_id)) {
-            state.ownership().forget_snapshot(SnapshotId(old_id));
+            state
+                .ownership()
+                .try_forget_snapshot(SnapshotId(old_id))
+                .map_err(|error| RecoveryError::Invalid(error.to_string()))?;
         }
     }
     for (id, owner) in snapshot_owners {
-        state.ownership().record_snapshot(id, owner);
+        state
+            .ownership()
+            .try_record_snapshot(id, &owner)
+            .map_err(|error| RecoveryError::Invalid(error.to_string()))?;
     }
 
     store.replace_after_recovery(recovered)?;
@@ -745,6 +762,13 @@ fn recover_desired_state(
                 handle.state = VmState::Running;
             })
         }
+        DesiredVmState::Stopped if handle.state == VmState::Created => state
+            .hypervisor()
+            .start(handle.id)
+            .and_then(|()| state.hypervisor().stop(handle.id))
+            .map(|()| {
+                handle.state = VmState::Stopped;
+            }),
         DesiredVmState::Created | DesiredVmState::Stopped if handle.state == VmState::Running => {
             state.hypervisor().stop(handle.id).map(|()| {
                 handle.state = VmState::Stopped;
@@ -819,7 +843,7 @@ mod tests {
             state
                 .vms
                 .values()
-                .find(|intent| intent.runtime_id == 7)
+                .find(|intent| intent.runtime_id == Some(7))
                 .unwrap()
                 .owner,
             "acme"
@@ -997,6 +1021,26 @@ mod tests {
                     if state.snapshots.contains_key(snapshot_intent)
             )
         }));
+    }
+
+    #[test]
+    fn stopped_cold_vm_reaches_stopped_not_created() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(RecoveryStore::open(temp.path().join("state.json")).unwrap());
+        store
+            .record_cold_vm(
+                VmId(4),
+                VmConfig::default(),
+                VmState::Stopped,
+                &OrgId::default_org(),
+            )
+            .unwrap();
+        let hypervisor: Arc<dyn Hypervisor> = Arc::new(vm_mock::MockHypervisor::new());
+        let state = AppState::new(hypervisor.clone()).with_recovery_store(store);
+
+        let report = state.reconcile_restart().unwrap();
+        let recovered_id = VmId(report.outcomes[0].current_id.unwrap());
+        assert_eq!(hypervisor.state(recovered_id).unwrap(), VmState::Stopped);
     }
 
     fn outcome(previous_id: u64, decision: RecoveryDecision) -> RecoveryOutcome {

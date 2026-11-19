@@ -250,11 +250,23 @@ impl OwnershipMap {
         }
     }
 
+    pub(crate) fn try_record_vm(&self, vm: VmId, org: &OrgId) -> Result<(), OwnershipStoreError> {
+        self.store.record_vm(vm, org)
+    }
+
     /// Record `org` as the owner of `snap`.
     pub fn record_snapshot(&self, snap: SnapshotId, org: OrgId) {
         if let Err(e) = self.store.record_snapshot(snap, &org) {
             tracing::warn!(snapshot = snap.0, error = %e, "ownership store: record_snapshot failed");
         }
+    }
+
+    pub(crate) fn try_record_snapshot(
+        &self,
+        snap: SnapshotId,
+        org: &OrgId,
+    ) -> Result<(), OwnershipStoreError> {
+        self.store.record_snapshot(snap, org)
     }
 
     /// Drop the recorded owner of `vm`. Idempotent.
@@ -264,11 +276,19 @@ impl OwnershipMap {
         }
     }
 
+    pub(crate) fn try_forget_vm(&self, vm: VmId) -> Result<(), OwnershipStoreError> {
+        self.store.forget_vm(vm)
+    }
+
     /// Drop the recorded owner of `snap`.
     pub fn forget_snapshot(&self, snap: SnapshotId) {
         if let Err(e) = self.store.forget_snapshot(snap) {
             tracing::warn!(snapshot = snap.0, error = %e, "ownership store: forget_snapshot failed");
         }
+    }
+
+    pub(crate) fn try_forget_snapshot(&self, snap: SnapshotId) -> Result<(), OwnershipStoreError> {
+        self.store.forget_snapshot(snap)
     }
 
     /// Look up the recorded owner of `vm`, falling back to

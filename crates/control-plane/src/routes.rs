@@ -87,6 +87,9 @@ pub struct AppState {
     /// are rebuilt from fresh backend handles during restart reconciliation;
     /// persisted host ports are never trusted across a process boundary.
     vm_endpoints: Arc<Mutex<HashMap<VmId, VmEndpointState>>>,
+    /// Serializes snapshot export/delete/restore/fork so a backend mutation
+    /// and its journal commit appear as one control-plane operation.
+    snapshot_operations: Arc<Mutex<HashMap<SnapshotId, Arc<tokio::sync::Mutex<()>>>>>,
     /// Client used to forward external HTTP through the VM's loopback proxy.
     http_client: reqwest::Client,
     /// Prometheus counters exposed at `/metrics`.
@@ -166,6 +169,7 @@ impl AppState {
             fork_usage: Arc::new(Mutex::new(HashMap::new())),
             fork_quota,
             vm_endpoints: Arc::new(Mutex::new(HashMap::new())),
+            snapshot_operations: Arc::new(Mutex::new(HashMap::new())),
             http_client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
@@ -262,6 +266,17 @@ impl AppState {
                 })
                 .operation,
         )
+    }
+
+    pub(crate) fn snapshot_operation(&self, id: SnapshotId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut operations = self
+            .snapshot_operations
+            .lock()
+            .expect("snapshot operations mutex poisoned");
+        operations
+            .entry(id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     fn endpoint_for_request(
@@ -1033,6 +1048,8 @@ async fn restore_snapshot(
     let Path(id) = id?;
     let snap_id = SnapshotId(id);
     state.ownership.require_snapshot_access(snap_id, &org)?;
+    let operation = state.snapshot_operation(snap_id);
+    let _guard = operation.lock_owned().await;
     let handle = state.hypervisor.restore(snap_id)?;
     state.ownership.record_vm(handle.id, org.clone());
     state.record_endpoints(&handle);
@@ -1058,6 +1075,8 @@ async fn fork_snapshot(
     let Path(id) = id?;
     let snap_id = SnapshotId(id);
     state.ownership.require_snapshot_access(snap_id, &org)?;
+    let operation = state.snapshot_operation(snap_id);
+    let _guard = operation.lock_owned().await;
     // Dunning enforcement: past_due / unpaid / canceled past the
     // grace window returns 402 with an upgrade_endpoint hint. Runs
     // before the fork itself so we don't burn a warm-pool slot on an
@@ -1380,6 +1399,8 @@ async fn delete_snapshot(
     let Path(id) = id?;
     let snap_id = SnapshotId(id);
     state.ownership.require_snapshot_access(snap_id, &org)?;
+    let operation = state.snapshot_operation(snap_id);
+    let _guard = operation.lock_owned().await;
     // Drain warm children FIRST so their parent doesn't disappear out
     // from under them. Drain is idempotent — safe even if the snapshot
     // turns out to be unknown to the hypervisor.

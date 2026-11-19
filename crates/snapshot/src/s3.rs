@@ -178,20 +178,23 @@ impl SnapshotStore for S3SnapshotStore {
             artifacts.push(entry);
         }
         let snapshot_prefix = self.snap_prefix(snap_id);
+        let existing = self
+            .runtime
+            .block_on(async {
+                self.client
+                    .list_objects_v2()
+                    .bucket(&self.bucket)
+                    .prefix(&snapshot_prefix)
+                    .max_keys(1)
+                    .send()
+                    .await
+            })
+            .map_err(|e| sdk_to_store_err("check snapshot key", e))?;
+        if !existing.contents().is_empty() || !existing.common_prefixes().is_empty() {
+            return Err(StoreError::Conflict(snap_id));
+        }
 
         let published = self.runtime.block_on(async {
-            let existing = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(&snapshot_prefix)
-                .max_keys(1)
-                .send()
-                .await
-                .map_err(|e| sdk_to_store_err("check snapshot key", e))?;
-            if !existing.contents().is_empty() || !existing.common_prefixes().is_empty() {
-                return Err(StoreError::Conflict(snap_id));
-            }
             // Manifest is small; ship as a single PutObject from
             // memory. Backing file may be hundreds of MiB; stream
             // it from disk via `ByteStream::from_path`. The SDK
@@ -226,7 +229,6 @@ impl SnapshotStore for S3SnapshotStore {
         });
         match published {
             Ok(()) => Ok(()),
-            Err(StoreError::Conflict(id)) => Err(StoreError::Conflict(id)),
             Err(error) => {
                 let _ = self.delete(snap_id);
                 Err(error)
