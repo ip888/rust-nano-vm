@@ -222,6 +222,12 @@ impl Drop for Worker {
 
 type WorkerSlot = Arc<Mutex<Worker>>;
 
+#[derive(Debug, Clone, Copy)]
+struct SnapshotRoute {
+    owner_vm: VmId,
+    worker_id: SnapshotId,
+}
+
 /// Process-fleet [`Hypervisor`] implementation. Holds the worker
 /// map + the snapshot→VM routing table so `restore` and
 /// `snapshot_meta` can find the right worker even after the
@@ -242,11 +248,14 @@ pub struct ProcessFleet {
     /// the worker that captured them; this index lets us forward
     /// `restore` / `snapshot_meta` / `delete_snapshot` to the
     /// right worker.
-    snapshot_owner: RwLock<HashMap<SnapshotId, VmId>>,
+    snapshot_owner: RwLock<HashMap<SnapshotId, SnapshotRoute>>,
     /// Monotonic VM id source. The id is what the jailer uses to
     /// name the per-VM cgroup (`nanovm-vm-<id>`), so it must be
     /// unique across the lifetime of the control plane.
     next_vm_id: AtomicU64,
+    /// Fleet-global snapshot id source. Worker-local counters are independent
+    /// in every subprocess and therefore cannot be exposed directly.
+    next_snapshot_id: AtomicU64,
     /// Tokio runtime the IPC roundtrips run on. Owned (not
     /// borrowed) so the fleet works in non-tokio callers — the
     /// control plane creates a dedicated worker pool when it
@@ -303,6 +312,7 @@ impl ProcessFleet {
             workers: RwLock::new(HashMap::new()),
             snapshot_owner: RwLock::new(HashMap::new()),
             next_vm_id: AtomicU64::new(1),
+            next_snapshot_id: AtomicU64::new(1),
             runtime: Arc::new(runtime),
             warm_pool: Mutex::new(std::collections::VecDeque::new()),
         };
@@ -496,14 +506,6 @@ impl ProcessFleet {
             .ok_or(VmError::UnknownVm(id))
     }
 
-    /// Send a request to the worker owning `id` and parse the
-    /// response. Single-threaded per worker; the Mutex serializes
-    /// the request stream.
-    fn dispatch(&self, id: VmId, req: Request) -> VmResult<Response> {
-        let slot = self.worker_for(id)?;
-        self.dispatch_to_slot(&slot, req)
-    }
-
     /// Translate the orchestrator's `id` to the worker-internal
     /// id, build the request via the closure, and dispatch. Used
     /// for every method that carries a `VmId` (start/stop/state/
@@ -521,7 +523,7 @@ impl ProcessFleet {
             let guard = slot.lock().expect("worker lock");
             guard
                 .worker_vm_id
-                .ok_or_else(|| VmError::Backend("worker id not yet assigned for this VM".into()))?
+                .ok_or(VmError::UnknownVm(orchestrator_id))?
         };
         let req = build(worker_id);
         self.dispatch_to_slot(&slot, req)
@@ -740,14 +742,21 @@ impl Hypervisor for ProcessFleet {
 
     fn snapshot(&self, id: VmId) -> VmResult<SnapshotId> {
         let resp = self.dispatch_remapped(id, |worker_id| Request::Snapshot { id: worker_id })?;
-        let snap = unwrap_response(resp, |r| match r {
+        let worker_snapshot = unwrap_response(resp, |r| match r {
             Response::Snapshot { id } => Ok(id),
             other => Err(other),
         })?;
+        let snap = SnapshotId(self.next_snapshot_id.fetch_add(1, Ordering::Relaxed));
         self.snapshot_owner
             .write()
             .expect("snapshot owner lock")
-            .insert(snap, id);
+            .insert(
+                snap,
+                SnapshotRoute {
+                    owner_vm: id,
+                    worker_id: worker_snapshot,
+                },
+            );
         Ok(snap)
     }
 
@@ -757,15 +766,20 @@ impl Hypervisor for ProcessFleet {
         // worker and ask it to adopt the same directory; then
         // call Restore on the new worker against the just-adopted
         // local id.
-        let owner_vm = self
+        let route = self
             .snapshot_owner
             .read()
             .expect("snapshot owner lock")
             .get(&snap)
             .copied()
             .ok_or(VmError::UnknownSnapshot(snap))?;
-        let owner_slot = self.worker_for(owner_vm)?;
-        let export = self.dispatch_to_slot(&owner_slot, Request::SnapshotExportDir { id: snap })?;
+        let owner_slot = self.worker_for(route.owner_vm)?;
+        let export = self.dispatch_to_slot(
+            &owner_slot,
+            Request::SnapshotExportDir {
+                id: route.worker_id,
+            },
+        )?;
         let dir = match unwrap_response(export, |r| match r {
             Response::OptPath { path } => Ok(path),
             other => Err(other),
@@ -832,6 +846,9 @@ impl Hypervisor for ProcessFleet {
 
     fn destroy(&self, id: VmId) -> VmResult<()> {
         let slot = self.worker_for(id)?;
+        if slot.lock().expect("worker lock").worker_vm_id.is_none() {
+            return Err(VmError::UnknownVm(id));
+        }
         // Cooperative shutdown — best-effort. The Worker's Drop
         // SIGKILLs if this doesn't land in time. Translate to the
         // worker-internal id before asking it to destroy.
@@ -847,7 +864,7 @@ impl Hypervisor for ProcessFleet {
         self.snapshot_owner
             .write()
             .expect("snapshot owner lock")
-            .retain(|_, owner_vm| *owner_vm != id);
+            .retain(|_, route| route.owner_vm != id);
         Ok(())
     }
 
@@ -867,6 +884,15 @@ impl Hypervisor for ProcessFleet {
             .collect();
         let mut handles = Vec::with_capacity(ids.len());
         for id in ids {
+            let is_vm_worker = self
+                .worker_for(id)?
+                .lock()
+                .expect("worker lock")
+                .worker_vm_id
+                .is_some();
+            if !is_vm_worker {
+                continue;
+            }
             let state = self.state(id).unwrap_or(VmState::Created);
             let slot = self.worker_for(id)?;
             let endpoints = slot.lock().expect("worker lock").endpoints.clone();
@@ -890,14 +916,20 @@ impl Hypervisor for ProcessFleet {
     }
 
     fn delete_snapshot(&self, snap: SnapshotId) -> VmResult<()> {
-        let owner_vm = self
+        let route = self
             .snapshot_owner
             .read()
             .expect("snapshot owner lock")
             .get(&snap)
             .copied()
             .ok_or(VmError::UnknownSnapshot(snap))?;
-        let resp = self.dispatch(owner_vm, Request::DeleteSnapshot { id: snap })?;
+        let owner_slot = self.worker_for(route.owner_vm)?;
+        let resp = self.dispatch_to_slot(
+            &owner_slot,
+            Request::DeleteSnapshot {
+                id: route.worker_id,
+            },
+        )?;
         unwrap_response(resp, |r| match r {
             Response::Empty => Ok(()),
             other => Err(other),
@@ -906,22 +938,98 @@ impl Hypervisor for ProcessFleet {
             .write()
             .expect("snapshot owner lock")
             .remove(&snap);
+        if owner_slot
+            .lock()
+            .expect("worker lock")
+            .worker_vm_id
+            .is_none()
+        {
+            self.workers
+                .write()
+                .expect("workers lock")
+                .remove(&route.owner_vm);
+        }
         Ok(())
     }
 
     fn snapshot_meta(&self, snap: SnapshotId) -> VmResult<SnapshotMeta> {
-        let owner_vm = self
+        let route = self
             .snapshot_owner
             .read()
             .expect("snapshot owner lock")
             .get(&snap)
             .copied()
             .ok_or(VmError::UnknownSnapshot(snap))?;
-        let resp = self.dispatch(owner_vm, Request::SnapshotMeta { id: snap })?;
+        let owner_slot = self.worker_for(route.owner_vm)?;
+        let resp = self.dispatch_to_slot(
+            &owner_slot,
+            Request::SnapshotMeta {
+                id: route.worker_id,
+            },
+        )?;
         unwrap_response(resp, |r| match r {
-            Response::SnapshotMeta(m) => Ok(m),
+            Response::SnapshotMeta(mut m) => {
+                m.id = snap;
+                Ok(m)
+            }
             other => Err(other),
         })
+    }
+
+    fn snapshot_export_dir(&self, snap: SnapshotId) -> VmResult<Option<std::path::PathBuf>> {
+        let route = self
+            .snapshot_owner
+            .read()
+            .expect("snapshot owner lock")
+            .get(&snap)
+            .copied()
+            .ok_or(VmError::UnknownSnapshot(snap))?;
+        let owner_slot = self.worker_for(route.owner_vm)?;
+        let resp = self.dispatch_to_slot(
+            &owner_slot,
+            Request::SnapshotExportDir {
+                id: route.worker_id,
+            },
+        )?;
+        unwrap_response(resp, |r| match r {
+            Response::OptPath { path } => Ok(path),
+            other => Err(other),
+        })
+    }
+
+    fn snapshot_adopt(&self, dir: &std::path::Path) -> VmResult<SnapshotId> {
+        let owner_vm = VmId(self.next_vm_id.fetch_add(1, Ordering::Relaxed));
+        let slot = self.spawn_worker(owner_vm)?;
+        let adopted = self.dispatch_to_slot(
+            &slot,
+            Request::SnapshotAdopt {
+                dir: dir.to_path_buf(),
+            },
+        );
+        let adopted = match adopted {
+            Ok(response) => unwrap_response(response, |r| match r {
+                Response::Snapshot { id } => Ok(id),
+                other => Err(other),
+            }),
+            Err(error) => Err(error),
+        };
+        let worker_snapshot = adopted?;
+        let snap = SnapshotId(self.next_snapshot_id.fetch_add(1, Ordering::Relaxed));
+        self.workers
+            .write()
+            .expect("workers lock")
+            .insert(owner_vm, slot);
+        self.snapshot_owner
+            .write()
+            .expect("snapshot owner lock")
+            .insert(
+                snap,
+                SnapshotRoute {
+                    owner_vm,
+                    worker_id: worker_snapshot,
+                },
+            );
+        Ok(snap)
     }
 
     fn vm_meta(&self, id: VmId) -> VmResult<VmMeta> {

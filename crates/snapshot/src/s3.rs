@@ -19,6 +19,7 @@
 //! ```text
 //! s3://<bucket>/<prefix>/snap-<id>/manifest.json
 //! s3://<bucket>/<prefix>/snap-<id>/memory.cow
+//! s3://<bucket>/<prefix>/snap-<id>/<backend-sidecar>
 //! ```
 //!
 //! When `prefix` is empty the keys collapse to `snap-<id>/...`.
@@ -37,13 +38,16 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use tokio::runtime::Runtime;
 
-use crate::store::{SnapshotIdNum, SnapshotStore, StoreError, StoreLocation};
+use crate::store::{
+    validate_downloaded_snapshot, SnapshotIdNum, SnapshotStore, StoreError, StoreLocation,
+};
 use crate::Manifest;
 
 /// Conventional environment variable for overriding the S3 endpoint
@@ -57,6 +61,7 @@ pub struct S3SnapshotStore {
     bucket: String,
     prefix: String,
     runtime: Runtime,
+    publication: Mutex<()>,
 }
 
 impl std::fmt::Debug for S3SnapshotStore {
@@ -125,6 +130,7 @@ impl S3SnapshotStore {
             bucket,
             prefix,
             runtime,
+            publication: Mutex::new(()),
         })
     }
 
@@ -153,13 +159,42 @@ impl S3SnapshotStore {
 
 impl SnapshotStore for S3SnapshotStore {
     fn put(&self, snap_id: SnapshotIdNum, src_dir: &Path) -> Result<(), StoreError> {
-        let manifest = Manifest::read_from_dir(src_dir)?;
+        let _publication = self
+            .publication
+            .lock()
+            .map_err(|_| StoreError::Network("snapshot publication lock poisoned".to_owned()))?;
+        let mut manifest = Manifest::read_from_dir(src_dir)?;
+        manifest.snapshot_id = snap_id;
         let manifest_bytes = manifest.to_json_pretty()?;
-        let backing_path = manifest.backing_file_path(src_dir);
-        let backing_key = self.join_key(&format!("snap-{snap_id}/{}", manifest.backing_file));
         let manifest_key = self.manifest_key(snap_id);
+        let mut artifacts = Vec::new();
+        for entry in fs::read_dir(src_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file()
+                || entry.file_name() == std::ffi::OsStr::new(Manifest::FILE_NAME)
+            {
+                continue;
+            }
+            artifacts.push(entry);
+        }
+        let snapshot_prefix = self.snap_prefix(snap_id);
+        let existing = self
+            .runtime
+            .block_on(async {
+                self.client
+                    .list_objects_v2()
+                    .bucket(&self.bucket)
+                    .prefix(&snapshot_prefix)
+                    .max_keys(1)
+                    .send()
+                    .await
+            })
+            .map_err(|e| sdk_to_store_err("check snapshot key", e))?;
+        if !existing.contents().is_empty() || !existing.common_prefixes().is_empty() {
+            return Err(StoreError::Conflict(snap_id));
+        }
 
-        self.runtime.block_on(async {
+        let published = self.runtime.block_on(async {
             // Manifest is small; ship as a single PutObject from
             // memory. Backing file may be hundreds of MiB; stream
             // it from disk via `ByteStream::from_path`. The SDK
@@ -175,28 +210,36 @@ impl SnapshotStore for S3SnapshotStore {
                 .await
                 .map_err(|e| sdk_to_store_err("put manifest", e))?;
 
-            if backing_path.exists() {
-                let body = ByteStream::from_path(&backing_path)
+            for artifact in artifacts {
+                let file_name = artifact.file_name().to_string_lossy().into_owned();
+                let body = ByteStream::from_path(artifact.path())
                     .await
                     .map_err(|e| StoreError::Io(std::io::Error::other(e)))?;
                 self.client
                     .put_object()
                     .bucket(&self.bucket)
-                    .key(&backing_key)
+                    .key(self.join_key(&format!("snap-{snap_id}/{file_name}")))
                     .body(body)
                     .content_type("application/octet-stream")
                     .send()
                     .await
-                    .map_err(|e| sdk_to_store_err("put backing", e))?;
+                    .map_err(|e| sdk_to_store_err("put snapshot artifact", e))?;
             }
             Ok::<_, StoreError>(())
-        })?;
-        Ok(())
+        });
+        match published {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = self.delete(snap_id);
+                Err(error)
+            }
+        }
     }
 
     fn get(&self, snap_id: SnapshotIdNum, dst_dir: &Path) -> Result<(), StoreError> {
         fs::create_dir_all(dst_dir)?;
         let manifest_key = self.manifest_key(snap_id);
+        let snapshot_prefix = self.snap_prefix(snap_id);
 
         self.runtime.block_on(async {
             // 1. Pull manifest
@@ -223,35 +266,62 @@ impl SnapshotStore for S3SnapshotStore {
             let manifest = Manifest::from_json(&manifest_bytes)?;
             manifest.write_to_dir(dst_dir)?;
 
-            // 2. Pull backing file (if the manifest references one)
-            let backing_key = self.join_key(&format!("snap-{snap_id}/{}", manifest.backing_file));
-            let backing_resp = self
-                .client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(&backing_key)
-                .send()
-                .await;
-            let backing_resp = match backing_resp {
-                Ok(r) => r,
-                // A snapshot with manifest-but-no-backing is legal
-                // (mock backend snapshots don't ship one). Don't
-                // surface that as NotFound.
-                Err(err) if is_no_such_key(&err) => return Ok(()),
-                Err(err) => return Err(sdk_to_store_err("get backing", err)),
-            };
-            let dst_backing = manifest.backing_file_path(dst_dir);
-            let mut byte_stream = backing_resp.body;
-            let mut out = std::fs::File::create(&dst_backing)?;
-            while let Some(chunk) = byte_stream
-                .try_next()
-                .await
-                .map_err(|e| StoreError::Network(format!("backing chunk: {e}")))?
-            {
-                std::io::Write::write_all(&mut out, &chunk)?;
+            // 2. Pull every artifact beneath this snapshot prefix. This
+            // includes memory plus vCPU, machine, and device sidecars without
+            // coupling the store to a particular backend or JDK.
+            let mut continuation: Option<String> = None;
+            loop {
+                let mut list = self
+                    .client
+                    .list_objects_v2()
+                    .bucket(&self.bucket)
+                    .prefix(&snapshot_prefix);
+                if let Some(token) = continuation {
+                    list = list.continuation_token(token);
+                }
+                let listed = list
+                    .send()
+                    .await
+                    .map_err(|e| sdk_to_store_err("list snapshot artifacts", e))?;
+                for object in listed.contents() {
+                    let Some(key) = object.key() else { continue };
+                    if key == manifest_key {
+                        continue;
+                    }
+                    let relative = key.strip_prefix(&snapshot_prefix).ok_or_else(|| {
+                        StoreError::Network(format!(
+                            "snapshot store returned key outside requested prefix: {key}"
+                        ))
+                    })?;
+                    if relative.is_empty() || relative.contains('/') {
+                        continue;
+                    }
+                    let artifact = self
+                        .client
+                        .get_object()
+                        .bucket(&self.bucket)
+                        .key(key)
+                        .send()
+                        .await
+                        .map_err(|e| sdk_to_store_err("get snapshot artifact", e))?;
+                    let mut byte_stream = artifact.body;
+                    let mut out = std::fs::File::create(dst_dir.join(relative))?;
+                    while let Some(chunk) = byte_stream
+                        .try_next()
+                        .await
+                        .map_err(|e| StoreError::Network(format!("artifact chunk: {e}")))?
+                    {
+                        std::io::Write::write_all(&mut out, &chunk)?;
+                    }
+                }
+                continuation = listed.next_continuation_token().map(str::to_owned);
+                if continuation.is_none() {
+                    break;
+                }
             }
             Ok(())
         })?;
+        validate_downloaded_snapshot(snap_id, dst_dir)?;
         Ok(())
     }
 
@@ -311,9 +381,8 @@ impl SnapshotStore for S3SnapshotStore {
 
         self.runtime.block_on(async {
             // Enumerate everything under the snap-<id>/ prefix (we
-            // know only manifest + backing file are there today but
-            // future versions may add device-state sidecars), then
-            // delete them in one batch.
+            // enumerate every manifest, backing, and backend sidecar
+            // artifact, then delete them in one batch.
             let resp = self
                 .client
                 .list_objects_v2()

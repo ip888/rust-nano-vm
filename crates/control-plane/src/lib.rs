@@ -56,6 +56,7 @@ pub mod fork_quota;
 mod keys;
 pub mod metrics;
 mod ownership;
+mod recovery;
 mod request_id;
 mod routes;
 mod sandbox;
@@ -70,6 +71,10 @@ pub use auth::{ApiTokens, IssuedToken, OrgId, Role, RuntimeTokenInfo, TokenId};
 pub use fork_quota::ForkQuota;
 pub use metrics::Metrics;
 pub use ownership::{OwnershipMap, OwnershipStoreError};
+pub use recovery::{
+    RecoveryDecision, RecoveryError, RecoveryKind, RecoveryOutcome, RecoveryReport, RecoveryStore,
+    ENV_STATE_PATH,
+};
 pub use request_id::RequestId;
 pub use routes::{cors_layer_from, router, AppState};
 pub use warm_pool::WarmPool;

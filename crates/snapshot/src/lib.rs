@@ -16,8 +16,9 @@
 //! ```text
 //! <snap-id>/
 //! ├── manifest.json       — [`Manifest`], serde-JSON, human-inspectable
-//! └── memory.cow          — header + page data
-//!                           (optional for mock; required for real backends)
+//! ├── memory.cow          — header + page data
+//! │                          (optional for mock; required for real backends)
+//! └── backend sidecars    — vCPU, machine, and device state when applicable
 //! ```
 //!
 //! `manifest.json` holds metadata (size, page count, labels). The memory
@@ -427,6 +428,15 @@ pub enum SnapshotError {
         found: u32,
         /// Version this build supports.
         expected: u32,
+    },
+    /// Manifest was stored under a directory/object prefix whose durable id
+    /// did not match the manifest's embedded id.
+    #[error("snapshot id mismatch: manifest has {manifest}, expected {expected}")]
+    IdMismatch {
+        /// Id embedded in `manifest.json`.
+        manifest: u64,
+        /// Id selected by the durable-store key.
+        expected: u64,
     },
     /// `page_size * page_count` doesn't match `memory_bytes`. The file is
     /// corrupt or was written by a buggy producer.

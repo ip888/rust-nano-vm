@@ -183,6 +183,10 @@ cargo test  --features kvm -p vm-kvm
 cargo run --release -p bench --bin nanovm-fork-bench -- --forks 100
 ```
 
+For one-node control-plane restart recovery, persistence configuration, and
+the `recreated` / `expired` / `unrecoverable` decisions, see
+[`docs/restart-recovery.md`](docs/restart-recovery.md).
+
 The `kvm` feature stays opt-in so `cargo test --workspace` is green on
 portable CI (no `/dev/kvm`, no root, no nested virt).
 

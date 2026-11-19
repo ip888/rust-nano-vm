@@ -108,6 +108,13 @@ pub(crate) enum ApiError {
         /// Human-readable detail surfaced to the client.
         message: String,
     },
+    /// The requested operation would overwrite immutable durable state.
+    Conflict {
+        /// Stable machine-readable code.
+        code: &'static str,
+        /// Human-readable detail.
+        message: String,
+    },
     /// Internal failure with a dynamic message (failed background
     /// task, IO error during durable-store interaction, …). Renders
     /// as 500 with code `"internal"`. The static-message variant
@@ -223,6 +230,7 @@ impl IntoResponse for ApiError {
             ApiError::Bad(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg),
             ApiError::Unsupported { code, message } => (StatusCode::NOT_IMPLEMENTED, code, message),
             ApiError::NotFound { code, message } => (StatusCode::NOT_FOUND, code, message),
+            ApiError::Conflict { code, message } => (StatusCode::CONFLICT, code, message),
             ApiError::TooManyRequests { .. } => {
                 unreachable!("TooManyRequests handled above with Retry-After header")
             }

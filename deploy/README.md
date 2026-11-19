@@ -189,8 +189,8 @@ preserves the HTTP method, headers, request body, path, and query string.
 
 ## Honest non-features
 
-- **No auto-scaling.** The control plane is stateful (VM ids, snapshot ids, ownership map are all in-memory today). A multi-replica deployment is HA-blast-radius only — pin clients to one replica via session affinity if you need stable ids.
-- **No persistence.** Snapshots live on disk until you set `NANOVM_SNAPSHOT_STORE=s3://...` to push to a durable store. Per-org ownership is in-memory — a restart resets the binding (every resource falls back to `OrgId::default_org()`). A SQLite backing for ownership lands in a follow-up PR.
+- **No auto-scaling.** VM ids, worker processes, and host endpoints are still process-local. Keep this as one control-plane replica and rediscover resource ids after a restart.
+- **Optional one-node recovery.** Set `NANOVM_RECOVERY_STATE_PATH` and `NANOVM_SNAPSHOT_STORE` on persistent storage to reconcile VM/snapshot intent and ownership before serving traffic. See [`docs/restart-recovery.md`](../docs/restart-recovery.md). This does not provide multi-node locking or replicated state.
 - **No cross-region replication.** S3 snapshot store enables cross-region restore, but the control plane itself is single-region per deployment.
 
 ## Observability

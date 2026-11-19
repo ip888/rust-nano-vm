@@ -76,6 +76,8 @@ pub(crate) async fn export_snapshot(
     let snap = SnapshotId(id);
     // Cross-org access check before doing anything expensive.
     state.ownership().require_snapshot_access(snap, &org)?;
+    let operation = state.snapshot_operation(snap);
+    let _guard = operation.lock_owned().await;
     let Json(req) = body.unwrap_or(Json(ExportRequest::default()));
     let store = state
         .snapshot_store()
@@ -106,6 +108,11 @@ pub(crate) async fn export_snapshot(
         .await
         .map_err(|e| ApiError::InternalDyn(format!("export task panicked: {e}")))?
         .map_err(|e| store_err_to_api(e, &display_uri))?;
+    if let Some(recovery) = state.recovery_store() {
+        recovery
+            .mark_snapshot_durable(snap, SnapshotId(target_id))
+            .map_err(|error| ApiError::InternalDyn(error.to_string()))?;
+    }
 
     Ok((
         StatusCode::OK,
@@ -163,7 +170,13 @@ pub(crate) async fn import_snapshot(
     // `/v1/snapshots` lists and can `restore` / `fork` / `delete` it.
     // Without this the adopted snapshot lands in the default-org
     // bucket and isn't reachable from a non-operator caller.
-    state.ownership().record_snapshot(local_id, org);
+    state.ownership().record_snapshot(local_id, org.clone());
+    if let Some(recovery) = state.recovery_store() {
+        recovery
+            .record_snapshot(local_id, &org)
+            .and_then(|()| recovery.mark_snapshot_durable(local_id, SnapshotId(src_snap_id)))
+            .map_err(|error| ApiError::InternalDyn(error.to_string()))?;
+    }
 
     // Best-effort cleanup of the temp dir — the backend has copied
     // what it needs into its own storage.
@@ -190,6 +203,12 @@ fn store_err_to_api(err: snapshot::StoreError, uri: &str) -> ApiError {
         StoreError::Auth(msg) => ApiError::Unauthorized(format!("snapshot store auth: {msg}")),
         StoreError::BadUri(msg) => ApiError::Bad(format!("snapshot store uri: {msg}")),
         StoreError::Format(e) => ApiError::Bad(format!("snapshot store format: {e}")),
+        StoreError::Conflict(id) => ApiError::Conflict {
+            code: "snapshot_store_conflict",
+            message: format!(
+                "snapshot store key {id} is already occupied; choose a new as_snapshot_id"
+            ),
+        },
         // Network and IO failures bubble up as 5xx — they're
         // operational rather than client-fixable.
         StoreError::Network(msg) => ApiError::InternalDyn(format!("snapshot store network: {msg}")),

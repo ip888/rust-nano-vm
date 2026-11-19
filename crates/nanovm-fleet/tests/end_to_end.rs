@@ -194,6 +194,34 @@ fn restore_roundtrips_via_export_and_adopt_to_a_fresh_worker() {
 }
 
 #[test]
+fn adopted_snapshot_survives_original_worker_destroy() {
+    let dir = tempfile::tempdir().unwrap();
+    let fleet = make_fleet(dir.path());
+    let vm = fleet.create_vm(&VmConfig::default()).expect("create_vm");
+    fleet.start(vm.id).expect("start");
+    let original = fleet.snapshot(vm.id).expect("snapshot");
+    let export_dir = fleet
+        .snapshot_export_dir(original)
+        .expect("export dir")
+        .expect("on-disk snapshot");
+
+    let adopted = fleet.snapshot_adopt(&export_dir).expect("adopt");
+    assert_eq!(fleet.list_vms().unwrap().len(), 1, "keeper is not a VM");
+    assert!(matches!(
+        fleet.destroy(vm_core::VmId(2)).unwrap_err(),
+        vm_core::VmError::UnknownVm(_)
+    ));
+    fleet.destroy(vm.id).expect("destroy original worker");
+    assert!(fleet.list_vms().unwrap().is_empty());
+
+    let restored = fleet.restore(adopted).expect("restore adopted snapshot");
+    assert_eq!(fleet.list_vms().unwrap().len(), 1);
+    fleet.destroy(restored.id).expect("destroy restored");
+    fleet.delete_snapshot(adopted).expect("delete adopted");
+    assert!(fleet.list_snapshots().unwrap().is_empty());
+}
+
+#[test]
 fn destroy_unknown_vm_returns_unknown_vm() {
     let dir = tempfile::tempdir().unwrap();
     let fleet = make_fleet(dir.path());
