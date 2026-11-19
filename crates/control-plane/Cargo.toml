@@ -18,7 +18,7 @@ name = "nanovm-openapi"
 path = "src/bin/openapi.rs"
 
 [dependencies]
-vm-core.workspace = true
+vm-core = { workspace = true, features = ["serde"] }
 vm-mock.workspace = true
 # Process-fleet Hypervisor backend, gated by NANOVM_BACKEND=fleet
 # at runtime. The dep stays in the default build because the

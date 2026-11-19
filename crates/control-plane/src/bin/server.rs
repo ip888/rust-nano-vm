@@ -87,6 +87,10 @@
 //!   other). Requires the binary built with `--features sqlite`.
 //!   Accepts either `sqlite:///data/nanovm.sqlite` or a bare
 //!   `/data/nanovm.sqlite` path.
+//! - `NANOVM_RECOVERY_STATE_PATH` — path to an atomically-written JSON
+//!   journal that preserves VM/snapshot intent and ownership across a
+//!   control-plane restart. Intended for one replica with a persistent
+//!   local volume. Unset keeps the historical process-local behaviour.
 //! - `NANOVM_BACKEND` — Hypervisor backend to install. Values:
 //!     - `mock` (default) — in-process `MockHypervisor`, no /dev/kvm
 //!       needed. Right pick for CI, smoke tests, and the "single
@@ -237,6 +241,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // than serving one customer's VM to another after a redeploy.
     let ownership = control_plane::OwnershipMap::from_env()
         .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+    let recovery = control_plane::RecoveryStore::from_env()
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?
+        .map(Arc::new);
+    if let Some(store) = &recovery {
+        info!(
+            path = %store.path().display(),
+            "durable one-node restart recovery enabled"
+        );
+    } else {
+        info!(
+            "durable restart recovery disabled (set {}/path/state.json to enable)",
+            control_plane::ENV_STATE_PATH
+        );
+    }
 
     // Optional Stripe billing context. `None` when the `billing`
     // feature is off OR when any of STRIPE_SECRET_KEY /
@@ -284,8 +302,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_backend_label(backend_label)
         .with_ownership_map(Arc::new(ownership))
         .with_vm_defaults(vm_defaults);
+    let state = if let Some(store) = recovery {
+        state.with_recovery_store(store)
+    } else {
+        state
+    };
     #[cfg(feature = "billing")]
     let state = state.with_billing(billing_ctx);
+
+    let recovery_report = state.reconcile_restart()?;
+    for outcome in &recovery_report.outcomes {
+        match outcome.decision {
+            control_plane::RecoveryDecision::Recreated => info!(
+                kind = ?outcome.kind,
+                previous_id = outcome.previous_id,
+                current_id = outcome.current_id,
+                reason = %outcome.reason,
+                "restart recovery: recreated"
+            ),
+            control_plane::RecoveryDecision::Expired => warn!(
+                kind = ?outcome.kind,
+                previous_id = outcome.previous_id,
+                reason = %outcome.reason,
+                "restart recovery: expired"
+            ),
+            control_plane::RecoveryDecision::Unrecoverable => warn!(
+                kind = ?outcome.kind,
+                previous_id = outcome.previous_id,
+                reason = %outcome.reason,
+                "restart recovery: unrecoverable"
+            ),
+        }
+    }
+    info!(
+        recreated = recovery_report.recreated(),
+        expired = recovery_report.expired(),
+        unrecoverable = recovery_report.unrecoverable(),
+        "restart recovery reconciliation complete"
+    );
 
     // Metered-billing reporter. Off by default. Enabled when
     // NANOVM_BILLING_REPORT_SECS is set to a positive integer AND

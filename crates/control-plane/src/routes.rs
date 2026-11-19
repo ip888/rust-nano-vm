@@ -83,9 +83,9 @@ pub struct AppState {
     /// Per-token fork rate limiter. Shared `Arc` so handlers can poll
     /// without contending on `AppState`'s clone.
     fork_quota: Arc<crate::ForkQuota>,
-    /// VM endpoints returned by the backend. These are process-local because
-    /// live VM workers are process-local too; durable recovery lands with the
-    /// restart/reconciliation stage.
+    /// VM endpoints returned by the backend. These remain process-local and
+    /// are rebuilt from fresh backend handles during restart reconciliation;
+    /// persisted host ports are never trusted across a process boundary.
     vm_endpoints: Arc<Mutex<HashMap<VmId, VmEndpointState>>>,
     /// Client used to forward external HTTP through the VM's loopback proxy.
     http_client: reqwest::Client,
@@ -105,6 +105,10 @@ pub struct AppState {
     /// `/v1/snapshots/:id/*` access. Single-tenant deployments
     /// (default-org only) keep working without touching this map.
     ownership: Arc<OwnershipMap>,
+    /// Optional one-node durable intent journal used to reconcile process
+    /// restarts. `None` preserves the historical ephemeral-control-plane
+    /// behaviour for local development and tests.
+    recovery: Option<Arc<crate::RecoveryStore>>,
     /// Process start time (monotonic clock) — used to compute uptime
     /// reported on `GET /v1/health`. Set once when the first `AppState`
     /// is constructed and shared across clones.
@@ -170,6 +174,7 @@ impl AppState {
             warm_pool,
             snapshot_store: None,
             ownership: Arc::new(OwnershipMap::default()),
+            recovery: None,
             start_instant: Instant::now(),
             started_at: rfc3339_now(),
             backend_label: "mock",
@@ -188,7 +193,7 @@ impl AppState {
         self
     }
 
-    fn record_endpoints(&self, handle: &vm_core::VmHandle) {
+    pub(crate) fn record_endpoints(&self, handle: &vm_core::VmHandle) {
         let mut endpoints = self
             .vm_endpoints
             .lock()
@@ -204,6 +209,10 @@ impl AppState {
         state.endpoints = handle.endpoints.clone();
         state.active = handle.state == VmState::Running;
         state.cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+    }
+
+    pub(crate) fn record_recovered_endpoints(&self, handle: &vm_core::VmHandle) {
+        self.record_endpoints(handle);
     }
 
     fn deactivate_endpoints(&self, id: VmId) {
@@ -322,6 +331,29 @@ impl AppState {
     /// implementing the export/import endpoints.
     pub(crate) fn snapshot_store(&self) -> Option<&Arc<dyn snapshot::SnapshotStore>> {
         self.snapshot_store.as_ref()
+    }
+
+    /// Install a durable one-node restart journal. Lifecycle and snapshot
+    /// mutations are persisted atomically after the backend operation.
+    pub fn with_recovery_store(mut self, store: Arc<crate::RecoveryStore>) -> Self {
+        self.recovery = Some(store);
+        self
+    }
+
+    pub(crate) fn recovery_store(&self) -> Option<&Arc<crate::RecoveryStore>> {
+        self.recovery.as_ref()
+    }
+
+    /// Reconcile persisted VM and snapshot intent against a fresh hypervisor.
+    ///
+    /// Call once during control-plane startup, before accepting traffic. The
+    /// report deliberately continues past per-resource failures so operators
+    /// can see all `expired` and `unrecoverable` items in a single restart.
+    pub fn reconcile_restart(&self) -> Result<crate::RecoveryReport, crate::RecoveryError> {
+        let Some(store) = &self.recovery else {
+            return Ok(crate::RecoveryReport::default());
+        };
+        crate::recovery::reconcile(self, store)
     }
 
     /// Override the backend label surfaced on `GET /v1/health`. Real
@@ -646,8 +678,13 @@ async fn create_vm(
     let mut cfg = VmConfig::try_from(req).map_err(ApiError::Bad)?;
     state.vm_defaults.apply_to(&mut cfg);
     let handle = state.hypervisor.create_vm(&cfg)?;
-    state.ownership.record_vm(handle.id, org);
+    state.ownership.record_vm(handle.id, org.clone());
     state.record_endpoints(&handle);
+    if let Some(recovery) = state.recovery_store() {
+        recovery
+            .record_cold_vm(handle.id, cfg, handle.state, &org)
+            .map_err(|error| ApiError::InternalDyn(error.to_string()))?;
+    }
     Ok((StatusCode::CREATED, Json(handle.into())))
 }
 
@@ -722,7 +759,20 @@ async fn start_vm(
     let lifecycle = state.lifecycle_operation(vm_id);
     let _guard = lifecycle.lock_owned().await;
     state.hypervisor.start(vm_id)?;
-    state.reactivate_endpoints(vm_id);
+    if let Ok(handles) = state.hypervisor.list_vms() {
+        if let Some(handle) = handles.into_iter().find(|handle| handle.id == vm_id) {
+            state.record_endpoints(&handle);
+        } else {
+            state.reactivate_endpoints(vm_id);
+        }
+    } else {
+        state.reactivate_endpoints(vm_id);
+    }
+    if let Some(recovery) = state.recovery_store() {
+        recovery
+            .set_vm_state(vm_id, VmState::Running)
+            .map_err(|error| ApiError::InternalDyn(error.to_string()))?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -740,6 +790,11 @@ async fn stop_vm(
     if let Err(error) = state.hypervisor.stop(vm_id) {
         state.reactivate_endpoints(vm_id);
         return Err(error.into());
+    }
+    if let Some(recovery) = state.recovery_store() {
+        recovery
+            .set_vm_state(vm_id, VmState::Stopped)
+            .map_err(|error| ApiError::InternalDyn(error.to_string()))?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -915,6 +970,11 @@ async fn destroy_vm(
     }
     state.forget_endpoint_state(vm_id);
     state.ownership.forget_vm(vm_id);
+    if let Some(recovery) = state.recovery_store() {
+        recovery
+            .forget_vm(vm_id)
+            .map_err(|error| ApiError::InternalDyn(error.to_string()))?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -937,7 +997,12 @@ async fn snapshot_vm(
             .map_err(|e| ApiError::Bad(format!("snapshot body: {e}")))?
     };
     let snap = state.hypervisor.snapshot(vm_id)?;
-    state.ownership.record_snapshot(snap, org);
+    state.ownership.record_snapshot(snap, org.clone());
+    if let Some(recovery) = state.recovery_store() {
+        recovery
+            .record_snapshot(snap, &org)
+            .map_err(|error| ApiError::InternalDyn(error.to_string()))?;
+    }
     let mut dto: SnapshotDto = snap.into();
     if let Some(dir) = req.to_dir {
         // Pull the captured geometry from the backend, render it as a
@@ -969,8 +1034,13 @@ async fn restore_snapshot(
     let snap_id = SnapshotId(id);
     state.ownership.require_snapshot_access(snap_id, &org)?;
     let handle = state.hypervisor.restore(snap_id)?;
-    state.ownership.record_vm(handle.id, org);
+    state.ownership.record_vm(handle.id, org.clone());
     state.record_endpoints(&handle);
+    if let Some(recovery) = state.recovery_store() {
+        recovery
+            .record_snapshot_vm(handle.id, snap_id, handle.state, &org)
+            .map_err(|error| ApiError::InternalDyn(error.to_string()))?;
+    }
     Ok((StatusCode::CREATED, Json(handle.into())))
 }
 
@@ -1045,6 +1115,11 @@ async fn fork_snapshot(
     };
     state.ownership.record_vm(handle.id, org.clone());
     state.record_endpoints(&handle);
+    if let Some(recovery) = state.recovery_store() {
+        recovery
+            .record_snapshot_vm(handle.id, snap_id, handle.state, &org)
+            .map_err(|error| ApiError::InternalDyn(error.to_string()))?;
+    }
     let fork_ms = started.elapsed().as_millis() as u64;
 
     let mut fork_count = 1u64;
@@ -1311,6 +1386,11 @@ async fn delete_snapshot(
     state.warm_pool.drain(snap_id);
     state.hypervisor.delete_snapshot(snap_id)?;
     state.ownership.forget_snapshot(snap_id);
+    if let Some(recovery) = state.recovery_store() {
+        recovery
+            .forget_snapshot(snap_id)
+            .map_err(|error| ApiError::InternalDyn(error.to_string()))?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

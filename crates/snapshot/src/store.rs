@@ -1,8 +1,9 @@
 //! Pluggable durable-storage backend for snapshots.
 //!
-//! A snapshot is a directory containing `manifest.json` and `memory.cow`
-//! (see the crate root). For local single-host workloads, keeping those
-//! files on the VMM's local filesystem is sufficient. For **production
+//! A snapshot is a directory containing `manifest.json`, `memory.cow`, and
+//! backend state sidecars (see the crate root). For local single-host
+//! workloads, keeping those files on the VMM's local filesystem is
+//! sufficient. For **production
 //! deployments** — multi-region warm pools, cross-host failover,
 //! deploy-and-redeploy without losing the warmed base image — the
 //! snapshot needs to live somewhere durable that any host can pull it
@@ -16,12 +17,13 @@
 //!
 //! ### Object layout
 //!
-//! For any backend, a snapshot id `N` is stored as **two named blobs**
-//! under a per-snapshot prefix:
+//! For any backend, a snapshot id `N` is stored as named artifacts under a
+//! per-snapshot prefix:
 //!
 //! ```text
 //! <store-root>/snap-<N>/manifest.json
 //! <store-root>/snap-<N>/memory.cow
+//! <store-root>/snap-<N>/<backend-sidecar>...
 //! ```
 //!
 //! - Filesystem backend: `<store-root>` is a host path; the blobs are
@@ -106,17 +108,15 @@ pub enum StoreError {
 /// the codebase. The trait is `Send + Sync` so an `Arc<dyn
 /// SnapshotStore>` can be shared across handler threads.
 pub trait SnapshotStore: Send + Sync + std::fmt::Debug {
-    /// Upload the snapshot at `src_dir` (which must contain
-    /// `manifest.json` + the backing file referenced in it) to the
-    /// store under id `snap_id`. Idempotent on the backend: re-putting
-    /// the same id overwrites.
+    /// Upload every regular snapshot artifact in `src_dir` (manifest,
+    /// backing file, and backend/device sidecars) under `snap_id`.
+    /// Re-putting the same id overwrites those artifacts.
     fn put(&self, snap_id: SnapshotIdNum, src_dir: &Path) -> Result<(), StoreError>;
 
     /// Download the snapshot with id `snap_id` into the directory
     /// `dst_dir` (which the implementation creates if missing).
-    /// After a successful return, `dst_dir/manifest.json` and the
-    /// referenced backing file are present and ready for the local
-    /// restore path.
+    /// After a successful return, all stored artifacts are present and ready
+    /// for the local restore path.
     fn get(&self, snap_id: SnapshotIdNum, dst_dir: &Path) -> Result<(), StoreError>;
 
     /// Enumerate the snapshot ids currently in the store. Order is
@@ -140,10 +140,12 @@ pub trait SnapshotStore: Send + Sync + std::fmt::Debug {
 /// ```text
 /// /<root>/snap-42/manifest.json
 /// /<root>/snap-42/memory.cow
+/// /<root>/snap-42/vcpu-0.json
+/// /<root>/snap-42/machine.json
 /// ```
 ///
-/// `put` copies the manifest and the backing file referenced in it
-/// into the destination. `get` reads them out — the caller hands the
+/// `put` copies the manifest, backing file, and backend state sidecars into
+/// the destination. `get` reads them out — the caller hands the
 /// returned directory to the existing `Manifest::read_from_dir` path,
 /// no changes to the restore code.
 #[derive(Debug, Clone)]
@@ -165,25 +167,42 @@ impl FsSnapshotStore {
     }
 }
 
+pub(crate) fn validate_downloaded_snapshot(
+    snap_id: SnapshotIdNum,
+    dir: &Path,
+) -> Result<(), StoreError> {
+    let manifest = Manifest::read_from_dir(dir)?;
+    if manifest.snapshot_id != snap_id {
+        return Err(SnapshotError::IdMismatch {
+            manifest: manifest.snapshot_id,
+            expected: snap_id,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 impl SnapshotStore for FsSnapshotStore {
     fn put(&self, snap_id: SnapshotIdNum, src_dir: &Path) -> Result<(), StoreError> {
         let dst = self.snap_dir(snap_id);
         fs::create_dir_all(&dst)?;
 
         // Read manifest first so we know which backing file to copy.
-        let manifest = Manifest::read_from_dir(src_dir)?;
+        let mut manifest = Manifest::read_from_dir(src_dir)?;
+        manifest.snapshot_id = snap_id;
 
         // Copy manifest.json verbatim (re-serialize so the on-disk
         // bytes are normalized regardless of what's on src).
         manifest.write_to_dir(&dst)?;
 
-        // Copy backing file. If the manifest references a backing
-        // file that doesn't exist in src_dir, surface that as a
-        // Format error rather than silently completing.
-        let src_backing = manifest.backing_file_path(src_dir);
-        if src_backing.exists() {
-            let dst_backing = manifest.backing_file_path(&dst);
-            fs::copy(&src_backing, &dst_backing)?;
+        for entry in fs::read_dir(src_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file()
+                || entry.file_name() == std::ffi::OsStr::new(Manifest::FILE_NAME)
+            {
+                continue;
+            }
+            fs::copy(entry.path(), dst.join(entry.file_name()))?;
         }
         Ok(())
     }
@@ -198,11 +217,16 @@ impl SnapshotStore for FsSnapshotStore {
         let manifest = Manifest::read_from_dir(&src)?;
         manifest.write_to_dir(dst_dir)?;
 
-        let src_backing = manifest.backing_file_path(&src);
-        if src_backing.exists() {
-            let dst_backing = manifest.backing_file_path(dst_dir);
-            fs::copy(&src_backing, &dst_backing)?;
+        for entry in fs::read_dir(&src)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file()
+                || entry.file_name() == std::ffi::OsStr::new(Manifest::FILE_NAME)
+            {
+                continue;
+            }
+            fs::copy(entry.path(), dst_dir.join(entry.file_name()))?;
         }
+        validate_downloaded_snapshot(snap_id, dst_dir)?;
         Ok(())
     }
 
@@ -345,6 +369,8 @@ mod tests {
         let backing_path = m.backing_file_path(dir);
         let bytes: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
         fs::write(&backing_path, &bytes).unwrap();
+        fs::write(dir.join("vcpu-0.json"), b"{\"rip\":4096}").unwrap();
+        fs::write(dir.join("machine.json"), b"{\"clock\":0}").unwrap();
         m
     }
 
@@ -438,6 +464,14 @@ mod tests {
         let restored_backing = fs::read(restored.backing_file_path(&dst)).unwrap();
         let original_backing = fs::read(original.backing_file_path(&src)).unwrap();
         assert_eq!(restored_backing, original_backing);
+        assert_eq!(
+            fs::read(dst.join("vcpu-0.json")).unwrap(),
+            b"{\"rip\":4096}"
+        );
+        assert_eq!(
+            fs::read(dst.join("machine.json")).unwrap(),
+            b"{\"clock\":0}"
+        );
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&src);
@@ -452,6 +486,23 @@ mod tests {
         let err = store.get(99, &dst).unwrap_err();
         assert!(matches!(err, StoreError::NotFound(99)), "got {err:?}");
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dst);
+    }
+
+    #[test]
+    fn fs_store_rekeys_manifest_to_durable_id() {
+        let root = tmp_dir("rekey");
+        let store = FsSnapshotStore::new(&root);
+        let src = tmp_dir("rekey-src");
+        make_src_snapshot(&src, 42);
+
+        store.put(99, &src).unwrap();
+        let dst = tmp_dir("rekey-dst");
+        store.get(99, &dst).unwrap();
+
+        assert_eq!(Manifest::read_from_dir(&dst).unwrap().snapshot_id, 99);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
         let _ = fs::remove_dir_all(&dst);
     }
 

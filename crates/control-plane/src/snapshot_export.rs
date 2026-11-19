@@ -106,6 +106,11 @@ pub(crate) async fn export_snapshot(
         .await
         .map_err(|e| ApiError::InternalDyn(format!("export task panicked: {e}")))?
         .map_err(|e| store_err_to_api(e, &display_uri))?;
+    if let Some(recovery) = state.recovery_store() {
+        recovery
+            .mark_snapshot_durable(snap, SnapshotId(target_id))
+            .map_err(|error| ApiError::InternalDyn(error.to_string()))?;
+    }
 
     Ok((
         StatusCode::OK,
@@ -163,7 +168,13 @@ pub(crate) async fn import_snapshot(
     // `/v1/snapshots` lists and can `restore` / `fork` / `delete` it.
     // Without this the adopted snapshot lands in the default-org
     // bucket and isn't reachable from a non-operator caller.
-    state.ownership().record_snapshot(local_id, org);
+    state.ownership().record_snapshot(local_id, org.clone());
+    if let Some(recovery) = state.recovery_store() {
+        recovery
+            .record_snapshot(local_id, &org)
+            .and_then(|()| recovery.mark_snapshot_durable(local_id, SnapshotId(src_snap_id)))
+            .map_err(|error| ApiError::InternalDyn(error.to_string()))?;
+    }
 
     // Best-effort cleanup of the temp dir — the backend has copied
     // what it needs into its own storage.
